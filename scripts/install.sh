@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # Configuration
-GITHUB_REPO="afittestide/asimi-cli"
+GITHUB_REPO="afittestide/asimi"
 BINARY_NAME="asimi"
 
 # Colors for output

@@ -71,12 +71,12 @@ Test the one-liner installer:
 ```bash
 curl -fsSL https://asimi.dev/installer | bash
 # or
-curl -fsSL https://raw.githubusercontent.com/afittestide/asimi-cli/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/afittestide/asimi/main/scripts/install.sh | bash
 ```
 
 ### Verify the Release
 
-1. Check [GitHub Releases](https://github.com/afittestide/asimi-cli/releases)
+1. Check [GitHub Releases](https://github.com/afittestide/asimi/releases)
 2. Verify binaries are attached
 3. Test Homebrew installation:
    ```bash
@@ -113,7 +113,7 @@ The installer should be accessible at `https://asimi.dev/installer`. There are s
 
 1. **GitHub Raw URL (Fallback)**: The script is always available at:
    ```
-   https://raw.githubusercontent.com/afittestide/asimi-cli/main/scripts/install.sh
+   https://raw.githubusercontent.com/afittestide/asimi/main/scripts/install.sh
    ```
 
 2. **Domain Redirect**: Configure `asimi.dev/installer` to redirect to the GitHub raw URL.

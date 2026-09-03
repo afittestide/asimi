@@ -18,8 +18,8 @@ func TestAsVersionIsParseable(t *testing.T) {
 
 func TestGetAsimiSlug(t *testing.T) {
 	slug := GetAsimiSlug()
-	if slug != "afittestide/asimi-cli" {
-		t.Errorf("GetAsimiSlug() = %q, want %q", slug, "afittestide/asimi-cli")
+	if slug != "afittestide/asimi" {
+		t.Errorf("GetAsimiSlug() = %q, want %q", slug, "afittestide/asimi")
 	}
 }
 
@@ -66,7 +66,7 @@ func TestParseGitHubRelease(t *testing.T) {
 			name: "update available with matching asset",
 			body: `{
 				"tag_name": "v0.9.0",
-				"html_url": "https://github.com/afittestide/asimi-cli/releases/v0.9.0",
+				"html_url": "https://github.com/afittestide/asimi/releases/v0.9.0",
 				"body": "Release notes here",
 				"assets": [
 					{"name": "asimi_v0.9.0_darwin_amd64.tar.gz", "browser_download_url": "https://example.com/darwin_amd64.tar.gz"},
@@ -77,13 +77,13 @@ func TestParseGitHubRelease(t *testing.T) {
 			wantUpdate:     true,
 			wantErr:        false,
 			wantVersion:    "v0.9.0",
-			wantURL:        "https://github.com/afittestide/asimi-cli/releases/v0.9.0",
+			wantURL:        "https://github.com/afittestide/asimi/releases/v0.9.0",
 		},
 		{
 			name: "no update needed - same version",
 			body: `{
 				"tag_name": "v0.8.1",
-				"html_url": "https://github.com/afittestide/asimi-cli/releases/v0.8.1",
+				"html_url": "https://github.com/afittestide/asimi/releases/v0.8.1",
 				"body": "",
 				"assets": []
 			}`,
@@ -91,13 +91,13 @@ func TestParseGitHubRelease(t *testing.T) {
 			wantUpdate:     false,
 			wantErr:        false,
 			wantVersion:    "v0.8.1",
-			wantURL:        "https://github.com/afittestide/asimi-cli/releases/v0.8.1",
+			wantURL:        "https://github.com/afittestide/asimi/releases/v0.8.1",
 		},
 		{
 			name: "no update needed - older release",
 			body: `{
 				"tag_name": "v0.7.0",
-				"html_url": "https://github.com/afittestide/asimi-cli/releases/v0.7.0",
+				"html_url": "https://github.com/afittestide/asimi/releases/v0.7.0",
 				"body": "",
 				"assets": []
 			}`,
@@ -105,7 +105,7 @@ func TestParseGitHubRelease(t *testing.T) {
 			wantUpdate:     false,
 			wantErr:        false,
 			wantVersion:    "v0.7.0",
-			wantURL:        "https://github.com/afittestide/asimi-cli/releases/v0.7.0",
+			wantURL:        "https://github.com/afittestide/asimi/releases/v0.7.0",
 		},
 		{
 			name:           "invalid JSON",

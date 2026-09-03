@@ -1,6 +1,6 @@
 # Asimi CLI
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/afittestide/asimi-cli/ci.yml?branch=main&label=tests)](https://github.com/afittestide/asimi-cli/actions/workflows/ci.yml?query=branch%3Amain)
+[![Tests](https://img.shields.io/github/actions/workflow/status/afittestide/asimi/ci.yml?branch=main&label=tests)](https://github.com/afittestide/asimi/actions/workflows/ci.yml?query=branch%3Amain)
 
 > A safe, fast, imperial court to help you rule your project
 
@@ -69,7 +69,7 @@ go install github.com/afittestide/asimi@latest
 
 ### Binaries
 
-Download the binary from your platform from [latest releases](https://github.com/afittestide/asimi-cli/releases/latest) and copy to your favorite bin directory e.g, `/usr/local/bin`.
+Download the binary from your platform from [latest releases](https://github.com/afittestide/asimi/releases/latest) and copy to your favorite bin directory e.g, `/usr/local/bin`.
 
 ### First Steps
 
@@ -90,7 +90,7 @@ Asimi uses it instead of docker because it's more secure - on linux it doesn't r
 
 The sandbox is based on `.agents/sandbox/Dockerfile` which is created by the `init` command. 
 To build the image run `just build-sandbox` for an image named as in:
-`localhost/asimi/sandbox/afittestide/asimi-cli:latest`.
+`localhost/asimi/sandbox/afittestide/asimi:latest`.
 Asimi will launch a container based on this image the first time the model calls the shell tool.
 The container will stay up as long as the program is running. 
 Once the program exits, the container is shutdown and removed.
@@ -156,8 +156,8 @@ To develop Asimi itself:
 
 1. **Fork and clone:**
    ```bash
-   gh repo fork afittestide/asimi-cli --clone
-   cd asimi-cli
+   gh repo fork afittestide/asimi --clone
+   cd asimi
    ```
 
 2. **Install dependencies:**

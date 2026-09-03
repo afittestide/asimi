@@ -16,7 +16,7 @@ import (
 
 const (
 	githubOwner = "afittestide"
-	githubRepo  = "asimi-cli"
+	githubRepo  = "asimi"
 )
 
 // Update this before each release

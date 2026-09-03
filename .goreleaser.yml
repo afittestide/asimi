@@ -47,7 +47,7 @@ snapshot:
 release:
   github:
     owner: afittestide
-    name: asimi-cli
+    name: asimi
   draft: false
   prerelease: auto
   mode: replace
@@ -71,7 +71,7 @@ release:
     
   footer: |
     ---
-    **Full Changelog**: https://github.com/afittestide/asimi-cli/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/afittestide/asimi/compare/{{ .PreviousTag }}...{{ .Tag }}
 
 brews:
   - name: asimi
@@ -79,7 +79,7 @@ brews:
       owner: afittestide
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://github.com/afittestide/asimi-cli
+    homepage: https://github.com/afittestide/asimi
     description: "AI-powered CLI assistant with container support - safe, opinionated coding agent"
     license: MIT
     directory: Formula
@@ -98,4 +98,4 @@ brews:
       Asimi requires Podman for containerized shell execution.
       Install it with: brew install podman
       
-      For configuration, see: https://github.com/afittestide/asimi-cli
+      For configuration, see: https://github.com/afittestide/asimi

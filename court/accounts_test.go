@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/afittestide/asimi/internal/keyring"
+	"github.com/afittestide/asimi/internal/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -610,6 +611,21 @@ func TestGetKeysForVertex_InKeysMap(t *testing.T) {
 	assert.Equal(t, "map-project", cfg.ProjectID.Val)
 	assert.Equal(t, "europe-west1", cfg.Region.Val)
 	assert.Equal(t, `{"type":"service_account"}`, cfg.AuthCredentials.Val)
+}
+
+// TestGetConfigForProvider_AttributionHeaders verifies that User-Agent
+// and OpenRouter HTTP-Referer headers reflect the repository rename.
+func TestGetConfigForProvider_AttributionHeaders(t *testing.T) {
+	account := NewAccount(30, 60, 0, "")
+	cfg, err := account.GetConfigForProvider(schemas.OpenRouter)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	headers := cfg.NetworkConfig.ExtraHeaders
+	assert.Equal(t, "asimi/"+utils.AsimiVersion, headers["User-Agent"])
+	assert.Equal(t, "https://github.com/afittestide/asimi", headers["HTTP-Referer"])
+	assert.Equal(t, "Asimi", headers["X-Title"])
+	assert.Equal(t, "asimi", headers["originator"])
 }
 
 // TestGetConfigForProvider tests the config provider

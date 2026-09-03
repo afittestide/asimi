@@ -335,7 +335,7 @@ func (a *Account) GetConfigForProvider(provider schemas.ModelProvider) (*schemas
 	// Identify asimi to every provider. Bifrost's SetExtraHeaders only sets
 	// a header when it's absent, so these can't clobber Authorization etc.
 	headers := map[string]string{
-		"User-Agent": "asimi-cli/" + utils.AsimiVersion,
+		"User-Agent": "asimi/" + utils.AsimiVersion,
 		"originator": "asimi",
 	}
 	// Codex OAuth: set the chatgpt-account-id header so the backend routes
@@ -346,7 +346,7 @@ func (a *Account) GetConfigForProvider(provider schemas.ModelProvider) (*schemas
 	// OpenRouter app attribution: HTTP-Referer + X-Title surface asimi on
 	// openrouter.ai/rankings and in users' dashboards.
 	if provider == schemas.OpenRouter {
-		headers["HTTP-Referer"] = "https://github.com/afittestide/asimi-cli"
+		headers["HTTP-Referer"] = "https://github.com/afittestide/asimi"
 		headers["X-Title"] = "Asimi"
 	}
 	networkConfig.ExtraHeaders = headers

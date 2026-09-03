@@ -24,11 +24,11 @@ the registry, gated by minister realm permissions.
 - After e661, a headless terminal emulator (for nvim + terminal-bench drives)
   is added via config alone.
 
-Ref: https://github.com/afittestide/asimi-cli/issues/158
+Ref: https://github.com/afittestide/asimi/issues/158
 
 ### Court Alignment
 
-- Realign ministers to full 三省 (https://github.com/afittestide/asimi-cli/issues/154)
+- Realign ministers to full 三省 (https://github.com/afittestide/asimi/issues/154)
 - Sharpen roles → 文言文 (issues/156), tools (issues/155), DB schema (issues/152)
 
 ### The nvim co-path
@@ -45,19 +45,10 @@ Ref: https://github.com/afittestide/asimi-cli/issues/158
 - Git worktrees for concurrent rituals (issues/153)
 - Seal edict command with review/approval UI
 
-### Skills Support
-Core (`.agents/skills/**/SKILL.md` discovery + per-minister injection) is done
-(e662). Harmonized skills — a self-improving loop, not a store:
-- Add the **Ministry of Personnel (吏部)** — a minister that performs post-mortems
-  on sessions, distills lessons, and proposes new/improved skills
-- Proposals become/revise `.agents/skills/` SKILL.md files, which then feed back
-  into the existing discovery loop
-- (Remote marketplace via `agentskills.io/llms.txt` is a consideration, not core)
-
 ## V1.2
 
 - Realm-aligned minister permissions: the repo is earth + intent; tests/docs are
-  intent content (https://github.com/afittestide/asimi-cli/issues/160)
+  intent content (https://github.com/afittestide/asimi/issues/160)
 - Update swift-strike to BDD
 
 ## V2.0
