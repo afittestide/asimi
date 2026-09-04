@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/stretchr/testify/require"
@@ -315,4 +316,181 @@ func TestProjectSlugLowercasesRemoteSegments(t *testing.T) {
 
 	slug := projectSlug(dir)
 	require.Equal(t, "myorg/myproject", slug)
+}
+
+// newTestRepo creates a RepoInfo backed by a real git repo in a temp dir.
+// The repo has one committed file and one uncommitted modification so that
+// RefreshDiff produces non-zero added/deleted counts.
+func newTestRepo(t *testing.T) (*RepoInfo, string) {
+	t.Helper()
+	dir := t.TempDir()
+
+	_, err := runGitCommand(dir, "init")
+	require.NoError(t, err)
+	// Configure identity for commit
+	_, err = runGitCommand(dir, "config", "user.email", "test@example.com")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.name", "Test")
+	require.NoError(t, err)
+
+	// Committed file
+	committed := filepath.Join(dir, "committed.txt")
+	require.NoError(t, os.WriteFile(committed, []byte("line1\nline2\n"), 0o644))
+	_, err = runGitCommand(dir, "add", "committed.txt")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "commit", "-m", "initial")
+	require.NoError(t, err)
+
+	// Working tree modification
+	modified := filepath.Join(dir, "committed.txt")
+	require.NoError(t, os.WriteFile(modified, []byte("line1\nline2\nline3\n"), 0o644))
+
+	repo, err := gogit.PlainOpenWithOptions(dir, &gogit.PlainOpenOptions{DetectDotGit: true})
+	require.NoError(t, err)
+
+	ri := &RepoInfo{
+		ProjectRoot: dir,
+		repo:        repo,
+	}
+	ri.RefreshDiff()
+	return ri, dir
+}
+
+func TestRefreshDiffWithTTL_DoesNotRefreshWithinTTL(t *testing.T) {
+	ri, _ := newTestRepo(t)
+
+	// Record the diff state after first refresh
+	require.True(t, ri.diffInitialized, "newTestRepo should have initialized the diff")
+
+	// Manually set known state to verify TTL prevents re-computation.
+	ri.LinesAdded = 100
+	ri.LinesDeleted = 50
+	ri.lastDiffRefresh = time.Now()
+
+	// Called immediately after lastDiffRefresh → should be skipped within TTL
+	ri.RefreshDiffWithTTL(1 * time.Second)
+
+	// Values must be unchanged because refresh should have been skipped
+	require.Equal(t, 100, ri.LinesAdded, "RefreshDiffWithTTL within TTL must skip recomputation")
+	require.Equal(t, 50, ri.LinesDeleted, "RefreshDiffWithTTL within TTL must skip recomputation")
+}
+
+func TestRefreshDiffWithTTL_RefreshesAfterTTLExpiry(t *testing.T) {
+	ri, dir := newTestRepo(t)
+
+	// Force a refresh with a very old lastDiffRefresh to force TTL expiry
+	ri.lastDiffRefresh = time.Now().Add(-10 * time.Second)
+	ri.diffInitialized = true
+
+	// Set known stale values to verify recomputation
+	ri.LinesAdded = 99
+	ri.LinesDeleted = 88
+
+	ri.RefreshDiffWithTTL(100 * time.Millisecond)
+
+	// After TTL, the diff must be recomputed from the real repo state
+	// committed.txt has 2 lines committed and 3 in worktree → 1 added, 0 deleted
+	require.Equal(t, 1, ri.LinesAdded,
+		"after TTL expiry, RefreshDiffWithTTL must recompute added lines")
+	require.Equal(t, 0, ri.LinesDeleted,
+		"after TTL expiry, RefreshDiffWithTTL must recompute deleted lines")
+	_ = dir
+}
+
+func TestRefreshDiffWithTTL_InitializesWhenNotYetLoaded(t *testing.T) {
+	dir := t.TempDir()
+	_, err := runGitCommand(dir, "init")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.email", "test@example.com")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.name", "Test")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("hello\n"), 0o644))
+	_, err = runGitCommand(dir, "add", "file.txt")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "commit", "-m", "init")
+	require.NoError(t, err)
+
+	repo, err := gogit.PlainOpenWithOptions(dir, &gogit.PlainOpenOptions{DetectDotGit: true})
+	require.NoError(t, err)
+
+	ri := &RepoInfo{repo: repo}
+	require.False(t, ri.diffInitialized,
+		"newly created RepoInfo must not have diff initialized")
+
+	// Clean repo, no working tree changes
+	ri.RefreshDiffWithTTL(time.Hour)
+	require.True(t, ri.diffInitialized, "RefreshDiffWithTTL should initialize the diff")
+	require.Equal(t, 0, ri.LinesAdded, "clean repo should have no additions")
+	require.Equal(t, 0, ri.LinesDeleted, "clean repo should have no deletions")
+}
+
+func TestIsClean_UsesCachedDiffAfterInitialization(t *testing.T) {
+	ri, _ := newTestRepo(t)
+
+	// Contents of committed.txt in worktree is 3 lines vs 2 committed → dirty
+	require.False(t, ri.IsClean(), "working tree has an added line, so IsClean must be false")
+
+	// Now simulate a clean state (revert the modification)
+	worktree, err := ri.repo.Worktree()
+	require.NoError(t, err)
+	_, err = runGitCommand(ri.ProjectRoot, "checkout", "--", "committed.txt")
+	require.NoError(t, err)
+	require.NoError(t, worktree.Reset(&gogit.ResetOptions{Mode: gogit.HardReset}))
+
+	// Manually update the diff to reflect clean state
+	ri.LinesAdded = 0
+	ri.LinesDeleted = 0
+	ri.diffInitialized = true
+
+	// IsClean should use cached values, not re-run git
+	require.True(t, ri.IsClean(), "IsClean should report clean after diff is updated")
+	require.True(t, ri.diffInitialized, "IsClean should not reset diffInitialized")
+
+	// Change the underlying worktree again — cache is now stale, which is
+	// expected because RefreshDiff is not re-run on every IsClean call.
+	require.NoError(t, os.WriteFile(filepath.Join(ri.ProjectRoot, "committed.txt"), []byte("one\n"), 0o644))
+
+	// Still returns stale cached value — this is the intended behaviour:
+	// IsClean avoids subprocess per call, and higher-level code calls
+	// RefreshDiff at logical points (submit prompt, tool call success).
+	require.True(t, ri.IsClean(),
+		"IsClean should use cached values without triggering RefreshDiff")
+}
+
+func TestIsClean_InitializesDiffOnFirstCall(t *testing.T) {
+	dir := t.TempDir()
+	_, err := runGitCommand(dir, "init")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.email", "test@example.com")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.name", "Test")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("one\n"), 0o644))
+	_, err = runGitCommand(dir, "add", "file.txt")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "commit", "-m", "init")
+	require.NoError(t, err)
+
+	repo, err := gogit.PlainOpenWithOptions(dir, &gogit.PlainOpenOptions{DetectDotGit: true})
+	require.NoError(t, err)
+
+	ri := &RepoInfo{repo: repo}
+	require.False(t, ri.diffInitialized, "before RefreshDiff/IsClean, diff must not be initialized")
+
+	// Clean repo → true
+	require.True(t, ri.IsClean(), "clean repo should be reported as clean")
+	require.True(t, ri.diffInitialized, "IsClean should trigger diff initialization")
+
+	// Now make it dirty and call IsClean again
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("one\ntwo\n"), 0o644))
+
+	// diffInitialized is already true → it will return the CACHED clean result.
+	// This is the optimization — to get current state, caller must RefreshDiff.
+	require.True(t, ri.IsClean(),
+		"after init, IsClean must use cached values (caller must Refresh for fresh state)")
+
+	// But after refreshing, IsClean reflects the dirty state
+	ri.RefreshDiff()
+	require.False(t, ri.IsClean(), "after RefreshDiff, IsClean must report dirty")
 }

@@ -965,7 +965,7 @@ func (c *ChatComponent) ClearToolCallMessageIndex() {
 
 // HandleToolCallScheduled handles a scheduled tool call message
 func (c *ChatComponent) HandleToolCallScheduled(msg runners.ToolCallScheduledMsg) {
-	c.AddMessage("📋 " + msg.Formatted)
+	c.AppendToolCallMessage("📋 " + msg.Formatted)
 	c.SetToolCallMessageIndex(msg.CallID, len(c.Messages)-1)
 }
 
@@ -975,10 +975,10 @@ func (c *ChatComponent) HandleToolCallExecuting(msg runners.ToolCallExecutingMsg
 	// Update the existing message if we have its index
 	if idx, exists := c.GetToolCallMessageIndex(msg.CallID); exists && idx < len(c.Messages) {
 		c.Messages[idx].Content = formatted
-		c.UpdateContent()
+		c.contentDirty = true
 	} else {
 		// Fallback: add a new message if we don't have the index
-		c.AddMessage(formatted)
+		c.AppendToolCallMessage(formatted)
 	}
 }
 
@@ -988,12 +988,12 @@ func (c *ChatComponent) HandleToolCallSuccess(msg runners.ToolCallSuccessMsg) {
 	// Update the existing message if we have its index
 	if idx, exists := c.GetToolCallMessageIndex(msg.CallID); exists && idx < len(c.Messages) {
 		c.Messages[idx].Content = formatted
-		c.UpdateContent()
+		c.contentDirty = true
 		// Clean up the index mapping
 		c.DeleteToolCallMessageIndex(msg.CallID)
 	} else {
 		// Fallback: add a new message if we don't have the index
-		c.AddMessage(formatted)
+		c.AppendToolCallMessage(formatted)
 	}
 }
 
@@ -1007,12 +1007,12 @@ func (c *ChatComponent) HandleToolCallError(msg runners.ToolCallErrorMsg) {
 	// Update the existing message if we have its index
 	if idx, exists := c.GetToolCallMessageIndex(msg.CallID); exists && idx < len(c.Messages) {
 		c.Messages[idx].Content = formatted
-		c.UpdateContent()
+		c.contentDirty = true
 		// Clean up the index mapping
 		c.DeleteToolCallMessageIndex(msg.CallID)
 	} else {
 		// Fallback: add a new message if we don't have the index
-		c.AddMessage(formatted)
+		c.AppendToolCallMessage(formatted)
 	}
 }
 
@@ -1022,12 +1022,12 @@ func (c *ChatComponent) HandleToolCallAborted(msg runners.ToolCallAbortedMsg) {
 	// Update the existing message if we have its index
 	if idx, exists := c.GetToolCallMessageIndex(msg.CallID); exists && idx < len(c.Messages) {
 		c.Messages[idx].Content = formatted
-		c.UpdateContent()
+		c.contentDirty = true
 		// Clean up the index mapping
 		c.DeleteToolCallMessageIndex(msg.CallID)
 	} else {
 		// Fallback: add a new message if we don't have the index
-		c.AddMessage(formatted)
+		c.AppendToolCallMessage(formatted)
 	}
 }
 func (c *ChatComponent) AddMarkdownMessage(message string) {

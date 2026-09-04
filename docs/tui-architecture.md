@@ -570,6 +570,7 @@ type UIConfig struct {
     CtrlCDebounceTime    time.Duration `koanf:"ctrl_c_debounce_time"`
     CtrlCWindowTime      time.Duration `koanf:"ctrl_c_window_time"`
     PromptExpandedHeight int           `koanf:"prompt_expanded_height"` // Default: 10
+    TickInterval   time.Duration `koanf:"tick_interval"`   // Chat render-tick debounce, Default: 100ms
 }
 ```
 
@@ -577,6 +578,7 @@ type UIConfig struct {
 # asimi.conf
 ui:
   prompt_expanded_height: 15  # Grow to 15 lines instead of default 10
+  tick_interval: 250ms  # Debounce between streaming chat content updates
 ```
 
 ### Integration with View()

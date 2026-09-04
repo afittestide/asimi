@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/afittestide/asimi/internal/runners"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -368,4 +369,218 @@ func TestChatComponent_StartBlock(t *testing.T) {
 		assert.Equal(t, -1, chat.blockLines[0][0]) // No messages yet, so -1
 		assert.Equal(t, 10, chat.blockLines[0][1])
 	})
+}
+
+// ===== Tool Call Handler Tests (edict 780) =====
+//
+// These tests verify that the HandleToolCall* methods use a debounced
+// contentDirty flag instead of forcing synchronous re-renders. The TUI's
+// chatRenderTickMsg debounce flushes the dirty content at 50ms intervals.
+
+func TestHandleToolCallScheduled_SetsContentDirtyAndRegistersIndex(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	baseline := chat.Viewport.View()
+
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID:    "tc-1",
+		ToolName:  "read_file",
+		Formatted: "read_file: test.go",
+	})
+
+	// Must mark dirty (deferred render), NOT update content synchronously
+	assert.True(t, chat.contentDirty,
+		"HandleToolCallScheduled should set contentDirty=true (deferred render)")
+	assert.Len(t, chat.Messages, 1,
+		"Scheduled tool call should append exactly one message")
+	assert.Equal(t, "📋 read_file: test.go", chat.Messages[0].Content,
+		"Scheduled message content should include the 📋 prefix")
+
+	// Viewport must be stale (not yet rendered)
+	assert.Equal(t, baseline, chat.Viewport.View(),
+		"Scheduled tool call should NOT immediately update the viewport")
+
+	// Index should be registered for subsequent handlers
+	idx, exists := chat.GetToolCallMessageIndex("tc-1")
+	assert.True(t, exists, "tool call index should be registered")
+	assert.Equal(t, 0, idx, "index should point to the first message")
+
+	// After FlushDirty, viewport reflects the scheduled tool call
+	chat.FlushDirty()
+	assert.Contains(t, chat.Viewport.View(), "read_file: test.go",
+		"viewport should show the scheduled tool call after FlushDirty")
+}
+
+func TestHandleToolCallExecuting_UpdatesExistingAndMarksDirty(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	// Seed with a scheduled message
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-2", ToolName: "write_file", Formatted: "write_file: x.go",
+	})
+	// Reset contentDirty so we can verify the executing handler marks it again
+	chat.FlushDirty()
+	assert.False(t, chat.contentDirty, "precondition: contentDirty should be false after flush")
+
+	// Sent executing message for the same call
+	chat.HandleToolCallExecuting(runners.ToolCallExecutingMsg{
+		CallID: "tc-2", ToolName: "write_file", Input: "x.go", Formatted: "write_file: running",
+	})
+
+	assert.True(t, chat.contentDirty, "executing should set contentDirty=true")
+	assert.Len(t, chat.Messages, 1, "executing should update existing message, not append a new one")
+	assert.Equal(t, "⚙️ write_file: running", chat.Messages[0].Content,
+		"executing should replace message content with the ⚙️-prefixed format")
+}
+
+func TestHandleToolCallExecuting_FallbackWhenNoIndex(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	baseline := chat.Viewport.View()
+
+	// No toolCallMessageIndex set for tc-99 → falls back to append
+	chat.HandleToolCallExecuting(runners.ToolCallExecutingMsg{
+		CallID: "tc-99", ToolName: "unknown", Formatted: "unknown: noindex",
+	})
+
+	assert.True(t, chat.contentDirty, "fallback should use AppendToolCallMessage → dirty")
+	assert.Len(t, chat.Messages, 1, "fallback should append a new message")
+	assert.Equal(t, "⚙️ unknown: noindex", chat.Messages[0].Content)
+	assert.Equal(t, baseline, chat.Viewport.View(),
+		"fallback should NOT synchronously update the viewport")
+}
+
+func TestHandleToolCallSuccess_UpdatesAndClearsIndex(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	// Build with a scheduled message first
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-3", ToolName: "grep", Formatted: "grep: foo",
+	})
+	chat.UpdateContent() // clear dirty flag from scheduled
+
+	// Success with same CallID
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-3", ToolName: "grep", Input: "foo", Result: "match",
+		Formatted: "grep: match",
+	})
+
+	assert.True(t, chat.contentDirty, "success should set contentDirty=true")
+	assert.Len(t, chat.Messages, 1, "success should update existing message, not append")
+	assert.Equal(t, checkPrefix+" grep: match", chat.Messages[0].Content,
+		"success should add the check prefix to the formatted content")
+
+	// Index mapping must be cleaned up on success
+	_, exists := chat.GetToolCallMessageIndex("tc-3")
+	assert.False(t, exists, "tool call index should be removed after success")
+}
+
+func TestHandleToolCallSuccess_FallbackWhenNoIndex(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-unknown", ToolName: "shell", Result: "ok", Formatted: "shell: ok",
+	})
+
+	assert.True(t, chat.contentDirty, "fallback success should mark contentDirty=true")
+	assert.Len(t, chat.Messages, 1, "fallback should append a new message")
+	assert.Equal(t, checkPrefix+" shell: ok", chat.Messages[0].Content)
+}
+
+func TestHandleToolCallError_UpdatesAndClearsIndex(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-4", ToolName: "shell", Formatted: "shell: run",
+	})
+	chat.UpdateContent() // clear scheduled dirty
+
+	chat.HandleToolCallError(runners.ToolCallErrorMsg{
+		CallID: "tc-4", ToolName: "shell", Error: "boom", Formatted: "shell: boom",
+	})
+
+	assert.True(t, chat.contentDirty, "error should set contentDirty=true")
+	assert.Len(t, chat.Messages, 1, "error should update existing message, not append")
+	assert.Contains(t, chat.Messages[0].Content, "shell: boom",
+		"error message should include the formatted content")
+	assert.Contains(t, chat.Messages[0].Content, "⁉️",
+		"error message should have a warning icon")
+
+	_, exists := chat.GetToolCallMessageIndex("tc-4")
+	assert.False(t, exists, "tool call index should be removed after error")
+}
+
+func TestHandleToolCallError_UserDeniedUsesBlockedIcon(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.HandleToolCallError(runners.ToolCallErrorMsg{
+		CallID: "tc-deny", ToolName: "shell",
+		Error:     "command denied by user",
+		Formatted: "shell: denied",
+	})
+
+	assert.Contains(t, chat.Messages[0].Content, "⛔︎",
+		"user-denied errors should use the ⛔ blocker icon")
+	assert.True(t, chat.contentDirty, "denied error should mark content dirty")
+}
+
+func TestHandleToolCallAborted_UpdatesAndClearsIndex(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-5", ToolName: "shell", Formatted: "shell: run",
+	})
+	chat.UpdateContent()
+
+	chat.HandleToolCallAborted(runners.ToolCallAbortedMsg{
+		CallID: "tc-5", ToolName: "shell", Reason: "restart", Formatted: "shell: aborted",
+	})
+
+	assert.True(t, chat.contentDirty, "aborted should set contentDirty=true")
+	assert.Len(t, chat.Messages, 1, "aborted should update existing message, not append")
+	assert.Contains(t, chat.Messages[0].Content, "🚫 shell: aborted",
+		"aborted message should have the 🚫 icon and formatted content")
+
+	_, exists := chat.GetToolCallMessageIndex("tc-5")
+	assert.False(t, exists, "tool call index should be removed after abort")
+}
+
+func TestHandleToolCallFallbacks_AllUseAppendToolCallMsg(t *testing.T) {
+	// When no toolCallMessageIndex is found, all handlers should fall back to
+	// AppendingToolCallMessage (deferred render) rather than AddMessage (sync render).
+	chat := NewChatComponent(80, 20, false)
+	baseline := chat.Viewport.View()
+
+	// No index set → fallback append
+	chat.HandleToolCallAborted(runners.ToolCallAbortedMsg{
+		CallID: "x", ToolName: "tool", Reason: "r", Formatted: "tool: aborted",
+	})
+
+	assert.True(t, chat.contentDirty, "fallback must mark contentDirty")
+	assert.Len(t, chat.Messages, 1)
+	assert.Equal(t, baseline, chat.Viewport.View(),
+		"deferred rendering must NOT synchronously update viewport")
+
+	chat.FlushDirty()
+	assert.Contains(t, chat.Viewport.View(), "tool: aborted",
+		"viewport should reflect the appended message after flush")
+}
+
+// TestToolCallHandlers_ConsistentDirtyStateAfterFlush verifies that after
+// FlushDirty (simulating the debounce tick), contentDirty is cleared and the
+// viewport is up to date.
+func TestToolCallHandlers_ConsistentDirtyStateAfterFlush(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-6", ToolName: "shell", Formatted: "shell: run",
+	})
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-6", ToolName: "shell", Result: "ok", Formatted: "shell: ok",
+	})
+
+	assert.True(t, chat.contentDirty, "after handlers, contentDirty should be true")
+
+	chat.FlushDirty()
+	assert.False(t, chat.contentDirty, "after flush, contentDirty should be false")
+	assert.Contains(t, chat.Viewport.View(), "shell: ok",
+		"viewport should show the final tool call result")
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	gogit "github.com/go-git/go-git/v5"
 )
@@ -18,16 +19,18 @@ import (
 // RepoInfo contains information about the git repository and worktree.
 // This type is shared between main and court packages.
 type RepoInfo struct {
-	ProjectRoot  string
-	WorktreePath string
-	Branch       string
-	IsWorktree   bool
-	IsMain       bool
-	Slug         string // Project slug (e.g., "owner/repo")
-	LinesAdded   int    // Lines added in working directory
-	LinesDeleted int    // Lines deleted in working directory
-	status       string
-	repo         *gogit.Repository
+	ProjectRoot     string
+	WorktreePath    string
+	Branch          string
+	IsWorktree      bool
+	IsMain          bool
+	Slug            string // Project slug (e.g., "owner/repo")
+	LinesAdded      int    // Lines added in working directory
+	LinesDeleted    int    // Lines deleted in working directory
+	status          string
+	repo            *gogit.Repository
+	lastDiffRefresh time.Time
+	diffInitialized bool
 }
 
 // GetRepoInfo returns information about the current git repository and worktree
@@ -217,9 +220,14 @@ func (r *RepoInfo) GetStatus() string {
 
 // IsClean returns true if the working tree has no changes
 func (r *RepoInfo) IsClean() bool {
-	r.RefreshDiff()
-	if r.repo != nil {
-		r.status = readShortStatus(r.repo)
+	if r == nil {
+		return true
+	}
+	if !r.diffInitialized {
+		r.RefreshDiff()
+		if r.repo != nil {
+			r.status = readShortStatus(r.repo)
+		}
 	}
 	return r.LinesAdded == 0 && r.LinesDeleted == 0
 }
@@ -229,6 +237,9 @@ func (r *RepoInfo) RefreshDiff() {
 	if r == nil || r.repo == nil {
 		return
 	}
+
+	r.lastDiffRefresh = time.Now()
+	r.diffInitialized = true
 
 	// TODO: add support for non-worktree branches
 	worktree, err := r.repo.Worktree()
@@ -268,6 +279,18 @@ func (r *RepoInfo) RefreshDiff() {
 	r.LinesAdded = added
 	r.LinesDeleted = deleted
 	slog.Debug("Refreshed git diff", "+", added, "-", deleted)
+}
+
+// RefreshDiffWithTTL recalculates diff statistics only if more than ttl has elapsed
+// since the last refresh.
+func (r *RepoInfo) RefreshDiffWithTTL(ttl time.Duration) {
+	if r == nil || r.repo == nil {
+		return
+	}
+	if r.diffInitialized && time.Since(r.lastDiffRefresh) < ttl {
+		return
+	}
+	r.RefreshDiff()
 }
 
 func (r *RepoInfo) BranchSlugOrDefault() string {
