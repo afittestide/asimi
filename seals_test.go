@@ -32,8 +32,8 @@ func TestEdictSelectWindowRenderList_ShowsBothSeals(t *testing.T) {
 
 	assert.True(t, strings.Contains(lines[0], "Select edict"), "Should have title")
 	assert.True(t, strings.Contains(lines[1], "[  1]"), "Should show edict number")
-	assert.True(t, strings.Contains(lines[1], "刑"), "Should show judge seal (刑)")
-	assert.True(t, strings.Contains(lines[1], "門"), "Should show chancellor seal (門)")
+	assert.True(t, strings.Contains(lines[1], "👩‍⚖️"), "Should show judge seal 👩")
+	assert.True(t, strings.Contains(lines[1], "☯️"), "Should show chancellor seal ☯")
 	assert.True(t, strings.Contains(lines[1], "Fix the login bug"), "Should show intent")
 }
 
@@ -50,8 +50,8 @@ func TestEdictSelectWindowRenderList_ShowsJudgeSealOnly(t *testing.T) {
 	lines := strings.Split(render, "\n")
 
 	assert.True(t, strings.Contains(lines[1], "[  2]"), "Should show edict number")
-	assert.True(t, strings.Contains(lines[1], "刑"), "Should show judge seal (刑)")
-	assert.False(t, strings.Contains(lines[1], "門"), "Should NOT show chancellor seal (門)")
+	assert.True(t, strings.Contains(lines[1], "👩‍⚖️"), "Should show judge seal 👩")
+	assert.False(t, strings.Contains(lines[1], "☯️"), "Should NOT show chancellor seal ☯")
 	assert.True(t, strings.Contains(lines[1], "  "), "Should have space where chancellor seal is absent")
 }
 
@@ -68,8 +68,8 @@ func TestEdictSelectWindowRenderList_ShowsChancellorSealOnly(t *testing.T) {
 	lines := strings.Split(render, "\n")
 
 	assert.True(t, strings.Contains(lines[1], "[  3]"), "Should show edict number")
-	assert.False(t, strings.Contains(lines[1], "刑"), "Should NOT show judge seal (刑)")
-	assert.True(t, strings.Contains(lines[1], "門"), "Should show chancellor seal (門)")
+	assert.False(t, strings.Contains(lines[1], "👩‍⚖️"), "Should NOT show judge seal 👩")
+	assert.True(t, strings.Contains(lines[1], "☯️"), "Should show chancellor seal ☯")
 	assert.True(t, strings.Contains(lines[1], "  "), "Should have space where judge seal is absent")
 }
 
@@ -86,8 +86,8 @@ func TestEdictSelectWindowRenderList_NoSeals(t *testing.T) {
 	lines := strings.Split(render, "\n")
 
 	assert.True(t, strings.Contains(lines[1], "[  4]"), "Should show edict number")
-	assert.False(t, strings.Contains(lines[1], "刑"), "Should NOT show judge seal (刑)")
-	assert.False(t, strings.Contains(lines[1], "門"), "Should NOT show chancellor seal (門)")
+	assert.False(t, strings.Contains(lines[1], "👩‍⚖️"), "Should NOT show judge seal 👩")
+	assert.False(t, strings.Contains(lines[1], "☯️"), "Should NOT show chancellor seal ☯")
 }
 
 func TestEdictSelectWindowRenderList_Selection(t *testing.T) {
@@ -105,13 +105,13 @@ func TestEdictSelectWindowRenderList_Selection(t *testing.T) {
 
 	assert.True(t, strings.HasPrefix(lines[1], "  "), "Unselected item should have space prefix: %q", lines[1])
 	assert.True(t, strings.Contains(lines[1], "First"), "Unselected item should show 'First'")
-	assert.True(t, strings.Contains(lines[1], "刑"), "Unselected item should show judge seal")
-	assert.False(t, strings.Contains(lines[1], "門"), "Unselected item should NOT show chancellor seal")
+	assert.True(t, strings.Contains(lines[1], "👩‍⚖️"), "Unselected item should show judge seal")
+	assert.False(t, strings.Contains(lines[1], "☯️"), "Unselected item should NOT show chancellor seal")
 
 	assert.True(t, strings.HasPrefix(lines[2], "▶ "), "Selected item should have ▶ prefix: %q", lines[2])
 	assert.True(t, strings.Contains(lines[2], "Second"), "Selected item should show 'Second'")
-	assert.True(t, strings.Contains(lines[2], "刑"), "Selected item should show judge seal")
-	assert.True(t, strings.Contains(lines[2], "門"), "Selected item should show chancellor seal")
+	assert.True(t, strings.Contains(lines[2], "👩‍⚖️"), "Selected item should show judge seal")
+	assert.True(t, strings.Contains(lines[2], "☯️"), "Selected item should show chancellor seal")
 }
 
 func TestEdictSelectWindowRenderList_Empty(t *testing.T) {
@@ -141,20 +141,20 @@ func TestEdictSelectWindowRenderList_MultipleEdicts(t *testing.T) {
 	lines := strings.Split(render, "\n")
 
 	assert.Contains(t, lines[1], "[  1]")
-	assert.Contains(t, lines[1], "刑")
-	assert.Contains(t, lines[1], "門")
+	assert.Contains(t, lines[1], "👩‍⚖️")
+	assert.Contains(t, lines[1], "☯️")
 
 	assert.Contains(t, lines[2], "[  2]")
-	assert.Contains(t, lines[2], "刑")
-	assert.NotContains(t, lines[2], "門")
+	assert.Contains(t, lines[2], "👩‍⚖️")
+	assert.NotContains(t, lines[2], "☯️")
 
 	assert.Contains(t, lines[3], "[  3]")
-	assert.NotContains(t, lines[3], "刑")
-	assert.NotContains(t, lines[3], "門")
+	assert.NotContains(t, lines[3], "👩‍⚖️")
+	assert.NotContains(t, lines[3], "☯️")
 
 	assert.Contains(t, lines[4], "[  4]")
-	assert.NotContains(t, lines[4], "刑")
-	assert.Contains(t, lines[4], "門")
+	assert.NotContains(t, lines[4], "👩‍⚖️")
+	assert.Contains(t, lines[4], "☯️")
 }
 
 func TestHandleExitKeys_EscInEdictList_GoesToChat(t *testing.T) {

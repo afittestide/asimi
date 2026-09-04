@@ -542,12 +542,12 @@ func (s *EdictSelectWindow) RenderList(selectedIndex, scrollOffset, visibleSlots
 
 			judge := "  "
 			if edict.HasJudgeSeal {
-				judge = "刑"
+				judge = "👩‍⚖️"
 			}
 
 			chancellor := "  "
 			if edict.HasChancellorSeal {
-				chancellor = "門"
+				chancellor = "☯️"
 			}
 
 			linePrefix := fmt.Sprintf("%s[%3d] %s %s ", prefix, edict.ID, judge, chancellor)
