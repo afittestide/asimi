@@ -1526,6 +1526,19 @@ func (m TUIModel) handleCompletionSelection() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m *TUIModel) maybeScheduleRenderTick(chat *ChatComponent) tea.Cmd {
+	if chat != nil && chat.contentDirty && !m.renderTickPending {
+		m.renderTickPending = true
+		// Debounce re-renders while streaming to coalesce rapid content updates.
+		interval := 100 * time.Millisecond
+		if m.config != nil && m.config.UI.TickInterval > 0 {
+			interval = m.config.UI.TickInterval
+		}
+		return tea.Tick(interval, func(time.Time) tea.Msg { return chatRenderTickMsg{} })
+	}
+	return nil
+}
+
 func (m *TUIModel) startWaitingForResponse() tea.Cmd {
 	if m.waitingForResponse {
 		return nil
@@ -2122,27 +2135,32 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		chat.AddToRawHistory("TOOL_SCHEDULED", fmt.Sprintf("%s with input: %s", msg.ToolName, msg.Input))
 		chat.HandleToolCallScheduled(msg)
+		return m, m.maybeScheduleRenderTick(chat)
 
 	case runners.ToolCallExecutingMsg:
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		chat.AddToRawHistory("TOOL_EXECUTING", fmt.Sprintf("%s with input: %s", msg.ToolName, msg.Input))
 		chat.HandleToolCallExecuting(msg)
+		return m, m.maybeScheduleRenderTick(chat)
 
 	case runners.ToolCallSuccessMsg:
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		chat.AddToRawHistory("TOOL_SUCCESS", fmt.Sprintf("%s\nInput: %s\nOutput: %s", msg.ToolName, msg.Input, msg.Result))
 		chat.HandleToolCallSuccess(msg)
-		m.repoInfo.RefreshDiff()
+		m.repoInfo.RefreshDiffWithTTL(500 * time.Millisecond)
+		return m, m.maybeScheduleRenderTick(chat)
 
 	case runners.ToolCallErrorMsg:
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		chat.AddToRawHistory("TOOL_ERROR", fmt.Sprintf("%s\nInput: %s\nError: %v", msg.ToolName, msg.Input, msg.Error))
 		chat.HandleToolCallError(msg)
+		return m, m.maybeScheduleRenderTick(chat)
 
 	case runners.ToolCallAbortedMsg:
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		chat.AddToRawHistory("TOOL_ABORTED", fmt.Sprintf("%s\nInput: %s\nReason: %s", msg.ToolName, msg.Input, msg.Reason))
 		chat.HandleToolCallAborted(msg)
+		return m, m.maybeScheduleRenderTick(chat)
 
 	case errMsg:
 		chat := m.tabs.Content().Chat
@@ -2290,9 +2308,8 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status.ContextPercent = msg.PercentContextUsed
 		var cmds []tea.Cmd
 		// Schedule the debounce tick if dirty and none pending
-		if chat.contentDirty && !m.renderTickPending {
-			m.renderTickPending = true
-			cmds = append(cmds, tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg { return chatRenderTickMsg{} }))
+		if cmd := m.maybeScheduleRenderTick(chat); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 		if m.tabs.AnyStreaming() {
 			m.waitingStart = time.Now()
@@ -2548,19 +2565,6 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case court.ZhengmingPendingMsg:
-		// Handsoff mode: auto-answer with the recommended option (option[0])
-		// for each question, skip the answering UI entirely.
-		if m.handsoff {
-			answers := make([]string, len(msg.Questions))
-			for i, q := range msg.Questions {
-				if len(q.Options) > 0 {
-					answers[i] = q.Options[0]
-				}
-			}
-			slog.Info("handsoff: auto-answering zhengming", "request_id", msg.RequestID, "answers", answers)
-			go m.handleAnsweringComplete(AnsweredMsg{RequestID: msg.RequestID, Answers: answers})
-			return m, nil
-		}
 		// A zhengming halts the court — route to the minister's own tab
 		// so the Ruler sees the context, then auto-scroll the chat.
 		// Falls back to the active tab if no tab exists for the minister.
@@ -2671,6 +2675,13 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tools.EditorRequest:
+		// In handsoff mode, auto-approve without opening $EDITOR. The tool
+		// (e.g. approve_doc → suggest_edict for large payloads) blocks on
+		// ResultChan, so we must reply or the call hangs forever.
+		if m.handsoff {
+			msg.ResultChan <- tools.EditorResult{Content: msg.Content, Saved: true}
+			return m, nil
+		}
 		// A tool wants to open content in $EDITOR — TUI owns the temp-file
 		// lifecycle so the host running the editor doesn't need to share a
 		// filesystem with whoever generated the content (daemon case).

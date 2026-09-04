@@ -67,6 +67,7 @@ func DefaultConfig() Config {
 			CtrlCDebounceTime:    200 * time.Millisecond, // Debounce for duplicate CTRL-C events from terminals
 			CtrlCWindowTime:      2000 * time.Millisecond,
 			PromptExpandedHeight: 10,
+			TickInterval:         100 * time.Millisecond, // Debounce between chat content updates when streaming
 		},
 		Session: SessionConfig{
 			Enabled:      true,

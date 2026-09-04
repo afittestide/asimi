@@ -373,6 +373,7 @@ func TestLoadProjectConfig_DefaultsOnly(t *testing.T) {
 	assert.Equal(t, 300, cfg.LLM.RequestTimeoutSeconds)
 	assert.Equal(t, 600, cfg.LLM.StreamIdleTimeoutSeconds)
 	assert.Equal(t, 3, cfg.LLM.MaxRetries)
+	assert.Equal(t, 100*time.Millisecond, cfg.UI.TickInterval)
 }
 
 // TestLoadProjectConfig_EnvOverridesModel verifies that ASIMI_MODEL and
@@ -569,6 +570,30 @@ agents_file = "CLAUDE.md"
 	assert.Equal(t, "CLAUDE.md", cfg.Session.AgentsFile)
 	// Defaults should still be present for unoverridden fields
 	assert.True(t, cfg.Session.Enabled)
+}
+
+// TestLoadProjectConfig_TickInterval verifies that [ui] tick_interval
+// can be overridden from the project config and defaults otherwise.
+func TestLoadProjectConfig_TickInterval(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+	projectConfig := `[ui]
+tick_interval = "250ms"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, 250*time.Millisecond, cfg.UI.TickInterval)
 }
 
 func TestLoadProjectConfig_UserConfigPlusProjectOverride(t *testing.T) {

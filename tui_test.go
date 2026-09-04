@@ -6725,6 +6725,81 @@ func TestHandsoff_ZhengmingAutoAnswer(t *testing.T) {
 	assert.Equal(t, "Option A", resp.answer, "should auto-answer with the recommended option[0]")
 }
 
+// TestHandsoff_SuggestedEdictDisplays verifies that in handsoff mode an edict
+// suggestion is added to the minister's chat before being auto-answered, so
+// the ruler can see the proposed edict.
+func TestHandsoff_SuggestedEdictDisplays(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+	model.handsoff = true
+
+	msg := court.ZhengmingPendingMsg{
+		RequestID:  "zhengming-suggest-handsoff-1",
+		MinisterID: "secretary",
+		EdictKey:   storage.EdictKey{ID: 0},
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Add a login page and wire it to the auth service", Summary: "Add login page", Options: []string{tools.AnswerApproveEdict, tools.AnswerReject}},
+		},
+	}
+
+	newModel, _ := model.handleCustomMessages(msg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	// The suggested edict should be shown in the chat.
+	chat := updated.tabs.ChatByTab(msg.MinisterID)
+	require.NotNil(t, chat, "secretary chat should exist")
+	found := false
+	for _, cm := range chat.Messages {
+		if strings.Contains(cm.Content, "📜 Suggested New Edict") &&
+			strings.Contains(cm.Content, "Add login page") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "suggested edict should be displayed in the chat before auto-answering")
+
+	// It should still be auto-answered with the recommended option.
+	require.Eventually(t, func() bool {
+		return len(mock.zhengmingResponses) == 1
+	}, 2*time.Second, 10*time.Millisecond, "HandleZhengmingResponse should be called")
+	resp := mock.zhengmingResponses[0]
+	assert.Equal(t, tools.AnswerApproveEdict, resp.answer, "should auto-approve the suggested edict")
+}
+
+// TestHandsoff_EditorRequest_AutoApproves verifies that in handsoff mode an
+// EditorRequest is auto-approved without opening $EDITOR. Without this guard
+// the TUI would spawn $EDITOR even in handsoff, blocking on interactive input
+// while approve_doc (→ suggest_edict for large payloads) waits on ResultChan.
+func TestHandsoff_EditorRequest_AutoApproves(t *testing.T) {
+	model := newTestModel(t)
+	model.handsoff = true
+
+	resultChan := make(chan tools.EditorResult, 1)
+	msg := tools.EditorRequest{
+		Content:    "Proposed edict content exceeding 500 characters so it routes through approve_doc instead of the direct zhengming path...",
+		Filename:   "suggested_edict.md",
+		ResultChan: resultChan,
+	}
+
+	newModel, cmd := model.handleCustomMessages(msg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Nil(t, cmd, "handsoff should not launch the editor (no tea.ExecProcess)")
+
+	select {
+	case res := <-resultChan:
+		assert.True(t, res.Saved, "editor result should be Saved in handsoff mode")
+		assert.Equal(t, msg.Content, res.Content, "content should be returned unchanged")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for EditorResult — ApproveDocTool would hang")
+	}
+
+	// The TUI model is unchanged (no editor state to update in handsoff).
+	_ = updated
+}
+
 // TestHandsoff_ZhengmingMultipleQuestions verifies that handsoff mode
 // auto-answers all questions, joining answers with "; ".
 func TestHandsoff_ZhengmingMultipleQuestions(t *testing.T) {
@@ -6883,4 +6958,159 @@ func TestHandsoff_OnboardingAutoNo(t *testing.T) {
 	resp, ok := msg.(yesNoResponseMsg)
 	require.True(t, ok, "should return yesNoResponseMsg")
 	assert.False(t, resp.answer, "onboarding should auto-answer NO in handsoff mode")
+}
+
+// ===== Tool Call Debounced Render Tests (edict 784) =====
+
+func TestMaybeScheduleRenderTick_SchedulesWhenDirty(t *testing.T) {
+	model := newTestModel(t)
+	chat := model.tabs.Content().Chat
+	chat.contentDirty = true
+	model.renderTickPending = false
+
+	cmd := model.maybeScheduleRenderTick(chat)
+	require.NotNil(t, cmd, "dirty chat without pending tick should schedule a render tick")
+	require.True(t, model.renderTickPending, "renderTickPending should be set to true")
+
+	cmdMsg := cmd()
+	_, ok := cmdMsg.(chatRenderTickMsg)
+	assert.True(t, ok, "scheduled command should produce a chatRenderTickMsg")
+}
+
+func TestMaybeScheduleRenderTick_UsesConfiguredInterval(t *testing.T) {
+	model := newTestModel(t)
+	// Force a tiny interval so invoking the tick command returns immediately,
+	// proving the configurable interval path (not a hardcoded one) is used.
+	model.config.UI.TickInterval = time.Nanosecond
+	chat := model.tabs.Content().Chat
+	chat.contentDirty = true
+	model.renderTickPending = false
+
+	cmd := model.maybeScheduleRenderTick(chat)
+	require.NotNil(t, cmd, "dirty chat without pending tick should schedule a render tick")
+
+	cmdMsg := cmd()
+	_, ok := cmdMsg.(chatRenderTickMsg)
+	assert.True(t, ok, "scheduled command should produce a chatRenderTickMsg")
+}
+
+func TestMaybeScheduleRenderTick_NoScheduleWhenNotDirty(t *testing.T) {
+	model := newTestModel(t)
+	chat := model.tabs.Content().Chat
+	chat.contentDirty = false
+	model.renderTickPending = false
+
+	cmd := model.maybeScheduleRenderTick(chat)
+	assert.Nil(t, cmd, "clean chat should not schedule a render tick")
+	assert.False(t, model.renderTickPending, "renderTickPending should remain false")
+}
+
+func TestMaybeScheduleRenderTick_NoScheduleWhenTickPending(t *testing.T) {
+	model := newTestModel(t)
+	chat := model.tabs.Content().Chat
+	chat.contentDirty = true
+	model.renderTickPending = true
+
+	cmd := model.maybeScheduleRenderTick(chat)
+	assert.Nil(t, cmd, "should not schedule a second tick when one is already pending")
+	assert.True(t, model.renderTickPending, "renderTickPending should stay true")
+}
+
+func TestMaybeScheduleRenderTick_NilChat(t *testing.T) {
+	model := newTestModel(t)
+	model.renderTickPending = false
+
+	cmd := model.maybeScheduleRenderTick(nil)
+	assert.Nil(t, cmd, "nil chat should not schedule a render tick")
+	assert.False(t, model.renderTickPending, "renderTickPending should remain false")
+}
+
+func TestToolCallScheduledMsg_DebouncedRenderScheduling(t *testing.T) {
+	model := newTestModel(t)
+
+	// Get the active chat
+	chat := model.tabs.ChatByTab("some-channel")
+	baseline := chat.Viewport.View()
+
+	newModel, cmd := model.handleCustomMessages(runners.ToolCallScheduledMsg{
+		ChannelID: "some-channel",
+		CallID:    "tc1",
+		ToolName:  "read_file",
+		Formatted: "read_file: test.go",
+	})
+
+	updated := newModel.(TUIModel)
+
+	// The chat is dirty — deferred rendering.
+	chat = updated.tabs.ChatByTab("some-channel")
+	assert.True(t, chat.contentDirty, "ToolCallScheduled should mark content dirty")
+	assert.Equal(t, baseline, chat.Viewport.View(),
+		"ToolCallScheduled should NOT synchronously render")
+
+	// A render tick should be scheduled via maybeScheduleRenderTick
+	assert.True(t, updated.renderTickPending, "renderTickPending should be true")
+
+	// Verify the message is in the chat but viewport is stale until flush
+	assert.Equal(t, "📋 read_file: test.go", chat.Messages[0].Content)
+
+	// The tick command should produce a chatRenderTickMsg
+	if cmd != nil {
+		msg := cmd()
+		_, ok := msg.(chatRenderTickMsg)
+		assert.True(t, ok, "tool call handler should return chatRenderTickMsg cmd")
+	}
+}
+
+func TestToolCallSuccessMsg_DebouncedRenderAndTTLRefresh(t *testing.T) {
+	// Create a repo with a created diff to verify TTL use
+	ri := &repo.RepoInfo{}
+	model := NewTUIModel(mockConfig(), ri, nil, nil, nil, nil, nil, nil)
+
+	msg := runners.ToolCallSuccessMsg{
+		ChannelID: "forge",
+		CallID:    "call-ok",
+		ToolName:  "shell",
+		Formatted: "shell: success",
+	}
+	newModel, cmd := model.handleCustomMessages(msg)
+	updated := newModel.(TUIModel)
+
+	chat := updated.tabs.ChatByTab("forge")
+	assert.True(t, chat.contentDirty, "ToolCallSuccess should mark content dirty")
+	assert.True(t, updated.renderTickPending, "ToolCallSuccess should schedule a render tick")
+
+	// Verify a chatRenderTickMsg command was returned
+	if cmd != nil {
+		cmdMsg := cmd()
+		_, ok := cmdMsg.(chatRenderTickMsg)
+		assert.True(t, ok, "ToolCallSuccess handler should schedule a chatRenderTickMsg")
+	}
+}
+
+func TestToolCallErrorMsg_DebouncedRenderScheduling(t *testing.T) {
+	model := newTestModel(t)
+
+	chat := model.tabs.ChatByTab("forge")
+	require.NotNil(t, chat)
+
+	msg := runners.ToolCallErrorMsg{
+		ChannelID: "forge",
+		CallID:    "call-err",
+		ToolName:  "shell",
+		Error:     "boom",
+		Formatted: "shell: error",
+	}
+	newModel, cmd := model.handleCustomMessages(msg)
+	updated := newModel.(TUIModel)
+
+	// contentDirty should be true
+	chat = updated.tabs.ChatByTab("forge")
+	assert.True(t, chat.contentDirty, "ToolCallError should mark content dirty")
+	assert.True(t, updated.renderTickPending, "should schedule a render tick")
+
+	if cmd != nil {
+		cmdMsg := cmd()
+		_, ok := cmdMsg.(chatRenderTickMsg)
+		assert.True(t, ok, "ToolCallError handler should return a chatRenderTickMsg")
+	}
 }

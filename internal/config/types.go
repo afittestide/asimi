@@ -61,6 +61,7 @@ type UIConfig struct {
 	CtrlCDebounceTime    time.Duration `koanf:"ctrl_c_debounce_time"`   // Quiet period for CTRL-C burst detection (handles iOS duplicate events)
 	CtrlCWindowTime      time.Duration `koanf:"ctrl_c_window_time"`     // Window for second CTRL-C press to quit
 	PromptExpandedHeight int           `koanf:"prompt_expanded_height"` // Height prompt grows to when multiline (default: 10)
+	TickInterval         time.Duration `koanf:"tick_interval"`          // Chat render-tick debounce interval (default: 100ms)
 }
 
 // SessionConfig holds session persistence configuration
