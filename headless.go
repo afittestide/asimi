@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
@@ -157,12 +158,13 @@ func headlessContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParam
 // When handsoff is false, zhengming requests are answered interactively:
 // each question is printed as a numbered menu and the user selects from stdin.
 type headlessSink struct {
-	court      *court.Court
-	handsoff   bool
-	done       chan int
-	enactedSet map[uint]bool // tracks edicts we've already auto-enacted
-	stdin      io.Reader     // for interactive zhengming prompts
-	stdout     io.Writer     // for interactive zhengming menus
+	court              *court.Court
+	handsoff           bool
+	done               chan int
+	enactedSet         map[uint]bool // tracks edicts we've already auto-enacted
+	pendingSuggestions int           // number of edict suggestions awaiting edict creation
+	stdin              io.Reader     // for interactive zhengming prompts
+	stdout             io.Writer     // for interactive zhengming menus
 }
 
 func newHeadlessSink(c *court.Court) *headlessSink {
@@ -202,7 +204,10 @@ func (s *headlessSink) handle(msg any) {
 		// is running — whether auto-enacted by the sink or enacted by
 		// the secretary via enact_ritual — completion will be signaled
 		// by ritual_completed/ritual_failed events.
-		if len(s.enactedSet) == 0 {
+		// If an edict suggestion is pending auto-approval (async chain:
+		// auto-answer → zhengzhang answered → EdictCreated → ritual), the
+		// edict creation hasn't landed yet, so wait rather than exit now.
+		if len(s.enactedSet) == 0 && s.pendingSuggestions == 0 {
 			s.finish(0)
 		}
 
@@ -212,10 +217,28 @@ func (s *headlessSink) handle(msg any) {
 
 	case court.ZhengmingPendingMsg:
 		if s.handsoff {
+			// In handsoff mode an edict suggestion is auto-approved. Before
+			// answering, surface the proposed edict so the ruler can see it,
+			// and register it as pending so StreamDoneMsg doesn't exit before
+			// the async edict-creation chain completes.
+			if isEdictSuggestion(m) {
+				s.printSuggestedEdict(m)
+				s.pendingSuggestions++
+			}
 			s.autoAnswerZhengming(m)
 		} else {
 			s.interactiveAnswerZhengming(m)
 		}
+
+	case tools.EditorRequest:
+		// An approve_doc request (e.g. from suggest_edict for payloads >500
+		// chars) blocks on ResultChan. Headless has no interactive editor, so
+		// always auto-approve the content unchanged. Print it to stdout so
+		// the ruler still sees what was proposed.
+		if !s.handsoff {
+			fmt.Fprintf(s.stdout, "\n--- Document for review ---\n%s\n--- End ---\n", m.Content)
+		}
+		m.ResultChan <- tools.EditorResult{Content: m.Content, Saved: true}
 
 	case court.EventNotificationMsg:
 		s.handleEvent(m)
@@ -240,6 +263,12 @@ func (s *headlessSink) handle(msg any) {
 
 	case runners.ToolCallErrorMsg:
 		fmt.Printf("\n[%s error] %s\n", m.ToolName, m.Error)
+
+	default:
+		// Unhandled message types used to be silently dropped (e.g. the
+		// EditorRequest hang before we added its case). Warn so a flapping
+		// or missing handler is caught early rather than deadlocking tools.
+		slog.Warn("headless: unhandled event", "type", fmt.Sprintf("%T", msg))
 	}
 }
 
@@ -263,6 +292,9 @@ func (s *headlessSink) handleEvent(msg court.EventNotificationMsg) {
 		edictID := msg.EdictKey.ID
 		if edictID == 0 {
 			return
+		}
+		if s.pendingSuggestions > 0 {
+			s.pendingSuggestions--
 		}
 		if s.enactedSet[edictID] {
 			return
@@ -318,6 +350,28 @@ func (s *headlessSink) handleRitualStep(msg court.RitualStepMsg) {
 		fmt.Fprintf(os.Stderr, "\n[ritual %s failed: %s]\n", msg.RitualName, msg.Message)
 		s.finish(1)
 	}
+}
+
+// isEdictSuggestion reports whether a zhengming request is an edict
+// suggestion (as created by the suggest_edict tool): a single question whose
+// first option approves edict creation and that targets a brand-new edict.
+func isEdictSuggestion(msg court.ZhengmingPendingMsg) bool {
+	return len(msg.Questions) > 0 &&
+		len(msg.Questions[0].Options) > 0 &&
+		msg.Questions[0].Options[0] == tools.AnswerApproveEdict &&
+		msg.EdictKey.ID == 0
+}
+
+// printSuggestedEdict prints a formatted block showing the proposed edict to
+// stdout before the handsoff auto-answer approves it.
+func (s *headlessSink) printSuggestedEdict(msg court.ZhengmingPendingMsg) {
+	q := msg.Questions[0]
+	fmt.Fprintf(s.stdout, "\n📜 Suggested New Edict\n")
+	if q.Summary != "" {
+		fmt.Fprintf(s.stdout, "%s\n", q.Summary)
+	}
+	fmt.Fprintf(s.stdout, "%s\n", q.Text)
+	fmt.Fprintf(s.stdout, "[handsoff] Approving...\n")
 }
 
 // autoAnswerZhengming answers with the recommended option (option[0]) for

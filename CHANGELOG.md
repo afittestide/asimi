@@ -5,6 +5,23 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`--reasoning-effort` flag** — new `--reasoning-effort` CLI flag (plus `ASIMI_REASONING_EFFORT` env, subcommand, and `[llm]` config plumbing) for setting the reasoning effort / model thinking level on supported providers, useful for harness-driven and headless runs (e798)
+
+### Changed
+
+- **Repo rename completed** — docs, `scripts/install.sh`, `.goreleaser.yml`, and version strings updated to finish the repository name change
+- **TUI update speed (e780)** — chat content re-renders are now debounced while streaming via a new `[ui] tick_interval` config (default `100ms`), letting the TUI batch streaming updates for smoother, faster rendering
+- **Edict selector seals use emojis** — the judge and chancellor seal glyphs in the `:edict` list are now rendered as emojis (👩‍⚖️ / ☯️) instead of kanji (刑 / 門)
+- **Git diff TTL caching** — repo status/diff statistics (`internal/repo`) are now cached and refreshed with a TTL instead of being recomputed on every call, and tool-call messages are batched as dirty content updates instead of forcing full re-renders; both reduce unnecessary TUI work
+
+### Fixed
+
+- **ATIF trajectory completeness (e814, in progress)** — fixes to the `--atif` recorder so recorded trajectories are well-formed: the final assistant `message_end` is now always closed by a `turn_end`, `turn_end.toolResults[].content` is populated, `usage` surfaces cache/cost/reasoning when the provider returns them, and model/thinking-level switches emit `model_change` / `thinking_level_change` events
+
 ## [0.13.0] - 2026-09-01
 
 ### Added

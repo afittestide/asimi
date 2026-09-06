@@ -1,13 +1,27 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	gologger "gorm.io/gorm/logger"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
@@ -477,6 +491,272 @@ func TestHeadlessSink_HandsoffOn_ZhengmingAutoAnswered(t *testing.T) {
 	}
 }
 
+// setupHeadlessCourtDB opens an in-memory sqlite DB migrated with the storage
+// models needed by a real Court. It returns the gorm DB and a file path for
+// the sqlite file (so WAL/locking behaves like production).
+func setupHeadlessCourtDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "headless_court_test")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	dbPath := filepath.Join(dir, "court.db")
+
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+
+	db, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{
+		Logger: gologger.Default.LogMode(gologger.Silent),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, db.AutoMigrate(
+		&storage.Edict{},
+		&storage.Zhengming{},
+		&storage.TianEvent{},
+		&storage.Ling{},
+		&storage.ForgeManifest{},
+		&storage.Seal{},
+		&storage.JudgeVerdict{},
+		&storage.CensorPrecedent{},
+	))
+	return db
+}
+
+// TestHeadlessSink_HandsoffZhengmingJoinsAnswers verifies that the headless
+// auto-answer (autoAnswerZhengming) answers a multi-question zhengming using
+// the recommended option[0] of each question, joined with "; " — the shared
+// handsoff behavior originally asserted by the TUI handsoff zhengming tests.
+// It exercises the real Court path (a pending zhengming is stored and the
+// answer is recorded back via HandleZhengmingResponse).
+func TestHeadlessSink_HandsoffZhengmingJoinsAnswers(t *testing.T) {
+	db := setupHeadlessCourtDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := court.NewCourt(db, cfg, nil, slog.New(slog.DiscardHandler))
+
+	// Register a pending multi-question zhengming.
+	req := storage.Zhengming{
+		RequestID:  "headless-auto-1",
+		EdictID:    0,
+		Username:   cfg.Username,
+		Project:    cfg.Project,
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Q1?", Options: []string{"A", "B"}},
+			{Text: "Q2?", Options: []string{"X", "Y"}},
+		},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	sink := newHeadlessSink(s)
+	sink.handsoff = true
+	sink.handle(court.ZhengmingPendingMsg{
+		RequestID:  "headless-auto-1",
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Q1?", Options: []string{"A", "B"}},
+			{Text: "Q2?", Options: []string{"X", "Y"}},
+		},
+	})
+
+	// The auto-answer runs in a goroutine; poll for the zhengming to flip
+	// to answered with the joined recommended options.
+	require.Eventually(t, func() bool {
+		var stored storage.Zhengming
+		if err := db.First(&stored, "request_id = ?", "headless-auto-1").Error; err != nil {
+			return false
+		}
+		return stored.Status == storage.ZhengmingAnswered && stored.Answer == "A; X"
+	}, 3*time.Second, 20*time.Millisecond, "auto-answer should join options as 'A; X'")
+}
+
+// TestHeadlessSink_HandsoffZhengmingSingleAnswer verifies that a single
+// question is auto-answered with option[0], preserving the coverage removed
+// with the TUI handsoff zhengming tests.
+func TestHeadlessSink_HandsoffZhengmingSingleAnswer(t *testing.T) {
+	db := setupHeadlessCourtDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := court.NewCourt(db, cfg, nil, slog.New(slog.DiscardHandler))
+
+	req := storage.Zhengming{
+		RequestID:  "headless-auto-single",
+		EdictID:    0,
+		Username:   cfg.Username,
+		Project:    cfg.Project,
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Which approach?", Options: []string{"Option A", "Option B"}},
+		},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	sink := newHeadlessSink(s)
+	sink.handsoff = true
+	sink.handle(court.ZhengmingPendingMsg{
+		RequestID:  "headless-auto-single",
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Which approach?", Options: []string{"Option A", "Option B"}},
+		},
+	})
+
+	require.Eventually(t, func() bool {
+		var stored storage.Zhengming
+		if err := db.First(&stored, "request_id = ?", "headless-auto-single").Error; err != nil {
+			return false
+		}
+		return stored.Status == storage.ZhengmingAnswered && stored.Answer == "Option A"
+	}, 3*time.Second, 20*time.Millisecond, "auto-answer should pick option[0]")
+}
+
+// TestHeadlessSink_StreamDoneWithPendingSuggestion_DoesNotFinish verifies
+// that StreamDoneMsg does NOT signal completion when an edict suggestion is
+// pending auto-approval — even if the edict hasn't been created yet
+// (enactedSet is empty). This prevents the headless process from exiting
+// before the async auto-answer chain creates the edict and runs the ritual.
+func TestHeadlessSink_StreamDoneWithPendingSuggestion_DoesNotFinish(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	sink.handle(court.ZhengmingPendingMsg{
+		RequestID:  "req-suggest",
+		MinisterID: "secretary",
+		EdictKey:   storage.EdictKey{ID: 0},
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Fix the suggest_edict flow", Summary: "Fix suggest_edict flow", Options: []string{tools.AnswerApproveEdict, tools.AnswerReject}},
+		},
+	})
+	require.Equal(t, 1, sink.pendingSuggestions, "suggestion should be tracked as pending")
+
+	// Even with no enacted edict, StreamDone must not finish while a
+	// suggestion is pending.
+	sink.handle(court.StreamDoneMsg{ChannelID: "secretary"})
+	select {
+	case code := <-sink.done:
+		t.Fatalf("should not signal done while suggestion pending, got code %d", code)
+	default:
+		// correct — edict creation/ritual completion will signal later
+	}
+
+	// Once the edict is created, the pending count decrements and the ritual
+	// is enacted, so completion is now driven by the ritual events.
+	sink.handle(court.EventNotificationMsg{
+		EventType: storage.EventEdictCreated,
+		EdictKey:  storage.EdictKey{ID: 42},
+		Payload:   map[string]interface{}{"intent": "Fix suggest_edict flow"},
+	})
+	require.Equal(t, 0, sink.pendingSuggestions, "pending suggestion should be cleared after edict creation")
+	require.True(t, sink.enactedSet[42], "edict 42 should be tracked after creation")
+
+	// Ritual completion signals exit 0.
+	sink.handle(court.EventNotificationMsg{
+		EventType: storage.EventRitualCompleted,
+		EdictKey:  storage.EdictKey{ID: 42},
+	})
+	select {
+	case code := <-sink.done:
+		assert.Equal(t, 0, code)
+	default:
+		t.Fatal("expected done signal after ritual completed")
+	}
+}
+
+// TestHeadlessSink_SuggestedEdictPrints verifies that in handsoff mode an
+// edict suggestion is printed to stdout (before auto-answering) so the ruler
+// can see the proposed edict.
+func TestHeadlessSink_SuggestedEdictPrints(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	var out strings.Builder
+	sink.stdout = &out
+
+	sink.handle(court.ZhengmingPendingMsg{
+		RequestID:  "req-suggest-print",
+		MinisterID: "secretary",
+		EdictKey:   storage.EdictKey{ID: 0},
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Add a login page and wire it to the auth service", Summary: "Add login page", Options: []string{tools.AnswerApproveEdict, tools.AnswerReject}},
+		},
+	})
+
+	outStr := out.String()
+	assert.Contains(t, outStr, "📜 Suggested New Edict")
+	assert.Contains(t, outStr, "Add login page")
+	assert.Contains(t, outStr, "Add a login page and wire it to the auth service")
+	assert.Contains(t, outStr, "[handsoff] Approving")
+
+	// A non-suggestion zhengming must not print the suggestion block.
+	out.Reset()
+	sink.handle(court.ZhengmingPendingMsg{
+		RequestID:  "req-other",
+		MinisterID: "secretary",
+		EdictKey:   storage.EdictKey{ID: 0},
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Which option?", Options: []string{"A", "B"}},
+		},
+	})
+	assert.NotContains(t, out.String(), "📜 Suggested New Edict")
+}
+
+// TestHeadlessSink_EditorRequest_HandsoffAutoApproves verifies that the
+// headless sink handles tools.EditorRequest by auto-approving the content
+// unchanged. In handsoff mode, it must NOT print the document. Without this
+// handler, approve_doc blocks forever on ResultChan and suggest_edict hangs.
+func TestHeadlessSink_EditorRequest_HandsoffAutoApproves(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	var out strings.Builder
+	sink.stdout = &out
+
+	resultChan := make(chan tools.EditorResult, 1)
+	sink.handle(tools.EditorRequest{
+		Content:    "large document content >500 chars...",
+		Filename:   "suggested_edict.md",
+		ResultChan: resultChan,
+	})
+
+	select {
+	case res := <-resultChan:
+		assert.True(t, res.Saved, "editor result should be Saved in handsoff mode")
+		assert.Equal(t, "large document content >500 chars...", res.Content, "content should be unchanged")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for EditorResult — ApproveDocTool would hang")
+	}
+
+	// In handsoff mode the document is not printed to stdout.
+	assert.NotContains(t, out.String(), "Document for review")
+}
+
+// TestHeadlessSink_EditorRequest_NonHandsoffPrints verifies that when NOT in
+// handsoff mode, an EditorRequest prints the content to stdout (so the user
+// still sees it) and still auto-approves since headless has no editor.
+func TestHeadlessSink_EditorRequest_NonHandsoffPrints(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	sink.handsoff = false
+	var out strings.Builder
+	sink.stdout = &out
+
+	resultCh := make(chan tools.EditorResult, 1)
+	sink.handle(tools.EditorRequest{
+		Content:    "Some document body",
+		Filename:   "doc.md",
+		ResultChan: resultCh,
+	})
+
+	assert.Contains(t, out.String(), "Document for review")
+	assert.Contains(t, out.String(), "Some document body")
+
+	select {
+	case res := <-resultCh:
+		assert.True(t, res.Saved, "should auto-approve even when not handsoff")
+		assert.Equal(t, "Some document body", res.Content)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for EditorResult")
+	}
+}
+
 // TestHeadlessSink_HandsoffOff_NoAutoEnact verifies that when handsoff is
 // false, EventEdictCreated does NOT auto-enact swift-strike (edict is
 // tracked in enactedSet but no ritual is published).
@@ -586,4 +866,140 @@ func TestHeadlessSink_InteractiveZhengming_NilCourt_NoPanic(t *testing.T) {
 		t.Fatal("should not signal done on ZhengmingPendingMsg")
 	default:
 	}
+}
+
+// TestHeadlessActivation_ATIF_E2E is a terminal-bench readiness smoke test.
+// It builds the real asimi binary and runs it end-to-end in headless mode
+// against a copy of the ror-project:
+//
+//	asimi --handsoff --atif --isolated-host -p "add a feature"
+//
+// It verifies that (1) asimi exits successfully, (2) asimi actually made
+// changes to the project (git diff is non-empty), and (3) the ATIF
+// trajectory file (agent/asimi.txt) was fully populated — not empty.
+//
+// The model/provider used is whatever the caller is actually configured to
+// run: this test deliberately does NOT force a model. Any ASIMI_MODEL /
+// ASIMI_PROVIDER (or backend config) the user has in effect is inherited by
+// the subprocess, so the readiness check exercises the production setup.
+//
+// Requires a real LLM, so it is gated the same way as
+// TestInitRitualWithLLM_E2E: it skips unless CI=true and LLM_E2E=1 are both
+// set and a provider API key is present in the environment.
+func TestActivation_ATIF_E2E(t *testing.T) {
+	skipIfNotCI(t)
+	if os.Getenv("LLM_E2E") == "" {
+		t.Skip("skipping real-LLM E2E (set LLM_E2E=1 to run)")
+	}
+	// Detect any configured provider purely as a gate — we inherit (and
+	// exercise) whatever model the caller actually runs, not a hardcoded one.
+	provider, _, _ := detectLLMProvider()
+	if provider == "" {
+		t.Skip("no LLM API key found (set ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY)")
+	}
+	t.Logf("provider key detected: %s (model comes from user config/env)", provider)
+
+	// 1. Build the real asimi binary from the module root.
+	repoRoot, err := os.Getwd()
+	require.NoError(t, err)
+	binary := filepath.Join(t.TempDir(), "asimi")
+	build := exec.Command("go", "build", "-tags", "containers_image_openpgp", "-o", binary, ".")
+	build.Dir = repoRoot
+	buildOut, buildErr := build.CombinedOutput()
+	require.NoError(t, buildErr, "failed to build asimi binary\nOutput: %s", buildOut)
+
+	// 2. Set up a clean git repo from the ror-project demo so the agent has
+	// a real project to modify.
+	tmpDir := t.TempDir()
+	srcDir := filepath.Join(repoRoot, "testdata", "ror-project")
+	cpCmd := exec.Command("cp", "-r", srcDir+"/.", tmpDir)
+	require.NoError(t, cpCmd.Run(), "failed to copy testdata/ror-project")
+
+	require.NoError(t, os.Chdir(tmpDir))
+	t.Cleanup(func() { os.Chdir(repoRoot) })
+
+	initTestGitRepo(t, tmpDir)
+	// Give the repo a remote so project_slug is populated (mirrors the
+	// project-init E2E test).
+	runTestGitCommand(t, tmpDir, "remote", "add", "origin", "https://github.com/testorg/ror-demo.git")
+
+	// Baseline: no working-tree changes yet.
+	assert.Empty(t, gitStatus(t, tmpDir), "expected clean tree before activation")
+
+	// 3. Activate asimi headlessly against the ror-project with the real LLM,
+	// turning on ATIF trajectory recording (--atif), handsoff auto-approval,
+	// and isolated-host (terminal-bench runs in an already-isolated
+	// environment, so no podman sandbox or approval gates).
+	// The subprocess inherits the caller's environment verbatim, so whatever
+	// model/provider the user has configured (config file, ASIMI_MODEL,
+	// ASIMI_PROVIDER, or the provider API key) is exercised — we do not force
+	// a model here, keeping this a true readiness check.
+	prompt := "add a feature: list all posts with titles"
+	cmd := exec.Command(binary, "--handsoff", "--atif", "--isolated-host", "-p", prompt)
+	cmd.Dir = tmpDir
+	cmd.Env = os.Environ()
+	cmdOutput := &lockBuffer{}
+	cmd.Stdout = cmdOutput
+	cmd.Stderr = cmdOutput
+
+	runCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	err = cmd.Run()
+	if ctxErr := runCtx.Err(); ctxErr == context.DeadlineExceeded {
+		t.Fatalf("asimi activation timed out\nOutput:\n%s", cmdOutput.String())
+	}
+	require.NoError(t, err, "asimi activation failed\nOutput:\n%s", cmdOutput.String())
+
+	// 4. Assert the activation made changes to the project.
+	status := gitStatus(t, tmpDir)
+	require.NotEmpty(t, status, "asimi should have made code changes\nOutput:\n%s", cmdOutput.String())
+	t.Logf("changes made by asimi:\n%s", status)
+
+	// 5. Assert the ATIF trajectory was fully recorded. With --atif the agent
+	// name is "asimi", so the trajectory lives at agent/asimi.txt and must be
+	// non-empty with only valid JSONL events.
+	atifFile := filepath.Join(tmpDir, "agent", "asimi.txt")
+	data, atifErr := os.ReadFile(atifFile)
+	require.NoError(t, atifErr, "expected ATIF file at agent/asimi.txt")
+	require.NotEmpty(t, strings.TrimSpace(string(data)), "ATIF file should be fully populated (non-empty)")
+	lineCount := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		lineCount++
+		require.True(t, json.Valid([]byte(line)), "ATIF line %d is not valid JSON: %s", lineCount, line)
+	}
+	t.Logf("ATIF file %s fully populated with %d JSONL events", atifFile, lineCount)
+}
+
+// lockBuffer is a minimal concurrency-safe buffer for capturing a command's
+// stdout/stderr so diagnostics can be printed on test failure.
+type lockBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// gitStatus returns the porcelain status for a directory (non-empty when the
+// working tree has uncommitted changes).
+func gitStatus(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git status failed: %s", out)
+	return strings.TrimSpace(string(out))
 }
