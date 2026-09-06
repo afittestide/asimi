@@ -15,121 +15,121 @@
     - name: print
       out: b4 {{ .edict }} after
 
-- name: release-version
-  description: |
-    Prepares and executes a version release following the documented release
-    process. Updates CHANGELOG, version constant, roadmap, commits, tags,
-    and pushes with explicit Ruler confirmation.
-  inputs:
-    version:
-      type: string
-      required: true
-  background:
-    - the earth status
-  max_retries: 2
-  steps:
-    - name: prepare-changelog
-      minister: war
-      effort: medium
-      given:
-        - "!git log $(git describe --tags --abbrev=0 2>/dev/null || echo HEAD~20)..HEAD --oneline  # recent_commits"
-      act: |
-        Review the git log since the last tag (below) and compare against the
-        Unreleased section of CHANGELOG.md. Ensure all user-notable changes are
-        captured under Unreleased. Then rename the Unreleased section to the
-        target version ({{ .version }}) with today's date, following the
-        Keep a Changelog format.
-
-        Use replace_text to edit CHANGELOG.md in place — do NOT rewrite the file.
-
-        ## Recent Commits
-        {{ .recent_commits }}
-      on_failure: retry
-
-    - name: bump-version
-      minister: forge
-      effort: low
-      given:
-        - "!grep 'var AsimiVersion' internal/utils/asimi_version.go  # current_version_line"
-      act: |
-        Update the AsimiVersion constant in internal/utils/asimi_version.go to
-        "{{ .version }}". Use replace_text to change only the version value on
-        the `var AsimiVersion =` line. Do not modify any other code in that file.
-
-        Current line:
-        {{ .current_version_line }}
-      on_failure: retry
-
-    - name: update-roadmap
-      minister: forge
-      effort: low
-      act: |
-        Review docs/roadmap.md wntry for {{ .version }}.
-        Move all lines that weren't done in the version to the next version.
-        Laastly, completly remove the roadmap entry for {{ .version }}
-        in this release ({{ .version }}). Move completed items out of the
-        "to develop" sections or mark them as done. Use replace_text for
-        targeted edits — do NOT rewrite the file.
-      on_failure: retry
-
-    - name: verify-release-readiness
-      minister: judge
-      effort: low
-      given:
-        - the earth status
-        - "!just test  # test_results"
-        - "!just lint  # lint_results"
-        - "!just build  # build_result"
-      act: |
-        Verify that tests pass, linter is clean, and the project builds.
-        Confirm the CHANGELOG version matches the version in asimi_version.go.
-        Confirm the git tag for {{ .version }} does not already exist.
-        If anything fails, report clearly and do not proceed.
-
-        Use record_verdict to record pass/fail.
-      then:
-        - the verdicts are passed
-        - record the judge's seal
-      on_failure: goto
-      on_failure_target: prepare-changelog
-
-    - name: chancellor-reviews
-      minister: chancellor
-      effort: low
-      given:
-        - the earth status
-        - the manifests
-      act: |
-        Review all release changes for correctness — CHANGELOG format, version
-        consistency, roadmap accuracy, no unintended code changes.
-
-        Call record_precedent ONCE with approved=true if the release artifacts
-        are clean. Then return a one-sentence confirmation.
-      then:
-        - record the chancellor's seal
-      on_failure: goto
-      on_failure_target: prepare-changelog
-
-    - name: commit-and-tag
-      minister: secretary
-      effort: low
-      given:
-        - the earth status
-      act: |
-        Stage CHANGELOG.md, internal/utils/asimi_version.go, docs/roadmap.md,
-        and any other modified release files. Commit with message
-        "chore: releasing v{{ .version }}". Then create an annotated git tag:
-        git tag -a v{{ .version }} -m "Release v{{ .version }}".
-        Do NOT push — the Ruler must confirm the push as the final step.
-
-    - name: confirm-push
-      minister: secretary
-      effort: low
-      act: |
-        Call ask_ruler asking the Ruler to confirm pushing the release
-        tag and commit to origin. Options:
-        - "Push release" (runs `git push origin main --tags`)
-        - "Hold — review locally first" (stops here, Ruler pushes manually
-          when ready)
-  then:
-    - the release is tagged and (if confirmed) pushed
+# - name: release-version
+#   description: |
+#     Prepares and executes a version release following the documented release
+#     process. Updates CHANGELOG, version constant, roadmap, commits, tags,
+#     and pushes with explicit Ruler confirmation.
+#   inputs:
+#     version:
+#       type: string
+#       required: true
+#   background:
+#     - the earth status
+#   max_retries: 2
+#   steps:
+#     - name: prepare-changelog
+#       minister: secretery
+#       effort: medium
+#       given:
+#         - "!git log $(git describe --tags --abbrev=0 2>/dev/null || echo HEAD~20)..HEAD --oneline  # recent_commits"
+#       act: |
+#         Review the git log since the last tag (below) and compare against the
+#         Unreleased section of CHANGELOG.md. Ensure all user-notable changes are
+#         captured under Unreleased. Then rename the Unreleased section to the
+#         target version ({{ .version }}) with today's date, following the
+#         Keep a Changelog format.
+# 
+#         Use replace_text to edit CHANGELOG.md in place — do NOT rewrite the file.
+# 
+#         ## Recent Commits
+#         {{ .recent_commits }}
+#       on_failure: retry
+# 
+#     - name: bump-version
+#       minister: forge
+#       effort: low
+#       given:
+#         - "!grep 'var AsimiVersion' internal/utils/asimi_version.go  # current_version_line"
+#       act: |
+#         Update the AsimiVersion constant in internal/utils/asimi_version.go to
+#         "{{ .version }}". Use replace_text to change only the version value on
+#         the `var AsimiVersion =` line. Do not modify any other code in that file.
+# 
+#         Current line:
+#         {{ .current_version_line }}
+#       on_failure: retry
+# 
+#     - name: update-roadmap
+#       minister: forge
+#       effort: low
+#       act: |
+#         Review docs/roadmap.md wntry for {{ .version }}.
+#         Move all lines that weren't done in the version to the next version.
+#         Laastly, completly remove the roadmap entry for {{ .version }}
+#         in this release ({{ .version }}). Move completed items out of the
+#         "to develop" sections or mark them as done. Use replace_text for
+#         targeted edits — do NOT rewrite the file.
+#       on_failure: retry
+# 
+#     - name: verify-release-readiness
+#       minister: judge
+#       effort: low
+#       given:
+#         - the earth status
+#         - "!just test  # test_results"
+#         - "!just lint  # lint_results"
+#         - "!just build  # build_result"
+#       act: |
+#         Verify that tests pass, linter is clean, and the project builds.
+#         Confirm the CHANGELOG version matches the version in asimi_version.go.
+#         Confirm the git tag for {{ .version }} does not already exist.
+#         If anything fails, report clearly and do not proceed.
+# 
+#         Use record_verdict to record pass/fail.
+#       then:
+#         - the verdicts are passed
+#         - record the judge's seal
+#       on_failure: goto
+#       on_failure_target: prepare-changelog
+# 
+#     - name: chancellor-reviews
+#       minister: chancellor
+#       effort: low
+#       given:
+#         - the earth status
+#         - the manifests
+#       act: |
+#         Review all release changes for correctness — CHANGELOG format, version
+#         consistency, roadmap accuracy, no unintended code changes.
+# 
+#         Call record_precedent ONCE with approved=true if the release artifacts
+#         are clean. Then return a one-sentence confirmation.
+#       then:
+#         - record the chancellor's seal
+#       on_failure: goto
+#       on_failure_target: prepare-changelog
+# 
+#     - name: commit-and-tag
+#       minister: secretary
+#       effort: low
+#       given:
+#         - the earth status
+#       act: |
+#         Stage CHANGELOG.md, internal/utils/asimi_version.go, docs/roadmap.md,
+#         and any other modified release files. Commit with message
+#         "chore: releasing v{{ .version }}". Then create an annotated git tag:
+#         git tag -a v{{ .version }} -m "Release v{{ .version }}".
+#         Do NOT push — the Ruler must confirm the push as the final step.
+# 
+#     - name: confirm-push
+#       minister: secretary
+#       effort: low
+#       act: |
+#         Call ask_ruler asking the Ruler to confirm pushing the release
+#         tag and commit to origin. Options:
+#         - "Push release" (runs `git push origin main --tags`)
+#         - "Hold — review locally first" (stops here, Ruler pushes manually
+#           when ready)
+#   then:
+#     - the release is tagged and (if confirmed) pushed

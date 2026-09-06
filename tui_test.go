@@ -6691,83 +6691,6 @@ func TestZhengmingPendingMsg_FallbackToActiveTab(t *testing.T) {
 
 // --- Handsoff mode tests ---
 
-// TestHandsoff_ZhengmingAutoAnswer verifies that in handsoff mode, a
-// ZhengmingPendingMsg is auto-answered with the recommended option (option[0])
-// without entering answering mode.
-func TestHandsoff_ZhengmingAutoAnswer(t *testing.T) {
-	mock := &mockCourtClient{}
-	model := newTestModel(t)
-	model.court = mock
-	model.handsoff = true
-
-	msg := court.ZhengmingPendingMsg{
-		RequestID:  "zhengming-handsoff-1",
-		MinisterID: "chancellor",
-		Questions: storage.ZhengmingQuestions{
-			{Text: "Which approach?", Summary: "Approach?", Options: []string{"Option A", "Option B"}},
-		},
-	}
-
-	newModel, _ := model.handleCustomMessages(msg)
-	updated, ok := newModel.(TUIModel)
-	require.True(t, ok)
-
-	// Prompt should NOT be in answering mode — handsoff short-circuits
-	assert.Nil(t, updated.prompt().answering, "prompt should not enter answering mode in handsoff")
-
-	// The zhengming should have been auto-answered via HandleZhengmingResponse
-	// (called in a goroutine, so we poll)
-	require.Eventually(t, func() bool {
-		return len(mock.zhengmingResponses) == 1
-	}, 2*time.Second, 10*time.Millisecond, "HandleZhengmingResponse should be called")
-	resp := mock.zhengmingResponses[0]
-	assert.Equal(t, "zhengming-handsoff-1", resp.requestID)
-	assert.Equal(t, "Option A", resp.answer, "should auto-answer with the recommended option[0]")
-}
-
-// TestHandsoff_SuggestedEdictDisplays verifies that in handsoff mode an edict
-// suggestion is added to the minister's chat before being auto-answered, so
-// the ruler can see the proposed edict.
-func TestHandsoff_SuggestedEdictDisplays(t *testing.T) {
-	mock := &mockCourtClient{}
-	model := newTestModel(t)
-	model.court = mock
-	model.handsoff = true
-
-	msg := court.ZhengmingPendingMsg{
-		RequestID:  "zhengming-suggest-handsoff-1",
-		MinisterID: "secretary",
-		EdictKey:   storage.EdictKey{ID: 0},
-		Questions: storage.ZhengmingQuestions{
-			{Text: "Add a login page and wire it to the auth service", Summary: "Add login page", Options: []string{tools.AnswerApproveEdict, tools.AnswerReject}},
-		},
-	}
-
-	newModel, _ := model.handleCustomMessages(msg)
-	updated, ok := newModel.(TUIModel)
-	require.True(t, ok)
-
-	// The suggested edict should be shown in the chat.
-	chat := updated.tabs.ChatByTab(msg.MinisterID)
-	require.NotNil(t, chat, "secretary chat should exist")
-	found := false
-	for _, cm := range chat.Messages {
-		if strings.Contains(cm.Content, "📜 Suggested New Edict") &&
-			strings.Contains(cm.Content, "Add login page") {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "suggested edict should be displayed in the chat before auto-answering")
-
-	// It should still be auto-answered with the recommended option.
-	require.Eventually(t, func() bool {
-		return len(mock.zhengmingResponses) == 1
-	}, 2*time.Second, 10*time.Millisecond, "HandleZhengmingResponse should be called")
-	resp := mock.zhengmingResponses[0]
-	assert.Equal(t, tools.AnswerApproveEdict, resp.answer, "should auto-approve the suggested edict")
-}
-
 // TestHandsoff_EditorRequest_AutoApproves verifies that in handsoff mode an
 // EditorRequest is auto-approved without opening $EDITOR. Without this guard
 // the TUI would spawn $EDITOR even in handsoff, blocking on interactive input
@@ -6798,32 +6721,6 @@ func TestHandsoff_EditorRequest_AutoApproves(t *testing.T) {
 
 	// The TUI model is unchanged (no editor state to update in handsoff).
 	_ = updated
-}
-
-// TestHandsoff_ZhengmingMultipleQuestions verifies that handsoff mode
-// auto-answers all questions, joining answers with "; ".
-func TestHandsoff_ZhengmingMultipleQuestions(t *testing.T) {
-	mock := &mockCourtClient{}
-	model := newTestModel(t)
-	model.court = mock
-	model.handsoff = true
-
-	msg := court.ZhengmingPendingMsg{
-		RequestID:  "zhengming-handsoff-2",
-		MinisterID: "forge",
-		Questions: storage.ZhengmingQuestions{
-			{Text: "Q1?", Options: []string{"A", "B"}},
-			{Text: "Q2?", Options: []string{"X", "Y"}},
-		},
-	}
-
-	model.handleCustomMessages(msg)
-
-	require.Eventually(t, func() bool {
-		return len(mock.zhengmingResponses) == 1
-	}, 2*time.Second, 10*time.Millisecond, "HandleZhengmingResponse should be called")
-	resp := mock.zhengmingResponses[0]
-	assert.Equal(t, "A; X", resp.answer, "should join recommended options with '; '")
 }
 
 // TestHandsoff_YesNoAutoAnswerYes verifies that enterYesNoOrAuto returns

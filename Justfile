@@ -46,6 +46,14 @@ test-coverage:
 test-intent:
     go test -mod=mod -run TestIntentGherkin -timeout 30s .
 
+# Run the terminal-bench activation E2E test with a real LLM.
+# Requires CI=true, LLM_E2E=1, and a provider API key in the environment
+# (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY).
+# Uses whatever model/provider the caller has configured (config, ASIMI_MODEL,
+# ASIMI_PROVIDER) — the test does not force a model.
+test-atif:
+    CI=1 go test -tags containers_image_openpgp -run TestActivation_ATIF_E2E -timeout 20m -v .
+
 # Run linting
 lint:
     go vet ./...

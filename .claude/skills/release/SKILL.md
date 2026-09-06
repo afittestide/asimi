@@ -1,11 +1,11 @@
 ---
 name: release
-description: Run the full release process for asimi-cli - update changelog, bump version, update roadmap, commit, and tag. Use when the user says "release", "cut a release", "prepare release", or similar.
+description: Run the full release process for asimi - update changelog, bump version, update roadmap, commit, and tag. Use when the user says "release", "cut a release", "prepare release", or similar.
 user-invocable: true
 argument-hint: [version]
 ---
 
-You are performing a release of asimi-cli. The target version is `$ARGUMENTS`.
+You are releasing version `$ARGUMENTS` of asimi.
 
 If no version argument was provided, read the current version from line 34 of `main.go` (the `var version` line), determine the next appropriate version by reviewing the CHANGELOG.md unreleased section, and ask the user to confirm before proceeding.
 
@@ -34,7 +34,7 @@ var version = "$ARGUMENTS"
 - Check for new open issues that should be on the roadmap: `gh issue list --state open`
 - Add relevant new open issues to the roadmap table using the format:
   ```
-  | [#XX - Feature Name](https://github.com/afittestide/asimi-cli/issues/XX) | Brief description |
+  | [#XX - Feature Name](https://github.com/afittestide/asimi/issues/XX) | Brief description |
   ```
 
 ## 4. Show the user a summary of all changes and ask for approval before committing

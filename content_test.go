@@ -26,6 +26,28 @@ func TestTabGreetingsAllPresent(t *testing.T) {
 	}
 }
 
+func TestInitTabGreetingsIdempotent(t *testing.T) {
+	t.Skip("To be handled by e815")
+	defs, err := ministers.LoadMinisters()
+	require.NoError(t, err)
+
+	tm := NewTabManager(80, 24, true, func() string { return "" }, defs)
+
+	// Seed twice, as happens on model switch / OAuth re-login.
+	initTabGreetings(&tm, defs)
+	initTabGreetings(&tm, defs)
+
+	for _, tab := range tm.tabs {
+		count := 0
+		for _, msg := range tab.Content.Chat.Messages {
+			if msg.Type == MessageTypeGreeting {
+				count++
+			}
+		}
+		assert.Equal(t, 1, count, "tab %q should have exactly one greeting", tab.Target)
+	}
+}
+
 func TestAddGreetingMessage_UsesGreetingType(t *testing.T) {
 	chat := NewChatComponent(80, 20, true)
 
