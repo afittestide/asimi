@@ -1394,6 +1394,40 @@ func TestModelContextSize_UnknownNotCached(t *testing.T) {
 	assert.Equal(t, 2, prov.listCalls, "unresolved size must not be cached; second session re-probes")
 }
 
+func TestModelContextSize_RepeatedCallsNoReProbe(t *testing.T) {
+	t.Parallel()
+
+	// Regression: the TUI refreshes context info on every render (each
+	// keystroke), so getModelContextSize was probing bifrost on every call for
+	// a model the registry already answers — an endless list_models network
+	// storm that stalled typing. The resolved size must be memoized per
+	// session so repeated calls never touch the network again.
+	prov := &networkTrackingProvider{}
+	cfg := &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "gpt-4o",
+	}}
+
+	sess, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// First call resolves from the deterministic registry (no network).
+	assert.Equal(t, 128_000, sess.getModelContextSize())
+	assert.Equal(t, 0, prov.listCalls, "registry covers gpt-4o; no bifrost probe needed")
+
+	// Simulate the render loop calling over and over; must stay at zero
+	// network probes.
+	for i := 0; i < 50; i++ {
+		assert.Equal(t, 128_000, sess.getModelContextSize())
+	}
+	assert.Equal(t, 0, prov.listCalls, "repeated per-session calls must not re-probe bifrost")
+
+	// GetContextInfo funnels through getModelContextSize and must share the
+	// same memoized result.
+	assert.Greater(t, sess.GetContextInfo().TotalTokens, 0)
+	assert.Equal(t, 0, prov.listCalls, "GetContextInfo must not re-probe bifrost")
+}
+
 func TestSession_GetContextInfo_WithContextFiles(t *testing.T) {
 	t.Parallel()
 

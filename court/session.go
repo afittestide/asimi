@@ -200,8 +200,18 @@ type Session struct {
 	// own the lifecycle (per-step, per-turn, etc.).
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 
-	model        LLMProvider // LLM client (implements ChatCompletionRequest/ChatCompletionStreamRequest)
-	config       *internalconfig.LLMConfig
+	model  LLMProvider // LLM client (implements ChatCompletionRequest/ChatCompletionStreamRequest)
+	config *internalconfig.LLMConfig
+
+	// Per-session model context-size memo. Holds the resolved window for the
+	// current provider:model (including registry/default resolutions) so the
+	// TUI's per-render GetContextInfo() never re-probes bifrost on each
+	// keystroke. Unlike the package-level modelContextByKey cache, a registry
+	// or "guessed" default is stored here and never shared across sessions;
+	// a model change displaces it. See getModelContextSize.
+	ctxSizeKey   string
+	ctxSize      int
+	ctxSizeSet   bool
 	atifRecorder atifRecorder // ATIF trajectory recorder (non-nil when --atif is set)
 	tools        []Tool
 	messages     []schemas.ChatMessage
@@ -378,6 +388,9 @@ func (s *Session) UpdateModel(provider, modelID string) {
 	if s.Provider != provider || s.Model != modelID {
 		s.Provider = provider
 		s.Model = modelID
+		// The resolved context window is keyed by provider:model; a change must
+		// displace the stale per-session memo so the next lookup resolves fresh.
+		s.ctxSizeSet = false
 		s.atifModelChanged(provider, modelID)
 	}
 }
@@ -825,26 +838,53 @@ func (s *Session) getModelContextSize() int {
 	}
 	key := provider + ":" + modelName
 
-	// Lazy path: shared bifrost cache — one network lookup per
-	// provider:model, stored at package level for all sessions.
+	// Per-session fast path: the window was already resolved for this exact
+	// provider:model during this session's lifetime. This is what keeps the
+	// TUI's per-render GetContextInfo() from re-probing bifrost on keystrokes.
+	if s.ctxSizeSet && s.ctxSizeKey == key {
+		return s.ctxSize
+	}
+
+	// Shared lazy path: one network lookup per provider:model, stored at
+	// package level for all sessions. Only genuine bifrost-reported values
+	// are stored here — never a registry guess or a fabricated default.
 	if size, ok := modelContextByKey.Load(key); ok {
+		s.rememberContextSize(key, size.(int))
 		return size.(int)
 	}
-	size := s.resolveContextSizeFromBifrost(provider, modelName)
-	if size == defaultUnknownContextRef {
-		// Fast path: regex registry (deterministic, no I/O).
-		if size := matchContextRule(modelContextSizes, key); size > 0 {
-			slog.Info("Using context size from registry", "size", size)
-			return size // leave uncached — re-probe bifrost on next call
-		}
-		// An unknown window is a guess and must not be cached: every later
-		// session for this provider:model would otherwise receive a
-		// fabricated default. Leave the shared cache clean and re-probe.
-		slog.Warn("context window unknown; not guessing and not caching", "provider", provider, "model", modelName)
-		return defaultUnknownContextRef // no Store — never cache a guess
+
+	// Deterministic registry first — the primary fast path, no I/O. Trying
+	// the registry before bifrost keeps a known model's first resolution free
+	// of a network round-trip that previously happened on every UI render.
+	if size := matchContextRule(modelContextSizes, key); size > 0 {
+		slog.Info("Using context size from registry", "size", size)
+		s.rememberContextSize(key, size)
+		return size
 	}
-	modelContextByKey.Store(key, size) // only real bifrost values cached
-	return size
+
+	// Lazy bifrost probe, only for models the registry does not cover.
+	if size := s.resolveContextSizeFromBifrost(provider, modelName); size != defaultUnknownContextRef {
+		modelContextByKey.Store(key, size) // real bifrost value, safe to share
+		s.rememberContextSize(key, size)
+		return size
+	}
+
+	// Unresolvable. A "guessed" default must never enter the shared package
+	// cache (a later session would inherit a fabricated value), but we still
+	// memoize it per-session so the render loop doesn't re-probe bifrost on
+	// every keystroke.
+	slog.Warn("context window unknown; not guessing", "provider", provider, "model", modelName)
+	s.rememberContextSize(key, defaultUnknownContextRef)
+	return defaultUnknownContextRef
+}
+
+// rememberContextSize memoizes the resolved window size for the active
+// provider:model in the per-session cache. Only the current key is kept; a
+// provider/model change naturally displaces the stale entry.
+func (s *Session) rememberContextSize(key string, size int) {
+	s.ctxSizeKey = key
+	s.ctxSize = size
+	s.ctxSizeSet = true
 }
 
 // updateTokenCounts recalculates and stores token counts for all context components
