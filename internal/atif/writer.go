@@ -13,24 +13,38 @@ import (
 // It writes to two locations:
 //   - agent/<agent_name>.txt (aggregated JSONL)
 //   - agent/<agent_name>/sessions/<session_id>.jsonl (per-session JSONL)
+//
+// Output paths are rooted at projectRoot so recording stays correct even when
+// the OS working directory changes (e.g. ritual step sessions run with OS CWD
+// under .../court). When projectRoot is empty, paths fall back to the current
+// working directory.
 type AtifWriter struct {
-	mu        sync.Mutex
-	aggFile   *os.File
-	sessFile  *os.File
-	agentName string
-	sessionID string
-	aggPath   string
-	sessPath  string
+	mu          sync.Mutex
+	aggFile     *os.File
+	sessFile    *os.File
+	agentName   string
+	sessionID   string
+	projectRoot string
+	aggPath     string
+	sessPath    string
 }
 
 // NewAtifWriter creates an AtifWriter for the given agent name and session ID.
-// If the agent/ directory cannot be created, a warning is logged and nil is returned.
-func NewAtifWriter(agentName, sessionID string) *AtifWriter {
+// Output files are rooted at projectRoot so recording tracks the canonical
+// project rather than the transient OS working directory. If projectRoot is
+// empty, the current working directory is used. If the agent/ directory cannot
+// be created, Open logs a warning and the writer stays closed (non-fatal).
+func NewAtifWriter(agentName, sessionID, projectRoot string) *AtifWriter {
+	root := projectRoot
+	if root == "" {
+		root, _ = os.Getwd()
+	}
 	w := &AtifWriter{
-		agentName: agentName,
-		sessionID: sessionID,
-		aggPath:   filepath.Join("agent", agentName+".txt"),
-		sessPath:  filepath.Join("agent", agentName, "sessions", sessionID+".jsonl"),
+		agentName:   agentName,
+		sessionID:   sessionID,
+		projectRoot: root,
+		aggPath:     filepath.Join(root, "agent", agentName+".txt"),
+		sessPath:    filepath.Join(root, "agent", agentName, "sessions", sessionID+".jsonl"),
 	}
 	return w
 }
@@ -70,6 +84,7 @@ func (w *AtifWriter) Open() {
 	w.aggFile = aggFile
 	w.sessFile = sessFile
 	slog.Debug("atif: trajectory recording started",
+		"projectRoot", w.projectRoot,
 		"aggregated", w.aggPath,
 		"session", w.sessPath)
 }

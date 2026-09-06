@@ -87,6 +87,13 @@ type responseChoice struct {
 	ToolCalls        []schemas.ChatAssistantMessageToolCall
 	PromptTokens     int // actual prompt token count from provider (0 if unavailable)
 	CompletionTokens int // actual completion token count from provider (0 if unavailable)
+
+	CacheRead  int // prompt cache-read tokens from provider (0 if unavailable)
+	CacheWrite int // prompt cache-write tokens from provider (0 if unavailable)
+	Reasoning  int // reasoning/output token count from provider (0 if unavailable)
+	InputCost  float64
+	OutputCost float64
+	TotalCost  float64
 }
 
 // --- Stream notification message types ---
@@ -361,6 +368,26 @@ func (s *Session) SetAtifRecorder(r atifRecorder) {
 	s.atifRecorder = r
 	if r != nil {
 		r.Start()
+	}
+}
+
+// UpdateModel sets the session's provider/model. When the model actually
+// changes (or is first set after a recorder is attached) it records an
+// ATIF model_change so downstream consumers observe the switch.
+func (s *Session) UpdateModel(provider, modelID string) {
+	if s.Provider != provider || s.Model != modelID {
+		s.Provider = provider
+		s.Model = modelID
+		s.atifModelChanged(provider, modelID)
+	}
+}
+
+// UpdateReasoningEffort sets the session's reasoning-effort level and
+// records an ATIF thinking_level_change when the value changes.
+func (s *Session) UpdateReasoningEffort(level string) {
+	if level != "" && level != s.ReasoningEffort {
+		s.ReasoningEffort = level
+		s.atifThinkingLevelChanged(level)
 	}
 }
 
@@ -1244,6 +1271,9 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 		var toolCalls []schemas.ChatAssistantMessageToolCall
 		var finishReason string
 		var promptTokens, completionTokens int
+		var promptDetails *schemas.ChatPromptTokensDetails
+		var completionDetails *schemas.ChatCompletionTokensDetails
+		var reportedCost *schemas.BifrostCost
 		toolCallMap := make(map[int]*schemas.ChatAssistantMessageToolCall)
 
 	streamLoop:
@@ -1276,6 +1306,9 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 				if chunk.BifrostChatResponse != nil && chunk.BifrostChatResponse.Usage != nil {
 					promptTokens = chunk.BifrostChatResponse.Usage.PromptTokens
 					completionTokens = chunk.BifrostChatResponse.Usage.CompletionTokens
+					promptDetails = chunk.BifrostChatResponse.Usage.PromptTokensDetails
+					completionDetails = chunk.BifrostChatResponse.Usage.CompletionTokensDetails
+					reportedCost = chunk.BifrostChatResponse.Usage.Cost
 				}
 				continue
 			}
@@ -1283,6 +1316,9 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 			if chunk.BifrostChatResponse.Usage != nil {
 				promptTokens = chunk.BifrostChatResponse.Usage.PromptTokens
 				completionTokens = chunk.BifrostChatResponse.Usage.CompletionTokens
+				promptDetails = chunk.BifrostChatResponse.Usage.PromptTokensDetails
+				completionDetails = chunk.BifrostChatResponse.Usage.CompletionTokensDetails
+				reportedCost = chunk.BifrostChatResponse.Usage.Cost
 			}
 			choice := chunk.BifrostChatResponse.Choices[0]
 			if choice.FinishReason != nil {
@@ -1358,6 +1394,12 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 			ToolCalls:        toolCalls,
 			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
+			CacheRead:        cacheReadTokens(promptDetails),
+			CacheWrite:       cacheWriteTokens(promptDetails),
+			Reasoning:        reasoningTokens(completionDetails),
+			InputCost:        usageCost(reportedCost, func(c *schemas.BifrostCost) float64 { return c.InputTokensCost }),
+			OutputCost:       usageCost(reportedCost, func(c *schemas.BifrostCost) float64 { return c.OutputTokensCost }),
+			TotalCost:        usageCost(reportedCost, func(c *schemas.BifrostCost) float64 { return c.TotalCost }),
 		}, nil
 	}
 
@@ -1391,8 +1433,49 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 	if resp.Usage != nil {
 		result.PromptTokens = resp.Usage.PromptTokens
 		result.CompletionTokens = resp.Usage.CompletionTokens
+		result.CacheRead = cacheReadTokens(resp.Usage.PromptTokensDetails)
+		result.CacheWrite = cacheWriteTokens(resp.Usage.PromptTokensDetails)
+		result.Reasoning = reasoningTokens(resp.Usage.CompletionTokensDetails)
+		result.InputCost = usageCost(resp.Usage.Cost, func(c *schemas.BifrostCost) float64 { return c.InputTokensCost })
+		result.OutputCost = usageCost(resp.Usage.Cost, func(c *schemas.BifrostCost) float64 { return c.OutputTokensCost })
+		result.TotalCost = usageCost(resp.Usage.Cost, func(c *schemas.BifrostCost) float64 { return c.TotalCost })
 	}
 	return result, nil
+}
+
+// --- ATIF usage helpers ---
+
+// usageCost returns the cost component identified by sel, or 0 when the
+// provider did not report a cost breakdown.
+func usageCost(c *schemas.BifrostCost, sel func(*schemas.BifrostCost) float64) float64 {
+	if c == nil {
+		return 0
+	}
+	return sel(c)
+}
+
+// cacheReadTokens extracts prompt cache-read tokens from prompt details.
+func cacheReadTokens(d *schemas.ChatPromptTokensDetails) int {
+	if d == nil {
+		return 0
+	}
+	return d.CachedReadTokens
+}
+
+// cacheWriteTokens extracts prompt cache-write tokens from prompt details.
+func cacheWriteTokens(d *schemas.ChatPromptTokensDetails) int {
+	if d == nil {
+		return 0
+	}
+	return d.CachedWriteTokens
+}
+
+// reasoningTokens extracts output reasoning tokens from completion details.
+func reasoningTokens(d *schemas.ChatCompletionTokensDetails) int {
+	if d == nil {
+		return 0
+	}
+	return d.ReasoningTokens
 }
 
 // appendMessage adds LLM response content and tool calls to the message history
@@ -1686,6 +1769,21 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 	var finalText string
 	maxTurns := s.config.MaxTurns
 
+	// ATIF: the turn that started above must close with exactly one turn_end
+	// describing the last assistant message on every return path (ctx cancel,
+	// error, max-turns, tool-loop-max, and normal stop). We accumulate the
+	// assistant message and all tool results across the tool loop and emit
+	// a single turn_end via defer so no early return leaves the turn open.
+	var lastAssistant atifRecorderMessage
+	var allToolResults []atifRecorderToolResult
+	turnEnded := false
+	defer func() {
+		if !turnEnded {
+			turnEnded = true
+			s.atifTurnEnded(lastAssistant, allToolResults)
+		}
+	}()
+
 	for i := 0; i < maxTurns; i++ {
 		s.resetStreamBuffer()
 
@@ -1754,8 +1852,11 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 			}
 			s.appendMessage(choice)
 			// ATIF: assistant message_end (max_tokens)
-			s.atifMessageEnded(s.buildAssistantMsg(choice, responseContent))
-			s.atifTurnEnded(s.buildAssistantMsg(choice, responseContent), nil)
+			finalMsg := s.buildAssistantMsg(choice, responseContent)
+			lastAssistant = finalMsg
+			s.atifMessageEnded(finalMsg)
+			turnEnded = true
+			s.atifTurnEnded(finalMsg, nil)
 			return responseContent + "\n\n[Response truncated due to length limit]", nil
 		}
 
@@ -1776,7 +1877,9 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 			msg := s.buildAssistantMsg(choice, responseContent)
 			msg.StopReason = "error"
 			msg.ErrorMessage = &errMsg
+			lastAssistant = msg
 			s.atifMessageEnded(msg)
+			turnEnded = true
 			s.atifTurnEnded(msg, nil)
 			return responseContent, err
 		}
@@ -1794,13 +1897,14 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 
 		// ATIF: assistant message_end
 		assistantMsg := s.buildAssistantMsg(choice, responseContent)
+		lastAssistant = assistantMsg
 		s.atifMessageEnded(assistantMsg)
 
 		s.appendMessage(choice)
 
 		// Handle tool calls - if no tool calls, we're done
 		if len(choice.ToolCalls) == 0 {
-			s.atifTurnEnded(assistantMsg, nil)
+			lastAssistant = assistantMsg
 			break
 		}
 
@@ -1889,16 +1993,21 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 				Role:       "toolResult",
 				ToolCallID: toolCallID,
 				ToolName:   toolName,
-				IsError:    isError,
-				Timestamp:  time.Now().UnixMilli(),
+				Content: []atifRecorderContentBlock{
+					{Type: "text", Text: strPtr(content)},
+				},
+				IsError:   isError,
+				Timestamp: time.Now().UnixMilli(),
 			})
 		}
 
 		if shouldReturn {
-			s.atifTurnEnded(assistantMsg, toolResults)
+			allToolResults = append(allToolResults, toolResults...)
 			if s.notify != nil {
 				s.notify(StreamCompleteMsg{ChannelID: s.channelID})
 			}
+			turnEnded = true
+			s.atifTurnEnded(lastAssistant, allToolResults)
 			return finalText, nil
 		}
 
@@ -1907,11 +2016,14 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 			if s.notify != nil {
 				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err})
 			}
+			allToolResults = append(allToolResults, toolResults...)
+			turnEnded = true
+			s.atifTurnEnded(lastAssistant, allToolResults)
 			return "", err
 		}
 
 		if len(toolMessages) > 0 {
-			s.atifTurnEnded(assistantMsg, toolResults)
+			allToolResults = append(allToolResults, toolResults...)
 			continue
 		}
 
@@ -2034,6 +2146,20 @@ func (s *Session) atifToolExecutionEnded(toolCallID, toolName string, result str
 	}
 }
 
+// atifModelChanged records a provider/model switch on the recorder.
+func (s *Session) atifModelChanged(provider, modelID string) {
+	if s.atifRecorder != nil {
+		s.atifRecorder.ModelChanged(provider, modelID)
+	}
+}
+
+// atifThinkingLevelChanged records a thinking-level change on the recorder.
+func (s *Session) atifThinkingLevelChanged(level string) {
+	if s.atifRecorder != nil {
+		s.atifRecorder.ThinkingLevelChanged(level)
+	}
+}
+
 // buildAssistantMsg builds an atifRecorderMessage from a responseChoice.
 func (s *Session) buildAssistantMsg(choice *responseChoice, responseContent string) atifRecorderMessage {
 	msg := atifRecorderMessage{
@@ -2088,7 +2214,17 @@ func (s *Session) buildAssistantMsg(choice *responseChoice, responseContent stri
 	msg.Usage = &atifRecorderUsage{
 		Input:       choice.PromptTokens,
 		Output:      choice.CompletionTokens,
+		CacheRead:   choice.CacheRead,
+		CacheWrite:  choice.CacheWrite,
+		Reasoning:   choice.Reasoning,
 		TotalTokens: totalTokens,
+	}
+	if choice.InputCost != 0 || choice.OutputCost != 0 || choice.TotalCost != 0 {
+		msg.Usage.Cost = &atifRecorderCost{
+			Input:  choice.InputCost,
+			Output: choice.OutputCost,
+			Total:  choice.TotalCost,
+		}
 	}
 
 	return msg

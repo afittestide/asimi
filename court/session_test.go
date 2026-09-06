@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1727,6 +1728,73 @@ func (p *capturingProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *
 	return &schemas.BifrostListModelsResponse{}, nil
 }
 
+// toolResultProvider streams a tool call on the first request (triggering
+// tool execution) and a final answer on subsequent requests, so tests can
+// exercise the full tool-execution ATIF path.
+type toolResultProvider struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *toolResultProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	p.mu.Lock()
+	p.calls++
+	first := p.calls == 1
+	p.mu.Unlock()
+
+	ch := make(chan *schemas.BifrostStreamChunk)
+	go func() {
+		defer close(ch)
+		if first {
+			finish := "tool_calls"
+			toolID := "call_confirmer"
+			ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+				Choices: []schemas.BifrostResponseChoice{{
+					Index: 0,
+					ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+						Delta: &schemas.ChatStreamResponseChoiceDelta{
+							ToolCalls: []schemas.ChatAssistantMessageToolCall{{
+								Index: 0,
+								ID:    &toolID,
+								Function: schemas.ChatAssistantMessageToolCallFunction{
+									Name:      strPtr("confirmer"),
+									Arguments: `{}`,
+								},
+							}},
+						},
+					},
+					FinishReason: &finish,
+				}},
+			}}
+			return
+		}
+		finish := "stop"
+		content := "all done"
+		ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+				},
+				FinishReason: &finish,
+			}},
+		}}
+	}()
+	return ch, nil
+}
+
+func (p *toolResultProvider) ChatCompletionRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	return nil, nil
+}
+
+func (p *toolResultProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *toolResultProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
 // TestSession_ReasoningEffortRoutesToRequest verifies that a session's
 // ReasoningEffort value is forwarded as the reasoning.effort parameter on
 // the outgoing chat request.
@@ -2353,7 +2421,9 @@ func TestExecuteToolCall_InjectsSessionIDIntoContext(t *testing.T) {
 
 // mockAtifRecorder is a test recorder that captures ATIF events for verification.
 type mockAtifRecorder struct {
-	events []string
+	events         []string
+	lastTurnEnded  atifRecorderMessage
+	lastToolResult []atifRecorderToolResult
 }
 
 func (m *mockAtifRecorder) Start() {
@@ -2367,6 +2437,8 @@ func (m *mockAtifRecorder) TurnStarted() {
 }
 func (m *mockAtifRecorder) TurnEnded(msg atifRecorderMessage, toolResults []atifRecorderToolResult) {
 	m.events = append(m.events, "turn_end")
+	m.lastTurnEnded = msg
+	m.lastToolResult = toolResults
 }
 func (m *mockAtifRecorder) MessageStarted(msg atifRecorderMessage) {
 	m.events = append(m.events, "msg_start:"+msg.Role)
@@ -2382,6 +2454,12 @@ func (m *mockAtifRecorder) ToolExecutionEnded(toolCallID, toolName string, resul
 }
 func (m *mockAtifRecorder) ToolExecutionUpdated(toolCallID, toolName string, partialResult string, args any) {
 	m.events = append(m.events, "tool_update:"+toolName)
+}
+func (m *mockAtifRecorder) ModelChanged(provider, modelID string) {
+	m.events = append(m.events, "model_change:"+modelID)
+}
+func (m *mockAtifRecorder) ThinkingLevelChanged(level string) {
+	m.events = append(m.events, "thinking_level_change:"+level)
 }
 
 // compile-time check
@@ -2491,6 +2569,12 @@ func TestSession_AtifBuildAssistantMsg(t *testing.T) {
 		StopReason:       "stop",
 		PromptTokens:     10,
 		CompletionTokens: 5,
+		CacheRead:        7,
+		CacheWrite:       2,
+		Reasoning:        3,
+		InputCost:        0.001,
+		OutputCost:       0.002,
+		TotalCost:        0.003,
 		ToolCalls: []schemas.ChatAssistantMessageToolCall{
 			{
 				ID: strPtr("call_1"),
@@ -2517,6 +2601,13 @@ func TestSession_AtifBuildAssistantMsg(t *testing.T) {
 	assert.Equal(t, 10, msg.Usage.Input)
 	assert.Equal(t, 5, msg.Usage.Output)
 	assert.Equal(t, 15, msg.Usage.TotalTokens)
+	assert.Equal(t, 7, msg.Usage.CacheRead)
+	assert.Equal(t, 2, msg.Usage.CacheWrite)
+	assert.Equal(t, 3, msg.Usage.Reasoning)
+	require.NotNil(t, msg.Usage.Cost)
+	assert.InDelta(t, 0.001, msg.Usage.Cost.Input, 0.00001)
+	assert.InDelta(t, 0.002, msg.Usage.Cost.Output, 0.00001)
+	assert.InDelta(t, 0.003, msg.Usage.Cost.Total, 0.00001)
 }
 
 func TestSession_AtifBuildAssistantMsg_NoToolCalls(t *testing.T) {
@@ -2537,6 +2628,302 @@ func TestSession_AtifBuildAssistantMsg_NoToolCalls(t *testing.T) {
 	require.Len(t, msg.Content, 1) // only text
 	assert.Equal(t, "text", msg.Content[0].Type)
 	assert.Equal(t, "Hello!", *msg.Content[0].Text)
+}
+
+// TestSession_AskWithStreaming_TurnEndFollowsAssistantEnd verifies the ATIF
+// lifecycle: the final assistant message_end is immediately followed by a
+// turn_end on the normal (no-tool) stop path.
+func TestSession_AskWithStreaming_TurnEndFollowsAssistantMessage(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+	sess, err := NewSession(mockLLM, &SessionConfig{}, nil, nil, func(any) {}, "You are helpful", "ch")
+	require.NoError(t, err)
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	_, err = sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.NoError(t, err)
+	sess.closeAtif()
+
+	// Assert the last two recorded events are assistant message_end then turn_end.
+	assistantEndIdx := -1
+	turnEndIdx := -1
+	for i, e := range rec.events {
+		switch {
+		case e == "msg_end:assistant":
+			assistantEndIdx = i
+		case e == "turn_end":
+			turnEndIdx = i
+		}
+	}
+	assert.Greater(t, assistantEndIdx, -1, "should have an assistant message_end")
+	assert.Greater(t, turnEndIdx, -1, "should have a turn_end")
+	assert.Equal(t, assistantEndIdx+1, turnEndIdx,
+		"final assistant message_end must be immediately followed by turn_end")
+
+	// The turn_end should describe the final assistant answer.
+	assert.Equal(t, "assistant", rec.lastTurnEnded.Role)
+	assert.Equal(t, "stop", rec.lastTurnEnded.StopReason)
+}
+
+// TestSession_AskWithStreaming_ToolResultContent verifies that turn_end
+// toolResults carry the non-empty tool content text through the recorder.
+// We drive the full streaming path with a custom provider that returns a
+// tool_call then a final answer, and assert the turn_end toolResults content.
+func TestSession_AskWithStreaming_ToolResultContent(t *testing.T) {
+	mockLLM := &toolResultProvider{}
+	tool := &mockTool{name: "confirmer", output: `{"ok": true}`}
+	sess, err := NewSession(mockLLM, &SessionConfig{}, []Tool{tool}, nil, func(any) {}, "You are helpful", "ch")
+	require.NoError(t, err)
+	sess.model = mockLLM
+	sess.Provider = "test"
+	sess.Model = "test-model"
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	_, err = sess.AskWithStreaming(context.Background(), "do the tool", nil)
+	require.NoError(t, err)
+	sess.closeAtif()
+
+	require.NotEmpty(t, rec.lastToolResult, "should have captured tool results in turn_end")
+	for i, tr := range rec.lastToolResult {
+		require.NotEmptyf(t, tr.Content, "tool result %d should have content", i)
+		assert.Equal(t, "text", tr.Content[0].Type)
+		require.NotNil(t, tr.Content[0].Text)
+	}
+}
+
+// TestSession_UpdateModel_EmitsModelChange verifies that changing the model
+// emits a model_change recorder event.
+func TestSession_UpdateModel_EmitsModelChange(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+	sess, err := NewSession(mockLLM, &SessionConfig{}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	sess.UpdateModel("openai", "gpt-4o")
+	sess.closeAtif()
+
+	assert.Contains(t, rec.events, "model_change:gpt-4o", "UpdateModel should record a model_change")
+}
+
+// TestSession_UpdateModel_Idempotent verifies UpdateModel does not re-emit
+// model_change when the provider/model are unchanged.
+func TestSession_UpdateModel_Idempotent(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+	sess, err := NewSession(mockLLM, &SessionConfig{LLM: internalconfig.LLMConfig{Provider: "openai", Model: "gpt-4o"}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	if sess.Provider == "" {
+		sess.Provider = "openai"
+		sess.Model = "gpt-4o"
+	}
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	sess.UpdateModel("openai", "gpt-4o")
+	sess.closeAtif()
+
+	for _, e := range rec.events {
+		assert.NotEqual(t, "model_change:gpt-4o", e, "unchanged model change should not be emitted")
+	}
+}
+
+// TestSession_UpdateReasoningEffort_EmitsThinkingLevelChange verifies that
+// changing the reasoning-effort level emits a thinking_level_change recorder
+// event and that an unchanged level is idempotent (no re-emission).
+func TestSession_UpdateReasoningEffort_EmitsThinkingLevelChange(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+	sess, err := NewSession(mockLLM, &SessionConfig{}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	sess.UpdateReasoningEffort("high")
+	sess.UpdateReasoningEffort("low")
+	sess.UpdateReasoningEffort("low") // unchanged -> no new event
+	sess.closeAtif()
+
+	assert.Equal(t, 2, countPrefix(rec.events, "thinking_level_change:"),
+		"should emit thinking_level_change when the level changes, but not when unchanged")
+	assert.Contains(t, rec.events, "thinking_level_change:high")
+	assert.Contains(t, rec.events, "thinking_level_change:low")
+}
+
+// countPrefix returns the number of events whose string starts with prefix.
+func countPrefix(events []string, prefix string) int {
+	n := 0
+	for _, e := range events {
+		if strings.HasPrefix(e, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSession_UsagePlumbing_SurfacesCacheCostReasoning feeds a provider whose
+// usage carries cache tokens, cost, and reasoning tokens and asserts those
+// surface in the ATIF recorder's RecorderUsage/RecorderCost via the last
+// assistant message.
+func TestSession_UsagePlumbing_SurfacesCacheCostReasoning(t *testing.T) {
+	cacheRead := 30
+	cacheWrite := 10
+	reasoning := 5
+	cost := &schemas.BifrostCost{
+		InputTokensCost:  0.00001,
+		OutputTokensCost: 0.00002,
+		TotalCost:        0.00003,
+	}
+	mockLLM := mocks.NewLLMProviderWithChunks([]mocks.StreamingChunk{
+		{Content: "hello", FinishReason: "stop", Usage: &schemas.BifrostLLMUsage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+			PromptTokensDetails: &schemas.ChatPromptTokensDetails{
+				CachedReadTokens:  cacheRead,
+				CachedWriteTokens: cacheWrite,
+			},
+			CompletionTokensDetails: &schemas.ChatCompletionTokensDetails{
+				ReasoningTokens: reasoning,
+			},
+			Cost: cost,
+		}},
+	})
+
+	sess, err := NewSession(mockLLM, &SessionConfig{LLM: internalconfig.LLMConfig{Provider: "test", Model: "test-model"}}, nil, nil, func(any) {}, "", "ch")
+	require.NoError(t, err)
+	sess.Provider = "test"
+	sess.Model = "test-model"
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	_, err = sess.AskWithStreaming(context.Background(), "hi", nil)
+	require.NoError(t, err)
+	sess.closeAtif()
+
+	require.NotNil(t, rec.lastTurnEnded.Usage, "turn_end assistant message should have usage")
+	assert.Equal(t, 100, rec.lastTurnEnded.Usage.Input)
+	assert.Equal(t, 50, rec.lastTurnEnded.Usage.Output)
+	assert.Equal(t, cacheRead, rec.lastTurnEnded.Usage.CacheRead)
+	assert.Equal(t, cacheWrite, rec.lastTurnEnded.Usage.CacheWrite)
+	assert.Equal(t, reasoning, rec.lastTurnEnded.Usage.Reasoning)
+	require.NotNil(t, rec.lastTurnEnded.Usage.Cost)
+	assert.InDelta(t, 0.00001, rec.lastTurnEnded.Usage.Cost.Input, 0.0000001)
+	assert.InDelta(t, 0.00002, rec.lastTurnEnded.Usage.Cost.Output, 0.0000001)
+	assert.InDelta(t, 0.00003, rec.lastTurnEnded.Usage.Cost.Total, 0.0000001)
+}
+
+// TestSession_AskWithStreaming_MaxTokensEndsTurn verifies that the max-tokens
+// truncation exit path still emits exactly one turn_end and that the final
+// assistant message_end is immediately followed by it.
+func TestSession_AskWithStreaming_MaxTokensEndsTurn(t *testing.T) {
+	mockLLM := mocks.NewLLMProviderWithChunks([]mocks.StreamingChunk{
+		{Content: "truncated", FinishReason: "max_tokens"},
+	})
+	sess, err := NewSession(mockLLM, &SessionConfig{LLM: internalconfig.LLMConfig{MaxTurns: 1}}, nil, nil, func(any) {}, "You are helpful", "ch")
+	require.NoError(t, err)
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	resp, err := sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.NoError(t, err)
+	assert.Contains(t, resp, "[Response truncated due to length limit]")
+	sess.closeAtif()
+
+	// Exactly one turn_end must exist and it must follow the assistant's
+	// message_end immediately on the truncation path.
+	endIdx := -1
+	turnEndIdx := -1
+	for i, e := range rec.events {
+		switch {
+		case e == "msg_end:assistant":
+			endIdx = i
+		case e == "turn_end":
+			turnEndIdx = i
+		}
+	}
+	assert.Greater(t, endIdx, -1, "should have an assistant message_end on max_tokens path")
+	assert.Greater(t, turnEndIdx, -1, "should emit a turn_end on max_tokens path")
+	assert.Equal(t, endIdx+1, turnEndIdx, "assistant message_end must be immediately followed by turn_end on max_tokens path")
+	assert.Equal(t, "assistant", rec.lastTurnEnded.Role)
+	assert.Equal(t, "max_tokens", rec.lastTurnEnded.StopReason)
+}
+
+// TestSession_AskWithStreaming_CtxCancelEndsTurn verifies that the context
+// cancellation exit path still emits exactly one turn_end so no turn is left
+// open when the stream is interrupted.
+func TestSession_AskWithStreaming_CtxCancelEndsTurn(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+	mockLLM.DelayBetweenChunks = 50 * time.Millisecond
+	mockLLM.SetStreamingChunks([]mocks.StreamingChunk{
+		{Content: "Slow "},
+		{Content: "response here", FinishReason: "stop"},
+	})
+
+	sess, err := NewSession(mockLLM, &SessionConfig{}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = sess.AskWithStreaming(ctx, "Hello", nil)
+	require.Equal(t, context.Canceled, err)
+	sess.closeAtif()
+
+	// Cancellation must still close the turn with exactly one turn_end.
+	var turnEnds []string
+	for _, e := range rec.events {
+		if e == "turn_end" {
+			turnEnds = append(turnEnds, e)
+		}
+	}
+	assert.Len(t, turnEnds, 1, "cancellation should emit exactly one turn_end")
+}
+
+// TestSession_AskWithStreaming_ErrorStopReasonEndsTurn verifies that the
+// error/content_filter stop-reason exit path still emits a turn_end after the
+// assistant message_end so the trajectory stays well-formed on provider error.
+func TestSession_AskWithStreaming_ErrorStopReasonEndsTurn(t *testing.T) {
+	mockLLM := mocks.NewLLMProviderWithChunks([]mocks.StreamingChunk{
+		{Content: "oops", FinishReason: "content_filter"},
+	})
+	sess, err := NewSession(mockLLM, &SessionConfig{LLM: internalconfig.LLMConfig{MaxTurns: 1}}, nil, nil, func(any) {}, "You are helpful", "ch")
+	require.NoError(t, err)
+
+	rec := &mockAtifRecorder{}
+	sess.SetAtifRecorder(rec)
+
+	_, err = sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stop_reason=content_filter")
+	sess.closeAtif()
+
+	// Exactly one turn_end must follow the assistant message_end on the error path.
+	endIdx := -1
+	turnEndIdx := -1
+	for i, e := range rec.events {
+		switch {
+		case e == "msg_end:assistant":
+			endIdx = i
+		case e == "turn_end":
+			turnEndIdx = i
+		}
+	}
+	assert.Greater(t, endIdx, -1, "should emit an assistant message_end on error path")
+	assert.Greater(t, turnEndIdx, -1, "should emit a turn_end on error path")
+	assert.Equal(t, endIdx+1, turnEndIdx, "assistant message_end must be immediately followed by turn_end on error path")
 }
 
 func TestExecuteToolCall_InjectsSessionIDViaScheduler(t *testing.T) {

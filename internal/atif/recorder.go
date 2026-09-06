@@ -7,22 +7,28 @@ import (
 )
 
 // TrajectoryRecorder implements AtifRecorder, writing ATIF events as JSONL
-// to aggregated and per-session files.
+// to aggregated and per-session files. Output is rooted at projectRoot so
+// paths stay canonical even when the OS working directory changes during a
+// session (e.g. ritual step sessions run with OS CWD under .../court).
 type TrajectoryRecorder struct {
-	writer    *AtifWriter
-	sessionID string
-	agentName string
-	eventID   int
-	turnOpen  bool
+	writer      *AtifWriter
+	sessionID   string
+	agentName   string
+	projectRoot string
+	eventID     int
+	turnOpen    bool
 }
 
-// NewTrajectoryRecorder creates a new TrajectoryRecorder for the given agent name.
-// The agent/ directory is created on Start(), not here.
-func NewTrajectoryRecorder(agentName, sessionID string) *TrajectoryRecorder {
+// NewTrajectoryRecorder creates a new TrajectoryRecorder for the given agent.
+// Output paths are rooted at projectRoot (canonical project cwd); when it is
+// empty the current working directory is used. The agent/ directory is created
+// on Start(), not here.
+func NewTrajectoryRecorder(agentName, sessionID, projectRoot string) *TrajectoryRecorder {
 	return &TrajectoryRecorder{
-		writer:    NewAtifWriter(agentName, sessionID),
-		sessionID: sessionID,
-		agentName: agentName,
+		writer:      NewAtifWriter(agentName, sessionID, projectRoot),
+		sessionID:   sessionID,
+		agentName:   agentName,
+		projectRoot: projectRoot,
 	}
 }
 
@@ -36,7 +42,12 @@ func (r *TrajectoryRecorder) Start() {
 		return
 	}
 
-	cwd, _ := os.Getwd()
+	// Record the canonical project root as cwd rather than the transient OS
+	// working directory. Ritual step sessions may be running from .../court.
+	cwd := r.projectRoot
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 
 	// Session event
 	r.writer.WriteEvent(SessionEvent{

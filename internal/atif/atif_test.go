@@ -47,17 +47,30 @@ func readLines(t *testing.T, path string) []string {
 
 func TestNewAtifWriter(t *testing.T) {
 	setupTestDir(t)
-	w := NewAtifWriter("test-agent", "sess-001")
+	cwd, _ := os.Getwd() // empty projectRoot falls back to cwd
+	w := NewAtifWriter("test-agent", "sess-001", "")
 	require.NotNil(t, w)
 	assert.Equal(t, "test-agent", w.agentName)
 	assert.Equal(t, "sess-001", w.sessionID)
-	assert.Equal(t, filepath.Join("agent", "test-agent.txt"), w.aggPath)
-	assert.Equal(t, filepath.Join("agent", "test-agent", "sessions", "sess-001.jsonl"), w.sessPath)
+	assert.Equal(t, cwd, w.projectRoot)
+	assert.Equal(t, filepath.Join(cwd, "agent", "test-agent.txt"), w.aggPath)
+	assert.Equal(t, filepath.Join(cwd, "agent", "test-agent", "sessions", "sess-001.jsonl"), w.sessPath)
+}
+
+func TestNewAtifWriter_WithProjectRoot(t *testing.T) {
+	setupTestDir(t)
+	w := NewAtifWriter("test-agent", "sess-001", "/project/root")
+	require.NotNil(t, w)
+	assert.Equal(t, "test-agent", w.agentName)
+	assert.Equal(t, "sess-001", w.sessionID)
+	assert.Equal(t, "/project/root", w.projectRoot)
+	assert.Equal(t, filepath.Join("/project/root", "agent", "test-agent.txt"), w.aggPath)
+	assert.Equal(t, filepath.Join("/project/root", "agent", "test-agent", "sessions", "sess-001.jsonl"), w.sessPath)
 }
 
 func TestAtifWriter_OpenAndClose(t *testing.T) {
 	setupTestDir(t)
-	w := NewAtifWriter("test-agent", "sess-001")
+	w := NewAtifWriter("test-agent", "sess-001", "")
 	require.NotNil(t, w)
 
 	assert.False(t, w.IsOpen(), "should not be open before Open()")
@@ -77,7 +90,7 @@ func TestAtifWriter_OpenAndClose(t *testing.T) {
 
 func TestAtifWriter_WriteEvent(t *testing.T) {
 	setupTestDir(t)
-	w := NewAtifWriter("test-agent", "sess-001")
+	w := NewAtifWriter("test-agent", "sess-001", "")
 	w.Open()
 	defer w.Close()
 
@@ -130,7 +143,7 @@ func TestAtifWriter_WriteEvent_NilSafe(t *testing.T) {
 
 func TestAtifWriter_WriteEvent_ClosedWriter(t *testing.T) {
 	setupTestDir(t)
-	w := NewAtifWriter("test-agent", "sess-001")
+	w := NewAtifWriter("test-agent", "sess-001", "")
 	w.Open()
 	w.Close()
 
@@ -145,7 +158,7 @@ func TestAtifWriter_WriteEvent_ClosedWriter(t *testing.T) {
 
 func TestAtifWriter_Open_EmptyAgentName(t *testing.T) {
 	setupTestDir(t)
-	w := NewAtifWriter("", "test-session")
+	w := NewAtifWriter("", "test-session", "")
 	w.Open() // Should not panic even with empty agent name
 	// With empty agent name, paths are "agent/.txt" and "agent//sessions/..."
 	// This is valid but odd. Just verify no panic.
@@ -154,7 +167,7 @@ func TestAtifWriter_Open_EmptyAgentName(t *testing.T) {
 
 func TestAtifWriter_Flush(t *testing.T) {
 	setupTestDir(t)
-	w := NewAtifWriter("test-agent", "sess-001")
+	w := NewAtifWriter("test-agent", "sess-001", "")
 	w.Open()
 	defer w.Close()
 
@@ -173,7 +186,7 @@ func TestAtifWriter_IsOpen(t *testing.T) {
 		want bool
 	}{
 		{"nil receiver", nil, false},
-		{"unopened", NewAtifWriter("a", "b"), false},
+		{"unopened", NewAtifWriter("a", "b", ""), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -185,18 +198,53 @@ func TestAtifWriter_IsOpen(t *testing.T) {
 // --- TrajectoryRecorder tests ---
 
 func TestNewTrajectoryRecorder(t *testing.T) {
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	require.NotNil(t, r)
 	assert.Equal(t, "test-agent", r.agentName)
 	assert.Equal(t, "sess-001", r.sessionID)
+	assert.Equal(t, "", r.projectRoot)
 	assert.NotNil(t, r.writer)
 	assert.Equal(t, 0, r.eventID)
 	assert.False(t, r.turnOpen)
 }
 
+func TestTrajectoryRecorder_WithProjectRoot(t *testing.T) {
+	// Simulate a ritual step session: the OS cwd is a subdirectory (e.g.
+	// .../court) while the canonical project root is a separate directory.
+	projectRoot := t.TempDir()
+	courtDir := t.TempDir()
+	orig, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(courtDir))
+	t.Cleanup(func() { os.Chdir(orig) })
+
+	r := NewTrajectoryRecorder("test-agent", "sess-001", projectRoot)
+	r.Start()
+	defer r.Close()
+
+	// Paths must be rooted at the project root, not the transient os.Getwd()
+	// (which here is courtDir).
+	assert.Equal(t, filepath.Join(projectRoot, "agent", "test-agent.txt"), r.writer.aggPath)
+	assert.NotContains(t, r.writer.aggPath, courtDir)
+
+	// Files must actually be created under the project root.
+	_, err = os.Stat(r.writer.aggPath)
+	assert.NoError(t, err, "aggregated file should exist under project root")
+	_, err = os.Stat(r.writer.sessPath)
+	assert.NoError(t, err, "session file should exist under project root")
+
+	// The recorded session cwd must be the project root, not os.Getwd().
+	lines := readLines(t, r.writer.aggPath)
+	require.Len(t, lines, 2)
+	var sess SessionEvent
+	err = json.Unmarshal([]byte(lines[0]), &sess)
+	require.NoError(t, err)
+	assert.Equal(t, projectRoot, sess.Cwd)
+}
+
 func TestTrajectoryRecorder_Start(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -227,7 +275,7 @@ func TestTrajectoryRecorder_Start_NilSafe(t *testing.T) {
 
 func TestTrajectoryRecorder_FullTurnLifecycle(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -294,7 +342,7 @@ func TestTrajectoryRecorder_FullTurnLifecycle(t *testing.T) {
 
 func TestTrajectoryRecorder_TurnLifecycleWithToolExecution(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -411,7 +459,7 @@ func TestTrajectoryRecorder_TurnLifecycleWithToolExecution(t *testing.T) {
 
 func TestTrajectoryRecorder_ToolExecutionUpdate(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -434,7 +482,7 @@ func TestTrajectoryRecorder_ToolExecutionUpdate(t *testing.T) {
 
 func TestTrajectoryRecorder_ModelChanged(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -455,7 +503,7 @@ func TestTrajectoryRecorder_ModelChanged(t *testing.T) {
 
 func TestTrajectoryRecorder_ThinkingLevelChanged(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -475,7 +523,7 @@ func TestTrajectoryRecorder_ThinkingLevelChanged(t *testing.T) {
 
 func TestTrajectoryRecorder_MessageWithCost(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -531,7 +579,7 @@ func TestTrajectoryRecorder_MessageWithCost(t *testing.T) {
 
 func TestTrajectoryRecorder_MessageWithError(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -556,7 +604,7 @@ func TestTrajectoryRecorder_MessageWithError(t *testing.T) {
 
 func TestTrajectoryRecorder_MessageWithContentBlocks(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -589,7 +637,7 @@ func TestTrajectoryRecorder_MessageWithContentBlocks(t *testing.T) {
 
 func TestTrajectoryRecorder_TurnEnded_WithoutOpenTurn(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -617,7 +665,7 @@ func TestTrajectoryRecorder_NilSafe(t *testing.T) {
 
 func TestTrajectoryRecorder_Close_Idempotent(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	r.Close()
 	r.Close() // second close should not panic
@@ -749,7 +797,7 @@ func TestRecorderToolResultsToSchema_EmptyContent(t *testing.T) {
 
 func TestTrajectoryRecorder_Start_CreatesDir(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r := NewTrajectoryRecorder("test-agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 
@@ -762,7 +810,7 @@ func TestTrajectoryRecorder_Start_CreatesDir(t *testing.T) {
 
 func TestTrajectoryRecorder_AgentNameWithSpaces(t *testing.T) {
 	setupTestDir(t)
-	r := NewTrajectoryRecorder("my agent", "sess-001")
+	r := NewTrajectoryRecorder("my agent", "sess-001", "")
 	r.Start()
 	defer r.Close()
 

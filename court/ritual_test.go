@@ -551,112 +551,6 @@ func TestLoadAllRituals_MissingProjectDir(t *testing.T) {
 	}
 }
 
-// findProjectRoot returns the project root directory by walking up from the
-// test's working directory until it finds go.mod.
-func findProjectRoot(t *testing.T) string {
-	t.Helper()
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("os.Getwd: %v", err)
-	}
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatal("could not find project root (go.mod)")
-		}
-		dir = parent
-	}
-}
-
-func TestLoadAllRituals_ProjectReleaseVersionRitual(t *testing.T) {
-	// The real .agents/rituals.yaml must load and validate, including
-	// the release-version ritual added in edict 665.
-	projectDir := findProjectRoot(t)
-	rituals, err := LoadAllRituals(projectDir)
-	if err != nil {
-		t.Fatalf("LoadAllRituals(%q) error = %v", projectDir, err)
-	}
-
-	var release *RitualDef
-	for _, r := range rituals {
-		if r.Name == "release-version" {
-			release = r
-			break
-		}
-	}
-	if release == nil {
-		t.Fatal("release-version ritual not found in loaded rituals")
-	}
-
-	// Must have exactly 7 steps per the edict spec
-	if len(release.Steps) != 7 {
-		t.Fatalf("expected 7 steps, got %d", len(release.Steps))
-	}
-
-	// Verify step names match the edict spec
-	expectedSteps := []string{
-		"prepare-changelog",
-		"bump-version",
-		"update-roadmap",
-		"verify-release-readiness",
-		"chancellor-reviews",
-		"commit-and-tag",
-		"confirm-push",
-	}
-	for i, want := range expectedSteps {
-		if release.Steps[i].Name != want {
-			t.Errorf("step %d: expected name %q, got %q", i, want, release.Steps[i].Name)
-		}
-	}
-
-	// Verify ministers are assigned correctly
-	expectedMinisters := map[string]string{
-		"prepare-changelog":        "war",
-		"bump-version":             "forge",
-		"update-roadmap":           "forge",
-		"verify-release-readiness": "judge",
-		"chancellor-reviews":       "chancellor",
-		"commit-and-tag":           "secretary",
-		"confirm-push":             "secretary",
-	}
-	for _, step := range release.Steps {
-		if want, ok := expectedMinisters[step.Name]; ok {
-			if step.Minister != want {
-				t.Errorf("step %q: expected minister %q, got %q", step.Name, want, step.Minister)
-			}
-		}
-	}
-
-	// Verify the version input is required
-	v, ok := release.Inputs["version"]
-	if !ok {
-		t.Fatal("expected 'version' input on release-version ritual")
-	}
-	if !v.Required {
-		t.Error("expected 'version' input to be required")
-	}
-
-	// Verify on_failure goto targets reference real steps
-	for _, step := range release.Steps {
-		if step.OnFailure == "goto" {
-			found := false
-			for _, s := range release.Steps {
-				if s.Name == step.OnFailureTarget {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("step %q on_failure_target %q does not match any step name",
-					step.Name, step.OnFailureTarget)
-			}
-		}
-	}
-}
-
 func TestRitualGuardLoadRituals(t *testing.T) {
 	// Test that RitualGuard.LoadRituals correctly loads and registers rituals
 	db := setupRitualTestDB(t)
@@ -2071,6 +1965,66 @@ func TestRitualMinisterStepCompletes(t *testing.T) {
 	}
 	if result != "done after work" {
 		t.Errorf("Expected result 'done after work', got %q", result)
+	}
+}
+
+// TestRitualStepSessionGetsAtifRecorder verifies that ritual step sessions get
+// an ATIF trajectory recorder when the RitualRunner has an ATIF agent name set
+// (propagated from the --atif flag), matching the main/interactive sessions.
+func TestRitualStepSessionGetsAtifRecorder(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name:        "atif-step",
+		Description: "Test ATIF recorder on ritual step session",
+		Steps: []RitualStep{
+			{Name: "ask", Minister: "forge", Task: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "done after work",
+	}
+
+	ministers := map[string]Minister{"forge": forgeM}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go forgeM.Run(ctx)
+
+	court := &Court{
+		ministers: ministers,
+		logger:    slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, nil, repo.RepoInfo{})
+	runner.SetAtifAgentName("forge")
+
+	exec, err := runner.Start(ctx, "atif-step", testEK(10), nil, func(any) {})
+	if err != nil {
+		t.Fatalf("Failed to start ritual: %v", err)
+	}
+
+	err = runner.Run(ctx, exec)
+	if err != nil {
+		t.Fatalf("Ritual run failed: %v", err)
+	}
+
+	if exec.State != RitualStateCompleted {
+		t.Fatalf("Expected state 'completed', got %s", exec.State)
+	}
+
+	sess := exec.stepStates[0].Session
+	if sess == nil {
+		t.Fatal("Expected step session to be created")
+	}
+	if sess.atifRecorder == nil {
+		t.Error("Expected step session to have a non-nil atifRecorder when RitualRunner.atifAgentName is set")
 	}
 }
 

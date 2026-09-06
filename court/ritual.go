@@ -399,6 +399,7 @@ type RitualRunner struct {
 	idleTimeout     time.Duration                                               // max silence before a step is aborted (0 = default)
 	waitZhengming   func(ctx context.Context, requestID string) (string, error) // injected by Court
 	isolatedHost    bool                                                        // skip sandbox steps when true
+	atifAgentName   string                                                      // ATIF agent name for ritual step sessions
 
 	// Pause/resume for ruler interjection. When the ruler prompts on a ritual
 	// tab, the ritual pauses: the step context is cancelled (stopping the
@@ -447,6 +448,12 @@ func (r *RitualRunner) SetConfig(sandboxCfg *config.SandboxConfig, projectSlug s
 	if courtCfg != nil && courtCfg.StepIdleTimeout > 0 {
 		r.idleTimeout = courtCfg.StepIdleTimeout
 	}
+}
+
+// SetAtifAgentName sets the ATIF agent name so ritual step sessions get an
+// ATIF trajectory recorder, matching the main/interactive sessions.
+func (r *RitualRunner) SetAtifAgentName(name string) {
+	r.atifAgentName = name
 }
 
 // waitForZhengming delegates to the Court's blocking wait.
@@ -1823,7 +1830,11 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 	actSession := exec.stepStates[exec.CurrentStep].Session
 	if actSession == nil {
 		cfg := minister.GetConfig()
-		sessionConfig := &SessionConfig{LLM: cfg, WorkingDir: minister.RepoInfo().ProjectRoot}
+		sessionConfig := &SessionConfig{
+			LLM:           cfg,
+			WorkingDir:    minister.RepoInfo().ProjectRoot,
+			AtifAgentName: r.atifAgentName,
+		}
 		var err error
 		actSession, err = CreateSession(minister, minister.Model(), sessionConfig, notify, exec.ChannelID(), exec.EdictKey())
 		if err != nil {

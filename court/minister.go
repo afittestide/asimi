@@ -536,12 +536,15 @@ func CreateSessionWithOpts(minister Minister, client LLMProvider, config *Sessio
 }
 
 // attachAtifRecorder creates and attaches an ATIF trajectory recorder to the
-// session if the config has an agent name set. Non-fatal on failure.
+// session if the config has an agent name set. Non-fatal on failure. The
+// recorder roots its output at the canonical project root (config.WorkingDir)
+// so trajectory files land in the project's agent/ directory regardless of the
+// transient OS working directory of the session.
 func attachAtifRecorder(sess *Session, cfg *SessionConfig) {
 	if cfg == nil || cfg.AtifAgentName == "" {
 		return
 	}
-	recorder := atif.NewTrajectoryRecorder(cfg.AtifAgentName, sess.ID)
+	recorder := atif.NewTrajectoryRecorder(cfg.AtifAgentName, sess.ID, cfg.WorkingDir)
 	sess.SetAtifRecorder(recorder)
 }
 

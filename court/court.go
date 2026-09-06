@@ -589,6 +589,13 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 	}
 	s.llmClient = client
 	s.sessionCfg = config
+	if config != nil {
+		// Re-broadcast the resolved provider/model to live sessions so they
+		// record an ATIF model_change when the switch actually happens (the
+		// recorder lives on the session, not the court), and propagate the
+		// reasoning-effort level as a thinking_level_change.
+		s.propagateModelToSessions(config)
+	}
 	for _, minister := range s.Ministers() {
 		if base, ok := minister.(interface {
 			SetMinisterConfig(LLMProvider, *SessionConfig, repo.RepoInfo)
@@ -608,6 +615,9 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 			projectSlug = s.config.Project
 		}
 		s.ritualGuard.RitualRunner().SetConfig(sandboxCfg, projectSlug, repoInfo, s.config)
+		if config != nil {
+			s.ritualGuard.RitualRunner().SetAtifAgentName(config.AtifAgentName)
+		}
 	}
 	// Update repoInfo on the RitualGuard (not covered by the Ministers
 	// loop since RitualGuard is stored separately) and reload rituals
@@ -630,6 +640,25 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 	s.injectSkills()
 
 	s.logger.Info("court model configured", "ministers", s.ministerIDs())
+}
+
+// propagateModelToSessions broadcasts the resolved provider/model and
+// reasoning-effort level to every live minister session so the attached
+// ATIF recorder can emit model_change / thinking_level_change events.
+func (s *Court) propagateModelToSessions(config *SessionConfig) {
+	for _, minister := range s.Ministers() {
+		gs, ok := minister.(interface{ GetSessions() map[string]*Session })
+		if !ok {
+			continue
+		}
+		for _, sess := range gs.GetSessions() {
+			if sess == nil {
+				continue
+			}
+			sess.UpdateModel(config.LLM.Provider, config.LLM.Model)
+			sess.UpdateReasoningEffort(config.LLM.ReasoningEffort)
+		}
+	}
 }
 
 // SetContext reconfigures the Court with the given credentials and
