@@ -21,6 +21,11 @@ type AtifRecorder interface {
 	ToolExecutionEnded(toolCallID, toolName string, result string, isError bool)
 	// ToolExecutionUpdated records partial/streaming tool output.
 	ToolExecutionUpdated(toolCallID, toolName string, partialResult string, args any)
+	// ModelChanged records a provider/model switch on the session. It lets
+	// downstream consumers observe model selection changes mid-session.
+	ModelChanged(provider, modelID string)
+	// ThinkingLevelChanged records a change in the reasoning-effort level.
+	ThinkingLevelChanged(level string)
 }
 
 // RecorderMessage carries message content and metadata for ATIF events.

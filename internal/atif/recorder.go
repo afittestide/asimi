@@ -171,6 +171,33 @@ func (r *TrajectoryRecorder) ToolExecutionUpdated(toolCallID, toolName string, p
 	})
 }
 
+// ModelChanged writes a model_change event.
+func (r *TrajectoryRecorder) ModelChanged(provider, modelID string) {
+	if r == nil || !r.writer.IsOpen() {
+		return
+	}
+	r.writer.WriteEvent(ModelChangeEvent{
+		Type:      TypeModelChange,
+		ID:        r.nextEventID(),
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Provider:  provider,
+		ModelID:   modelID,
+	})
+}
+
+// ThinkingLevelChanged writes a thinking_level_change event.
+func (r *TrajectoryRecorder) ThinkingLevelChanged(level string) {
+	if r == nil || !r.writer.IsOpen() {
+		return
+	}
+	r.writer.WriteEvent(ThinkingLevelChangeEvent{
+		Type:          TypeThinkingLevelChange,
+		ID:            r.nextEventID(),
+		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
+		ThinkingLevel: level,
+	})
+}
+
 // --- Conversion helpers: types.go -> schema.go ---
 
 func recorderMsgToSchema(m RecorderMessage) SchemaMessageData {

@@ -432,6 +432,47 @@ func TestTrajectoryRecorder_ToolExecutionUpdate(t *testing.T) {
 	assert.Equal(t, "partial output", update.PartialResult.Content[0].Text)
 }
 
+func TestTrajectoryRecorder_ModelChanged(t *testing.T) {
+	setupTestDir(t)
+	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r.Start()
+	defer r.Close()
+
+	r.ModelChanged("openai", "gpt-4o")
+
+	lines := readLines(t, r.writer.aggPath)
+	require.Len(t, lines, 3) // session + agent_start + model_change
+
+	var mc ModelChangeEvent
+	err := json.Unmarshal([]byte(lines[2]), &mc)
+	require.NoError(t, err)
+	assert.Equal(t, TypeModelChange, mc.Type)
+	assert.Equal(t, "openai", mc.Provider)
+	assert.Equal(t, "gpt-4o", mc.ModelID)
+	assert.NotEmpty(t, mc.ID)
+	assert.NotEmpty(t, mc.Timestamp)
+}
+
+func TestTrajectoryRecorder_ThinkingLevelChanged(t *testing.T) {
+	setupTestDir(t)
+	r := NewTrajectoryRecorder("test-agent", "sess-001")
+	r.Start()
+	defer r.Close()
+
+	r.ThinkingLevelChanged("high")
+
+	lines := readLines(t, r.writer.aggPath)
+	require.Len(t, lines, 3) // session + agent_start + thinking_level_change
+
+	var tc ThinkingLevelChangeEvent
+	err := json.Unmarshal([]byte(lines[2]), &tc)
+	require.NoError(t, err)
+	assert.Equal(t, TypeThinkingLevelChange, tc.Type)
+	assert.Equal(t, "high", tc.ThinkingLevel)
+	assert.NotEmpty(t, tc.ID)
+	assert.NotEmpty(t, tc.Timestamp)
+}
+
 func TestTrajectoryRecorder_MessageWithCost(t *testing.T) {
 	setupTestDir(t)
 	r := NewTrajectoryRecorder("test-agent", "sess-001")
