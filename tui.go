@@ -513,7 +513,7 @@ func (m *TUIModel) switchModel() tea.Cmd {
 			return llmInitErrorMsg{err: err}
 		}
 		slog.Info("LLM model switched successfully")
-		return llmInitSuccessMsg{}
+		return llmInitSuccessMsg{fromSwitch: true}
 	}
 }
 
@@ -3238,6 +3238,15 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// LLM is configured daemon-side by now; just reflect readiness
 		// in the status bar. Client init success doesn't mean verified.
 		m.status.SetProvider(m.config.LLM.Provider, m.config.LLM.Model, false)
+
+		// Only a genuine boot fires the court_started lifecycle event (which
+		// triggers the wakeup ritual and seeds new-tab greetings). A mid-session
+		// model switch must not re-fire it: doing so would re-seed already-greeted
+		// tabs and persist duplicate tian_events rows. The daemon-side ConfigureModel
+		// already records an ATIF model_change on the live sessions.
+		if msg.fromSwitch {
+			return m, nil
+		}
 
 		// Fire court_started event to trigger wakeup ritual and health checks
 		latest, hasUpdate, err := utils.CheckForUpdates(context.Background())

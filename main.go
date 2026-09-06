@@ -248,7 +248,15 @@ type errMsg struct{ err error }
 // llmInitSuccessMsg is sent when LLM initialization completes
 // successfully. The bifrost client lives daemon-side now; callers use
 // it only as a "we're ready, paint the provider" signal.
-type llmInitSuccessMsg struct{}
+//
+// fromSwitch marks the message as coming from a mid-session model switch
+// (via switchModel) rather than a genuine boot. The handler must not
+// re-fire court_started for a model switch: that lifecycle event seeds
+// new-tab greetings and persists tian_events rows, both of which should
+// happen exactly once per process, not on every model change.
+type llmInitSuccessMsg struct {
+	fromSwitch bool
+}
 
 // llmInitErrorMsg is sent when LLM initialization fails
 type llmInitErrorMsg struct {

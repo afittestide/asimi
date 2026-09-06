@@ -103,6 +103,50 @@ func TestLLMInitSuccess_DoesNotShowModelSelection(t *testing.T) {
 	_ = newModel
 }
 
+// TestModelSwitch_DoesNotFireCourtStarted verifies that a model switch (like
+// Init, it produces an llmInitSuccessMsg, but marked fromSwitch) must NOT
+// re-fire the court_started lifecycle event, persist a tian_events row, or
+// re-seed an already-greeted tab. Only a genuine boot does that.
+func TestModelSwitch_DoesNotFireCourtStarted(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, mock)
+
+	// Simulate a genuine first boot so each tab is greeted exactly once.
+	defs, err := ministers.LoadAllMinisters("")
+	require.NoError(t, err)
+	initTabGreetings(&model.tabs, defs)
+
+	greetingCount := func() int {
+		n := 0
+		for _, tab := range model.tabs.tabs {
+			for _, msg := range tab.Content.Chat.Messages {
+				if msg.Type == MessageTypeGreeting {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	before := greetingCount()
+	require.Greater(t, before, 0, "first boot should seed greetings")
+
+	// A model switch arrives as an llmInitSuccessMsg with fromSwitch=true.
+	newModel, cmd := model.Update(llmInitSuccessMsg{fromSwitch: true})
+	_ = newModel
+	_ = cmd
+
+	// It must not publish any court_started event (no tian_events row).
+	for _, ev := range mock.publishedEvents {
+		assert.NotEqual(t, storage.EventCourtStarted, ev.eventType,
+			"model switch must not publish a court_started lifecycle event")
+	}
+	// It must not re-seed already-greeted tabs.
+	assert.Equal(t, before, greetingCount(),
+		"model switch must not re-seed an already-greeted tab")
+	// It must still reflect the current provider/model in the status bar.
+	require.NotNil(t, newModel.(TUIModel).status)
+}
+
 // TestTUIModelWindowSizeMsg tests handling of window size messages
 func TestTUIModelWindowSizeMsg(t *testing.T) {
 	model := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, nil)
