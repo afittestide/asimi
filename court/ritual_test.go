@@ -2002,7 +2002,13 @@ func TestRitualStepSessionGetsAtifRecorder(t *testing.T) {
 		logger:    slog.Default(),
 	}
 
-	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, nil, repo.RepoInfo{})
+	// The minister's own RepoInfo().ProjectRoot is empty (SetMinisterConfig was
+	// never called), so the step session's project root must come from the
+	// runner's authoritative repoInfo — reproducing the real daemon scenario
+	// where ritual step sessions run with the court cwd but ATIF trajectories
+	// must still land under the canonical project root.
+	const canonicalRoot = "/canonical/project/root"
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, nil, repo.RepoInfo{ProjectRoot: canonicalRoot})
 	runner.SetAtifAgentName("forge")
 
 	exec, err := runner.Start(ctx, "atif-step", testEK(10), nil, func(any) {})
@@ -2025,6 +2031,14 @@ func TestRitualStepSessionGetsAtifRecorder(t *testing.T) {
 	}
 	if sess.atifRecorder == nil {
 		t.Error("Expected step session to have a non-nil atifRecorder when RitualRunner.atifAgentName is set")
+	}
+	// The session's project root must come from the runner's authoritative
+	// repoInfo (canonicalRoot), NOT the minister's empty RepoInfo().ProjectRoot.
+	// If it were empty, the ATIF writer would fall back to os.Getwd() and
+	// mis-root trajectories under .../court/agent/.
+	if sess.WorkingDir != canonicalRoot {
+		t.Errorf("Expected step session WorkingDir to be the runner's project root %q, got %q",
+			canonicalRoot, sess.WorkingDir)
 	}
 }
 

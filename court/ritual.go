@@ -1832,7 +1832,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 		cfg := minister.GetConfig()
 		sessionConfig := &SessionConfig{
 			LLM:           cfg,
-			WorkingDir:    minister.RepoInfo().ProjectRoot,
+			WorkingDir:    r.repoInfo.ProjectRoot,
 			AtifAgentName: r.atifAgentName,
 		}
 		var err error
