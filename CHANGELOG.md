@@ -5,7 +5,7 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.1] - 2026-09-07
 
 ### Added
 
@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **ATIF trajectory completeness (e814, in progress)** — fixes to the `--atif` recorder so recorded trajectories are well-formed: the final assistant `message_end` is now always closed by a `turn_end`, `turn_end.toolResults[].content` is populated, `usage` surfaces cache/cost/reasoning when the provider returns them, and model/thinking-level switches emit `model_change` / `thinking_level_change` events
+- **ATIF trajectory completeness ** — fixes to the `--atif` recorder so recorded trajectories are well-formed
+- **Slowdown** - getting context size from the provider in a loop led to sluginsh off the ui as Asimi was busy waiting for the model's context size
 
 ## [0.13.0] - 2026-09-01
 
