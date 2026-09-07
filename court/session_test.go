@@ -1428,6 +1428,53 @@ func TestModelContextSize_RepeatedCallsNoReProbe(t *testing.T) {
 	assert.Equal(t, 0, prov.listCalls, "GetContextInfo must not re-probe bifrost")
 }
 
+func TestModelContextSize_RegistryCachedNoReProbe(t *testing.T) {
+	t.Parallel()
+
+	// Regression for the registry fast-path: the deterministic registry result
+	// must be stored in the shared modelContextByKey cache, so a second
+	// getModelContextSize() invocation (from a fresh session) returns from the
+	// cache without performing a bifrost probe. Registry-covered models never
+	// touch the network, but the shared memoization guarantees no per-call or
+	// per-session re-resolution. Any unresolved size is never cached.
+	prov := &networkTrackingProvider{}
+	cfg := &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "anthropic",
+		Model:    "claude-3-5-sonnet-latest",
+	}}
+
+	sess, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// First call resolves deterministically from the registry (no network).
+	assert.Equal(t, 200_000, sess.getModelContextSize())
+	assert.Equal(t, 0, prov.listCalls, "registry covers claude-3-5-sonnet-latest; first call needs no probe")
+
+	// The deterministic registry result must now be committed to the shared
+	// modelContextByKey cache. This is the crux of the fix: a registry-covered
+	// model never probes bifrost regardless of caching, so the only way for a
+	// later session to skip re-running the registry branch (and re-emitting the
+	// "Using context size from registry" log) is for this shared cache to hold
+	// the resolved size. Assert the cache was populated, not just the return value.
+	key := "anthropic:claude-3-5-sonnet-latest"
+	cached, ok := modelContextByKey.Load(key)
+	require.True(t, ok, "registry result must be stored in the shared modelContextByKey cache")
+	assert.Equal(t, 200_000, cached, "shared cache must hold the deterministic registry size")
+
+	// A fresh session hits the shared provider:model cache and still resolves
+	// the registry size without touching the network.
+	sess2, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, 200_000, sess2.getModelContextSize())
+	assert.Equal(t, 0, prov.listCalls, "registry result cached; second session must not probe bifrost")
+
+	// The shared entry must persist; a clean-load allows the next session to
+	// short-circuit the registry branch entirely.
+	cached, ok = modelContextByKey.Load(key)
+	require.True(t, ok, "shared cache entry must persist across sessions")
+	assert.Equal(t, 200_000, cached)
+}
+
 func TestSession_GetContextInfo_WithContextFiles(t *testing.T) {
 	t.Parallel()
 

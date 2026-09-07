@@ -1,5 +1,6 @@
 # Binary
 asimi
+./agent
 .gocache/
 # Test output
 *.out

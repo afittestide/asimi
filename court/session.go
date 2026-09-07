@@ -858,6 +858,7 @@ func (s *Session) getModelContextSize() int {
 	// of a network round-trip that previously happened on every UI render.
 	if size := matchContextRule(modelContextSizes, key); size > 0 {
 		slog.Info("Using context size from registry", "size", size)
+		modelContextByKey.Store(key, size) // deterministic result → cache it, stop re-probing
 		s.rememberContextSize(key, size)
 		return size
 	}
