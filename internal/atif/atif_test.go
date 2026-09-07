@@ -68,6 +68,52 @@ func TestNewAtifWriter_WithProjectRoot(t *testing.T) {
 	assert.Equal(t, filepath.Join("/project/root", "agent", "test-agent", "sessions", "sess-001.jsonl"), w.sessPath)
 }
 
+func TestNewAtifWriter_ASIMIHome(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("ASIMI_HOME", tmp)
+	w := NewAtifWriter("test-agent", "sess-001", "/project/root")
+	require.NotNil(t, w)
+	assert.Equal(t, filepath.Join(tmp, "sessions", "sess-001", "sess-001.jsonl"), w.sessPath)
+	assert.Equal(t, filepath.Join("/project/root", "agent", "test-agent.txt"), w.aggPath)
+}
+
+func TestNewAtifWriter_ASIMIHome_Unset(t *testing.T) {
+	t.Setenv("ASIMI_HOME", "")
+	w := NewAtifWriter("test-agent", "sess-001", "/project/root")
+	require.NotNil(t, w)
+	assert.Equal(t, filepath.Join("/project/root", "agent", "test-agent", "sessions", "sess-001.jsonl"), w.sessPath)
+	assert.Equal(t, filepath.Join("/project/root", "agent", "test-agent.txt"), w.aggPath)
+}
+
+func TestNewAtifWriter_ASIMIHome_EmptyProjectRoot(t *testing.T) {
+	setupTestDir(t)
+	tmp := t.TempDir()
+	t.Setenv("ASIMI_HOME", tmp)
+	cwd, _ := os.Getwd()
+	w := NewAtifWriter("test-agent", "sess-001", "")
+	require.NotNil(t, w)
+	assert.Equal(t, filepath.Join(tmp, "sessions", "sess-001", "sess-001.jsonl"), w.sessPath)
+	assert.Equal(t, filepath.Join(cwd, "agent", "test-agent.txt"), w.aggPath)
+}
+
+func TestAtifWriter_ASIMIHome_OpenCreatesAggDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+	// Fresh project root with no agent/ directory (the Harbor container case).
+	root := t.TempDir()
+
+	w := NewAtifWriter("test-agent", "sess-001", root)
+	require.NotNil(t, w)
+	w.Open()
+	defer w.Close()
+
+	assert.True(t, w.IsOpen(), "should be open after Open()")
+	_, err := os.Stat(w.aggPath)
+	assert.NoError(t, err, "aggregated file should exist under fresh project root")
+	_, err = os.Stat(w.sessPath)
+	assert.NoError(t, err, "session file should exist under ASIMI_HOME")
+}
+
 func TestAtifWriter_OpenAndClose(t *testing.T) {
 	setupTestDir(t)
 	w := NewAtifWriter("test-agent", "sess-001", "")
