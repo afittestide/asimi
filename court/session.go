@@ -1277,7 +1277,8 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 	}
 
 	autoStr := "auto"
-	maxTokens := 64000
+	// Default cap for MaxCompletionTokens when tools are enabled
+	maxTokens := 262144
 	if cap, ok := modelMaxOutputTokens[s.Model]; ok && cap < maxTokens {
 		maxTokens = cap
 	}
