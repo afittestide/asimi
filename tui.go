@@ -2343,6 +2343,9 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			chat.AddToRawHistory("MINISTER_FAILED",
 				fmt.Sprintf("Minister %s failed: %v", msg.MinisterID, msg.Error))
 			chat.AddMessage(fmt.Sprintf("%s%s %s failed: %v", systemPrefix, completeFailurePrefix, msg.MinisterID, msg.Error))
+			// A failed minister's session has already stopped; release the
+			// streaming flag so the tab becomes closable.
+			m.clearStreamingTab(msg.ChannelID)
 		} else {
 			chat.AddToRawHistory("MINISTER_COMPLETED",
 				fmt.Sprintf("Minister %s completed", msg.MinisterID))
@@ -2421,10 +2424,15 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				chat.AddMessage(fmt.Sprintf("  Completed: %s of %s", msg.StepName, msg.RitualName))
 			}
+			// Step finished; release the streaming flag (next step's
+			// "started" will re-assert it).
+			m.clearStreamingTab(msg.ChannelID)
 		case "failed":
 			chat.AddMessage(fmt.Sprintf("  Failed: %s of %s", msg.StepName, msg.RitualName))
+			m.clearStreamingTab(msg.ChannelID)
 		case "aborted":
 			chat.AddMessage(fmt.Sprintf("  Aborted: %s of %s", msg.StepName, msg.RitualName))
+			m.clearStreamingTab(msg.ChannelID)
 		case "retrying":
 			chat.AddMessage(fmt.Sprintf("  Retrying: %s of %s", msg.StepName, msg.RitualName))
 		case "ritual_completed":
@@ -2433,12 +2441,21 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ritualPrefix, msg.RitualName, msg.EdictID, msg.Message)
 			chat.AddMessage(text)
 			chat.Indent--
+			m.clearStreamingTab(msg.ChannelID)
 		case "ritual_failed":
 			m.tabs.SetTabChatMode(msg.ChannelID, false)
 			chat.AddMessage(fmt.Sprintf("%s Ritual %s failed: %s", completeFailurePrefix, msg.RitualName, msg.Message))
 			if chat.Indent > 0 {
 				chat.Indent--
 			}
+			m.clearStreamingTab(msg.ChannelID)
+		case "ritual_aborted":
+			m.tabs.SetTabChatMode(msg.ChannelID, false)
+			chat.AddMessage(fmt.Sprintf("%s Ritual %s aborted: %s", completeFailurePrefix, msg.RitualName, msg.Message))
+			if chat.Indent > 0 {
+				chat.Indent--
+			}
+			m.clearStreamingTab(msg.ChannelID)
 		}
 		return m, nil
 

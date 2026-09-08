@@ -6108,6 +6108,215 @@ func TestRitualFailed_ClearsChatMode(t *testing.T) {
 	assert.False(t, tab.ChatMode, "ChatMode should be cleared on ritual_failed")
 }
 
+// TestRitualFailed_ClearsStreaming verifies that a terminal "ritual_failed"
+// status clears the Streaming flag so the tab becomes closable.
+func TestRitualFailed_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		Status:     "ritual_failed",
+		Message:    "something went wrong",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared on ritual_failed")
+}
+
+// TestRitualStepFailed_ClearsStreaming verifies that a step-level "failed"
+// status clears the Streaming flag so the tab becomes closable.
+func TestRitualStepFailed_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		StepName:   "forge",
+		Status:     "failed",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared on step failure")
+}
+
+// TestMinisterCompletedError_ClearsStreaming verifies that when a minister
+// fails (MinisterCompletedMsg with Error set), the tab's Streaming flag is
+// cleared so the tab becomes closable.
+func TestMinisterCompletedError_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.MinisterCompletedMsg{
+		ChannelID:  "e647",
+		MinisterID: "forge",
+		Error:      errors.New("minister failed"),
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared when a minister fails")
+}
+
+// TestRitualStepStarted_SetsStreaming is a regression test verifying that a
+// step "started" status still asserts the Streaming flag on a new tab.
+func TestRitualStepStarted_SetsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		StepName:   "forge",
+		Status:     "started",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab := updatedModel.tabs.TabByTarget("e647")
+	require.NotNil(t, tab, "ritual tab should be auto-created for e647")
+	assert.True(t, tab.Streaming, "Streaming should be set on step started")
+}
+
+// TestCloseFailedRitualTab verifies that a failed ritual tab with
+// Streaming cleared can be closed via :quit — no "cannot close tab while
+// streaming" error.
+func TestCloseFailedRitualTab(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+	initialTabs := model.tabs.TabCount()
+
+	// Add a second tab so :quit closes a tab rather than quits the app.
+	model.tabs.Add("chat2", "chat", "target2")
+	model.tabs.ActiveTab().Streaming = false
+
+	cmd := handleQuitCommand(model, []string{})
+
+	require.Nil(t, cmd, "closing a non-streaming tab returns no tea.Cmd")
+	require.Equal(t, initialTabs, model.tabs.TabCount(), "non-streaming tab should close on :quit")
+}
+
+// TestRitualAborted_ClearsStreaming verifies that the terminal "ritual_aborted"
+// status clears the Streaming flag so the aborted tab becomes closable.
+func TestRitualAborted_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		Status:     "ritual_aborted",
+		Message:    "stopped by ruler",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared on ritual_aborted")
+}
+
+// TestRitualStepAborted_ClearsStreaming verifies that a step-level "aborted"
+// status clears the Streaming flag so the tab becomes closable.
+func TestRitualStepAborted_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		StepName:   "forge",
+		Status:     "aborted",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared on step aborted")
+}
+
+// TestRitualStepCompleted_ClearsStreaming verifies that a step-level
+// "completed" status clears the Streaming flag (the next step's "started"
+// will re-assert it).
+func TestRitualStepCompleted_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		StepName:   "forge",
+		Status:     "completed",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared on step completed")
+}
+
+// TestRitualCompleted_ClearsStreaming verifies that the terminal
+// "ritual_completed" status clears the Streaming flag so the tab becomes
+// closable.
+func TestRitualCompleted_ClearsStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e647",
+		RitualName: "swift-strike",
+		Status:     "ritual_completed",
+		EdictID:    647,
+		Message:    "done",
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	tab = updatedModel.tabs.TabByTarget("e647")
+	assert.False(t, tab.Streaming, "Streaming should be cleared on ritual_completed")
+}
+
 // TestRitualStepMsg_QueuedAddsSystemMessage verifies that when a ritual is
 // queued (court is busy), a system message with the time and queue position
 // is added to the chat — not just a toast.
