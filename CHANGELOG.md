@@ -5,6 +5,17 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] - 2026-09-08
+
+### Fixed
+
+- Aborted and failed ritual no longer blocks the rituals queue
+
+### Changed
+
+- Default context size set to 256K for unknown models
+
+
 ## [0.13.1] - 2026-09-07
 
 ### Added
@@ -21,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **ATIF trajectory completeness ** — fixes to the `--atif` recorder so recorded trajectories are well-formed
-- **Slowdown** - getting context size from the provider in a loop led to sluginsh off the ui as Asimi was busy waiting for the model's context size
+- **Slowdown** - getting context size from the provider in a loop led to sluginsh off the ui
 
 ## [0.13.0] - 2026-09-01
 
