@@ -30,7 +30,7 @@ type SuggestEdictTool struct {
 func (t SuggestEdictTool) Name() string { return "suggest_edict" }
 
 func (t SuggestEdictTool) Description() string {
-	return `When the path to heaven is revealed, suggest a new edict`
+	return `Create or replace an edict`
 }
 
 func (t SuggestEdictTool) Call(ctx context.Context, input string) (string, error) {
@@ -172,7 +172,7 @@ func (t SuggestEdictTool) ParameterSchema() map[string]any {
 			},
 			"edict_id": map[string]any{
 				"type":        "integer",
-				"description": "Optional. When provided and non-zero, the suggestion replaces the existing edict.",
+				"description": "Optional. When provided and non-zero, the suggestion replaces the given edict.",
 			},
 		},
 		"required": []string{"suggestion", "summary"},

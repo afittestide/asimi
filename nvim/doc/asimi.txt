@@ -1,0 +1,54 @@
+*asimi* *asimi-nvim*
+
+The Asimi Neovim plugin turns Neovim into a first-class frontend for
+the Asimi Court daemon. It communicates over the existing msgpack-RPC
+unix socket — no Go code changes needed.
+
+INSTALLATION ~
+
+With lazy.nvim:
+  { "afittestide/asimi-cli", dir = "/path/to/asimi-cli/nvim" }
+
+Or manually add the nvim/ directory to your runtimepath.
+
+SETUP ~
+
+  require("asimi").setup({
+    socket = nil,           -- override socket path
+    autoconnect = true,     -- connect on startup
+    autostart = true,       -- spawn daemon if socket is dead
+    log_level = "info",     -- debug | info | warn | error
+    api_keys = {},          -- additional API keys
+  })
+
+COMMANDS ~
+
+:AsimiConnect [path]	Connect to the daemon (or autostart)
+:AsimiDisconnect		Disconnect from the daemon
+:AsimiHealth		Check minister availability
+:AsimiTab [name]		Switch to minister tab (forge|secretary|judge|chancellor)
+:AsimiCancel		Cancel streaming for current minister
+
+CHAT ~
+
+Each minister has its own tabpage with a buftype=prompt buffer.
+Type your message at the `> ` prompt and press <CR> to submit.
+Streaming responses appear above the prompt line.
+
+Keymaps (in chat buffer):
+  <CR>	Submit prompt
+  <Ctrl-C>	Cancel streaming
+  G	Jump to bottom and resume auto-follow
+
+Icons:
+  👑  User message
+  🎏  AI streaming
+  🐉  AI success
+  🦐  AI failure
+  💭  Reasoning/thinking
+  🛠️  System message
+  🏯  Greeting
+  ⛩️  Ritual step
+  🔱  Minister invocation
+
+vim:ft=help:tw=78:

@@ -15,7 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Default context size set to 256K for unknown models
 
-
 ## [0.13.1] - 2026-09-07
 
 ### Added
