@@ -367,6 +367,26 @@ func PostGormMigrate(db *gorm.DB) error {
 	}
 	slog.Debug("post-GORM migration: renamed sage seals to chancellor",
 		"rows_affected", result.RowsAffected)
+
+	// Backfill censor_precedents.edict_id for per-manifest precedents from the
+	// owning forge_manifests row. Edict-level rows (manifest_id = '') are left
+	// at 0 (unknown owner). Idempotent: it only fills rows where edict_id = 0.
+	backfill := db.Exec(`
+		UPDATE censor_precedents SET edict_id = (
+			SELECT fm.edict_id FROM forge_manifests fm
+			WHERE fm.manifest_id = censor_precedents.manifest_id
+		)
+		WHERE censor_precedents.edict_id = 0
+		  AND censor_precedents.manifest_id != ''
+		  AND EXISTS (
+		    SELECT 1 FROM forge_manifests fm
+		    WHERE fm.manifest_id = censor_precedents.manifest_id
+		  )`)
+	if backfill.Error != nil {
+		return fmt.Errorf("backfill censor_precedents.edict_id: %w", backfill.Error)
+	}
+	slog.Debug("post-GORM migration: backfilled censor_precedents.edict_id",
+		"rows_affected", backfill.RowsAffected)
 	return nil
 }
 

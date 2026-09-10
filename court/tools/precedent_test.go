@@ -216,6 +216,67 @@ func TestRecordPrecedentTool_NoManifests_Rejected(t *testing.T) {
 	}
 }
 
+// TestRecordPrecedentTool_ZeroManifestsTagsEdictID verifies the zero-manifest
+// branch writes edict_id on the edict-level precedent.
+func TestRecordPrecedentTool_ZeroManifestsTagsEdictID(t *testing.T) {
+	db := setupPrecedentTestDB(t)
+
+	tool := RecordPrecedentTool{
+		Ctx: ToolContext{
+			Username: "testuser",
+			Project:  "testproject",
+			DB:       db,
+		},
+	}
+
+	if _, err := tool.Call(context.Background(),
+		`{"edict_id": 11, "approved": false, "reasoning": "edict-level rejection"}`); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var precedent storage.CensorPrecedent
+	if err := db.Where("manifest_id = ''").First(&precedent).Error; err != nil {
+		t.Fatalf("expected edict-level precedent to be created: %v", err)
+	}
+	if precedent.EdictID != 11 {
+		t.Errorf("expected edict_id 11 on edict-level precedent, got %d", precedent.EdictID)
+	}
+}
+
+// TestRecordPrecedentTool_PerManifestTagsEdictID verifies the per-manifest
+// branch tags edict_id on each recorded precedent.
+func TestRecordPrecedentTool_PerManifestTagsEdictID(t *testing.T) {
+	db := setupPrecedentTestDB(t)
+	db.Create(&storage.ForgeManifest{
+		ManifestID: "m1",
+		EdictID:    7,
+		Username:   "testuser",
+		Project:    "testproject",
+		Status:     storage.ManifestQuenched,
+	})
+
+	tool := RecordPrecedentTool{
+		Ctx: ToolContext{
+			Username: "testuser",
+			Project:  "testproject",
+			DB:       db,
+		},
+	}
+
+	if _, err := tool.Call(context.Background(),
+		`{"edict_id": 7, "approved": true, "reasoning": "LGTM"}`); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var precedent storage.CensorPrecedent
+	if err := db.Where("manifest_id = ?", "m1").First(&precedent).Error; err != nil {
+		t.Fatalf("expected per-manifest precedent to be created: %v", err)
+	}
+	if precedent.EdictID != 7 {
+		t.Errorf("expected edict_id 7 on per-manifest precedent, got %d", precedent.EdictID)
+	}
+}
+
 // TestRecordPrecedentTool_NoManifests_Approved verifies that when no manifests exist,
 // an approval creates an edict-level precedent and grants the sage seal.
 func TestRecordPrecedentTool_NoManifests_Approved(t *testing.T) {

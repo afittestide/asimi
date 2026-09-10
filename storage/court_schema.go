@@ -346,6 +346,7 @@ const (
 type CensorPrecedent struct {
 	PrecedentID   string          `gorm:"primaryKey;column:precedent_id"`
 	ManifestID    string          `gorm:"column:manifest_id;index"`
+	EdictID       uint            `gorm:"column:edict_id;index"`
 	Username      string          `gorm:"column:username;not null;default:''"`
 	Project       string          `gorm:"column:project;not null;default:''"`
 	Principle     string          `gorm:"column:principle"`

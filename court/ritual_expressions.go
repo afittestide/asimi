@@ -1174,19 +1174,23 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			return fmt.Errorf("precedent check failed: %d precedent(s) rejected — %s", len(rejectedPrecedents), strings.Join(details, "; "))
 		}
 
-		// Also check edict-level precedents (manifest_id = '')
+		// Also check edict-level precedents (manifest_id = ''), scoped to the
+		// CURRENT edict via edict_id. An edict-level precedent only has force
+		// over the edict it belongs to. If the current edict owns no edict-level
+		// record at all, the check is satisfied — a rejection for another edict
+		// must NOT block this one. Block only if the LATEST edict-level record
+		// for THIS edict is rejected.
 		var rejectedEdictPrecedents []storage.CensorPrecedent
 		if err := r.db.Raw(`
 			SELECT * FROM censor_precedents cp
 			WHERE cp.manifest_id = ''
-			  AND cp.username = ? AND cp.project = ?
+			  AND cp.edict_id = ?
 			  AND cp.created_at = (
 			    SELECT MAX(cp2.created_at) FROM censor_precedents cp2
-			    WHERE cp2.manifest_id = ''
-			      AND cp2.username = cp.username AND cp2.project = cp.project
+			    WHERE cp2.manifest_id = '' AND cp2.edict_id = cp.edict_id
 			  )
 			  AND cp.ruling = ?`,
-			thenKey.Username, thenKey.Project, storage.PrecedentRejected).
+			thenKey.ID, storage.PrecedentRejected).
 			Scan(&rejectedEdictPrecedents).Error; err != nil {
 			return fmt.Errorf("failed to query edict-level precedents: %w", err)
 		}

@@ -796,7 +796,7 @@ func TestPostGormMigrate_RenamesSageSeals(t *testing.T) {
 	gormDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 
-	require.NoError(t, gormDB.AutoMigrate(&Seal{}))
+	require.NoError(t, gormDB.AutoMigrate(&Seal{}, &CensorPrecedent{}, &ForgeManifest{}))
 
 	// Insert seals with mixed minister_ids
 	seals := []Seal{
@@ -836,4 +836,47 @@ func TestPostGormMigrate_RenamesSageSeals(t *testing.T) {
 	require.Equal(t, int64(0), sageCount, "idempotent: still no sage seals")
 	require.NoError(t, gormDB.Model(&Seal{}).Where("minister_id = 'chancellor'").Count(&chancellorCount).Error)
 	require.Equal(t, int64(3), chancellorCount, "idempotent: still 3 chancellor seals")
+}
+
+// TestPostGormMigrate_BackfillsCensorPrecedentEdictID verifies the migration
+// backfills censor_precedents.edict_id for per-manifest rows from their
+// owning forge_manifest, while leaving edict-level rows at 0.
+func TestPostGormMigrate_BackfillsCensorPrecedentEdictID(t *testing.T) {
+	gormDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+
+	require.NoError(t, gormDB.AutoMigrate(&Seal{}, &CensorPrecedent{}, &ForgeManifest{}))
+
+	// Two manifests owned by different edicts.
+	require.NoError(t, gormDB.Create(&ForgeManifest{
+		ManifestID: "man-a", EdictID: 1, Username: "u", Project: "p", Status: ManifestLive,
+	}).Error)
+	require.NoError(t, gormDB.Create(&ForgeManifest{
+		ManifestID: "man-b", EdictID: 2, Username: "u", Project: "p", Status: ManifestLive,
+	}).Error)
+
+	// Per-manifest precedents (edict_id left 0 to simulate pre-migration rows)
+	// plus one edict-level precedent.
+	require.NoError(t, gormDB.Create(&CensorPrecedent{
+		PrecedentID: "p-a", ManifestID: "man-a", Principle: "ethics_review",
+		Ruling: PrecedentApproved,
+	}).Error)
+	require.NoError(t, gormDB.Create(&CensorPrecedent{
+		PrecedentID: "p-b", ManifestID: "man-b", Principle: "ethics_review",
+		Ruling: PrecedentApproved,
+	}).Error)
+	require.NoError(t, gormDB.Create(&CensorPrecedent{
+		PrecedentID: "p-edict", ManifestID: "", Principle: "ethics_review",
+		Ruling: PrecedentApproved,
+	}).Error)
+
+	require.NoError(t, PostGormMigrate(gormDB))
+
+	var precA, precB, precEdict CensorPrecedent
+	require.NoError(t, gormDB.Where("precedent_id = ?", "p-a").First(&precA).Error)
+	require.NoError(t, gormDB.Where("precedent_id = ?", "p-b").First(&precB).Error)
+	require.NoError(t, gormDB.Where("precedent_id = ?", "p-edict").First(&precEdict).Error)
+	require.Equal(t, uint(1), precA.EdictID, "per-manifest precedent should inherit edict_id 1")
+	require.Equal(t, uint(2), precB.EdictID, "per-manifest precedent should inherit edict_id 2")
+	require.Equal(t, uint(0), precEdict.EdictID, "edict-level precedent should stay 0 (unknown owner)")
 }

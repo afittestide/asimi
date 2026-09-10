@@ -55,6 +55,7 @@ func (t RecordPrecedentTool) Call(ctx context.Context, input string) (string, er
 		precedent := storage.CensorPrecedent{
 			PrecedentID:   precedentID,
 			ManifestID:    "", // empty = edict-level
+			EdictID:       key.ID,
 			Username:      key.Username,
 			Project:       key.Project,
 			Principle:     "ethics_review",
@@ -70,6 +71,7 @@ func (t RecordPrecedentTool) Call(ctx context.Context, input string) (string, er
 			precedent := storage.CensorPrecedent{
 				PrecedentID:   precedentID,
 				ManifestID:    m.ManifestID,
+				EdictID:       key.ID,
 				Principle:     "ethics_review",
 				Ruling:        ruling,
 				Justification: params.Reasoning,

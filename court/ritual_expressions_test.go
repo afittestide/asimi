@@ -1696,6 +1696,7 @@ func TestCheckPrecedentApproved_EdictLevelRejected(t *testing.T) {
 	precedent := storage.CensorPrecedent{
 		PrecedentID: GenerateID("precedent", "1", "edict", "reject"),
 		ManifestID:  "",
+		EdictID:     1,
 		Username:    "testuser",
 		Project:     "testproject",
 		Principle:   "ethics_review",
@@ -1735,6 +1736,7 @@ func TestCheckPrecedentApproved_EdictLevelApproved(t *testing.T) {
 	precedent := storage.CensorPrecedent{
 		PrecedentID: GenerateID("precedent", "1", "edict", "approve"),
 		ManifestID:  "",
+		EdictID:     1,
 		Username:    "testuser",
 		Project:     "testproject",
 		Principle:   "ethics_review",
@@ -1756,6 +1758,128 @@ func TestCheckPrecedentApproved_EdictLevelApproved(t *testing.T) {
 	err := runner.runThen(context.Background(), exec, "check_precedent_approved")
 	if err != nil {
 		t.Errorf("Expected no error when edict-level precedent is approved, got: %v", err)
+	}
+}
+
+// TestCheckPrecedentApproved_CrossEdictRejectionDoesNotBlock verifies the
+// cross-edict scope fix: an edict-level REJECTED precedent belonging to
+// edict A must NOT block edict B's ascension gate.
+func TestCheckPrecedentApproved_CrossEdictRejectionDoesNotBlock(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.CensorPrecedent{}); err != nil {
+		t.Fatalf("Failed to migrate CensorPrecedent: %v", err)
+	}
+
+	// Edict A owns a rejected edict-level precedent.
+	precedentA := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "A", "edict", "reject"),
+		ManifestID:  "",
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "ethics_review",
+		Ruling:      storage.PrecedentRejected,
+	}
+	if err := db.Create(&precedentA).Error; err != nil {
+		t.Fatalf("Failed to create edict-level precedent for A: %v", err)
+	}
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	// Edict B (different edict) must NOT be blocked by A's rejection.
+	execB := &RitualExecution{
+		EdictID:  2,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	err := runner.runThen(context.Background(), execB, "check_precedent_approved")
+	if err != nil {
+		t.Errorf("Expected edict B to pass despite edict A's rejection, got: %v", err)
+	}
+
+	// Edict A itself IS blocked.
+	execA := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	err = runner.runThen(context.Background(), execA, "check_precedent_approved")
+	if err == nil {
+		t.Error("Expected edict A to be blocked by its own rejection, got nil")
+	}
+}
+
+// TestCheckPrecedentApproved_EdictLevelLatestWinsPerEdict verifies that the
+// edict-level check uses latest-wins scoped to the CURRENT edict: an older
+// rejection for this edict followed by a newer approval for this edict passes,
+// but the same-shaped data scoped to another edict does not interfere.
+func TestCheckPrecedentApproved_EdictLevelLatestWinsPerEdict(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.CensorPrecedent{}); err != nil {
+		t.Fatalf("Failed to migrate CensorPrecedent: %v", err)
+	}
+
+	// Edict 1: old rejection then newer approval → check passes.
+	rejected := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "1", "edict", "reject"),
+		ManifestID:  "",
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "ethics_review",
+		Ruling:      storage.PrecedentRejected,
+	}
+	if err := db.Create(&rejected).Error; err != nil {
+		t.Fatalf("Failed to create rejection: %v", err)
+	}
+	approved := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "1", "edict", "approve"),
+		ManifestID:  "",
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "ethics_review",
+		Ruling:      storage.PrecedentApproved,
+	}
+	if err := db.Create(&approved).Error; err != nil {
+		t.Fatalf("Failed to create approval: %v", err)
+	}
+	approved.CreatedAt = rejected.CreatedAt.Add(time.Minute)
+	db.Model(&storage.CensorPrecedent{}).Where("precedent_id = ?", approved.PrecedentID).Update("created_at", approved.CreatedAt)
+
+	// Edict 2: latest edict-level precedent is rejected (newer than edict 1's).
+	rejected2 := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "2", "edict", "reject"),
+		ManifestID:  "",
+		EdictID:     2,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "ethics_review",
+		Ruling:      storage.PrecedentRejected,
+	}
+	if err := db.Create(&rejected2).Error; err != nil {
+		t.Fatalf("Failed to create edict 2 rejection: %v", err)
+	}
+	// Make edict 1's approval later than edict 2's rejection to prove scoping.
+	approved.CreatedAt = rejected2.CreatedAt.Add(time.Minute)
+	db.Model(&storage.CensorPrecedent{}).Where("precedent_id = ?", approved.PrecedentID).Update("created_at", approved.CreatedAt)
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	// Edict 1's latest edict-level record is its own approval → passes.
+	exec1 := &RitualExecution{EdictID: 1, Username: "testuser", Project: "testproject"}
+	if err := runner.runThen(context.Background(), exec1, "check_precedent_approved"); err != nil {
+		t.Errorf("Expected edict 1 to pass with its own latest approval, got: %v", err)
+	}
+
+	// Edict 2's latest edict-level record is its own rejection → fails.
+	exec2 := &RitualExecution{EdictID: 2, Username: "testuser", Project: "testproject"}
+	if err := runner.runThen(context.Background(), exec2, "check_precedent_approved"); err == nil {
+		t.Error("Expected edict 2 to fail due to its own latest rejection, got nil")
 	}
 }
 
