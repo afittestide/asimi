@@ -42,7 +42,15 @@ func DefaultConfig() Config {
 	if err != nil {
 		slog.Warn("Failed to get user home directory", "error", err)
 	}
+	// Honor ASIMI_HOME: when set (containerized drivers like Harbor persist
+	// it to a writable location), default the court DB to ${ASIMI_HOME}/
+	// asimi.sqlite so startup works even when $HOME is read-only (e.g. under
+	// Harbor's --isolated-host container). Without ASIMI_HOME we keep the
+	// traditional ~/.local/share/asimi/asimi.sqlite default.
 	dbPath := filepath.Join(homeDir, ".local", "share", "asimi", "asimi.sqlite")
+	if home := os.Getenv("ASIMI_HOME"); home != "" {
+		dbPath = filepath.Join(home, "asimi.sqlite")
+	}
 
 	return Config{
 		Storage: StorageConfig{

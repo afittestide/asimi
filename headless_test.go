@@ -868,6 +868,57 @@ func TestHeadlessSink_InteractiveZhengming_NilCourt_NoPanic(t *testing.T) {
 	}
 }
 
+// TestHeadlessNoLLMStartup_DBHonorsASIMIHome verifies that DefaultConfig
+// defaults the court DB path to ${ASIMI_HOME}/asimi.sqlite (not the read-only
+// ~/.local/share/asimi) when ASIMI_HOME is set — mirroring how the ATIF writer
+// honors ASIMI_HOME. This is the config-side fix for the Harbor --isolated-host
+// startup crash (SQLite readonly error 1544) and needs no LLM to run.
+func TestHeadlessNoLLMStartup_DBHonorsASIMIHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+
+	cfg := config.DefaultConfig()
+	require.Equal(t, filepath.Join(home, "asimi.sqlite"), cfg.Storage.DatabasePath,
+		"DefaultConfig must default DB path to ${ASIMI_HOME}/asimi.sqlite when ASIMI_HOME is set")
+
+	// Without ASIMI_HOME, the classic ~/.local/share path is retained.
+	t.Setenv("ASIMI_HOME", "")
+	cfg = config.DefaultConfig()
+	require.NotEqual(t, "", cfg.Storage.DatabasePath)
+	require.True(t, strings.HasSuffix(cfg.Storage.DatabasePath, filepath.Join(".local", "share", "asimi", "asimi.sqlite")),
+		"DB path must fall back to the classic location when ASIMI_HOME is unset, got %q", cfg.Storage.DatabasePath)
+}
+
+// TestHeadlessNoLLMStartup_DBWritableFallback verifies that storage.InitDB
+// does not abort startup when the requested (resolved) DB path is unusable:
+// it falls back to ${ASIMI_HOME}/asimi.sqlite, then os.TempDir(), only erroring
+// if every candidate fails. The primary path is forced to fail by placing a
+// regular file as its parent (works regardless of whether the test runs as
+// root, where read-only directory permissions would not block writes). This is
+// the storage-side fix for the Harbor --isolated-host read-only $HOME crash.
+func TestHeadlessNoLLMStartup_DBWritableFallback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+
+	// Primary path made unusable: its parent is a regular file, so MkdirAll
+	// fails with ENOTDIR for any user (root included) and forces the fallback.
+	block := filepath.Join(t.TempDir(), "not-a-dir")
+	require.NoError(t, os.WriteFile(block, []byte("x"), 0o644))
+	primary := filepath.Join(block, "asimi.sqlite")
+
+	db, err := storage.InitDB(primary)
+	require.NoError(t, err, "InitDB must fall back to a writable path when the resolved path is unusable")
+	defer db.Close()
+
+	// The DB should have landed under ASIMI_HOME, not the unusable primary path.
+	require.Equal(t, filepath.Join(home, "asimi.sqlite"), db.Path())
+
+	// The court DB must be usable (schema present).
+	var version int
+	require.NoError(t, db.Conn().QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version))
+	require.GreaterOrEqual(t, version, 1)
+}
+
 // TestHeadlessActivation_ATIF_E2E is a terminal-bench readiness smoke test.
 // It builds the real asimi binary and runs it end-to-end in headless mode
 // against a copy of the ror-project:

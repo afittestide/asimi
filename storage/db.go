@@ -33,8 +33,56 @@ type DB struct {
 	path string
 }
 
-// InitDB initializes the SQLite database and creates tables if needed
+// dbCandidates returns the ordered list of database file paths to try when
+// initializing storage: the caller-supplied (resolved) path first, then the
+// ASIMI_HOME location, then a temp-dir fallback. The latter two are only used
+// when the requested path (or its directory) is unwritable — e.g. under
+// Harbor's --isolated-host container where $HOME is a read-only mount.
+func dbCandidates(primary string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(p string) {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	add(primary)
+	if home := os.Getenv("ASIMI_HOME"); home != "" {
+		add(filepath.Join(home, "asimi.sqlite"))
+	}
+	add(filepath.Join(os.TempDir(), "asimi", "asimi.sqlite"))
+	return out
+}
+
+// InitDB initializes the SQLite database and creates tables if needed.
+// It tries the requested path first and falls back to ${ASIMI_HOME}/asimi.sqlite
+// then os.TempDir()/asimi/asimi.sqlite when a path is unwritable, only erroring
+// if every candidate fails. This keeps startup alive in read-only $HOME
+// environments (e.g. Harbor --isolated-host containers).
 func InitDB(dbPath string) (*DB, error) {
+	candidates := dbCandidates(dbPath)
+	var lastErr error
+	for i, cand := range candidates {
+		db, err := initDBAt(cand)
+		if err == nil {
+			if i > 0 {
+				slog.Warn("database path unwritable, using fallback path",
+					"resolved_path", dbPath, "using", cand)
+			}
+			return db, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no database path candidates")
+	}
+	return nil, fmt.Errorf("failed to initialize database at any candidate: %w", lastErr)
+}
+
+// initDBAt opens (creating if needed) the SQLite database at the given path
+// and applies schema/migrations.
+func initDBAt(dbPath string) (*DB, error) {
 	// Ensure parent directory exists
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {

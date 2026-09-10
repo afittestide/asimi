@@ -402,6 +402,41 @@ func TestInitDB_BusyTimeout(t *testing.T) {
 	require.Equal(t, 5000, timeout, "busy_timeout should be 5000ms")
 }
 
+// TestInitDB_TempDirFallback verifies InitDB's last-resort fallback to
+// ${os.TempDir()}/asimi/asimi.sqlite when both the requested resolved path and
+// the ${ASIMI_HOME}/asimi.sqlite location are unusable (edict 836 startup
+// crash fix under Harbor --isolated-host read-only $HOME). Each bad candidate's
+// parent is a regular file, so MkdirAll fails with ENOTDIR for any user (root
+// included) and the tempdir candidate is the only viable path.
+func TestInitDB_TempDirFallback(t *testing.T) {
+	// unusable returns a DB path whose parent is a regular file: MkdirAll on
+	// its directory always fails (ENOTDIR), for root and non-root alike.
+	unusable := func() string {
+		block := filepath.Join(t.TempDir(), "placeholder-file")
+		require.NoError(t, os.WriteFile(block, []byte("x"), 0o644))
+		return filepath.Join(block, "asimi.sqlite")
+	}
+
+	// Make ${ASIMI_HOME}/asimi.sqlite unwritable too, by pointing ASIMI_HOME
+	// at a path inside a regular file. Then the tempdir is the only candidate.
+	homeBlock := filepath.Join(t.TempDir(), "home-file")
+	require.NoError(t, os.WriteFile(homeBlock, []byte("x"), 0o644))
+	t.Setenv("ASIMI_HOME", filepath.Join(homeBlock, "home"))
+
+	db, err := InitDB(unusable())
+	require.NoError(t, err, "InitDB must fall back to the temp dir when every other candidate is unwritable")
+	defer db.Close()
+
+	expected := filepath.Join(os.TempDir(), "asimi", "asimi.sqlite")
+	require.Equal(t, expected, db.Path(),
+		"final fallback must be the tempdir path, got %q", db.Path())
+
+	// The court DB must be usable (schema present).
+	var version int
+	require.NoError(t, db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version))
+	require.GreaterOrEqual(t, version, 1)
+}
+
 // TestSaveSession_IncrementalUpsert verifies that incremental upsert only adds
 // new messages and never deletes existing ones.
 func TestSaveSession_IncrementalUpsert(t *testing.T) {
