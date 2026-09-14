@@ -5,6 +5,18 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.3] - 2026-09-14
+
+### Added
+
+- **Minister communication over the Tian ledger** — ministers can now communicate through the Tian ledger
+
+### Fixed
+
+- **Harbor integration** — honor `ASIMI_HOME` for the court DB path and degrade gracefully when `$HOME` is unwritable, fixing the read-only-`$HOME` startup abort under `--isolated-host`; `initLogger` no longer panics when its log directory cannot be created (e836)
+- **Init-project ritual TODO comments** — the ritual now uses TODO comments correctly
+- **`suggest_edict` description** — improved the tool description for smoother activation
+
 ## [0.13.2] - 2026-09-08
 
 ### Fixed
