@@ -504,6 +504,16 @@ func setupHeadlessCourtDB(t *testing.T) *gorm.DB {
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
 
+	// Mirror production InitDB (storage/db.go) so the harness contends the
+	// same way real SQLite does. Without these, concurrent zhengming writes
+	// fail instantly with SQLITE_BUSY (database is locked) instead of waiting.
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	_, err = sqlDB.Exec("PRAGMA journal_mode = WAL")
+	require.NoError(t, err)
+	_, err = sqlDB.Exec("PRAGMA busy_timeout = 5000")
+	require.NoError(t, err)
+
 	db, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{
 		Logger: gologger.Default.LogMode(gologger.Silent),
 	})
