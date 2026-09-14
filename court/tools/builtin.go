@@ -95,7 +95,6 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 		Project:  opts.Ctx.Project,
 	}, intentRead)
 	r.Register(ListEdictsTool{DB: opts.Ctx.DB, Username: opts.Ctx.Username, Project: opts.Ctx.Project}, intentRead)
-	r.Register(QueryCourtTool{DB: opts.Ctx.DB, Username: opts.Ctx.Username, Project: opts.Ctx.Project}, intentRead)
 	r.Register(ListQuenchedManifestsTool{Ctx: opts.Ctx}, intentRead)
 	r.Register(QueryPrecedentsTool{Ctx: opts.Ctx}, intentRead)
 	r.Register(GetIncidentTool{Ctx: opts.Ctx}, intentRead)
@@ -135,6 +134,7 @@ func registerExtraTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	if opts.RitualLauncher != nil {
 		r.RegisterExtra("enact_ritual", InvokeRitualTool{Ctx: opts.Ctx, Launcher: opts.RitualLauncher})
 	}
+	r.RegisterExtra("tian_ledger", TianLedgerTool{Ctx: opts.Ctx})
 	if opts.ZhengmingRequester != nil {
 		r.RegisterExtraFactory("ask_ruler", func(mid string) Tool {
 			return AskRulerTool{

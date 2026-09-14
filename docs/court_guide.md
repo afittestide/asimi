@@ -138,13 +138,14 @@ Each minister is a specialized AI agent with a specific role:
 
 | Minister | Role | Core Tools | Specialized Tools |
 |----------|------|------------|-------------------|
-| **Chancellor** | Coordinates all ministers, manages edict lifecycle, interfaces with the Ruler | — | `create_edict`, `cancel_edict`, `answer_zhengming`, `get_edict_status`, `list_edicts`, `list_rituals`, `enact_ritual`, `get_tian_events`, `asimisql` |
+| **Secretary** | Manages court business and provides a bird's eye view of the Court | `read_file`, `glob`, `grep` | `suggest_edict`, `enact_ritual`, `consult_minister`, `asimisql` |
+| **Chancellor** | Coordinates all ministers, manages edict lifecycle, interfaces with the Ruler | — | `create_edict`, `cancel_edict`, `answer_zhengming`, `get_edict_status`, `list_edicts`, `list_rituals`, `enact_ritual`, `asimisql` |
 | **War** | Analyzes edicts, creates execution plans, decomposes work into Lings | `read_file`, `glob`, `grep` | `create_ling`, `update_ling`, `list_lings` |
 | **Forge** | Implements code changes according to plans | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `run_shell_command` | `create_manifest`, `update_manifest`, `commit_manifest` |
 | **Judge** | Writes tests and validates changes through test coverage | `read_file`, `write_file`, `edit_file`, `glob`, `run_shell_command` | `record_verdict`, `reject_manifest` |
 | **Chancellor** | Sees all state read-only, helps distill intent into edicts, performs code review with precedent tracking | `read_file`, `glob`, `grep` (all tables) | `create_edict`, `record_precedent` |
 
-**Core Tools** are the basic file system and shell tools needed for each minister's work. **Specialized Tools** are unique to each minister's role in the Court. All ministers share `ask_ruler` as a common tool. `consult_minister` is available only to the secretary via `extra_tools`.
+**Core Tools** are the basic file system and shell tools needed for each minister's work. **Specialized Tools** are unique to each minister's role in the Court. All ministers share `ask_ruler` and `tian_ledger` as common tools — the Tian ledger is open to every minister. `consult_minister` is available only to the secretary via `extra_tools`.
 
 ### Lings
 
@@ -539,6 +540,22 @@ When a step exhausts all `max_retries` attempts, the Court invokes the `report_f
 
 ## Tools Reference
 
+**Common Tools** (available to all ministers):
+- `ask_ruler(question)` — Request a clarification or decision from the Ruler
+- `tian_ledger(edict_id?, event_type?, limit?, offset?, since_id?, detail?)` — Query the Tian event ledger for a bird's eye view. `detail=summary` (default) tail-truncates `last_step_output` to the court-configured length; `detail=full` returns every payload key untruncated; `since_id` returns only events newer than the given id
+
+### Secretary Tools
+
+**Edict Management:**
+- `suggest_edict(intent)` — Distill the Ruler's intent into a new edict
+- `enact_ritual(ritual_name, edict_id)` — Start a ritual for an edict
+- `consult_minister(minister_id, task)` — Dispatch ad-hoc work to another minister
+
+**Observability:**
+- `asimisql(query)` — Execute raw SQL for advanced queries
+
+> The Secretary manages court business and provides a bird's eye view of the Court. For questions about what happened during an edict's lifecycle, use `tian_ledger`.
+
 ### Chancellor Tools
 
 **Edict Management:**
@@ -555,7 +572,6 @@ When a step exhausts all `max_retries` attempts, the Court invokes the `report_f
 - `enact_ritual(ritual_name, edict_id)` — Start a ritual for an edict
 
 **Observability:**
-- `get_tian_events(edict_id?, event_type?, limit?)` — Query the Tian event ledger
 - `asimisql(query)` — Execute raw SQL for advanced queries
 
 > The Chancellor orchestrates ministers through rituals, not direct invocation. For ad-hoc minister work, use `enact_ritual` with a custom ritual.
@@ -617,7 +633,15 @@ The Chancellor records **Precedents** from code reviews:
 
 ### Tian Events
 
-The **Tian** (天, Heaven) ledger records all events in the edict lifecycle for auditing and debugging. **All events are logged to the session logs** for complete traceability.
+The **Tian** (天, Heaven) ledger records all events in the edict lifecycle for auditing and debugging. **All events are logged to the session logs** for complete traceability. Every minister reads the ledger with the `tian_ledger` tool, which returns recent events filtered by edict, event type, and paginated with limit/offset — the bird's eye view of what transpired in the Court.
+
+Because `limit` bounds *rows*, not bytes, a single heavy event (e.g. a `ritual_completed` carrying a full review report in `payload.last_step_output`) can overflow the transport at the default `limit`. The tool therefore bounds its default surface:
+
+- **`detail=summary`** (default) — every payload key is returned verbatim **except** `last_step_output`, which is tail-truncated: only the **last N characters** survive (the end of a review carries its verdict), marked with a leading `…` and a `…(truncated)` suffix. The derived `detail` field is always computed from the *full* payload.
+- **`detail=full`** — every payload key is returned untruncated, bypassing the bound. Use this when you need the whole body.
+- **`since_id`** — an optional cursor. When `> 0`, only events with `id > since_id` are returned; poll with the highest id you have seen to fetch what's new without re-walking history. Still ordered `created_at DESC` and still honouring `limit`/`offset`.
+
+The truncation length N is a **court-level setting** (`court.output_limit` in the config file, default `500` chars); it is fixed for the whole court and is not a per-call tool input.
 
 Events are classified into two categories:
 
@@ -910,7 +934,7 @@ Key constraints:
 - **Chancellor cannot write files** — it orchestrates, never implements.
 - **Only Forge and Judge have shell access**.
 - **Chancellor sees all but changes nothing** — full read-only across every table; can only create edicts and record precedents.
-- All ministers share `ask_ruler` as a common tool. `consult_minister` is available only to the secretary via `extra_tools`.
+- All ministers share `ask_ruler` and `tian_ledger` as common tools — the Tian ledger is open to every minister. `consult_minister` is available only to the secretary via `extra_tools`.
 
 The `Session` also enforces **write protection** — a file must be read via `read_file` before it can be written via `write_file`. This is tracked per-session in `filesRead`.
 
@@ -971,7 +995,7 @@ Check the Tian events to see what happened:
 ```
 You: What happened with the logout feature?
 
-Chancellor: [Uses get_tian_events tool for edict issue-123]
+Secretary: [Uses tian_ledger tool for edict issue-123]
   Events show: ritual_step_failed at step "build" - compilation error
 ```
 

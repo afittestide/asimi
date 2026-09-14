@@ -112,7 +112,12 @@ type CourtConfig struct {
 	Username        string        `koanf:"username"`          // OS username for edict scoping
 	Project         string        `koanf:"project"`           // project slug for edict scoping
 	IsolatedHost    bool          `koanf:"isolated_host"`     // skip sandbox, run commands on host without approval
+	OutputLimit     int           `koanf:"output_limit"`      // max chars of heavy output fields in summary mode (default 500)
 }
+
+// DefaultOutputLimit is the fallback truncation length for heavy output
+// fields when court.output_limit is unset in summary mode.
+const DefaultOutputLimit = 500
 
 // DefaultCourtConfig returns the default configuration.
 func DefaultCourtConfig() *CourtConfig {
@@ -123,6 +128,7 @@ func DefaultCourtConfig() *CourtConfig {
 	return &CourtConfig{
 		StepIdleTimeout: 5 * time.Minute,
 		Username:        username,
+		OutputLimit:     DefaultOutputLimit,
 	}
 }
 

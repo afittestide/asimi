@@ -48,6 +48,9 @@ func createCourt(
 	} else if repoInfo.Slug != "" {
 		courtCfg.Project = repoInfo.Slug
 	}
+	if projectCfg.Court.OutputLimit > 0 {
+		courtCfg.OutputLimit = projectCfg.Court.OutputLimit
+	}
 	courtCfg.IsolatedHost = isolatedHost
 
 	ct := court.NewCourt(shared.DB, courtCfg, runner, shared.Logger)

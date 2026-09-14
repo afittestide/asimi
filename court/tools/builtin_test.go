@@ -170,7 +170,6 @@ func TestRegisterBuiltinToolsIntentRead(t *testing.T) {
 	assertHas(t, names, "list_ling")
 	assertHas(t, names, "get_incident")
 	assertHas(t, names, "list_edicts")
-	assertHas(t, names, "query_court")
 }
 
 func TestRegisterBuiltinToolsIntentWrite(t *testing.T) {
@@ -229,6 +228,10 @@ func TestRegisterBuiltinToolsExtraChancellor(t *testing.T) {
 	extraNames := toolNames(chancellorExtras)
 	assertHas(t, extraNames, "consult_minister")
 	assertHas(t, extraNames, "enact_ritual")
+
+	// tian_ledger is resolved as a common tool, not an extra
+	commonExtras := r.ExtraTools("forge", []string{"tian_ledger"})
+	assertHas(t, toolNames(commonExtras), "tian_ledger")
 
 	// Forge should also get the same extra tools if its def lists them
 	// (the registry doesn't gate on minister ID anymore — the YAML def decides)

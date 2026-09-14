@@ -2043,3 +2043,60 @@ func TestCourt_CancelZhengmingDispatch(t *testing.T) {
 		t.Fatal("WaitForZhengming should have returned after cancel")
 	}
 }
+
+// TestCourt_TianLedgerToolWiresOutputLimit guards the court-level config
+// path for edict 844: the truncation length set on CourtConfig must reach
+// the tian_ledger tool's ToolContext. Without this, the tool would
+// silently fall back to the default and a mis-wired court would ship.
+func TestCourt_TianLedgerToolWiresOutputLimit(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.OutputLimit = 1234
+	s := NewCourt(db, cfg, nil, nil)
+
+	registry := s.GetToolRegistry()
+	require.NotNil(t, registry, "court should build a tool registry")
+
+	extras := registry.ExtraTools("", []string{"tian_ledger"})
+	require.Len(t, extras, 1, "tian_ledger must be registered as an extra tool")
+
+	tool, ok := extras[0].(tools.TianLedgerTool)
+	require.True(t, ok, "tian_ledger must be a TianLedgerTool, got %T", extras[0])
+	assert.Equal(t, 1234, tool.Ctx.OutputLimit,
+		"tian_ledger must receive the court-level truncation limit")
+
+	// The documented default must be non-zero, otherwise summary mode would
+	// return an unbounded body and reintroduce the transport overflow.
+	assert.Equal(t, config.DefaultOutputLimit, config.DefaultCourtConfig().OutputLimit)
+	assert.NotZero(t, config.DefaultOutputLimit)
+}
+
+// TestExtractDetail_MirrorsProductionKeys verifies the snapshot's twin
+// projection derives detail from the keys production publishers actually
+// write (ritual → step → minister_id → intent), and returns empty for
+// unrecognised payloads rather than guessing.
+func TestExtractDetail_MirrorsProductionKeys(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload storage.JSON
+		want    string
+	}{
+		{"ritual key", storage.JSON{"ritual": "swift-strike", "execution_id": 1}, "swift-strike"},
+		{"step key", storage.JSON{"ritual": "", "step": "forge", "step_index": 0}, "forge"},
+		{"minister_id key", storage.JSON{"minister_id": "judge", "notes": "ok"}, "judge"},
+		{"intent key", storage.JSON{"intent": "fix it", "id": 5}, "fix it"},
+		{"ritual wins over step", storage.JSON{"ritual": "swift-strike", "step": "forge"}, "swift-strike"},
+		{"unknown keys yield empty", storage.JSON{"unrelated": "value"}, ""},
+		{"nil payload yields empty", nil, ""},
+		{"empty string is skipped", storage.JSON{"ritual": "", "step": "forge"}, "forge"},
+		{"huge trailing body does not affect detail", storage.JSON{"intent": "fix it", "last_step_output": strings.Repeat("X", 5000)}, "fix it"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := storage.TianEvent{Payload: tc.payload}
+			if got := extractDetail(ev); got != tc.want {
+				t.Errorf("extractDetail() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

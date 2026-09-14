@@ -47,6 +47,11 @@ type ToolContext struct {
 	Username   string         // daemon-level: OS username for DB scoping
 	Project    string         // daemon-level: project slug for DB scoping
 	DB         *gorm.DB       // daemon-level singleton
+
+	// OutputLimit bounds heavy output fields (e.g. last_step_output) in
+	// summary mode (court-level setting).
+	// The number is for how many characters from the end of the fields to store
+	OutputLimit int
 }
 
 // ProjectRoot returns the project root from the shared RepoInfo, or "" if unset.

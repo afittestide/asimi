@@ -410,6 +410,9 @@ func ProvideCourt(params CourtParams) *court.Court {
 		cfg.Project = params.RepoInfo.Slug
 	}
 	cfg.IsolatedHost = params.Config.Court.IsolatedHost
+	if params.Config.Court.OutputLimit > 0 {
+		cfg.OutputLimit = params.Config.Court.OutputLimit
+	}
 	params.Logger.Info("initializing Court", "user", cfg.Username, "project", cfg.Project)
 
 	s := court.NewCourt(params.GormDB, cfg, params.Runner, params.Logger)

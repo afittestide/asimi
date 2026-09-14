@@ -149,15 +149,13 @@ func extractDetail(ev storage.TianEvent) string {
 		return ""
 	}
 	payload := map[string]interface{}(ev.Payload)
-	// Try common payload fields for a human-readable detail
-	if name, ok := payload["ritual_name"].(string); ok {
-		return name
-	}
-	if name, ok := payload["minister"].(string); ok {
-		return name
-	}
-	if name, ok := payload["step_name"].(string); ok {
-		return name
+	// Mirror the keys production publishers actually write, and mirror
+	// tianEventDetail (tian_events_tool.go): detail always derives from the
+	// full payload, regardless of the tool's summary/full projection.
+	for _, key := range []string{"ritual", "step", "minister_id", "intent"} {
+		if name, ok := payload[key].(string); ok && name != "" {
+			return name
+		}
 	}
 	return ""
 }

@@ -303,10 +303,11 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 	// (project root is set later via SetRepoInfo).
 	repoInfo := &repo.RepoInfo{}
 	ctx := tools.ToolContext{
-		RepoInfo: repoInfo,
-		Username: s.config.Username,
-		Project:  s.config.Project,
-		DB:       s.db,
+		RepoInfo:    repoInfo,
+		Username:    s.config.Username,
+		Project:     s.config.Project,
+		DB:          s.db,
+		OutputLimit: s.config.OutputLimit,
 	}
 
 	// The Court owns the runtime-dispatch interfaces directly — no type

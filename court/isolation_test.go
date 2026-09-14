@@ -167,58 +167,47 @@ func TestIsolation_CouncilDecisions(t *testing.T) {
 	assert.Empty(t, decisionsB, "cross-project GetCouncilDecisionsForEdict should return empty")
 }
 
-// TestIsolation_QueryCourt verifies that query_court only returns the
-// current project's edicts and zhengming.
-func TestIsolation_QueryCourt(t *testing.T) {
+// TestIsolation_TianLedger verifies that tian_ledger only returns the
+// current project's ledger events.
+func TestIsolation_TianLedger(t *testing.T) {
 	db := setupMinisterTestDB(t)
 
-	// Create edict and zhengming under project A
+	// Create an edict and a ledger event under project A
 	edictA, err := createEdictForProject(db, isolationUserA, isolationProjA, "court test")
 	require.NoError(t, err)
 
-	// Create a pending zhengming for project A
-	zhengming := storage.Zhengming{
-		RequestID:  "zh-001",
-		EdictID:    edictA.ID,
-		Username:   isolationUserA,
-		Project:    isolationProjA,
-		MinisterID: "forge",
-		Questions:  storage.ZhengmingQuestions{{Text: "Proceed?", Options: []string{"yes", "no"}}},
-		Priority:   storage.PriorityNormal,
-		Status:     storage.ZhengmingPending,
+	event := storage.TianEvent{
+		EdictID:   edictA.ID,
+		Username:  isolationUserA,
+		Project:   isolationProjA,
+		EventType: "ritual_started",
+		Payload:   storage.JSON{"ritual": "swift_strike"},
 	}
-	require.NoError(t, db.Create(&zhengming).Error)
+	require.NoError(t, db.Create(&event).Error)
 
-	// Query court as project B with specific edict_id — should return no edict
-	toolB := tools.QueryCourtTool{DB: db, Username: isolationUserB, Project: isolationProjB}
+	// Query as project B with the specific edict_id — should see no events
+	toolB := tools.TianLedgerTool{Ctx: tools.ToolContext{
+		DB:       db,
+		Username: isolationUserB,
+		Project:  isolationProjB,
+	}}
 	result, err := toolB.Call(context.Background(), fmt.Sprintf(`{"edict_id": %d}`, edictA.ID))
 	require.NoError(t, err)
+	assert.Contains(t, result, "No Tian events found",
+		"cross-project tian_ledger with edict_id should return no events")
 
-	var courtResult map[string]interface{}
-	require.NoError(t, json.Unmarshal([]byte(result), &courtResult))
-
-	edicts, ok := courtResult["edicts"].([]interface{})
-	require.True(t, ok, "edicts should be a list")
-	assert.Empty(t, edicts, "cross-project query_court with edict_id should return no edicts")
-
-	// No pending zhengming for project B (zhengming query always filters by username/project)
-	_, hasZhengming := courtResult["pending_zhengming"]
-	assert.False(t, hasZhengming, "cross-project query_court should not return zhengming")
-
-	// Now query as project A with same edict_id — should see its edict
-	toolA := tools.QueryCourtTool{DB: db, Username: isolationUserA, Project: isolationProjA}
+	// Query as project A with same edict_id — should see its own event
+	toolA := tools.TianLedgerTool{Ctx: tools.ToolContext{
+		DB:       db,
+		Username: isolationUserA,
+		Project:  isolationProjA,
+	}}
 	resultA, err := toolA.Call(context.Background(), fmt.Sprintf(`{"edict_id": %d}`, edictA.ID))
 	require.NoError(t, err)
 
-	var courtResultA map[string]interface{}
-	require.NoError(t, json.Unmarshal([]byte(resultA), &courtResultA))
-	edictsA, ok := courtResultA["edicts"].([]interface{})
-	require.True(t, ok)
-	assert.NotEmpty(t, edictsA, "project A should see its own edict")
-
-	// Project A should see pending zhengming
-	_, hasZhengmingA := courtResultA["pending_zhengming"]
-	assert.True(t, hasZhengmingA, "project A should see its pending zhengming")
+	var eventsA []map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(resultA), &eventsA))
+	require.Len(t, eventsA, 1, "project A should see its own ledger event")
 }
 
 // TestIsolation_CensorPrecedent verifies that CensorPrecedent queries are

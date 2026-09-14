@@ -2090,9 +2090,9 @@ func TestRunLoop_ConcurrentTaskDispatch(t *testing.T) {
 }
 
 // TestMinisterImpl_Tools_IncludesCommonTools verifies that every minister
-// gets ask_ruler via the commonTools constant, even when their
-// extra_tools definition does not list it. Only the secretary should have
-// consult_minister (via extra_tools).
+// gets ask_ruler and tian_ledger via the commonTools constant, even when
+// their extra_tools definition does not list them. Only the secretary should
+// have consult_minister (via extra_tools).
 func TestMinisterImpl_Tools_IncludesCommonTools(t *testing.T) {
 	// Build a tool registry with consult_minister and ask_ruler registered as extra tools
 	registry := tools.NewToolRegistry()
@@ -2100,6 +2100,7 @@ func TestMinisterImpl_Tools_IncludesCommonTools(t *testing.T) {
 		return tools.ConsultMinisterTool{Ctx: tools.ToolContext{MinisterID: mid}}
 	})
 	registry.RegisterExtra("enact_ritual", tools.InvokeRitualTool{})
+	registry.RegisterExtra("tian_ledger", tools.TianLedgerTool{})
 	registry.RegisterExtraFactory("ask_ruler", func(mid string) tools.Tool {
 		return tools.AskRulerTool{MinisterID: mid}
 	})
@@ -2120,9 +2121,11 @@ func TestMinisterImpl_Tools_IncludesCommonTools(t *testing.T) {
 				names[tool.Name()] = true
 			}
 
-			// Every minister should have ask_ruler via commonTools
+			// Every minister should have ask_ruler and tian_ledger via commonTools
 			assert.True(t, names["ask_ruler"],
 				"%s should have ask_ruler via commonTools", def.ID)
+			assert.True(t, names["tian_ledger"],
+				"%s should have tian_ledger via commonTools", def.ID)
 
 			// Only the secretary should have consult_minister (via extra_tools)
 			if def.ID == "secretary" {
