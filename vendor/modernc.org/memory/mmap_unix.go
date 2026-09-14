@@ -9,9 +9,10 @@
 package memory // import "modernc.org/memory"
 
 import (
-	"golang.org/x/sys/unix"
 	"os"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const pageSizeLog = 16

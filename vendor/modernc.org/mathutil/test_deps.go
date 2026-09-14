@@ -6,6 +6,5 @@ package mathutil // import "modernc.org/mathutil"
 
 // Pull test dependencies too.
 // Enables easy 'go test X' after 'go get X'
-import (
+
 // nothing yet
-)

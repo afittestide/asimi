@@ -903,7 +903,6 @@ func ExecuteToolWithUserToken(ctx context.Context, config *schemas.MCPClientConf
 	return tempClient.CallTool(ctx, callRequest)
 }
 
-
 // GetCodeModeBindingLevel returns the current code mode binding level.
 // This method is safe to call concurrently from multiple goroutines.
 func (m *ToolsManager) GetCodeModeBindingLevel() schemas.CodeModeBindingLevel {

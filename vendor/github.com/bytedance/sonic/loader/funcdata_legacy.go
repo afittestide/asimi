@@ -20,5 +20,5 @@
 package loader
 
 func setEpclntab(mod *moduledata, val uintptr) {
-    // No-op for versions < 1.26
+	// No-op for versions < 1.26
 }

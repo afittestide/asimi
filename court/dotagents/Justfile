@@ -21,26 +21,33 @@ clean-sandbox:
 install:
     @echo "no install step configured"
 
-# Run linter & formatter (language-specific) — customize for your project
+# Run linter & formatter
+# TODO: (language-specific)
+# TODO: customize for your project
 lint:
     @echo "no lint step configured"
 
-# Run tests (language-specific) — customize for your project
+# Run tests
+# TODO: customize for your project
 test:
     @echo "no test step configured"
 
-# Start the program or server — customize for your project
+# Start the program or server
+# TODO: customize for your project
 run:
     @echo "no run step configured"
 
 # Build the project — customize for your project
+# TODO: customize for your project
 build: install
     @echo "no build step configured"
 
-# Clean build artifacts and caches — customize for your project
+# Clean build artifacts and caches
+# TODO: customize for your project
 clean:
     @echo "no clean step configured"
 
-# Install system dependencies — customize for your project
+# Install system dependencies
+# TODO: customize for your project
 bootstrap:
     @echo "no bootstrap step configured"

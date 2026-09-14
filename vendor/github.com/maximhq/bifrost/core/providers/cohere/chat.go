@@ -370,9 +370,8 @@ func (response *CohereChatResponse) ToBifrostChatResponse(model string) *schemas
 				ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{},
 			},
 		},
-		Created: int(time.Now().Unix()),
-		ExtraFields: schemas.BifrostResponseExtraFields{
-		},
+		Created:     int(time.Now().Unix()),
+		ExtraFields: schemas.BifrostResponseExtraFields{},
 	}
 
 	// Convert messages

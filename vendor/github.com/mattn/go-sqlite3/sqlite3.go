@@ -445,12 +445,12 @@ type SQLiteDriver struct {
 
 // SQLiteConn implements driver.Conn.
 type SQLiteConn struct {
-	mu             sync.Mutex
-	db             *C.sqlite3
-	loc            *time.Location
-	txlock         string
-	funcs          []*functionInfo
-	aggregators    []*aggInfo
+	mu          sync.Mutex
+	db          *C.sqlite3
+	loc         *time.Location
+	txlock      string
+	funcs       []*functionInfo
+	aggregators []*aggInfo
 	// Prepared-statement cache. The slice is allocated at Open with a
 	// fixed capacity equal to the configured cache size; cap bounds the
 	// cache, len is the live count, and entries are ordered LRU-first

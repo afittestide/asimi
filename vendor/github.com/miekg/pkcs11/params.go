@@ -55,13 +55,12 @@ type GCMParams struct {
 //
 // Encrypt/Decrypt. As an example:
 //
-//    gcmParams := pkcs11.NewGCMParams(make([]byte, 12), nil, 128)
-//    p.ctx.EncryptInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, gcmParams)},
-//			aesObjHandle)
-//    ct, _ := p.ctx.Encrypt(session, pt)
-//    iv := gcmParams.IV()
-//    gcmParams.Free()
-//
+//	   gcmParams := pkcs11.NewGCMParams(make([]byte, 12), nil, 128)
+//	   p.ctx.EncryptInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, gcmParams)},
+//				aesObjHandle)
+//	   ct, _ := p.ctx.Encrypt(session, pt)
+//	   iv := gcmParams.IV()
+//	   gcmParams.Free()
 func NewGCMParams(iv, aad []byte, tagSize int) *GCMParams {
 	return &GCMParams{
 		iv:      iv,
@@ -201,7 +200,7 @@ type RSAAESKeyWrapParams struct {
 
 func cRSAAESKeyWrapParams(p *RSAAESKeyWrapParams, arena arena) ([]byte, arena) {
 	var param []byte
-	params := C.CK_RSA_AES_KEY_WRAP_PARAMS {
+	params := C.CK_RSA_AES_KEY_WRAP_PARAMS{
 		ulAESKeyBits: C.CK_MECHANISM_TYPE(p.AESKeyBits),
 	}
 
@@ -212,4 +211,3 @@ func cRSAAESKeyWrapParams(p *RSAAESKeyWrapParams, arena arena) ([]byte, arena) {
 	}
 	return memBytes(unsafe.Pointer(&params), unsafe.Sizeof(params)), arena
 }
-

@@ -355,6 +355,7 @@
         rewrites from scratch and is the #1 cause of this ritual failing to converge.
         Always preserve the existing structure, headers, and any lines you are not
         explicitly told to touch.
+        Handle the TODO comments in the template files and remove them when done
 
         Detect the primary language from the codebase (Gemfile→ruby, go.mod→go,
         requirements.txt/pyproject.toml→python, package.json→node, Cargo.toml→rust).

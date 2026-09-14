@@ -7,7 +7,6 @@ package libc // import "modernc.org/libc"
 import (
 	"errors"
 	"fmt"
-	"golang.org/x/sys/windows"
 	"math"
 	mbits "math/bits"
 	"os"
@@ -22,6 +21,8 @@ import (
 	"unicode"
 	"unicode/utf16"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 
 	"github.com/ncruces/go-strftime"
 	"modernc.org/libc/errno"

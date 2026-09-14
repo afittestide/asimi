@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
+
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/restjson"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 	smithy "github.com/aws/smithy-go"
@@ -15,8 +18,6 @@ import (
 	"github.com/aws/smithy-go/ptr"
 	"github.com/aws/smithy-go/tracing"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"io"
-	"strings"
 )
 
 type awsRestjson1_deserializeOpCreateToken struct {

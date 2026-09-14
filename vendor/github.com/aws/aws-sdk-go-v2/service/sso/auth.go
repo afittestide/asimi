@@ -5,6 +5,9 @@ package sso
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
+
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	smithy "github.com/aws/smithy-go"
 	smithyauth "github.com/aws/smithy-go/auth"
@@ -12,8 +15,6 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	"github.com/aws/smithy-go/tracing"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"slices"
-	"strings"
 )
 
 func bindAuthParamsRegion(_ interface{}, params *AuthResolverParameters, _ interface{}, options Options) error {
