@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -48,40 +49,59 @@ var cli struct {
 	Atif            bool   `help:"Enable ATIF trajectory recording (agent name: asimi)"`
 }
 
-func initLogger() {
-	var logDir string
-	var logPath string
-
-	// Determine log directory and path
+// logDir returns the directory for the log file. Debug mode logs to the
+// current directory; otherwise to ${ASIMI_HOME} when set (containerized
+// drivers like Harbor persist it to a writable location), falling back to
+// ~/.local/share/asimi. Returns "" when no directory can be resolved.
+func logDir() string {
 	if cli.Debug {
-		// In debug mode, log to current directory
-		logDir = "."
-		logPath = filepath.Join(logDir, logBaseName+".log")
-		logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			panic(fmt.Errorf("failed to open log file %s: %w", logPath, err))
-		}
-		slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	} else {
-		// In production mode, log to user's data directory
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			panic(fmt.Errorf("failed to get user home directory: %w", err))
-		}
-		logDir = filepath.Join(homeDir, ".local", "share", "asimi")
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			panic(fmt.Errorf("failed to create log directory %s: %w", logDir, err))
-		}
-		logPath = filepath.Join(logDir, logBaseName+".log")
-		logFile := &lumberjack.Logger{
-			Filename:   logPath,
-			MaxSize:    10, // megabytes
-			MaxBackups: 3,
-			MaxAge:     28, // days
-			Compress:   true,
-		}
-		slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		return "."
 	}
+	if home := os.Getenv("ASIMI_HOME"); home != "" {
+		return home
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".local", "share", "asimi")
+}
+
+func initLogger() {
+	dir := logDir()
+	if dir == "" {
+		slog.Warn("could not resolve log directory; logging to stderr")
+		return
+	}
+
+	logPath := filepath.Join(dir, logBaseName+".log")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		// A read-only $HOME (e.g. Harbor --isolated-host) must not abort
+		// startup: fall back to the default stderr logger instead.
+		slog.Warn("failed to create log directory; logging to stderr", "dir", dir, "error", err)
+		return
+	}
+
+	level := slog.LevelInfo
+	if cli.Debug {
+		level = slog.LevelDebug
+	}
+	var w io.Writer = &lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    10, // megabytes
+		MaxBackups: 3,
+		MaxAge:     28, // days
+		Compress:   true,
+	}
+	if cli.Debug {
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			slog.Warn("failed to open log file; logging to stderr", "path", logPath, "error", err)
+			return
+		}
+		w = f
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})))
 }
 
 func runInteractiveMode() error {
