@@ -26,6 +26,7 @@ import (
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/storage"
+	"github.com/alecthomas/kong"
 )
 
 // TestHeadlessSink_StreamChunkWritesText verifies that StreamChunkMsg text
@@ -954,6 +955,37 @@ func TestLogDir_HonorsASIMIHome(t *testing.T) {
 	t.Setenv("ASIMI_HOME", home)
 	cli.Debug = true
 	require.Equal(t, ".", logDir())
+}
+
+// TestPromptFlagAcceptsLeadingDash guards Harbor Defect A: a benchmark task
+// prompt that begins with '-' must be consumed as the -p/--prompt value rather
+// than mistaken for a flag. Before cliOptions enabled hyphen-prefixed
+// parameters, `asimi -p '- do X'` aborted with
+// `--prompt: expected string value but got "- do X" (short flag)` and exit
+// code 80 — asimi never started.
+func TestPromptFlagAcceptsLeadingDash(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"short flag with dash value", []string{"-p", "- You are given a PyTorch state dict"}, "- You are given a PyTorch state dict"},
+		{"long flag with dash value", []string{"--prompt", "- hello"}, "- hello"},
+		{"equals form with dash value", []string{"--prompt=- hello"}, "- hello"},
+		{"plain value unchanged", []string{"-p", "hello"}, "hello"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := cli
+			t.Cleanup(func() { cli = orig })
+
+			parser, err := kong.New(&cli, cliOptions...)
+			require.NoError(t, err)
+			_, err = parser.Parse(tc.args)
+			require.NoError(t, err, "leading-dash prompt must parse as a value")
+			assert.Equal(t, tc.want, cli.Prompt)
+		})
+	}
 }
 
 // buildAsimiBinary builds the asimi binary from the module root and returns

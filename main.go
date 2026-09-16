@@ -26,6 +26,12 @@ import (
 
 var program *tea.Program
 
+// cliOptions configure kong's parse of the CLI. Enabling hyphen-prefixed
+// parameters lets a flag consume a value that begins with '-', so a task
+// prompt starting with a dash (`-p '- do X'`) parses as a value instead of
+// being mistaken for a flag and aborting with exit code 80.
+var cliOptions = []kong.Option{kong.WithHyphenPrefixedParameters(true)}
+
 // logBaseName names the log file (without extension). Default suits the TUI;
 // runDaemonMode overrides it so daemon and TUI write to separate files and
 // don't interleave when both run with --debug in the same cwd.
@@ -326,7 +332,7 @@ func main() {
 	// today a leading `daemon` arg is enough to branch cleanly.
 	if len(os.Args) > 1 && os.Args[1] == "daemon" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
-		kong.Parse(&cli)
+		kong.Parse(&cli, cliOptions...)
 		if err := daemon.Run(initDaemonShared); err != nil {
 			fmt.Fprintln(os.Stderr, "daemon:", err)
 			os.Exit(1)
@@ -335,7 +341,7 @@ func main() {
 	}
 
 	startTime := time.Now()
-	kong.Parse(&cli)
+	kong.Parse(&cli, cliOptions...)
 
 	// Handle --version flag
 	if cli.Version {
