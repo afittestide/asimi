@@ -4,8 +4,19 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 )
+
+// MalformedMarkerKey is the single JSON key used to represent a database value
+// that failed to parse. Scanning such a row degrades to a bounded marker
+// instead of returning an error, which would otherwise make GORM's Find abort
+// the whole result set on the first bad row (see edict 857).
+const MalformedMarkerKey = "__malformed__"
+
+// malformedMarkerLimit bounds how much of a malformed raw value is retained in
+// the marker, keeping it small and out of log lines.
+const malformedMarkerLimit = 200
 
 // JSON is a custom type for storing JSON data in the database
 type JSON map[string]interface{}
@@ -18,17 +29,26 @@ func (j JSON) Value() (driver.Value, error) {
 	return json.Marshal(j)
 }
 
-// Scan implements sql.Scanner for JSON
+// Scan implements sql.Scanner for JSON. Malformed input is tolerated: the
+// value becomes a bounded marker so a single poisoned row cannot abort a
+// multi-row query. The failure is logged by key/type only, never by raw value.
 func (j *JSON) Scan(value interface{}) error {
 	if value == nil {
 		*j = nil
 		return nil
 	}
-	bytes, ok := value.([]byte)
+	raw, ok := scanBytes(value)
 	if !ok {
-		return fmt.Errorf("failed to unmarshal JSON value: %v", value)
+		*j = nil
+		slog.Warn("JSON scan: unsupported value type", "type", fmt.Sprintf("%T", value))
+		return nil
 	}
-	return json.Unmarshal(bytes, j)
+	if err := json.Unmarshal(raw, j); err != nil {
+		*j = JSON{MalformedMarkerKey: trimRawValue(raw)}
+		slog.Warn("JSON scan: malformed JSON value", "error", err)
+		return nil
+	}
+	return nil
 }
 
 // StringArray is a custom type for storing string arrays in the database
@@ -42,17 +62,48 @@ func (s StringArray) Value() (driver.Value, error) {
 	return json.Marshal(s)
 }
 
-// Scan implements sql.Scanner for StringArray
+// Scan implements sql.Scanner for StringArray. Like JSON.Scan, malformed input
+// is tolerated and logged without embedding the raw value.
 func (s *StringArray) Scan(value interface{}) error {
 	if value == nil {
 		*s = nil
 		return nil
 	}
-	bytes, ok := value.([]byte)
+	raw, ok := scanBytes(value)
 	if !ok {
-		return fmt.Errorf("failed to unmarshal StringArray value: %v", value)
+		raw = nil
+		slog.Warn("StringArray scan: unsupported value type", "type", fmt.Sprintf("%T", value))
+		return nil
 	}
-	return json.Unmarshal(bytes, s)
+	if err := json.Unmarshal(raw, s); err != nil {
+		*s = nil
+		slog.Warn("StringArray scan: malformed JSON value", "error", err)
+		return nil
+	}
+	return nil
+}
+
+// scanBytes normalises a driver value to bytes; drivers hand back either
+// []byte or a string.
+func scanBytes(value interface{}) ([]byte, bool) {
+	switch v := value.(type) {
+	case []byte:
+		return v, true
+	case string:
+		return []byte(v), true
+	default:
+		return nil, false
+	}
+}
+
+// trimRawValue bounds a raw value to malformedMarkerLimit runes, appending an
+// ellipsis when truncated.
+func trimRawValue(raw []byte) string {
+	runes := []rune(string(raw))
+	if len(runes) <= malformedMarkerLimit {
+		return string(runes)
+	}
+	return string(runes[:malformedMarkerLimit]) + "…"
 }
 
 // EdictKey is the composite primary key for an edict (id, username, project).

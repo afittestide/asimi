@@ -157,7 +157,7 @@ func truncateTail(s string, maxChars int) string {
 
 // Format renders the query result for display in the TUI.
 func (t TianLedgerTool) Format(input, result string, err error) string {
-	msg := utils.NewMsgBlockBuilder("TianEvents")
+	msg := utils.NewMsgBlockBuilder("Heaven Ledger")
 	msg.WriteLn()
 	if err != nil {
 		msg.Writef("Error: %v", err)

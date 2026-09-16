@@ -630,6 +630,70 @@ func TestTianLedgerTool_SinceID(t *testing.T) {
 	}
 }
 
+func TestTianLedgerTool_MalformedPayloadDoesNotFailQuery(t *testing.T) {
+	db := setupTianEventsTestDB(t)
+	ctx := context.Background()
+
+	// A row written out-of-band with a literal newline inside a JSON string —
+	// the e836 poison that previously aborted the entire Find.
+	poison := "{\"answer\": \"line one\nline two\"}"
+	if err := db.Exec(
+		`INSERT INTO tian_events (edict_id, username, project, event_type, payload, created_at)
+		 VALUES (5, 'testuser', 'testproject', 'zhengming_answered', ?, datetime('now'))`,
+		poison,
+	).Error; err != nil {
+		t.Fatalf("failed to insert poisoned event: %v", err)
+	}
+
+	seedTianEvent(t, db, 5, "ritual_started", storage.JSON{"ritual": "swift-strike"})
+	seedTianEvent(t, db, 5, "edict_created", storage.JSON{"intent": "fix it"})
+
+	tool := TianLedgerTool{Ctx: ToolContext{
+		DB:       db,
+		Username: "testuser",
+		Project:  "testproject",
+	}}
+
+	result, err := tool.Call(ctx, `{"edict_id": 5}`)
+	if err != nil {
+		t.Fatalf("malformed payload failed the whole query: %v", err)
+	}
+	var events []tianEventSummary
+	if err := json.Unmarshal([]byte(result), &events); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 3 (valid rows must survive)", len(events))
+	}
+	foundPoison := false
+	for _, ev := range events {
+		if ev.EventType == "zhengming_answered" {
+			foundPoison = true
+		}
+		if ev.EventType == "ritual_started" && ev.Detail != "swift-strike" {
+			t.Errorf("valid event detail = %q, want %q", ev.Detail, "swift-strike")
+		}
+	}
+	if !foundPoison {
+		t.Errorf("malformed row was dropped, want it returned with a marker payload")
+	}
+
+	// The poisoned row's payload must surface as the bounded marker rather
+	// than being silently dropped by the tolerant scan.
+	for _, ev := range events {
+		if ev.EventType != "zhengming_answered" {
+			continue
+		}
+		if ev.Payload == nil {
+			t.Fatalf("malformed row payload is nil, want %q marker", storage.MalformedMarkerKey)
+		}
+		marker, ok := ev.Payload[storage.MalformedMarkerKey].(string)
+		if !ok || marker == "" {
+			t.Fatalf("malformed row payload = %#v, want %q marker", ev.Payload, storage.MalformedMarkerKey)
+		}
+	}
+}
+
 func TestTianLedgerTool_NilDB(t *testing.T) {
 	tool := TianLedgerTool{Ctx: ToolContext{
 		Username: "testuser",
