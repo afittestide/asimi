@@ -4767,6 +4767,53 @@ func TestHandleAnsweringComplete_ChatAnswerDeliveredToCourt(t *testing.T) {
 	assert.Equal(t, tools.AnswerChat, resp.answer)
 }
 
+// TestAnsweringChatMsg_ArmsCaptureThenSubmitsAsAnswer verifies that selecting
+// "Chat" arms chat-capture and the next submitted prompt is delivered as the
+// zhengming answer.
+func TestAnsweringChatMsg_ArmsCaptureThenSubmitsAsAnswer(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+
+	newModel, _ := model.handleCustomMessages(AnsweringChatMsg{RequestID: "req-capture-1"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	require.Equal(t, "req-capture-1", updated.pendingZhengmingChatRequestID,
+		"selecting Chat should arm chat-capture")
+	assert.Empty(t, mock.zhengmingResponses, "No response should be sent until text is submitted")
+
+	// Next submitted prompt becomes the answer.
+	newModel, _ = updated.handleCustomMessages(SubmitPromptMsg{Prompt: "my typed reply"})
+	updated, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Empty(t, updated.pendingZhengmingChatRequestID, "chat-capture should be cleared after submit")
+	require.Len(t, mock.zhengmingResponses, 1, "typed text should be delivered as the zhengming answer")
+	resp := mock.zhengmingResponses[0]
+	assert.Equal(t, "req-capture-1", resp.requestID)
+	assert.Equal(t, "my typed reply", resp.answer)
+}
+
+// TestAnsweringChatMsg_EdictMenu_DispatchesChatAction verifies that selecting
+// "Chat" in the edict action menu opens the edict's session rather than arming
+// a zhengming reply capture.
+func TestAnsweringChatMsg_EdictMenu_DispatchesChatAction(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+
+	showEdictActionMenu(model, 42)
+
+	newModel, cmd := model.handleCustomMessages(AnsweringChatMsg{RequestID: "edict-42"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Nil(t, updated.prompt().answering, "should exit answering mode")
+	assert.Empty(t, updated.pendingZhengmingChatRequestID,
+		"edict menu Chat must NOT arm zhengming chat-capture")
+	assert.Empty(t, mock.zhengmingResponses,
+		"edict menu Chat must NOT deliver a zhengming response")
+	assert.NotNil(t, cmd, "should dispatch the edict Chat action")
+}
+
 func TestEventSealGranted_RulerShowsToast(t *testing.T) {
 	mock := &mockCourtClient{}
 	model := newTestModel(t)

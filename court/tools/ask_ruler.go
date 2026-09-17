@@ -22,7 +22,7 @@ import (
 const (
 	AnswerApproveEdict      = "Approve edict"
 	AnswerReject            = "Reject"
-	AnswerChat              = "Chat" // User dismissed prompt (Chat button or Esc)
+	AnswerChat              = "Chat" // Dismissal sentinel (Esc / explicit cancel)
 	AnswerApproveAndProceed = "Approve and proceed"
 	AnswerLetMeClarify      = "Let me clarify"
 )

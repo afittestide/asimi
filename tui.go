@@ -102,6 +102,10 @@ type TUIModel struct {
 	pendingOnboarding bool
 	// Handsoff mode: auto-answer zhengming and YESNO prompts
 	handsoff bool
+	// pendingZhengmingChatRequestID is armed when the Ruler selects "Chat" in
+	// a zhengming prompt. The next submitted prompt is delivered as the
+	// zhengming answer to this request instead of starting a new turn.
+	pendingZhengmingChatRequestID string
 	// Pending API key input: set when user selects a login_required non-OpenAI provider
 	pendingAPIKeyProvider string
 	// Pending model name entry: set when user selects a manual_entry model
@@ -2059,6 +2063,16 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		content := msg.Prompt
 
+		// Chat-capture armed: the Ruler selected "Chat" in a zhengming prompt,
+		if m.pendingZhengmingChatRequestID != "" {
+			requestID := m.pendingZhengmingChatRequestID
+			m.pendingZhengmingChatRequestID = ""
+			m.tabs.Content().Chat.AddUserMessage(content)
+			m.tabs.Content().Chat.AddToRawHistory("USER", content)
+			m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{content}})
+			return m, nil
+		}
+
 		// Guard: block session start if not fully configured — show YES/NO
 		// prompt (same as startup onboarding) instead of a toast
 		obState := onboardingState(m.config)
@@ -2609,6 +2623,18 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, reloadEdictsListCmd(&m)
 		}
 		go m.handleAnsweringComplete(AnsweredMsg{RequestID: msg.RequestID, Answers: []string{tools.AnswerChat}})
+		return m, nil
+
+	case AnsweringChatMsg:
+		m.prompt().ExitAnsweringMode()
+		// Edict action menu "Chat" — open the edict's session, not a
+		// zhengming reply capture.
+		if edictID, ok := parseEdictActionRequestID(msg.RequestID); ok {
+			return m, dispatchEdictAction(&m, edictID, []string{"Chat"})
+		}
+		// Arm chat-capture: the next submitted prompt is delivered as the
+		// zhengming answer for this request.
+		m.pendingZhengmingChatRequestID = msg.RequestID
 		return m, nil
 
 	case AnsweringEditMsg:

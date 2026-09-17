@@ -7,7 +7,6 @@ import (
 	"unicode"
 
 	"github.com/afittestide/asimi/court"
-	"github.com/afittestide/asimi/court/tools"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -61,6 +60,13 @@ type AnsweredMsg struct {
 
 // AnsweringCancelMsg is emitted when the user cancels answering
 type AnsweringCancelMsg struct {
+	RequestID string
+}
+
+// AnsweringChatMsg is emitted when the user selects "Chat" in answering mode.
+// It returns control to the chat input; the next submitted message is then
+// delivered as the zhengming answer rather than opening a new turn.
+type AnsweringChatMsg struct {
 	RequestID string
 }
 
@@ -921,10 +927,9 @@ func (p PromptComponent) updateAnswering(keyMsg tea.KeyMsg) (PromptComponent, te
 				return AnsweringEditMsg{RequestID: requestID, Question: questionText}
 			}
 		} else if q.Options[q.Selected] == "Chat" {
-			// "Chat" selected — reject zhengming and return to chat
 			requestID := a.RequestID
 			return p, func() tea.Msg {
-				return AnsweredMsg{RequestID: requestID, Answers: []string{tools.AnswerChat}}
+				return AnsweringChatMsg{RequestID: requestID}
 			}
 		}
 		return p.advanceAnswer(q.Options[q.Selected])

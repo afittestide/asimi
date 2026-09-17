@@ -434,7 +434,8 @@ func TestHandleZhengmingPendingAppendsEditChat(t *testing.T) {
 	}
 }
 
-// TestAnsweringModeChatOption verifies that selecting "Chat" emits AnsweredMsg with AnswerChat.
+// TestAnsweringModeChatOption verifies that selecting "Chat" arms chat-capture
+// instead of immediately answering with the AnswerChat sentinel.
 func TestAnsweringModeChatOption(t *testing.T) {
 	prompt := NewPromptComponent(80, 10)
 
@@ -464,18 +465,15 @@ func TestAnsweringModeChatOption(t *testing.T) {
 	_, cmd := prompt.Update(enterMsg)
 
 	if cmd == nil {
-		t.Fatal("Expected cmd to emit AnsweredMsg")
+		t.Fatal("Expected cmd to emit AnsweringChatMsg")
 	}
 	msg := cmd()
-	answered, ok := msg.(AnsweredMsg)
+	chatMsg, ok := msg.(AnsweringChatMsg)
 	if !ok {
-		t.Fatalf("Expected AnsweredMsg, got %T", msg)
+		t.Fatalf("Expected AnsweringChatMsg, got %T", msg)
 	}
-	if answered.RequestID != "test-chat-1" {
-		t.Errorf("Expected RequestID 'test-chat-1', got %q", answered.RequestID)
-	}
-	if len(answered.Answers) != 1 || answered.Answers[0] != tools.AnswerChat {
-		t.Errorf("Expected Answers [%q], got %v", tools.AnswerChat, answered.Answers)
+	if chatMsg.RequestID != "test-chat-1" {
+		t.Errorf("Expected RequestID 'test-chat-1', got %q", chatMsg.RequestID)
 	}
 }
 
