@@ -19,6 +19,11 @@ set -euo pipefail
 GITHUB_REPO="afittestide/asimi"
 BINARY_NAME="asimi"
 
+# Temp dir for the download/extract step. Declared at script scope (not local to
+# main) so the EXIT trap below can still resolve it under `set -u` after main
+# returns.
+tmp_dir=""
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -237,9 +242,8 @@ main() {
     local checksums_url="${base_url}/checksums.txt"
     
     # Create temporary directory
-    local tmp_dir
     tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' EXIT
+    trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "$tmp_dir"' EXIT
     
     # Download files
     local archive_path="${tmp_dir}/${archive_name}"
@@ -254,6 +258,12 @@ main() {
     # Extract archive
     info "Extracting archive..."
     tar -xzf "$archive_path" -C "$tmp_dir"
+
+    # goreleaser wraps payload in a directory named after the archive
+    local extract_dir="${tmp_dir}/${archive_name%.tar.gz}"
+    if [[ ! -d "$extract_dir" ]]; then
+        extract_dir="$tmp_dir"
+    fi
     
     # Get installation directory
     local install_dir
@@ -270,11 +280,11 @@ main() {
     info "Installing to: $binary_path"
     
     if [[ -w "$install_dir" ]]; then
-        cp "${tmp_dir}/${BINARY_NAME}" "$binary_path"
+        cp "${extract_dir}/${BINARY_NAME}" "$binary_path"
         chmod +x "$binary_path"
     else
         info "Requesting sudo access to install to $install_dir"
-        sudo cp "${tmp_dir}/${BINARY_NAME}" "$binary_path"
+        sudo cp "${extract_dir}/${BINARY_NAME}" "$binary_path"
         sudo chmod +x "$binary_path"
     fi
     

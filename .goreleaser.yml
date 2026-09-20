@@ -27,6 +27,7 @@ builds:
 archives:
   - id: asimi
     name_template: 'asimi_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    wrap_in_directory: true
     formats:
       - tar.gz
     format_overrides:
