@@ -15,17 +15,11 @@
       act: |
         {{- if .error }}
         Your previous work failed. Here is the error output:
-
         {{ .error }}
-
         Fix the issues and re-implement the edict correctly.
         {{- end }}
-
         Implement the changes for the edict:
-
         {{ .edict }}
-
-        Focus on minimal, targeted changes to fulfill the intent.
       on_failure: retry
     - name: judging
       minister: judge
@@ -34,7 +28,6 @@
       act: |
         If any tests were changed, you need to verify that were not weakened
         and that non trivial changes are justified by the edict.
-
         If tests fail, provide clear feedback for the Forge on what needs to be fixed.
         If changes are not covered by test, add the missing tests and write them so they ensure the changed code will always work.
         When judgement is done, call record_verdict
@@ -51,10 +44,8 @@
         Record your insights using record_precedent.
         Produce a comprehensive code review report 
         Highlight any blocking issues and suggest improvements.
-
         ## Edict
         {{ .edict }}
-
       then:
         - the precedent is approved
         - record the chancellor's seal
