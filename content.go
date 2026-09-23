@@ -524,6 +524,20 @@ func (tm *TabManager) SwitchToTarget(target string) bool {
 	return false
 }
 
+// SwitchToZhengmingTarget routes a zhengming prompt to the tab that owns its
+// context. Ritual work routes by channel ("e<N>") when present; otherwise it
+// falls back to the minister's own tab. Returns the target that was switched
+// to, or "" when no matching tab exists (the active tab stays put).
+func (tm *TabManager) SwitchToZhengmingTarget(channelID, ministerID string) string {
+	if channelID != "" && tm.SwitchToTarget(channelID) {
+		return channelID
+	}
+	if ministerID != "" && tm.SwitchToTarget(ministerID) {
+		return ministerID
+	}
+	return ""
+}
+
 // TabCount returns the number of tabs
 func (tm *TabManager) TabCount() int {
 	return len(tm.tabs)

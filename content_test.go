@@ -407,3 +407,59 @@ func TestSwitchToTarget_FirstMatch(t *testing.T) {
 	assert.True(t, switched, "SwitchToTarget should find first matching tab")
 	assert.Equal(t, "dup", tm.ActiveTab().Target)
 }
+
+func TestSwitchToZhengmingTarget(t *testing.T) {
+	tests := []struct {
+		name      string
+		channelID string
+		minister  string
+		want      string
+	}{
+		{
+			name:      "prefers channel over minister",
+			channelID: "e42",
+			minister:  "judge",
+			want:      "e42",
+		},
+		{
+			name:      "falls back to minister when channel has no tab",
+			channelID: "e404",
+			minister:  "judge",
+			want:      "judge",
+		},
+		{
+			name:      "falls back to minister when channel empty",
+			channelID: "",
+			minister:  "judge",
+			want:      "judge",
+		},
+		{
+			name:      "active tab when nothing matches",
+			channelID: "e404",
+			minister:  "unknown",
+			want:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tm := newTestTabManager()
+			tm.DismissWelcome()
+
+			tm.Add("Ritual:e42", "ritual", "e42")
+			tm.Add("Judge", "judge", "judge")
+			activeBefore := tm.ActiveTab().Target
+
+			got := tm.SwitchToZhengmingTarget(tt.channelID, tt.minister)
+			assert.Equal(t, tt.want, got, "SwitchToZhengmingTarget returned unexpected target")
+
+			if tt.want == "" {
+				assert.Equal(t, activeBefore, tm.ActiveTab().Target,
+					"active tab should stay put when no target matches")
+			} else {
+				assert.Equal(t, tt.want, tm.ActiveTab().Target,
+					"active tab should be switched to the returned target")
+			}
+		})
+	}
+}
