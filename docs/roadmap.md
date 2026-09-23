@@ -1,5 +1,15 @@
 # Roadmap
 
+### v0.14.0
+
+### Full Parallelism
+- Git worktrees for concurrent rituals (issues/153)
+- Ling execution engine
+
+## V1.0
+
+### neovim base TUI
+
 The Go Bubbletea terminal UI is retired. Neovim is the first-class frontend via
 the in-repo `nvim/` plugin (`asimi.nvim`), which talks to the daemon over
 msgpack-RPC. It is distributed two ways: `lazy-asimi` (a drop-in lazy.nvim
@@ -8,8 +18,6 @@ plugin for a user's own nvim.
 
 Legacy TUI UI features (vim clone, sticky messages, step folding, thinking
 scroll, replace view, mode sharpening) are re-cast as nvim-plugin features.
-
-## V1.0
 
 ### MCP Support (e661 — leading)
 
@@ -41,9 +49,8 @@ Ref: https://github.com/afittestide/asimi/issues/158
 
 ## V1.1
 
-### Full Parallelism
-- Git worktrees for concurrent rituals (issues/153)
-- Seal edict command with review/approval UI
+### integrate diffView plugin
+- Seal edict command to have review/comment/approval UI
 
 ## V1.2
 
@@ -60,14 +67,4 @@ analytics). The Court is a process engine (seal chain, ritual DAGs, permissions)
 reading the spec at startup and pulling realm data as ritual context. A second
 mandate server — for digital marketers — proves the abstraction.
 
-### Self-harmonizing model
 
-V2.0 closes the loop: the Court turns its own history into a better mind. The
-Ministry of Personnel (吏部) post-mortems sessions and, alongside revised skills,
-outputs **fine-tuning corpora** (curated trajectories and lessons). These are
-used to fine-tune an **open-weight model**, letting Asimi break from an
-off-the-shelf foundation toward a model that already knows the Court's 三界
-conventions. ATIF trajectory capture (shipped) supplies the raw material; the
-mandate-fed Heaven data (CI, issues, TODOs) supplies the evaluation signal. The
-result feeds back into every living session — a Court that cultivates its own
-instrument.
