@@ -13,6 +13,30 @@ install:
 build:
     go build -tags containers_image_openpgp -o asimi .
 
+
+# Recipe: build the latest asimi for linux, then hand it to Harbor
+# (cross-compiles a static linux/amd64 binary, then runs a hello-world trial)
+hello-harbor *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CGO_ENABLED=0 GOOS=linux go build -tags containers_image_openpgp -o asimi_linux .
+    BIN="$(pwd)/asimi_linux"
+    echo "==> linux binary: ${BIN}"
+    file "${BIN}"
+    echo "==> running harbor hello-world trial against ${BIN}"
+    cd "${HARBOR_DIR:-../harbor}"
+    echo "==> harbor: $(uv run which harbor) ($(uv run harbor --version))"
+    uv run harbor run \
+        -p examples/tasks/hello-world \
+        -a asimi \
+        -o $(pwd)/jobs \
+        --model "openai/deepseek-v4.1-flash" \
+        --ak "local_binary=${BIN}" \
+        --ak "OPENAI_API_KEY=${OPENAI_API_KEY}" \
+        --ak "OPENAI_BASE_URL=${OPENAI_BASE_URL}" \
+        {{args}} 2>&1
+    echo "<== results written to ../harbor/jobs"
+
 # Run with debug logging
 run:
     pkill -9 asimi || true

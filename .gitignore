@@ -1,5 +1,6 @@
 # Binary
 asimi
+asimi_linux_amd64
 ./agent
 .gocache/
 # Test output
@@ -13,3 +14,6 @@ notes/
 tmp/
 dist/
 .envrc
+
+# Harbor job artifacts (may contain secrets)
+jobs/
