@@ -2596,11 +2596,11 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case court.ZhengmingPendingMsg:
-		// A zhengming halts the court — route to the minister's own tab
-		// so the Ruler sees the context, then auto-scroll the chat.
-		// Falls back to the active tab if no tab exists for the minister.
-		if m.tabs.SwitchToTarget(msg.MinisterID) {
-			if chat := m.tabs.ChatByTab(msg.MinisterID); chat != nil {
+		// A zhengming halts the court — route to the tab the question
+		// belongs to. Ritual work routes by channel ("e<N>") first, then
+		// falls back to the minister's own tab, else the active tab stays.
+		if target := m.tabs.SwitchToZhengmingTarget(msg.ChannelID, msg.MinisterID); target != "" {
+			if chat := m.tabs.ChatByTab(target); chat != nil {
 				chat.ScrollToBottom()
 			}
 		}

@@ -166,6 +166,7 @@ type ZhengmingPendingMsg struct {
 	RequestID  string                     `msgpack:"request_id"`
 	EdictKey   storage.EdictKey           `msgpack:"edict_key"`
 	MinisterID string                     `msgpack:"minister_id"`
+	ChannelID  string                     `msgpack:"channel_id,omitempty"`
 	Questions  storage.ZhengmingQuestions `msgpack:"questions"`
 	Priority   storage.ZhengmingPriority  `msgpack:"priority,omitempty"`
 }

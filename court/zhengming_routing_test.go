@@ -183,3 +183,60 @@ func TestZhengmingRouting_DBRecord(t *testing.T) {
 	assert.Equal(t, "chancellor", zhengming.MinisterID,
 		"storage.Zhengming.MinisterID should be 'chancellor', not 'secretary'")
 }
+
+// TestZhengmingRouting_ChannelIDFromContext verifies that when ask_ruler is
+// invoked with a channel-carrying context (as ritual execution threads via
+// tools.ChannelIDKey), the emitted ZhengmingPendingMsg carries that channel so
+// the TUI routes the prompt to the ritual tab instead of the active tab.
+func TestZhengmingRouting_ChannelIDFromContext(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	var mu sync.Mutex
+	var pendingMsgs []ZhengmingPendingMsg
+	s.SetNotify(func(msg any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if m, ok := msg.(ZhengmingPendingMsg); ok {
+			pendingMsgs = append(pendingMsgs, m)
+		}
+	})
+
+	registry := tools.NewToolRegistry()
+	tools.RegisterBuiltinTools(registry, tools.ToolRegistrationOpts{
+		Ctx: tools.ToolContext{
+			RepoInfo: &repo.RepoInfo{ProjectRoot: "/tmp"},
+			Username: "testuser",
+			Project:  "testproject",
+			DB:       db,
+		},
+		ZhengmingRequester: s,
+		WaitForZhengming:   nil,
+	})
+
+	judgeExtras := registry.ExtraTools("judge", commonTools)
+	var zhengmingTool tools.Tool
+	for _, tool := range judgeExtras {
+		if tool.Name() == "ask_ruler" {
+			zhengmingTool = tool
+			break
+		}
+	}
+	require.NotNil(t, zhengmingTool, "judge should have ask_ruler tool")
+
+	ctx := context.WithValue(context.Background(), tools.ChannelIDKey{}, "e42")
+	input := `{"edict_id": 42, "questions": [{"text": "Proceed?", "options": ["Yes", "No"]}]}`
+	_, err := zhengmingTool.Call(ctx, input)
+	require.NoError(t, err, "ask_ruler Call should not error")
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.Len(t, pendingMsgs, 1, "should have received one ZhengmingPendingMsg")
+	assert.Equal(t, "e42", pendingMsgs[0].ChannelID,
+		"ZhengmingPendingMsg.ChannelID should be resolved from tools.ChannelIDKey{} in ctx")
+	assert.Equal(t, "judge", pendingMsgs[0].MinisterID,
+		"ZhengmingPendingMsg.MinisterID should still carry the calling minister")
+}

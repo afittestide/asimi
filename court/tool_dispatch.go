@@ -95,6 +95,7 @@ func (s *Court) RequestZhengming(ctx context.Context, key storage.EdictKey, ques
 			RequestID:  requestID,
 			EdictKey:   key,
 			MinisterID: callerMinisterID,
+			ChannelID:  tools.ChannelIDFromContext(ctx),
 			Questions:  questions,
 			Priority:   priority,
 		})

@@ -31,6 +31,11 @@ func setupEventTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
+	// Close before t.TempDir's RemoveAll cleanup runs (t.Cleanup is LIFO, and
+	// TempDir registered its cleanup first). Background ritual goroutines keep
+	// writing to the DB after the test returns; leaving the handle open lets
+	// SQLite recreate journal files mid-removal, failing with ENOTEMPTY.
+	t.Cleanup(func() { sqlDB.Close() })
 
 	db, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),

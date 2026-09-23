@@ -55,7 +55,7 @@ func TestNotificationPipeline(t *testing.T) {
 		court.MinisterInvokingMsg{ChannelID: "ruling", MinisterID: "forge", EdictKey: storage.EdictKey{ID: 9}, Task: "write code"},
 		court.MinisterCompletedMsg{ChannelID: "ruling", MinisterID: "forge", EdictKey: storage.EdictKey{ID: 9}, Output: "done", Sealed: true},
 		court.EventNotificationMsg{ChannelID: "ruling", EventType: storage.EventSealGranted, EdictKey: storage.EdictKey{ID: 9}, Message: "sealed"},
-		court.ZhengmingPendingMsg{RequestID: "z-1", MinisterID: "chancellor", EdictKey: storage.EdictKey{ID: 9}},
+		court.ZhengmingPendingMsg{RequestID: "z-1", MinisterID: "chancellor", ChannelID: "e42", EdictKey: storage.EdictKey{ID: 9}},
 		court.ZhengmingAnsweredMsg{RequestID: "z-1", Answer: "yes"},
 		court.RitualStepMsg{ChannelID: "ruling", RitualName: "swift-strike", StepIndex: 1, TotalSteps: 3, Status: "ok"},
 		runners.ContainerLaunchedMsg{Message: "up", ContainerID: "abc123"},
@@ -171,7 +171,7 @@ func comparableEqual(a, b any) bool {
 		return ok && at.ChannelID == bt.ChannelID && at.EventType == bt.EventType && at.EdictKey == bt.EdictKey && at.Message == bt.Message
 	case court.ZhengmingPendingMsg:
 		bt, ok := b.(court.ZhengmingPendingMsg)
-		return ok && at.RequestID == bt.RequestID && at.MinisterID == bt.MinisterID && at.EdictKey == bt.EdictKey
+		return ok && at.RequestID == bt.RequestID && at.MinisterID == bt.MinisterID && at.ChannelID == bt.ChannelID && at.EdictKey == bt.EdictKey
 	case court.ZhengmingAnsweredMsg:
 		bt, ok := b.(court.ZhengmingAnsweredMsg)
 		return ok && at == bt
