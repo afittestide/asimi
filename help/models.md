@@ -70,6 +70,11 @@ Custom host:
   ANTHROPIC_BASE_URL    - Custom Anthropic endpoint
   OLLAMA_HOST           - Ollama server URL
 
+Base URLs are the **host root** and must NOT include `/v1` — asimi passes the
+URL to the provider SDK, which appends `/v1/chat/completions` itself. A `/v1`
+suffix would be doubled and return a misleading `404 Not Found`. A trailing
+slash and a missing `https://` scheme are normalized automatically.
+
 ### OAuth Tokens (Advanced)
   ANTHROPIC_OAUTH_TOKEN - Override stored OAuth token
   # Note: ANTHROPIC_CLIENT_ID, ANTHROPIC_CLIENT_SECRET, etc. are not yet implemented

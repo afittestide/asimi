@@ -303,12 +303,34 @@ func (a *Account) vertexKeys() []schemas.Key {
 	return []schemas.Key{key}
 }
 
-// getBaseURLFromEnv returns the base URL from the provider's convention-based
-// environment variable: strings.ToUpper(provider) + "_BASE_URL".
+// normalizeBaseURL reduces a configured base URL to the host root the
+// bifrost SDK expects: no trailing slash and no trailing "/v1", and an
+// https:// scheme prepended when one is missing. Bifrost appends the API
+// path itself (e.g. "/v1/chat/completions"), so a base_url carrying /v1
+// would double the segment and 404 with a misleading "Not Found".
+func normalizeBaseURL(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return ""
+	}
+	u = strings.TrimRight(u, "/")
+	// Trim a trailing "/v1" (case-insensitive), tolerating the slash we
+	// just removed above as well as one still attached.
+	if len(u) >= 3 && strings.EqualFold(u[len(u)-3:], "/v1") {
+		u = strings.TrimRight(u[:len(u)-3], "/")
+	}
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	return u
+}
+
+// getBaseURLFromEnv returns the normalized base URL from the provider's
+// convention-based environment variable: strings.ToUpper(provider) + "_BASE_URL".
 // Special cases: azure uses AZURE_OPENAI_BASE_URL, gemini uses GEMINI_BASE_URL.
 func getBaseURLFromEnv(provider string) string {
 	envVar := strings.ToUpper(provider) + "_BASE_URL"
-	return os.Getenv(envVar)
+	return normalizeBaseURL(os.Getenv(envVar))
 }
 
 // GetConfigForProvider returns network configuration for a provider
@@ -324,12 +346,17 @@ func (a *Account) GetConfigForProvider(provider schemas.ModelProvider) (*schemas
 		networkConfig.MaxRetries = a.maxRetries
 	}
 	if a.baseURL != "" {
-		networkConfig.BaseURL = a.baseURL
+		networkConfig.BaseURL = normalizeBaseURL(a.baseURL)
 	} else if baseURL := getBaseURLFromEnv(string(provider)); baseURL != "" {
 		networkConfig.BaseURL = baseURL
 		slog.Debug("base URL from env", "provider", provider, "base_url", networkConfig.BaseURL)
 	} else {
 		slog.Debug("base URL using provider default", "provider", provider)
+	}
+	if networkConfig.BaseURL != "" {
+		// Log the effective URL bifrost will actually request so a future
+		// 404 self-diagnoses: bifrost appends "/v1/chat/completions".
+		slog.Debug("effective base URL", "provider", provider, "base_url", networkConfig.BaseURL, "chat_endpoint", networkConfig.BaseURL+"/v1/chat/completions")
 	}
 
 	// Identify asimi to every provider. Bifrost's SetExtraHeaders only sets

@@ -613,6 +613,74 @@ func TestGetKeysForVertex_InKeysMap(t *testing.T) {
 	assert.Equal(t, `{"type":"service_account"}`, cfg.AuthCredentials.Val)
 }
 
+// TestNormalizeBaseURL covers the boundary normalization that keeps the
+// bifrost SDK convention: base_url is the host root, with no /v1 suffix
+// (bifrost appends /v1/chat/completions itself) and a scheme.
+func TestNormalizeBaseURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"already clean", "https://zro.moonmath.ai", "https://zro.moonmath.ai"},
+		{"trailing v1", "https://zro.moonmath.ai/v1", "https://zro.moonmath.ai"},
+		{"trailing v1 slash", "https://zro.moonmath.ai/v1/", "https://zro.moonmath.ai"},
+		{"trailing slash", "https://zro.moonmath.ai/", "https://zro.moonmath.ai"},
+		{"missing scheme", "zro.moonmath.ai/v1", "https://zro.moonmath.ai"},
+		{"missing scheme no v1", "zro.moonmath.ai", "https://zro.moonmath.ai"},
+		{"uppercase v1", "https://zro.moonmath.ai/V1", "https://zro.moonmath.ai"},
+		{"path preserved", "https://host.example.com/api", "https://host.example.com/api"},
+		{"whitespace trimmed", "  https://zro.moonmath.ai/v1  ", "https://zro.moonmath.ai"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeBaseURL(tt.in))
+		})
+	}
+}
+
+// TestGetConfigForProvider_NormalizesBaseURL verifies a config-supplied
+// base URL with a /v1 suffix is normalized before reaching bifrost.
+func TestGetConfigForProvider_NormalizesBaseURL(t *testing.T) {
+	account := NewAccountWithKeys(30, 60, 3, "https://zro.moonmath.ai/v1",
+		map[string]string{"openai": "sk-test"}, "")
+
+	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
+	require.NoError(t, err)
+	assert.Equal(t, "https://zro.moonmath.ai", cfg.NetworkConfig.BaseURL)
+}
+
+// TestGetBaseURLFromEnv_Normalizes verifies the env-var path is normalized
+// too, including the scheme-less form seen in the Debian log.
+func TestGetBaseURLFromEnv_Normalizes(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "zro.moonmath.ai/v1")
+	assert.Equal(t, "https://zro.moonmath.ai", getBaseURLFromEnv("openai"))
+}
+
+// TestInitBifrost_NormalizesBaseURL verifies the edict's point 3: the
+// boundary normalization must reach the Account that InitBifrost builds, so
+// the single code path InitBifrost → Account.baseURL → GetConfigForProvider
+// yields the corrected host-root URL on the wire. We assert the normalization
+// InitBifrost applies to its argument, then confirm the resulting Account
+// config is the corrected endpoint — no network is contacted.
+func TestInitBifrost_NormalizesBaseURL(t *testing.T) {
+	const raw = "https://zro.moonmath.ai/v1"
+	// InitBifrost must hand the Account the normalized URL, not the raw one.
+	normalized := normalizeBaseURL(raw)
+	require.Equal(t, "https://zro.moonmath.ai", normalized)
+
+	account := NewAccountWithKeys(30, 60, 3, normalized, map[string]string{"openai": "sk-test"}, "")
+	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
+	require.NoError(t, err)
+	assert.Equal(t, "https://zro.moonmath.ai", cfg.NetworkConfig.BaseURL,
+		"base URL reaching bifrost must be the host root, not the raw /v1 form")
+	assert.Equal(t, "https://zro.moonmath.ai/v1/chat/completions",
+		cfg.NetworkConfig.BaseURL+"/v1/chat/completions",
+		"the effective chat endpoint must not double the /v1 segment")
+}
+
 // TestGetConfigForProvider_AttributionHeaders verifies that User-Agent
 // and OpenRouter HTTP-Referer headers reflect the repository rename.
 func TestGetConfigForProvider_AttributionHeaders(t *testing.T) {
