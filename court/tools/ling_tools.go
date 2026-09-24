@@ -14,19 +14,21 @@ import (
 
 // InsertLingTool creates a new ling (task order) for an edict.
 type InsertLingTool struct {
-	Ctx ToolContext
+	Ctx     ToolContext
+	Igniter LingIgniter
 }
 
 func (t InsertLingTool) Name() string { return "insert_ling" }
 
 func (t InsertLingTool) Description() string {
-	return "Creates a new ling (task order) for an edict. The input should be a JSON object with 'edict_id', 'description', and optionally 'dependencies' (array of FULL ling IDs, e.g. '74183c66ba0507ba', that must complete first — never use shorthand aliases like '470-1')."
+	return "Creates a new ling (task order) for an edict. Lings are pending tasks; when a batch of insert_ling calls completes, ready lings run automatically, honouring dependencies. The input should be a JSON object with 'edict_id', 'description', optionally 'minister' (default 'forge'), and optionally 'dependencies' (array of FULL ling IDs, e.g. '74183c66ba0507ba', that must complete first — never use shorthand aliases like '470-1')."
 }
 
 func (t InsertLingTool) Call(ctx context.Context, input string) (string, error) {
 	var params struct {
 		EdictID      uint     `json:"edict_id"`
 		Description  string   `json:"description"`
+		Minister     string   `json:"minister,omitempty"`
 		Dependencies []string `json:"dependencies,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(input), &params); err != nil {
@@ -38,6 +40,9 @@ func (t InsertLingTool) Call(ctx context.Context, input string) (string, error) 
 	if params.Description == "" {
 		return "", fmt.Errorf("description is required")
 	}
+	if params.Minister == "" {
+		params.Minister = "forge"
+	}
 
 	lingID := GenerateID("ling", fmt.Sprintf("%d", params.EdictID), t.Ctx.Username, t.Ctx.Project,
 		params.Description, time.Now().String(), fmt.Sprintf("%d", rand.Int63()))
@@ -48,6 +53,7 @@ func (t InsertLingTool) Call(ctx context.Context, input string) (string, error) 
 		Username:     t.Ctx.Username,
 		Project:      t.Ctx.Project,
 		Description:  params.Description,
+		Minister:     params.Minister,
 		Dependencies: storage.StringArray(params.Dependencies),
 		Status:       storage.LingPending,
 	}
@@ -67,7 +73,16 @@ func (t InsertLingTool) Call(ctx context.Context, input string) (string, error) 
 		}
 	}
 
-	return fmt.Sprintf("Created ling %s for edict %d", lingID, params.EdictID), nil
+	// Observability only — publishing never runs a session.
+	key := storage.EdictKey{ID: params.EdictID, Username: t.Ctx.Username, Project: t.Ctx.Project}
+	if t.Igniter != nil {
+		t.Igniter.PublishLingCreated(key, lingID)
+		// Batch boundary: fire the automatic ignition trigger. It returns
+		// immediately and runs ready lings in the background.
+		t.Igniter.TriggerLingIgnition(key)
+	}
+
+	return fmt.Sprintf("Created ling %s for edict %d (minister %s)", lingID, params.EdictID, params.Minister), nil
 }
 
 func (t InsertLingTool) ParameterSchema() map[string]any {
@@ -81,6 +96,10 @@ func (t InsertLingTool) ParameterSchema() map[string]any {
 			"description": map[string]any{
 				"type":        "string",
 				"description": "Clear, atomic description of the task",
+			},
+			"minister": map[string]any{
+				"type":        "string",
+				"description": "Minister that executes this ling (e.g. 'forge', 'judge'). Defaults to 'forge' when omitted.",
 			},
 			"dependencies": map[string]any{
 				"type":        "array",

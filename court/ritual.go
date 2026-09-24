@@ -1326,88 +1326,19 @@ func (r *RitualRunner) toInterfaceSlice(val interface{}) ([]interface{}, error) 
 	}
 }
 
-// forkWorkUnit wraps a work unit with its extracted ID and dependency IDs.
-type forkWorkUnit struct {
-	Item   interface{}
-	ID     string   // extracted from item["ling_id"], or auto-generated
-	DepIDs []string // extracted from item["dependencies"], or empty
-}
-
-// buildDependencyMap extracts IDs and dependency lists from work units.
-// Items without a "ling_id" field get auto-generated IDs.
-// Items without a "dependencies" field have empty deps → immediately ready.
-func buildDependencyMap(workUnits []interface{}) []forkWorkUnit {
-	units := make([]forkWorkUnit, len(workUnits))
-	for i, item := range workUnits {
-		units[i].Item = item
-
-		m, ok := item.(map[string]interface{})
-		if !ok {
-			units[i].ID = fmt.Sprintf("_fork_%d", i)
-			continue
-		}
-
-		if id, ok := m["ling_id"].(string); ok && id != "" {
-			units[i].ID = id
-		} else {
-			units[i].ID = fmt.Sprintf("_fork_%d", i)
-		}
-
-		if deps, ok := m["dependencies"]; ok {
-			switch d := deps.(type) {
-			case []string:
-				units[i].DepIDs = d
-			case []interface{}:
-				for _, v := range d {
-					if s, ok := v.(string); ok {
-						units[i].DepIDs = append(units[i].DepIDs, s)
-					}
-				}
-			case storage.StringArray:
-				units[i].DepIDs = []string(d)
-			}
-		}
-	}
-	return units
-}
-
-// seedReadyQueue returns the indices of work units whose dependencies are all
-// satisfied. A unit with no dependencies is immediately ready.
-func seedReadyQueue(units []forkWorkUnit, done map[string]bool) []int {
-	var ready []int
-	for i, u := range units {
-		if done[u.ID] {
-			continue // already completed
-		}
-		allSatisfied := true
-		for _, dep := range u.DepIDs {
-			if !done[dep] {
-				allSatisfied = false
-				break
-			}
-		}
-		if allSatisfied {
-			ready = append(ready, i)
-		}
-	}
-	return ready
-}
-
-// executeForkDAG executes work units respecting dependency ordering.
-// Items with no dependencies are immediately ready; items with dependencies
-// wait until all their deps are done (as recorded in the DB via "record the ling completed").
-// Concurrency is controlled by batchSize (semaphore).
+// executeForkDAG executes work units respecting dependency ordering by driving
+// the shared dagEngine. Items with no dependencies are immediately ready;
+// items with dependencies wait until all their deps are done (as recorded in
+// the DB via "record the ling completed"). Concurrency is bounded by batchSize.
 func (r *RitualRunner) executeForkDAG(ctx context.Context, exec *RitualExecution, step RitualStep, workUnits []interface{}, batchSize int) ([]ForkResult, error) {
 	units := buildDependencyMap(workUnits)
 
 	if len(units) == 0 {
-		r.logger.Debug("fork DAG has no work units",
-			"ritual", exec.RitualName,
-			"step", step.Name)
+		r.logger.Debug("fork DAG has no work units", "ritual", exec.RitualName, "step", step.Name)
 		return nil, nil
 	}
 
-	// Build a set of IDs for quick lookup
+	// Build a set of IDs for quick lookup when seeding completed lings from DB.
 	idSet := make(map[string]bool, len(units))
 	for _, u := range units {
 		idSet[u.ID] = true
@@ -1418,190 +1349,50 @@ func (r *RitualRunner) executeForkDAG(ctx context.Context, exec *RitualExecution
 			"dependencies", u.DepIDs)
 	}
 
-	// Track completed items by ID. Seed with lings already done from DB.
-	done := make(map[string]bool)
-	doneBefore := len(done)
-	r.queryDoneLings(exec, idSet, done)
-	r.logger.Debug("fork DAG seeded done lings from DB",
-		"ritual", exec.RitualName,
-		"step", step.Name,
-		"already_done", len(done)-doneBefore,
-		"total_units", len(units))
-
-	// Track which indices have been dispatched
-	dispatched := make(map[int]bool)
-	// Track number of goroutines still running
-	running := 0
-
-	var results []ForkResult
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, batchSize)
-	resultCh := make(chan ForkResult, len(workUnits))
+	results := make([]ForkResult, 0, len(units))
 
-	// Helper: check if all deps for a unit are satisfied
-	depsSatisfied := func(u forkWorkUnit) bool {
-		for _, dep := range u.DepIDs {
-			if !done[dep] {
-				return false
-			}
-		}
-		return true
-	}
-
-	// Helper: find ready items that haven't been dispatched yet
-	getReady := func() []int {
-		var ready []int
-		for i, u := range units {
-			if dispatched[i] || done[u.ID] {
-				continue
-			}
-			if depsSatisfied(u) {
-				ready = append(ready, i)
-			}
-		}
-		return ready
-	}
-
-	// Helper: collect one completion from resultCh
-	collectOne := func() {
-		select {
-		case res := <-resultCh:
+	engine := &dagEngine{
+		units:     units,
+		batchSize: batchSize,
+		name:      "fork",
+		seedDone: func(done map[string]bool) {
+			doneBefore := len(done)
+			r.queryDoneLings(exec, idSet, done)
+			r.logger.Debug("fork DAG seeded done lings from DB",
+				"ritual", exec.RitualName,
+				"step", step.Name,
+				"already_done", len(done)-doneBefore,
+				"total_units", len(units))
+		},
+		refresh: func(done map[string]bool) {
+			r.queryDoneLings(exec, idSet, done)
+		},
+		run: func(ctx context.Context, u dagUnit) error {
+			r.markLingInProgress(exec, u)
+			res := r.executeForkItem(ctx, exec, step, u.Item, u.Index, len(units))
+			res._unitIdx = u.Index
 			mu.Lock()
 			results = append(results, res)
 			mu.Unlock()
-			unitID := ""
-			if res._unitIdx >= 0 && res._unitIdx < len(units) {
-				unitID = units[res._unitIdx].ID
-				done[unitID] = true
-			}
-			running--
 			errStr := ""
 			if res.Error != nil {
 				errStr = res.Error.Error()
 			}
-			r.logger.Debug("fork DAG collected unit result",
+			r.logger.Debug("fork DAG unit finished",
 				"ritual", exec.RitualName,
 				"step", step.Name,
-				"unit_id", unitID,
-				"unit_index", res._unitIdx,
-				"error", errStr,
-				"running", running)
-			// Re-query DB in case "record the ling completed" marked other lings done
-			r.queryDoneLings(exec, idSet, done)
-		case <-ctx.Done():
-		}
+				"unit_id", u.ID,
+				"unit_index", u.Index,
+				"error", errStr)
+			return res.Error
+		},
 	}
 
-	for {
-		// Find and dispatch ready items
-		ready := getReady()
-		for _, idx := range ready {
-			// Acquire semaphore — wait for a slot if at capacity
-			select {
-			case sem <- struct{}{}:
-				// Acquired
-			case res := <-resultCh:
-				// A slot freed — collect the result first
-				mu.Lock()
-				results = append(results, res)
-				mu.Unlock()
-				unitID := ""
-				if res._unitIdx >= 0 && res._unitIdx < len(units) {
-					unitID = units[res._unitIdx].ID
-					done[unitID] = true
-				}
-				running--
-				errStr := ""
-				if res.Error != nil {
-					errStr = res.Error.Error()
-				}
-				r.logger.Debug("fork DAG unit finished before dispatch",
-					"ritual", exec.RitualName,
-					"step", step.Name,
-					"unit_id", unitID,
-					"unit_index", res._unitIdx,
-					"error", errStr,
-					"running", running)
-				r.queryDoneLings(exec, idSet, done)
-				// Now acquire the freed slot
-				select {
-				case sem <- struct{}{}:
-				case <-ctx.Done():
-					wg.Wait()
-					return results, ctx.Err()
-				}
-			case <-ctx.Done():
-				wg.Wait()
-				return results, ctx.Err()
-			}
-
-			dispatched[idx] = true
-			running++
-			unit := units[idx]
-			r.markLingInProgress(exec, unit)
-			r.logger.Debug("fork DAG dispatching unit",
-				"ritual", exec.RitualName,
-				"step", step.Name,
-				"unit_id", unit.ID,
-				"unit_index", idx,
-				"dependencies", unit.DepIDs,
-				"running", running,
-				"batch_size", batchSize)
-
-			wg.Add(1)
-			go func(u forkWorkUnit, idx int) {
-				defer wg.Done()
-				defer func() { <-sem }()
-
-				result := r.executeForkItem(ctx, exec, step, u.Item, idx, len(units))
-				result._unitIdx = idx
-
-				// Re-query DB after completion
-				r.queryDoneLings(exec, idSet, done)
-
-				resultCh <- result
-			}(unit, idx)
-		}
-
-		// No more ready items. If nothing is running, check terminal conditions.
-		if running == 0 {
-			// Check for stuck items (undispatched items with unsatisfied deps)
-			var blocked []string
-			for _, u := range units {
-				if !done[u.ID] {
-					blocked = append(blocked, u.ID)
-				}
-			}
-			if len(blocked) > 0 {
-				r.logger.Warn("fork DAG stuck with unsatisfied dependencies",
-					"ritual", exec.RitualName,
-					"step", step.Name,
-					"blocked_count", len(blocked),
-					"blocked_units", blocked,
-					"done_count", len(done))
-				return results, fmt.Errorf("fork stuck: %d item(s) with unsatisfied dependencies: %v", len(blocked), blocked)
-			}
-			break // All done
-		}
-
-		// Wait for at least one completion to potentially unlock new items
-		collectOne()
+	if _, err := engine.execute(ctx); err != nil {
+		return results, err
 	}
-
-	wg.Wait()
-
-	// Drain any remaining results from the buffered channel
-	for {
-		select {
-		case res := <-resultCh:
-			mu.Lock()
-			results = append(results, res)
-			mu.Unlock()
-		default:
-			return results, nil
-		}
-	}
+	return results, nil
 }
 
 // queryDoneLings queries the DB for lings associated with this execution
@@ -1627,7 +1418,7 @@ func (r *RitualRunner) queryDoneLings(exec *RitualExecution, idSet map[string]bo
 // markLingInProgress updates the ling status to in_progress when the
 // DAG executor dispatches it. This is a lifecycle transition owned by
 // the executor for scheduling purposes.
-func (r *RitualRunner) markLingInProgress(exec *RitualExecution, unit forkWorkUnit) {
+func (r *RitualRunner) markLingInProgress(exec *RitualExecution, unit dagUnit) {
 	if exec.EdictID == 0 || r.db == nil {
 		return
 	}

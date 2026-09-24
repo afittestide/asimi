@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
 	"github.com/afittestide/asimi/storage"
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -2099,4 +2101,285 @@ func TestExtractDetail_MirrorsProductionKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Ling ignition (edict 847) ---
+
+// recordingProvider is an LLMProvider that records the last user prompt seen.
+type recordingProvider struct {
+	mu      sync.Mutex
+	prompts []string
+}
+
+func (p *recordingProvider) record(req *schemas.BifrostChatRequest) {
+	for _, m := range req.Input {
+		if m.Role == schemas.ChatMessageRoleUser && m.Content != nil && m.Content.ContentStr != nil {
+			p.mu.Lock()
+			p.prompts = append(p.prompts, *m.Content.ContentStr)
+			p.mu.Unlock()
+		}
+	}
+}
+
+// promptsSnapshot returns a copy of the recorded prompts, safe to read without
+// racing the recording goroutines.
+func (p *recordingProvider) promptsSnapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string{}, p.prompts...)
+}
+
+func (p *recordingProvider) ChatCompletionRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	p.record(req)
+	content := "done"
+	return &schemas.BifrostChatResponse{Choices: []schemas.BifrostResponseChoice{{
+		ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content}},
+		FinishReason:             strPtr("stop"),
+	}}}, nil
+}
+
+func (p *recordingProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	p.record(req)
+	ch := make(chan *schemas.BifrostStreamChunk, 1)
+	stop := "stop"
+	content := "done"
+	ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+		Choices: []schemas.BifrostResponseChoice{{
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content}},
+			FinishReason:             &stop,
+		}},
+	}}
+	close(ch)
+	return ch, nil
+}
+
+func (p *recordingProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *recordingProvider) ListModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *recordingProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+// lingTestMinister is a minimal Minister for ignition tests.
+type lingTestMinister struct {
+	MinisterBase
+	id       string
+	tasksCh  chan *Task
+	provider LLMProvider
+}
+
+func (m *lingTestMinister) ID() string           { return m.id }
+func (m *lingTestMinister) SystemPrompt() string { return "test" }
+func (m *lingTestMinister) Tools() []Tool        { return nil }
+func (m *lingTestMinister) Tasks() chan<- *Task  { return m.tasksCh }
+func (m *lingTestMinister) Model() LLMProvider   { return m.provider }
+func (m *lingTestMinister) GetConfig() config.LLMConfig {
+	return config.LLMConfig{Provider: "test", Model: "test"}
+}
+func (m *lingTestMinister) Run(ctx context.Context) {}
+
+// newLingTestCourt builds a Court wired for ignition tests.
+func newLingTestCourt(t *testing.T, db *gorm.DB) (*Court, *recordingProvider) {
+	t.Helper()
+	provider := &recordingProvider{}
+	ministers := map[string]Minister{}
+	for _, id := range []string{"forge", "judge"} {
+		ministers[id] = &lingTestMinister{
+			MinisterBase: MinisterBase{logger: slog.Default()},
+			id:           id,
+			tasksCh:      make(chan *Task, 1),
+			provider:     provider,
+		}
+	}
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	s := &Court{
+		db:        db,
+		ministers: ministers,
+		logger:    slog.Default(),
+		notify:    func(any) {},
+		config:    config.DefaultCourtConfig(),
+	}
+	s.sessionCfg = &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}
+	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
+		Base:        base,
+		GetMinister: s.GetMinister,
+	})
+	return s, provider
+}
+
+// newLingTestCourtPerMinister is like newLingTestCourt but gives each minister
+// its own recording provider, so a test can assert which minister ran which
+// ling. It returns the court and a map of minister ID → provider.
+func newLingTestCourtPerMinister(t *testing.T, db *gorm.DB) (*Court, map[string]*recordingProvider) {
+	t.Helper()
+	providers := map[string]*recordingProvider{}
+	ministers := map[string]Minister{}
+	for _, id := range []string{"forge", "judge"} {
+		provider := &recordingProvider{}
+		providers[id] = provider
+		ministers[id] = &lingTestMinister{
+			MinisterBase: MinisterBase{logger: slog.Default()},
+			id:           id,
+			tasksCh:      make(chan *Task, 1),
+			provider:     provider,
+		}
+	}
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	s := &Court{
+		db:        db,
+		ministers: ministers,
+		logger:    slog.Default(),
+		notify:    func(any) {},
+		config:    config.DefaultCourtConfig(),
+	}
+	s.sessionCfg = &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}
+	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
+		Base:        base,
+		GetMinister: s.GetMinister,
+	})
+	return s, providers
+}
+
+// TestIgniteLings_DependencyOrder verifies that lings authored in a batch with
+// intra-batch deps ignite in order: the dependent ling runs only after its
+// dependency completes, and both end up done.
+func TestIgniteLings_DependencyOrder(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider := newLingTestCourt(t, db)
+
+	key := storage.EdictKey{ID: 42, Username: "testuser", Project: "testproject"}
+	base := storage.Ling{EdictID: 42, Username: "testuser", Project: "testproject", Status: storage.LingPending}
+	a := base
+	a.LingID = "ling-a"
+	a.Description = "task A"
+	b := base
+	b.LingID = "ling-b"
+	b.Description = "task B"
+	b.Dependencies = storage.StringArray{"ling-a"}
+	require.NoError(t, db.Create(&a).Error)
+	require.NoError(t, db.Create(&b).Error)
+
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	provider.mu.Lock()
+	prompts := append([]string{}, provider.prompts...)
+	provider.mu.Unlock()
+	require.Len(t, prompts, 2, "both lings should have run")
+	assert.Contains(t, prompts[0], "task A", "ling a must run first")
+	assert.Contains(t, prompts[1], "task B", "ling b must run after a")
+
+	var lings []storage.Ling
+	require.NoError(t, db.Where("edict_id = ?", 42).Find(&lings).Error)
+	for _, l := range lings {
+		assert.Equal(t, storage.LingDone, l.Status, "ling %s should be done", l.LingID)
+	}
+
+	// Events: one created is not published here (only insert_ling does that);
+	// started/completed should each appear per ling.
+	var events []storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ?", 42).Find(&events).Error)
+	counts := map[storage.CourtEvent]int{}
+	for _, e := range events {
+		counts[e.EventType]++
+	}
+	assert.Equal(t, 2, counts[storage.EventLingStarted])
+	assert.Equal(t, 2, counts[storage.EventLingCompleted])
+	assert.Zero(t, counts[storage.EventLingFailed])
+}
+
+// TestIgniteLings_LeavesPendingWithoutDeps verifies lings whose dependencies
+// are not met stay pending without error.
+func TestIgniteLings_LeavesPendingWithoutDeps(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider := newLingTestCourt(t, db)
+
+	key := storage.EdictKey{ID: 43, Username: "testuser", Project: "testproject"}
+	blocked := storage.Ling{
+		LingID: "ling-blocked", EdictID: 43, Username: "testuser", Project: "testproject",
+		Description: "blocked task", Dependencies: storage.StringArray{"never-created"},
+		Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&blocked).Error)
+
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	provider.mu.Lock()
+	n := len(provider.prompts)
+	provider.mu.Unlock()
+	assert.Zero(t, n, "blocked ling must not run")
+
+	var got storage.Ling
+	require.NoError(t, db.First(&got, "ling_id = ?", "ling-blocked").Error)
+	assert.Equal(t, storage.LingPending, got.Status)
+}
+
+// TestRunLing_ResolvesLingMinister verifies that a ling's own `minister` field
+// is honoured: each ling is dispatched to the minister it names, and a ling
+// with no minister falls back to forge. This is the routing contract of
+// runLing / igniteLings (edict 847, change G).
+func TestRunLing_ResolvesLingMinister(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, providers := newLingTestCourtPerMinister(t, db)
+
+	// ling-forge omits the minister → must default to forge.
+	// ling-judge names judge explicitly.
+	lings := []storage.Ling{
+		{LingID: "ling-forge", EdictID: 44, Username: "testuser", Project: "testproject",
+			Description: "forge task", Status: storage.LingPending},
+		{LingID: "ling-judge", EdictID: 44, Username: "testuser", Project: "testproject",
+			Description: "judge task", Minister: "judge", Status: storage.LingPending},
+	}
+	for i := range lings {
+		require.NoError(t, db.Create(&lings[i]).Error)
+	}
+
+	key := storage.EdictKey{ID: 44, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	forgePrompts := providers["forge"].promptsSnapshot()
+	judgePrompts := providers["judge"].promptsSnapshot()
+	require.Len(t, forgePrompts, 1, "forge should run exactly the unspecified-minister ling")
+	require.Len(t, judgePrompts, 1, "judge should run exactly the ling that named it")
+	assert.Contains(t, forgePrompts[0], "forge task")
+	assert.Contains(t, judgePrompts[0], "judge task")
+
+	var judgeLing storage.Ling
+	require.NoError(t, db.First(&judgeLing, "ling_id = ?", "ling-judge").Error)
+	assert.Equal(t, storage.LingDone, judgeLing.Status)
+}
+
+// TestRunLing_FailingMinisterPublishesLingFailed verifies that a ling whose
+// minister is not registered is not silently dropped: it stays pending (so a
+// later trigger can retry) and a ling_failed event is published (edict 847).
+func TestRunLing_FailingMinisterPublishesLingFailed(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+
+	ling := storage.Ling{
+		LingID: "ling-orphan", EdictID: 45, Username: "testuser", Project: "testproject",
+		Description: "orphan task", Minister: "nonexistent", Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&ling).Error)
+
+	key := storage.EdictKey{ID: 45, Username: "testuser", Project: "testproject"}
+	// allowIncomplete=true means execute() itself returns nil; the failure is
+	// surfaced via the ling_failed event and the ling remaining pending.
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ?", 45).Find(&events).Error)
+	counts := map[storage.CourtEvent]int{}
+	for _, e := range events {
+		counts[e.EventType]++
+	}
+	assert.Equal(t, 1, counts[storage.EventLingFailed], "missing minister must publish ling_failed")
+
+	var got storage.Ling
+	require.NoError(t, db.First(&got, "ling_id = ?", "ling-orphan").Error)
+	assert.Equal(t, storage.LingPending, got.Status, "failed ling stays pending for retry")
 }

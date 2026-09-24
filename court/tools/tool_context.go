@@ -62,6 +62,14 @@ func (tc ToolContext) ProjectRoot() string {
 	return ""
 }
 
+// LingIgniter triggers execution of an edict's ready lings after a batch of
+// insert_ling calls completes, and records ling_created events for
+// observability. Implemented by the Court.
+type LingIgniter interface {
+	PublishLingCreated(key storage.EdictKey, lingID string)
+	TriggerLingIgnition(key storage.EdictKey)
+}
+
 // RitualLauncher starts ritual workflows (implemented by MinisterBase).
 type RitualLauncher interface {
 	StartRitual(name string, key storage.EdictKey, inputs map[string]string) error

@@ -29,6 +29,7 @@ type ToolRegistrationOpts struct {
 
 	MinisterConsultant MinisterConsultant
 	RitualLauncher     RitualLauncher
+	LingIgniter        LingIgniter
 
 	// MinisterIDs lists all registered minister IDs, used to build
 	// dynamic descriptions for tools like consult_minister.
@@ -99,7 +100,7 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	r.Register(QueryPrecedentsTool{Ctx: opts.Ctx}, intentRead)
 	r.Register(GetIncidentTool{Ctx: opts.Ctx}, intentRead)
 
-	r.Register(InsertLingTool{Ctx: opts.Ctx}, intentWrite)
+	r.Register(InsertLingTool{Ctx: opts.Ctx, Igniter: opts.LingIgniter}, intentWrite)
 	r.Register(UpdateLingStatusTool{Ctx: opts.Ctx}, intentWrite)
 	r.Register(TransitionEdictTool{DB: opts.Ctx.DB, Username: opts.Ctx.Username, Project: opts.Ctx.Project}, intentWrite)
 	r.Register(CreateIncidentTool{Ctx: opts.Ctx}, intentWrite)

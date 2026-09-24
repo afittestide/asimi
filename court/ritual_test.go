@@ -3258,6 +3258,104 @@ func TestSeedReadyQueue_NoDeps(t *testing.T) {
 	}
 }
 
+// TestDagEngine_SeedReadyDepWaitConcurrency is a regression test that the
+// ritual-free engine preserves fork DAG semantics: seed-ready units dispatch
+// immediately, dep-blocked units wait, and concurrency is bounded by batchSize.
+func TestDagEngine_SeedReadyDepWaitConcurrency(t *testing.T) {
+	units := buildDependencyMap([]interface{}{
+		map[string]interface{}{"ling_id": "a"},
+		map[string]interface{}{"ling_id": "b", "dependencies": []string{"a"}},
+		map[string]interface{}{"ling_id": "c", "dependencies": []string{"a"}},
+		map[string]interface{}{"ling_id": "d", "dependencies": []string{"b", "c"}},
+	})
+
+	var mu sync.Mutex
+	finished := map[string]bool{}
+	running := 0
+	maxConcurrent := 0
+	var order []string
+
+	engine := &dagEngine{
+		units:     units,
+		batchSize: 2,
+		name:      "test",
+		run: func(ctx context.Context, u dagUnit) error {
+			mu.Lock()
+			for _, dep := range u.DepIDs {
+				if !finished[dep] {
+					mu.Unlock()
+					return fmt.Errorf("unit %s started before dep %s finished", u.ID, dep)
+				}
+			}
+			running++
+			if running > maxConcurrent {
+				maxConcurrent = running
+			}
+			order = append(order, u.ID)
+			mu.Unlock()
+
+			time.Sleep(5 * time.Millisecond)
+
+			mu.Lock()
+			finished[u.ID] = true
+			running--
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	results, err := engine.execute(context.Background())
+	if err != nil {
+		t.Fatalf("engine.execute() error = %v", err)
+	}
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results, got %d", len(results))
+	}
+	if !finished["d"] {
+		t.Fatal("unit d never finished")
+	}
+	if maxConcurrent > 2 {
+		t.Errorf("concurrency exceeded batchSize: max %d, batchSize 2", maxConcurrent)
+	}
+	// a must be first; b and c must precede d.
+	pos := map[string]int{}
+	for i, id := range order {
+		pos[id] = i
+	}
+	if pos["a"] != 0 {
+		t.Errorf("expected a first, got order %v", order)
+	}
+	if pos["b"] > pos["d"] || pos["c"] > pos["d"] {
+		t.Errorf("d dispatched before its deps completed: %v", order)
+	}
+}
+
+// TestDagEngine_StuckFailsWhenIncompleteNotAllowed verifies the engine reports
+// unsatisfiable dependencies unless allowIncomplete is set.
+func TestDagEngine_StuckFailsWhenIncompleteNotAllowed(t *testing.T) {
+	units := buildDependencyMap([]interface{}{
+		map[string]interface{}{"ling_id": "a", "dependencies": []string{"missing"}},
+	})
+
+	engine := &dagEngine{
+		units:     units,
+		batchSize: 1,
+		name:      "test",
+		run: func(ctx context.Context, u dagUnit) error {
+			t.Fatalf("unit %s should never run", u.ID)
+			return nil
+		},
+	}
+	if _, err := engine.execute(context.Background()); err == nil {
+		t.Fatal("expected stuck error, got nil")
+	}
+
+	engine.allowIncomplete = true
+	if _, err := engine.execute(context.Background()); err != nil {
+		t.Fatalf("allowIncomplete engine returned error: %v", err)
+	}
+}
+
 func TestExecuteForkDAG_NoDeps(t *testing.T) {
 	// Non-DAG items (no dependencies) should all be dispatched immediately
 	db := setupRitualTestDB(t)

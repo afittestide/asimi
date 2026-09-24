@@ -258,6 +258,9 @@ const (
 	EventStepCompleted     CourtEvent = "step_completed"
 	EventStepFailed        CourtEvent = "step_failed"
 	EventLingCreated       CourtEvent = "ling_created"
+	EventLingStarted       CourtEvent = "ling_started"
+	EventLingCompleted     CourtEvent = "ling_completed"
+	EventLingFailed        CourtEvent = "ling_failed"
 	EventZhengmingNeeded   CourtEvent = "zhengming_needed"
 	EventZhengmingAnswered CourtEvent = "zhengming_answered"
 	EventEdictCancelled    CourtEvent = "edict_cancelled"
@@ -319,6 +322,7 @@ type Ling struct {
 	Description  string      `gorm:"column:description"`
 	Dependencies StringArray `gorm:"column:dependencies;type:json"`
 	Status       LingStatus  `gorm:"column:status"`
+	Minister     string      `gorm:"column:minister"`
 	CreatedAt    time.Time   `gorm:"column:created_at;autoCreateTime"`
 	UpdatedAt    time.Time   `gorm:"column:updated_at;autoUpdateTime"`
 }

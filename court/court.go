@@ -135,6 +135,11 @@ type Court struct {
 	// llmClient holds the current LLM provider (typically *bifrost.Bifrost)
 	// so the court can serve ListAllModels requests from the TUI.
 	llmClient LLMProvider
+
+	// lingIgniteMu guards lingIgniting, the per-edict mutexes that serialize
+	// ling ignition so overlapping insert_ling triggers never double-run a ling.
+	lingIgniteMu sync.Mutex
+	lingIgniting map[uint]*sync.Mutex
 }
 
 // NewCourt creates a new Court coordinator.
@@ -343,6 +348,7 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		NotifyFn:           notifyFn,
 		MinisterConsultant: s,
 		RitualLauncher:     ritualLauncher,
+		LingIgniter:        s,
 		MinisterIDs:        ministerIDs,
 	}
 
