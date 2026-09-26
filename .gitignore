@@ -1,6 +1,6 @@
 # Binary
 asimi
-asimi_linux_amd64
+asimi_linux
 ./agent
 .gocache/
 # Test output
