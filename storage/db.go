@@ -418,13 +418,17 @@ func PostGormMigrate(db *gorm.DB) error {
 
 	// Backfill censor_precedents.edict_id for per-manifest precedents from the
 	// owning forge_manifests row. Edict-level rows (manifest_id = '') are left
-	// at 0 (unknown owner). Idempotent: it only fills rows where edict_id = 0.
+	// at 0 (unknown owner). Idempotent: it only fills rows that are still
+	// unattributed (edict_id = 0 OR NULL — the NULL arm matters because
+	// `NULL = 0` is NULL in three-valued logic, so a bare `= 0` predicate would
+	// skip every legacy NULL row and let the normalization below collapse
+	// resolvable ownership to the sentinel).
 	backfill := db.Exec(`
 		UPDATE censor_precedents SET edict_id = (
 			SELECT fm.edict_id FROM forge_manifests fm
 			WHERE fm.manifest_id = censor_precedents.manifest_id
 		)
-		WHERE censor_precedents.edict_id = 0
+		WHERE (censor_precedents.edict_id = 0 OR censor_precedents.edict_id IS NULL)
 		  AND censor_precedents.manifest_id != ''
 		  AND EXISTS (
 		    SELECT 1 FROM forge_manifests fm
@@ -435,6 +439,18 @@ func PostGormMigrate(db *gorm.DB) error {
 	}
 	slog.Debug("post-GORM migration: backfilled censor_precedents.edict_id",
 		"rows_affected", backfill.RowsAffected)
+
+	// Normalize NULL edict_id to the single sentinel 0, per the documented
+	// contract (0 = unknown/legacy or deliberately edict-level). Runs after the
+	// backfill above so real owners are resolved first; legacy rows that cannot
+	// be attributed collapse to 0 rather than lingering as NULL. Idempotent and
+	// scoped to edict_id only — username/project are never touched.
+	normalize := db.Exec(`UPDATE censor_precedents SET edict_id = 0 WHERE edict_id IS NULL`)
+	if normalize.Error != nil {
+		return fmt.Errorf("normalize censor_precedents.edict_id NULL to 0: %w", normalize.Error)
+	}
+	slog.Debug("post-GORM migration: normalized NULL censor_precedents.edict_id to 0",
+		"rows_affected", normalize.RowsAffected)
 	return nil
 }
 

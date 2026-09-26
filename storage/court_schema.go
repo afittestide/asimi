@@ -397,17 +397,35 @@ const (
 	PrecedentRejected PrecedentRuling = "rejected"
 )
 
+// CensorPrecedent.EdictID contract (正名):
+//
+//	EdictID == 0 means the precedent has no owning edict. Two distinct cases
+//	  collapse onto this single sentinel:
+//	    1. Unknown/legacy: rows created before the edict_id column existed.
+//	    2. Deliberately edict-level: rulings that apply to the codebase as a
+//	       whole (e.g. manifest_id == "") rather than to one edict.
+//	EdictID > 0 is the id of the owning edict.
+//
+// NULL is not part of this contract; use HasEdict() to test ownership and
+// never compare the column directly against NULL.
+
 // CensorPrecedent represents an ethics review precedent from the Censor
 type CensorPrecedent struct {
 	PrecedentID   string          `gorm:"primaryKey;column:precedent_id"`
 	ManifestID    string          `gorm:"column:manifest_id;index"`
-	EdictID       uint            `gorm:"column:edict_id;index"`
+	EdictID       uint            `gorm:"column:edict_id;index"` // See the CensorPrecedent.EdictID contract above; use HasEdict().
 	Username      string          `gorm:"column:username;not null;default:''"`
 	Project       string          `gorm:"column:project;not null;default:''"`
 	Principle     string          `gorm:"column:principle"`
 	Ruling        PrecedentRuling `gorm:"column:ruling"`
 	Justification string          `gorm:"column:justification"`
 	CreatedAt     time.Time       `gorm:"column:created_at;autoCreateTime"`
+}
+
+// HasEdict reports whether the precedent is owned by an edict. It is the
+// sanctioned way to test ownership under the EdictID contract above.
+func (p CensorPrecedent) HasEdict() bool {
+	return p.EdictID != 0
 }
 
 // TableName returns the table name for CensorPrecedent
