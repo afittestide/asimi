@@ -20,7 +20,8 @@ hello-harbor *args:
     #!/usr/bin/env bash
     set -euo pipefail
     CGO_ENABLED=0 GOOS=linux go build -tags containers_image_openpgp -o asimi_linux .
-    BIN="$(pwd)/asimi_linux"
+    ROOT="$(pwd)"
+    BIN="${ROOT}/asimi_linux"
     echo "==> linux binary: ${BIN}"
     file "${BIN}"
     echo "==> running harbor hello-world trial against ${BIN}"
@@ -29,13 +30,13 @@ hello-harbor *args:
     uv run harbor run \
         -p examples/tasks/hello-world \
         -a asimi \
-        -o $(pwd)/jobs \
+        -o "${ROOT}/jobs" \
         --model "openai/deepseek-v4.1-flash" \
         --ak "local_binary=${BIN}" \
         --ak "OPENAI_API_KEY=${OPENAI_API_KEY}" \
         --ak "OPENAI_BASE_URL=${OPENAI_BASE_URL}" \
         {{args}} 2>&1
-    echo "<== results written to ../harbor/jobs"
+    echo "<== results written to ${ROOT}/jobs"
 
 # Run with debug logging
 run:
