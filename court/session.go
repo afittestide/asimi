@@ -705,6 +705,7 @@ var modelContextSizes = []modelContextRule{
 	// --- General family sizes (shared across providers) ---
 	// DeepSeek v4 line: 1M.
 	{regexp.MustCompile(`deepseek-v4`), 1_000_000},
+	{regexp.MustCompile(`kimi-k3`), 1_000_000},
 	// Anthropic Claude: 200k.
 	{regexp.MustCompile(`^[^:]+:(anthropic/)?claude-.*$`), 200_000},
 	// OpenAI gpt-4.1 line: 1M.
@@ -715,7 +716,6 @@ var modelContextSizes = []modelContextRule{
 	{regexp.MustCompile(`^[^:]+:minimax/minimax-m2\.[57]$`), 1_000_000},
 	{regexp.MustCompile(`^[^:]+:z-ai/glm-5\.[23]`), 1_000_000},
 	{regexp.MustCompile(`^[^:]+:mistralai/.*$`), 128_000},
-	{regexp.MustCompile(`^[^:]+:moonshotai/kimi-.*$`), 128_000},
 	{regexp.MustCompile(`^[^:]+:qwen/qwen3\.5-397b-a17b$`), 128_000},
 
 	// --- General provider fallbacks ---

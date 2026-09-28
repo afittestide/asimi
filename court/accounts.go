@@ -327,10 +327,23 @@ func normalizeBaseURL(raw string) string {
 
 // getBaseURLFromEnv returns the normalized base URL from the provider's
 // convention-based environment variable: strings.ToUpper(provider) + "_BASE_URL".
-// Special cases: azure uses AZURE_OPENAI_BASE_URL, gemini uses GEMINI_BASE_URL.
+// Note: this plain convention misses the special cases — azure really uses
+// AZURE_OPENAI_BASE_URL and googleai uses GEMINI_BASE_URL (see
+// provider_meta.go's providerBaseURLEnvVar, which this package can't import).
+// Hoisting that table to one shared location is tracked as a follow-up ling.
 func getBaseURLFromEnv(provider string) string {
 	envVar := strings.ToUpper(provider) + "_BASE_URL"
 	return normalizeBaseURL(os.Getenv(envVar))
+}
+
+// effectiveBaseURL resolves the base URL a provider will actually be
+// requested at: a configured value wins, then the provider's env-var
+// convention, then "" (the provider default baked into the SDK).
+func effectiveBaseURL(provider schemas.ModelProvider, configured string) string {
+	if configured != "" {
+		return normalizeBaseURL(configured)
+	}
+	return getBaseURLFromEnv(string(provider))
 }
 
 // GetConfigForProvider returns network configuration for a provider
@@ -345,18 +358,16 @@ func (a *Account) GetConfigForProvider(provider schemas.ModelProvider) (*schemas
 	if a.maxRetries > 0 {
 		networkConfig.MaxRetries = a.maxRetries
 	}
-	if a.baseURL != "" {
-		networkConfig.BaseURL = normalizeBaseURL(a.baseURL)
-	} else if baseURL := getBaseURLFromEnv(string(provider)); baseURL != "" {
+	if baseURL := effectiveBaseURL(provider, a.baseURL); baseURL != "" {
 		networkConfig.BaseURL = baseURL
-		slog.Debug("base URL from env", "provider", provider, "base_url", networkConfig.BaseURL)
+		slog.Debug("base URL resolved", "provider", provider, "base_url", networkConfig.BaseURL)
 	} else {
 		slog.Debug("base URL using provider default", "provider", provider)
 	}
 	if networkConfig.BaseURL != "" {
 		// Log the effective URL bifrost will actually request so a future
-		// 404 self-diagnoses: bifrost appends "/v1/chat/completions".
-		slog.Debug("effective base URL", "provider", provider, "base_url", networkConfig.BaseURL, "chat_endpoint", networkConfig.BaseURL+"/v1/chat/completions")
+		// 404 self-diagnoses: bifrost appends ChatPathFragment.
+		slog.Debug("effective base URL", "provider", provider, "base_url", networkConfig.BaseURL, "chat_endpoint", networkConfig.BaseURL+ChatPathFragment)
 	}
 
 	// Identify asimi to every provider. Bifrost's SetExtraHeaders only sets

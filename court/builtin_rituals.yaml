@@ -187,44 +187,6 @@
         Call ask_ruler with question "What's our next step?" and
         a few clear options. e.g, "review borderlands" or "clean-slate"
         
-- name: review-borderlands
-  description: |
-    Code review - judge and chancellor review the borderlands before
-    staging
-  background:
-    - the borderlands
-  steps:
-    - name: judging
-      minister: judge
-      given:
-        - the borderlands
-        - manifests for the borderlands
-        - "!just test || true  # test_out"
-      act: |
-        If the tests pass, ensure
-        the changes in the borderlands and middle kingdom are covered by tests.
-
-        {{ .borderlands }}
-
-        {{ .borderland_manifests }}
-
-        Use record_verdict to record pass/fail for this edict.
-        Reviewing is next so don't stage, commit nor push.
-    - name: reviewing
-      minister: chancellor
-      given:
-        - the borderlands
-        - manifests for the borderlands
-      act: |
-        Review the code changes for the edict.
-        Check for style violations, security concerns, and architectural issues.
-        Record your insights using record_precedent.
-        Produce a comprehensive code review report summarizing findings from both judge and chancellor.
-        Highlight any blocking issues and suggest improvements.
-        
-        ## Edict
-        {{ .edict }}
-
 - name: clean-slate
   description: |
     Review all uncommitted changes (staged and unstaged), split them
