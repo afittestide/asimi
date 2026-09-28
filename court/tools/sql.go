@@ -21,23 +21,19 @@ func (t AsimiSQLTool) Name() string {
 }
 
 func (t AsimiSQLTool) Description() string {
-	return `Execute SQL against the Court database. Use for edict status transitions and reviewing precedents:
+	return `Execute SQL against the Court database.
 
-Edict Status Transitions (via transition_edict tool, not direct SQL):
-- Status is derived from seals and zhengming tables
-- Use transition_edict tool to cancel edicts or grant ruler seal
-- Statuses: active (default), blocked (pending zhengming), sealed (ruler seal), cancelled (cancelled_at set)
+Schema reference (read before querying — do not guess tables or columns):
+- storage/court_schema.go — Court tables: edicts, seals, zhengming_requests, tian_events, tian_event_dlq, lings, forge_manifests, judge_verdicts, censor_precedents, incidents, ruler_councils, ritual_guard_checkpoint
+- storage/schema.go — core tables (sessions, messages, repositories, branches, ritual_executions, ritual_step_states, ...)
 
-Find Review Suggestions (Censor Precedents):
-- SELECT * FROM censor_precedents ORDER BY created_at DESC LIMIT 10;
-- SELECT principle, ruling, justification FROM censor_precedents WHERE ruling = 'rejected';
+Most Court tables carry username and project columns; scope queries by both, e.g.
+	SELECT id, intent, created_at FROM edicts WHERE username = 'daonb' AND project = 'afittestide/asimi-cli' ORDER BY created_at DESC LIMIT 5;
 
-Query Manifests and Verdicts:
-- SELECT * FROM forge_manifests WHERE status = 'forged' ORDER BY created_at DESC;
-- SELECT * FROM judge_verdicts WHERE outcome = 'failed';
+Note: the edicts primary key column is id (there is no edict_id column); other tables reference it via edict_id.
 
-Statuses:
-- Edicts: active, blocked, sealed, cancelled (derived from seals/zhengming)
+Status values:
+- Edicts: active, blocked, sealed, cancelled (derived from seals/zhengming; use transition_edict, not direct SQL)
 - Manifests: forged, live, quenched, rejected
 - Verdicts: passed, failed
 - Precedents: approved, rejected`
