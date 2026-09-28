@@ -24,7 +24,7 @@ import (
 // Court via fx DI, sends the prompt to the secretary, streams plain text
 // to stdout, and waits for the ritual (or chat) to complete.
 // Returns exit code 0 on success, 1 on failure.
-func runHeadlessMode() int {
+func runHeadlessModeImpl() int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

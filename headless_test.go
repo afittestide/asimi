@@ -951,10 +951,124 @@ func TestLogDir_HonorsASIMIHome(t *testing.T) {
 	require.True(t, strings.HasSuffix(logDir(), filepath.Join(".local", "share", "asimi")),
 		"logDir must fall back to ~/.local/share/asimi without ASIMI_HOME, got %q", logDir())
 
-	// Debug mode always logs to the current directory, regardless of ASIMI_HOME.
+	// $ASIMI_HOME takes precedence over --debug: it is the environment's
+	// signal that cwd is not writable (Harbor/read-only cwd).
 	t.Setenv("ASIMI_HOME", home)
 	cli.Debug = true
+	require.Equal(t, home, logDir(),
+		"logDir must point at ASIMI_HOME even in debug mode")
+
+	// With no ASIMI_HOME, --debug falls back to the current directory.
+	t.Setenv("ASIMI_HOME", "")
 	require.Equal(t, ".", logDir())
+}
+
+// TestDebugLogAnnouncement verifies the harness-visible line printed in
+// headless --debug runs, table-testing both path-resolution success and
+// failure cases.
+func TestDebugLogAnnouncement(t *testing.T) {
+	origDebug := cli.Debug
+	t.Cleanup(func() { cli.Debug = origDebug })
+
+	home := t.TempDir()
+
+	cases := []struct {
+		name      string
+		asimiHome string
+		home      string
+		debug     bool
+		want      string
+	}{
+		{
+			name:      "resolved via ASIMI_HOME",
+			asimiHome: home,
+			debug:     true,
+			want:      "Running in debug mode, log file at " + filepath.Join(home, "asimi.log"),
+		},
+		{
+			name:      "resolved via cwd in debug without home",
+			asimiHome: "",
+			debug:     true,
+			want:      "Running in debug mode, log file at " + mustAbs(t, "asimi.log"),
+		},
+		{
+			name:      "unresolved without home or debug cwd fallback",
+			asimiHome: "",
+			home:      "", // os.UserHomeDir fails
+			debug:     false,
+			want:      "Running in debug mode, log file at (unresolved; logging to stderr)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ASIMI_HOME", tc.asimiHome)
+			t.Setenv("HOME", tc.home)
+			cli.Debug = tc.debug
+			require.Equal(t, tc.want, debugLogAnnouncement())
+		})
+	}
+
+	// Restore for the emit-path test below.
+	cli.Debug = true
+	t.Setenv("ASIMI_HOME", home)
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	require.NoError(t, err)
+	return abs
+}
+
+// TestPrintDebugAnnouncementEmit covers the emit path itself (writer seam +
+// trailing newline + harness-visible prefix), guarding the production call
+// site: if the call site in main() stops passing os.Stdout, this test still
+// passes — but it fails if printDebugAnnouncement changes its format or loses
+// the newline, and its existence keeps the seam exercised.
+func TestPrintDebugAnnouncementEmit(t *testing.T) {
+	origDebug := cli.Debug
+	cli.Debug = true
+	t.Cleanup(func() { cli.Debug = origDebug })
+
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+
+	var buf bytes.Buffer
+	printDebugAnnouncement(&buf)
+
+	want := "Running in debug mode, log file at " + filepath.Join(home, "asimi.log") + "\n"
+	require.Equal(t, want, buf.String())
+}
+
+// TestRunHeadless verifies the wiring itself: in a debug headless run the
+// announcement is written to stdout before the headless mode runs. Uses a
+// stub for runHeadlessMode so no real headless session is booted.
+func TestRunHeadless(t *testing.T) {
+	origDebug := cli.Debug
+	origMode := runHeadlessMode
+	t.Cleanup(func() { cli.Debug = origDebug; runHeadlessMode = origMode })
+
+	clicks := []string{}
+	runHeadlessMode = func() int { clicks = append(clicks, "run"); return 7 }
+	cli.Debug = true
+	t.Setenv("ASIMI_HOME", t.TempDir())
+
+	var buf bytes.Buffer
+	code := runHeadless(&buf, time.Now())
+
+	require.Equal(t, 7, code, "runHeadless must return the headless run's exit code")
+	require.Equal(t, []string{"run"}, clicks, "runHeadlessMode must be called exactly once")
+	require.True(t, strings.HasPrefix(buf.String(), "Running in debug mode, log file at "),
+		"debug headless run must announce the log path first, got %q", buf.String())
+
+	// Without --debug, nothing is announced (stdout stays clean for piped output).
+	buf.Reset()
+	clicks = nil
+	cli.Debug = false
+	runHeadless(&buf, time.Now())
+	require.Empty(t, buf.String(), "announcement must not print outside debug mode")
+	require.Equal(t, []string{"run"}, clicks)
 }
 
 // TestPromptFlagAcceptsLeadingDash guards Harbor Defect A: a benchmark task

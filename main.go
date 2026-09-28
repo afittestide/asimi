@@ -37,6 +37,10 @@ var cliOptions = []kong.Option{kong.WithHyphenPrefixedParameters(true)}
 // don't interleave when both run with --debug in the same cwd.
 var logBaseName = "asimi"
 
+// runHeadlessMode is a variable so tests can stub the headless run and
+// exercise the runHeadless wiring without booting a real headless session.
+var runHeadlessMode = runHeadlessModeImpl
+
 var cli struct {
 	Version         bool   `help:"Print version information"`
 	Prompt          string `short:"p" help:"Prompt to send to the agent"`
@@ -55,22 +59,67 @@ var cli struct {
 	Atif            bool   `help:"Enable ATIF trajectory recording (agent name: asimi)"`
 }
 
-// logDir returns the directory for the log file. Debug mode logs to the
-// current directory; otherwise to ${ASIMI_HOME} when set (containerized
-// drivers like Harbor persist it to a writable location), falling back to
-// ~/.local/share/asimi. Returns "" when no directory can be resolved.
+// logDir returns the directory for the log file, following this scenario
+// model:
+//
+//	| Scenario         | ASIMI_HOME | --debug | Log dir                 |
+//	| Normal user      | unset      | unset   | ~/.local/share/asimi    |
+//	| Hands-on debug   | unset      | set     | . (cwd)                 |
+//	| Harbor/sandboxed | set        | either  | $ASIMI_HOME             |
+//
+// $ASIMI_HOME being set is the environment's signal that "cwd is not a
+// place to write" (e.g. Harbor, where cwd may be read-only); when set,
+// --debug controls verbosity only, not location. Returns "" when no
+// directory can be resolved.
 func logDir() string {
-	if cli.Debug {
-		return "."
-	}
 	if home := os.Getenv("ASIMI_HOME"); home != "" {
 		return home
+	}
+	if cli.Debug {
+		return "."
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
 	return filepath.Join(homeDir, ".local", "share", "asimi")
+}
+
+// These two functions are the Ling-2 feature. printDebugAnnouncement is the
+// production emit path (os.Stdout seam for tests); debugLogAnnouncement builds
+// the string. If either copy-paste registers only one, the build breaks —
+// deliberately: the pair must land together.
+func printDebugAnnouncement(w io.Writer) {
+	fmt.Fprintln(w, debugLogAnnouncement())
+}
+
+// debugLogAnnouncement returns the harness-visible line announced on stdout
+// in headless --debug runs. On resolution failure it marks the path as
+// unresolved instead.
+func debugLogAnnouncement() string {
+	dir := logDir()
+	line := "Running in debug mode, log file at "
+	if dir == "" {
+		return line + "(unresolved; logging to stderr)"
+	}
+	abs, err := filepath.Abs(filepath.Join(dir, logBaseName+".log"))
+	if err != nil {
+		return line + "(unresolved; logging to stderr)"
+	}
+	return line + abs
+}
+
+// runHeadless wires up non-interactive mode: initialize the logger first,
+// then (in debug mode) announce the resolved log path on stdout so captured
+// transcripts name it, then execute the prompt. stdout is a parameter so the
+// ordering and the announcement are unit-testable without a terminal.
+func runHeadless(stdout io.Writer, startTime time.Time) int {
+	initLogger()
+	if cli.Debug {
+		printDebugAnnouncement(stdout)
+		slog.Debug("[TIMING] initLogger() completed", "duration", time.Since(startTime))
+	}
+	return runHeadlessMode()
 }
 
 func initLogger() {
@@ -410,17 +459,8 @@ func main() {
 		hasPromptArg = cli.Prompt != ""
 	}
 
-	// For non-interactive mode, initialize the old logger
-	// For interactive mode, the fx-provided logger will be used
 	if hasPromptArg {
-		initLogger()
-		if cli.Debug {
-			slog.Debug("[TIMING] initLogger() completed", "duration", time.Since(startTime))
-		}
-	}
-
-	if hasPromptArg {
-		os.Exit(runHeadlessMode())
+		os.Exit(runHeadless(os.Stdout, startTime))
 	}
 
 	// Interactive mode
