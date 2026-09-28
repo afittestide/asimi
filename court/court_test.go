@@ -42,9 +42,18 @@ func setupCourtTestDB(t *testing.T) *gorm.DB {
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	require.NoError(t, err)
 
-	// Enable WAL mode and busy_timeout for better concurrency — the ritual
-	// guard runs concurrently and performs writes, so without these PRAGMAs
-	// SQLite returns "database is locked" errors.
+	// SQLite works best with a single connection: concurrent writers on
+	// separate pool connections race file locks, and PRAGMA busy_timeout is
+	// per-connection, so fresh pool connections would fail instantly with
+	// "database is locked". Production (storage/db.go) caps the pool at 1 —
+	// mirror that here so the DAG engine's concurrent ling runners serialize
+	// through one connection instead of flaking on SQLITE_BUSY.
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+
+	// Enable WAL mode and busy_timeout for belt-and-braces robustness — the
+	// ritual guard runs concurrently and performs writes, so without these
+	// PRAGMAs SQLite returns "database is locked" errors.
 	conn, err := sqlDB.Conn(context.Background())
 	require.NoError(t, err)
 	_, err = conn.ExecContext(context.Background(), "PRAGMA journal_mode = WAL")

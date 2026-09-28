@@ -54,6 +54,11 @@ func setupMinisterTestDBWithPath(t *testing.T) (*gorm.DB, string) {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
+	// Serialize access through one connection: concurrent writers on separate
+	// pool connections race file locks, and PRAGMA busy_timeout is
+	// per-connection (see storage/db.go and court/court_test.go).
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 
 	// Use gorm with the existing connection
 	db, err := gorm.Open(sqlite.Dialector{Conn: sqlDB}, &gorm.Config{

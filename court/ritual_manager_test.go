@@ -31,6 +31,12 @@ func setupEventTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
+	// Serialize access through one connection: background ritual goroutines
+	// write concurrently, and PRAGMA busy_timeout is per-connection, so extra
+	// pool connections would flake with "database is locked" (SQLITE_BUSY).
+	// Mirrors the production cap in storage/db.go.
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 	// Close before t.TempDir's RemoveAll cleanup runs (t.Cleanup is LIFO, and
 	// TempDir registered its cleanup first). Background ritual goroutines keep
 	// writing to the DB after the test returns; leaving the handle open lets
