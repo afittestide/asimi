@@ -1,12 +1,32 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// DeterministicSealID mirrors the historical tool-side ID scheme
+// (GenerateID("seal", edict, user, project, minister)) so that seals
+// invalidated by InvalidateSeals can be resurrected in place: the
+// tombstone already owns the ID the deterministic grant would mint.
+func DeterministicSealID(edictID uint, username, project, ministerID string) string {
+	h := sha256.New()
+	for _, p := range []string{
+		"seal",
+		fmt.Sprintf("%d", edictID),
+		username,
+		project,
+		ministerID,
+	} {
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
 
 // SealService manages the seal chain for edicts
 type SealService struct {
@@ -18,7 +38,10 @@ func NewSealService(db *gorm.DB) *SealService {
 	return &SealService{db: db}
 }
 
-// GrantSeal records a minister's seal on an edict
+// GrantSeal records (or resurrects) a minister's seal on an edict.
+// Idempotent per (edict, user, project, minister): a live seal is left
+// untouched, an invalidated tombstone at the deterministic ID is
+// resurrected, and only if neither exists is a fresh row inserted.
 func (s *SealService) GrantSeal(key EdictKey, ministerID string, metadata JSON) error {
 	if key.ID == 0 {
 		return fmt.Errorf("id is required")
@@ -27,9 +50,32 @@ func (s *SealService) GrantSeal(key EdictKey, ministerID string, metadata JSON) 
 		return fmt.Errorf("minister_id is required")
 	}
 
-	sealID := uuid.New().String()
+	has, err := s.HasSeal(key, ministerID)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+
+	// UPDATE first: an invalidated tombstone owns the deterministic ID.
+	detID := DeterministicSealID(key.ID, key.Username, key.Project, ministerID)
+	res := s.db.Model(&Seal{}).
+		Where("seal_id = ?", detID).
+		Updates(map[string]any{
+			"stale_at":  nil,
+			"sealed_at": time.Now(),
+			"metadata":  metadata,
+		})
+	if res.Error != nil {
+		return fmt.Errorf("failed to resurrect seal: %w", res.Error)
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+
 	seal := Seal{
-		SealID:     sealID,
+		SealID:     uuid.New().String(),
 		EdictID:    key.ID,
 		Username:   key.Username,
 		Project:    key.Project,
@@ -37,11 +83,9 @@ func (s *SealService) GrantSeal(key EdictKey, ministerID string, metadata JSON) 
 		SealedAt:   time.Now(),
 		Metadata:   metadata,
 	}
-
 	if err := s.db.Create(&seal).Error; err != nil {
 		return fmt.Errorf("failed to grant seal: %w", err)
 	}
-
 	return nil
 }
 
