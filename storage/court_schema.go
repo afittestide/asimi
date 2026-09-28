@@ -261,11 +261,15 @@ const (
 	EventLingStarted       CourtEvent = "ling_started"
 	EventLingCompleted     CourtEvent = "ling_completed"
 	EventLingFailed        CourtEvent = "ling_failed"
-	EventZhengmingNeeded   CourtEvent = "zhengming_needed"
-	EventZhengmingAnswered CourtEvent = "zhengming_answered"
-	EventEdictCancelled    CourtEvent = "edict_cancelled"
-	EventSealGranted       CourtEvent = "seal_granted"
-	EventEdictSealed       CourtEvent = "edict_sealed"
+	// EventLingIgnitionSkipped records that ignition was suppressed by config
+	// (court.ling_ignition_enabled=false); the ling itself is untouched and
+	// remains pending.
+	EventLingIgnitionSkipped CourtEvent = "ling_ignition_skipped"
+	EventZhengmingNeeded     CourtEvent = "zhengming_needed"
+	EventZhengmingAnswered   CourtEvent = "zhengming_answered"
+	EventEdictCancelled      CourtEvent = "edict_cancelled"
+	EventSealGranted         CourtEvent = "seal_granted"
+	EventEdictSealed         CourtEvent = "edict_sealed"
 )
 
 // TianEvent represents an event in the Tian ledger

@@ -5,6 +5,26 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.5] - 2026-09-28
+
+### Added
+
+- **Ling execution engine (built, default off)** — lings (task orders) can now execute over a shared DAG engine that honors declared dependencies; lings carry an owning minister and batches of `insert_ling` calls with satisfied dependencies can be ignited automatically. **Ignition is disabled by default** (`ling_ignition_enabled = false`) until per-ling worktree isolation lands (e531) — concurrent lings on one working tree are unsafe without it (e847)
+- **Kimi K3** — added Moonshot's Kimi K3 to the model roster/config defaults
+
+### Changed
+
+- **Provider error reporting** — provider errors now carry provider name and HTTP status context, improving operator diagnosis (e879)
+
+### Fixed
+
+- **Release tarball wrapping** — release tarballs no longer double-wrap the `asimi` binary under an `./asimi` directory, fixing the checksum/installer layout (e864)
+- **`OPENAI_BASE_URL` compatibility** — `openai`-compatible providers honor custom base URLs again (e863)
+- **ask_ruler routing** — ruler questions are routed to the correct tab (e866)
+- **`--isolated-host` log output** — headless-mode log output restored under `--isolated-host` (e881)
+- **Precedent tools** — `record_precedent` / `query_precedents` fixes (e874, e875, e876)
+- **Duplicate seal crash** — crash on duplicate seal grant; seal granting is now idempotent (e882)
+
 ## [0.13.4] - 2026-09-17
 
 ### Fixed

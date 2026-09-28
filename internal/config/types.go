@@ -113,6 +113,10 @@ type CourtConfig struct {
 	Project         string        `koanf:"project"`           // project slug for edict scoping
 	IsolatedHost    bool          `koanf:"isolated_host"`     // skip sandbox, run commands on host without approval
 	OutputLimit     int           `koanf:"output_limit"`      // max chars of heavy output fields in summary mode (default 500)
+	// LingIgnitionEnabled gates automatic execution of lings. It defaults to
+	// false (zero value) because concurrent lings share one working tree and
+	// are unsafe until per-ling worktree isolation lands (e531).
+	LingIgnitionEnabled bool `koanf:"ling_ignition_enabled"`
 }
 
 // DefaultOutputLimit is the fallback truncation length for heavy output

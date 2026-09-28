@@ -46,6 +46,16 @@ func (s *Court) TriggerLingIgnition(key storage.EdictKey) {
 	if s == nil || s.db == nil || key.ID == 0 {
 		return
 	}
+	// Nil-config safe: bootstrap fills config lazily, so a nil or absent
+	// config must behave as "disabled" and still record the skip in the ledger.
+	if s.config == nil || !s.config.LingIgnitionEnabled {
+		s.logger.Info("ling ignition disabled by config", "edict_id", key.ID)
+		s.PublishEvent(key, storage.EventLingIgnitionSkipped, storage.JSON{
+			"reason":       "ling_ignition_disabled_by_config",
+			"pending_e531": true,
+		})
+		return
+	}
 	ctx := s.ctx
 	if ctx == nil {
 		ctx = context.Background()

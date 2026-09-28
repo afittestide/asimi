@@ -2197,12 +2197,16 @@ func newLingTestCourt(t *testing.T, db *gorm.DB) (*Court, *recordingProvider) {
 		}
 	}
 	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	// Enable ignition explicitly: these tests exercise the engine; the
+	// production default is off until worktree isolation lands (e531).
+	cfg := config.DefaultCourtConfig()
+	cfg.LingIgnitionEnabled = true
 	s := &Court{
 		db:        db,
 		ministers: ministers,
 		logger:    slog.Default(),
 		notify:    func(any) {},
-		config:    config.DefaultCourtConfig(),
+		config:    cfg,
 	}
 	s.sessionCfg = &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}
 	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
@@ -2230,12 +2234,16 @@ func newLingTestCourtPerMinister(t *testing.T, db *gorm.DB) (*Court, map[string]
 		}
 	}
 	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	// Enable ignition explicitly: these tests exercise the engine; the
+	// production default is off until worktree isolation lands (e531).
+	cfg := config.DefaultCourtConfig()
+	cfg.LingIgnitionEnabled = true
 	s := &Court{
 		db:        db,
 		ministers: ministers,
 		logger:    slog.Default(),
 		notify:    func(any) {},
-		config:    config.DefaultCourtConfig(),
+		config:    cfg,
 	}
 	s.sessionCfg = &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}
 	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
@@ -2382,4 +2390,76 @@ func TestRunLing_FailingMinisterPublishesLingFailed(t *testing.T) {
 	var got storage.Ling
 	require.NoError(t, db.First(&got, "ling_id = ?", "ling-orphan").Error)
 	assert.Equal(t, storage.LingPending, got.Status, "failed ling stays pending for retry")
+}
+
+// TestTriggerLingIgnition_GateOffSkipsAndStaysPending verifies the off state
+// of the gate: a trigger with LingIgnitionEnabled=false must (a) spawn no
+// minister session (no ling_started event), (b) record a ling_ignition_skipped
+// event carrying the reason, and (c) leave the ling pending and listable
+// (e531 gate).
+func TestTriggerLingIgnition_GateOffSkipsAndStaysPending(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider := newLingTestCourt(t, db)
+	s.config.LingIgnitionEnabled = false
+
+	key := storage.EdictKey{ID: 46, Username: "testuser", Project: "testproject"}
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "ling-gated", EdictID: 46, Username: "testuser", Project: "testproject",
+		Description: "gated task", Status: storage.LingPending,
+	}).Error)
+
+	s.TriggerLingIgnition(key)
+
+	provider.mu.Lock()
+	n := len(provider.prompts)
+	provider.mu.Unlock()
+	assert.Zero(t, n, "no minister session may start while the gate is off")
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ?", 46).Find(&events).Error)
+	counts := map[storage.CourtEvent]int{}
+	var skipPayload storage.JSON
+	for _, e := range events {
+		counts[e.EventType]++
+		if e.EventType == storage.EventLingIgnitionSkipped {
+			skipPayload = e.Payload
+		}
+	}
+	assert.Zero(t, counts[storage.EventLingStarted], "no ling may start while the gate is off")
+	assert.Equal(t, 1, counts[storage.EventLingIgnitionSkipped], "skip must be visible in the ledger")
+	require.NotNil(t, skipPayload)
+	assert.Equal(t, "ling_ignition_disabled_by_config", skipPayload["reason"])
+	assert.Equal(t, true, skipPayload["pending_e531"])
+
+	var got storage.Ling
+	require.NoError(t, db.First(&got, "ling_id = ?", "ling-gated").Error)
+	assert.Equal(t, storage.LingPending, got.Status, "gated ling stays pending and listable")
+}
+
+// TestTriggerLingIgnition_GateOnIgnites verifies the on state of the gate:
+// with LingIgnitionEnabled=true the trigger processes pending lings.
+func TestTriggerLingIgnition_GateOnIgnites(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider := newLingTestCourt(t, db)
+
+	key := storage.EdictKey{ID: 47, Username: "testuser", Project: "testproject"}
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "ling-active", EdictID: 47, Username: "testuser", Project: "testproject",
+		Description: "active task", Status: storage.LingPending,
+	}).Error)
+
+	s.TriggerLingIgnition(key)
+	// TriggerLingIgnition runs in a background goroutine; poll for completion.
+	require.Eventually(t, func() bool {
+		var got storage.Ling
+		if err := db.First(&got, "ling_id = ?", "ling-active").Error; err != nil {
+			return false
+		}
+		return got.Status == storage.LingDone
+	}, 5*time.Second, 10*time.Millisecond, "gated-on trigger must ignite the ling")
+
+	provider.mu.Lock()
+	n := len(provider.prompts)
+	provider.mu.Unlock()
+	assert.Equal(t, 1, n, "exactly one minister session runs")
 }
