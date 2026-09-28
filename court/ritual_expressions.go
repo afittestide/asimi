@@ -1097,14 +1097,35 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			return fmt.Errorf("verdict check failed: %d manifest(s) rejected: %v", len(rejected), rejected)
 		}
 
-		// Check JudgeVerdict outcomes using latest-wins per manifest:
-		// For each manifest, only the most recent verdict (by created_at) matters.
-		// Fail only if the latest verdict for any manifest is failed.
+		// Check JudgeVerdict outcomes using latest-wins per manifest, but ONLY
+		// over CURRENT manifests — the same latest-per-(edict, username,
+		// project, file_path) set as the query above. A reforge mints a NEW
+		// manifest_id for the same file_path, so keying latest-wins by
+		// manifest_id alone would keep a failed verdict on a superseded
+		// manifest as "latest" forever, and the edict could never ascend
+		// (the e883 regression; same defect family as the e875/e876
+		// precedent gate).
+		//
+		// No weakening: a failed verdict on a CURRENT manifest still blocks.
+		//
+		// Verdict rows with NULL created_at are structurally invisible to the
+		// gate: SQL NULL never satisfies jv.created_at = MAX(...). This is the
+		// same e874-style contract the precedent gate documents — hand-inserted
+		// rows without timestamps (e.g. the manual ledger surgery on e883) can
+		// neither block nor unblock the gate; operators must record a new
+		// verdict row with a proper timestamp instead.
 		var failedVerdicts []storage.JudgeVerdict
 		if err := r.db.Raw(`
 			SELECT jv.* FROM judge_verdicts jv
 			JOIN forge_manifests fm ON fm.manifest_id = jv.manifest_id
 			WHERE fm.edict_id = ? AND fm.username = ? AND fm.project = ?
+			  AND fm.created_at = (
+			    SELECT MAX(fm2.created_at) FROM forge_manifests fm2
+			    WHERE fm2.edict_id = fm.edict_id
+			      AND fm2.username = fm.username
+			      AND fm2.project = fm.project
+			      AND fm2.file_path = fm.file_path
+			  )
 			  AND jv.created_at = (
 			    SELECT MAX(jv2.created_at) FROM judge_verdicts jv2
 			    WHERE jv2.manifest_id = jv.manifest_id
@@ -1123,19 +1144,26 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			return fmt.Errorf("verdict check failed: %d verdict(s) with failed outcome: %v", len(failedVerdicts), manifestIDs)
 		}
 
-		// Also check edict-level verdicts (manifest_id = '')
+		// Also check edict-level verdicts (manifest_id = ''), scoped to the
+		// CURRENT edict via edict_id. An edict-level verdict only has force
+		// over the edict it belongs to; without this scoping, one failed
+		// account-level row would block every subsequent ritual for the
+		// entire account. Rows with edict_id = 0 (legacy, or deliberately
+		// account-level) are gate-irrelevant and deliberately excluded.
 		var failedEdictVerdicts []storage.JudgeVerdict
 		if err := r.db.Raw(`
 			SELECT * FROM judge_verdicts jv
 			WHERE jv.manifest_id = '' AND jv.test_suite = 'edict'
+			  AND jv.edict_id = ?
 			  AND jv.username = ? AND jv.project = ?
 			  AND jv.created_at = (
 			    SELECT MAX(jv2.created_at) FROM judge_verdicts jv2
 			    WHERE jv2.manifest_id = '' AND jv2.test_suite = 'edict'
+			      AND jv2.edict_id = jv.edict_id
 			      AND jv2.username = jv.username AND jv2.project = jv.project
 			  )
 			  AND jv.outcome = ?`,
-			thenKey.Username, thenKey.Project, storage.VerdictFailed).
+			thenKey.ID, thenKey.Username, thenKey.Project, storage.VerdictFailed).
 			Scan(&failedEdictVerdicts).Error; err != nil {
 			return fmt.Errorf("failed to query edict-level verdicts: %w", err)
 		}

@@ -1617,10 +1617,14 @@ func TestCheckVerdictsPassed_EdictLevelFailed(t *testing.T) {
 		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
 	}
 
-	// Create a failed edict-level verdict (manifest_id = '')
+	// Create a failed edict-level verdict (manifest_id = '') owned by edict 1.
+	// Under the scoped gate, only a verdict with edict_id matching the current
+	// edict may block it; edict_id = 0 is legacy and gate-irrelevant (see
+	// TestCheckVerdictsPassed_LegacyVerdictDoesNotBlock).
 	verdict := storage.JudgeVerdict{
 		VerdictID:  GenerateID("verdict", "1", "edict", "fail"),
 		ManifestID: "",
+		EdictID:    1,
 		Username:   "testuser",
 		Project:    "testproject",
 		TestSuite:  "edict",
@@ -1681,6 +1685,342 @@ func TestCheckVerdictsPassed_EdictLevelPassed(t *testing.T) {
 	err := runner.runThen(context.Background(), exec, "check_verdicts_passed")
 	if err != nil {
 		t.Errorf("Expected no error when edict-level verdict is passed, got: %v", err)
+	}
+}
+
+// TestCheckVerdictsPassed_CrossEdictFailureDoesNotBlock is the regression
+// test for cross-edict poisoning: a failed edict-level verdict recorded by
+// edict 1 must not block edict 2 for the same user/project.
+func TestCheckVerdictsPassed_CrossEdictFailureDoesNotBlock(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.JudgeVerdict{}); err != nil {
+		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
+	}
+
+	// Edict 1's failed edict-level verdict.
+	verdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "1", "edict", "fail"),
+		ManifestID: "",
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		TestSuite:  "edict",
+		Outcome:    storage.VerdictFailed,
+	}
+	if err := db.Create(&verdict).Error; err != nil {
+		t.Fatalf("Failed to create edict-level verdict: %v", err)
+	}
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	// The gate for edict 2 must not see edict 1's failure.
+	exec := &RitualExecution{
+		EdictID:  2,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "check_verdicts_passed"); err != nil {
+		t.Errorf("Expected edict 2 unaffected by edict 1's failed verdict, got: %v", err)
+	}
+
+	// Sanity: the same gate still blocks edict 1.
+	exec.EdictID = 1
+	if err := runner.runThen(context.Background(), exec, "check_verdicts_passed"); err == nil {
+		t.Error("Expected edict 1 to be blocked by its own failed edict-level verdict, got nil")
+	}
+}
+
+// TestCheckVerdictsPassed_LegacyVerdictDoesNotBlock pins the Ruler-decided
+// semantics: a failed edict-level verdict with edict_id = 0 (legacy rows,
+// never backfilled) is account history and must not block any edict.
+func TestCheckVerdictsPassed_LegacyVerdictDoesNotBlock(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.JudgeVerdict{}); err != nil {
+		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
+	}
+
+	verdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "legacy", "edict", "fail"),
+		ManifestID: "",
+		// EdictID deliberately unset: zero value = legacy row.
+		Username:  "testuser",
+		Project:   "testproject",
+		TestSuite: "edict",
+		Outcome:   storage.VerdictFailed,
+	}
+	if err := db.Create(&verdict).Error; err != nil {
+		t.Fatalf("Failed to create legacy edict-level verdict: %v", err)
+	}
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		EdictID:  7,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "check_verdicts_passed"); err != nil {
+		t.Errorf("Expected legacy (edict_id=0) verdict not to block edict 7, got: %v", err)
+	}
+}
+
+// TestCheckVerdictsPassed_EdictLevelLatestWins verifies that an edict whose
+// latest edict-level verdict passes is unblocked, even though an older
+// failed row exists. Recovery = record a passing verdict, never delete rows.
+func TestCheckVerdictsPassed_EdictLevelLatestWins(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.JudgeVerdict{}); err != nil {
+		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
+	}
+
+	failedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "1", "edict", "fail"),
+		ManifestID: "",
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		TestSuite:  "edict",
+		Outcome:    storage.VerdictFailed,
+	}
+	if err := db.Create(&failedVerdict).Error; err != nil {
+		t.Fatalf("Failed to create failed verdict: %v", err)
+	}
+
+	passedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "1", "edict", "pass"),
+		ManifestID: "",
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		TestSuite:  "edict",
+		Outcome:    storage.VerdictPassed,
+	}
+	if err := db.Create(&passedVerdict).Error; err != nil {
+		t.Fatalf("Failed to create passed verdict: %v", err)
+	}
+	passedVerdict.CreatedAt = failedVerdict.CreatedAt.Add(time.Minute)
+	db.Model(&storage.JudgeVerdict{}).Where("verdict_id = ?", passedVerdict.VerdictID).Update("created_at", passedVerdict.CreatedAt)
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "check_verdicts_passed"); err != nil {
+		t.Errorf("Expected latest passed edict-level verdict to unblock edict 1, got: %v", err)
+	}
+}
+
+// TestCheckVerdictsPassed_SupersededFailedManifestDoesNotBlock is the e885
+// regression test for the reforge gate bug: an OLDER manifest for the same
+// file_path with a failed verdict must not block once a NEWER manifest for
+// that file_path exists and passes. Latest-wins is keyed by manifest_id
+// alone, so without the current-manifest scoping (the same latest-per-
+// (edict, username, project, file_path) filter the manifest query uses),
+// mf-old's failed verdict would remain "latest for its manifest" forever
+// and the edict could never ascend (observed on e883).
+func TestCheckVerdictsPassed_SupersededFailedManifestDoesNotBlock(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.JudgeVerdict{}); err != nil {
+		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
+	}
+
+	oldManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "1", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestRejected,
+	}
+	newManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "2", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	for _, m := range []*storage.ForgeManifest{&oldManifest, &newManifest} {
+		if err := db.Create(m).Error; err != nil {
+			t.Fatalf("Failed to create manifest: %v", err)
+		}
+	}
+	db.Model(&storage.ForgeManifest{}).Where("manifest_id = ?", newManifest.ManifestID).
+		Update("created_at", oldManifest.CreatedAt.Add(time.Minute))
+
+	failedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "1", "test", "file.go"),
+		ManifestID: oldManifest.ManifestID,
+		TestSuite:  "unit",
+		Outcome:    storage.VerdictFailed,
+	}
+	passedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "2", "test", "file.go"),
+		ManifestID: newManifest.ManifestID,
+		TestSuite:  "unit",
+		Outcome:    storage.VerdictPassed,
+	}
+	for _, v := range []*storage.JudgeVerdict{&failedVerdict, &passedVerdict} {
+		if err := db.Create(v).Error; err != nil {
+			t.Fatalf("Failed to create verdict: %v", err)
+		}
+	}
+	db.Model(&storage.JudgeVerdict{}).Where("verdict_id = ?", passedVerdict.VerdictID).
+		Update("created_at", failedVerdict.CreatedAt.Add(time.Minute))
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "check_verdicts_passed"); err != nil {
+		t.Errorf("Expected superseded manifest's failed verdict not to block, got: %v", err)
+	}
+}
+
+// TestCheckVerdictsPassed_CurrentManifestFailedVerdictBlocks pins the
+// no-weakening half of e885: a failed verdict on the CURRENT (latest)
+// manifest for a file_path must still fail the gate.
+func TestCheckVerdictsPassed_CurrentManifestFailedVerdictBlocks(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.JudgeVerdict{}); err != nil {
+		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
+	}
+
+	oldManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "1", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	newManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "2", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	for _, m := range []*storage.ForgeManifest{&oldManifest, &newManifest} {
+		if err := db.Create(m).Error; err != nil {
+			t.Fatalf("Failed to create manifest: %v", err)
+		}
+	}
+	db.Model(&storage.ForgeManifest{}).Where("manifest_id = ?", newManifest.ManifestID).
+		Update("created_at", oldManifest.CreatedAt.Add(time.Minute))
+
+	passedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "1", "test", "file.go"),
+		ManifestID: oldManifest.ManifestID,
+		TestSuite:  "unit",
+		Outcome:    storage.VerdictPassed,
+	}
+	failedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "2", "test", "file.go"),
+		ManifestID: newManifest.ManifestID,
+		TestSuite:  "unit",
+		Outcome:    storage.VerdictFailed,
+	}
+	for _, v := range []*storage.JudgeVerdict{&passedVerdict, &failedVerdict} {
+		if err := db.Create(v).Error; err != nil {
+			t.Fatalf("Failed to create verdict: %v", err)
+		}
+	}
+	db.Model(&storage.JudgeVerdict{}).Where("verdict_id = ?", failedVerdict.VerdictID).
+		Update("created_at", passedVerdict.CreatedAt.Add(time.Minute))
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	err := runner.runThen(context.Background(), exec, "check_verdicts_passed")
+	if err == nil {
+		t.Error("Expected error when the CURRENT manifest's latest verdict is failed, got nil")
+	} else if !strings.Contains(err.Error(), "failed outcome") {
+		t.Errorf("Expected error to mention 'failed outcome', got: %v", err)
+	}
+}
+
+// TestCheckVerdictsPassed_NullCreatedAtVerdictInvisible pins the e885
+// contract for verdict rows with NULL created_at (e.g. hand-inserted ledger
+// rows like the manual surgery on e883): SQL NULL never satisfies
+// jv.created_at = MAX(...), so such a row is structurally invisible to the
+// gate — it cannot block a passing edict and cannot rescue a failing one.
+func TestCheckVerdictsPassed_NullCreatedAtVerdictInvisible(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.JudgeVerdict{}); err != nil {
+		t.Fatalf("Failed to migrate JudgeVerdict: %v", err)
+	}
+
+	manifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "1", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	if err := db.Create(&manifest).Error; err != nil {
+		t.Fatalf("Failed to create manifest: %v", err)
+	}
+
+	// A failed verdict that CANNOT be seen by the gate: NULL created_at.
+	// This mirrors the hand-inserted row from e883's manual ledger surgery.
+	surgical := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "surgery", "test", "file.go"),
+		ManifestID: manifest.ManifestID,
+		TestSuite:  "edict",
+		Outcome:    storage.VerdictFailed,
+	}
+	if err := db.Create(&surgical).Error; err != nil {
+		t.Fatalf("Failed to create surgical verdict: %v", err)
+	}
+	if err := db.Exec("UPDATE judge_verdicts SET created_at = NULL WHERE verdict_id = ?", surgical.VerdictID).Error; err != nil {
+		t.Fatalf("Failed to null verdict created_at: %v", err)
+	}
+
+	// A properly recorded passing verdict, newer than everything.
+	passedVerdict := storage.JudgeVerdict{
+		VerdictID:  GenerateID("verdict", "1", "test", "file.go"),
+		ManifestID: manifest.ManifestID,
+		TestSuite:  "unit",
+		Outcome:    storage.VerdictPassed,
+	}
+	if err := db.Create(&passedVerdict).Error; err != nil {
+		t.Fatalf("Failed to create passed verdict: %v", err)
+	}
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "check_verdicts_passed"); err != nil {
+		t.Errorf("Expected NULL-timestamped failed verdict to be invisible to the gate, got: %v", err)
 	}
 }
 

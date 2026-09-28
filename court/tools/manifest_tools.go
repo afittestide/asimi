@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/afittestide/asimi/storage"
@@ -164,6 +165,7 @@ func (t RecordVerdictTool) Call(ctx context.Context, input string) (string, erro
 		verdict := storage.JudgeVerdict{
 			VerdictID:  verdictID,
 			ManifestID: "",
+			EdictID:    key.ID,
 			Username:   key.Username,
 			Project:    key.Project,
 			TestSuite:  "edict",
@@ -236,18 +238,19 @@ func (t RecordVerdictTool) sealIfComplete(key storage.EdictKey) bool {
 		}
 	}
 
-	// All quenched — grant judge seal
-	sealID := GenerateID("seal", fmt.Sprintf("%d", key.ID), key.Username, key.Project, t.Ctx.MinisterID)
-	seal := storage.Seal{
-		SealID:     sealID,
-		EdictID:    key.ID,
-		Username:   key.Username,
-		Project:    key.Project,
-		MinisterID: t.Ctx.MinisterID,
-		SealedAt:   time.Now(),
-		Metadata:   storage.JSON{"type": "judgment_complete"},
+	// All quenched — grant judge seal. GrantSeal is idempotent and
+	// resurrects tombstones rather than colliding with their IDs (e882).
+	// The verdict tool is the judge's; tolerate contexts where the
+	// minister id was never wired (tests, direct invocation).
+	ministerID := t.Ctx.MinisterID
+	if ministerID == "" {
+		ministerID = "judge"
 	}
-	if err := t.Ctx.DB.Create(&seal).Error; err != nil {
+	if err := storage.NewSealService(t.Ctx.DB).GrantSeal(key, ministerID, storage.JSON{"type": "judgment_complete"}); err != nil {
+		// Surface the failure instead of silently returning false, which
+		// previously masked both the e882 collision and empty-minister bugs.
+		log.Printf("ERROR sealIfComplete: failed to grant %s seal for edict %d: %v",
+			ministerID, key.ID, err)
 		return false
 	}
 	return true

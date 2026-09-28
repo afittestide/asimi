@@ -372,10 +372,20 @@ const (
 	VerdictFailed VerdictOutcome = "failed"
 )
 
-// JudgeVerdict represents a test/CI verdict from the Judge
+// JudgeVerdict.EdictID contract (正名) — mirrors CensorPrecedent.EdictID:
+//
+//	EdictID == 0 means the verdict has no owning edict (legacy rows, or
+//	  deliberately account-level records). Edict-level verdicts with
+//	  EdictID == 0 are gate-irrelevant: they must not block any edict.
+//	EdictID > 0 is the id of the owning edict; an edict-level verdict
+//	  (manifest_id == '', test_suite == 'edict') only affects that edict.
+//
+// No backfill: pre-existing rows have EdictID == 0 and become account
+// history, never gate-relevant.
 type JudgeVerdict struct {
 	VerdictID  string         `gorm:"primaryKey;column:verdict_id"`
 	ManifestID string         `gorm:"column:manifest_id;index"`
+	EdictID    uint           `gorm:"column:edict_id;index"` // See the JudgeVerdict.EdictID contract above.
 	Username   string         `gorm:"column:username"`
 	Project    string         `gorm:"column:project"`
 	TestSuite  string         `gorm:"column:test_suite"`
