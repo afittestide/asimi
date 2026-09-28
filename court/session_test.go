@@ -662,6 +662,35 @@ func TestSession_AskWithStreaming_LLMError(t *testing.T) {
 	assert.Contains(t, err.Error(), "rate limited")
 }
 
+// e879: the non-streaming ChatCompletionRequest failure must carry request
+// context (provider, effective base URL, path, status) — the regression the
+// chancellor's B1 caught — and must not leak credentials.
+func TestSession_GenerateLLMResponse_NonStreamingErrorHasContext(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+	status404 := 404
+	mockLLM.SetError(&schemas.BifrostError{
+		StatusCode: &status404,
+		Error: &schemas.ErrorField{
+			Message: "Not Found (Authorization: Bearer sk-test-secret)",
+		},
+	})
+
+	sess, err := NewSession(mockLLM,
+		&SessionConfig{LLM: internalconfig.LLMConfig{BaseURL: "https://zro.moonmath.ai/v2"}},
+		nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+	sess.Provider = "openai"
+	sess.Model = "test-model"
+
+	_, err = sess.generateLLMResponse(context.Background(), false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openai @ https://zro.moonmath.ai")
+	assert.Contains(t, err.Error(), "POST /v1/chat/completions")
+	assert.Contains(t, err.Error(), "status 404")
+	assert.Contains(t, err.Error(), "Not Found")
+	assert.NotContains(t, err.Error(), "sk-test-secret")
+}
+
 func TestSession_AskWithStreaming_StopReasonError(t *testing.T) {
 	mockLLM := mocks.NewLLMProvider()
 	mockLLM.SetStreamingChunks([]mocks.StreamingChunk{

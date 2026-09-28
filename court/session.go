@@ -73,10 +73,34 @@ func bifrostErrorToGoError(be *schemas.BifrostError) error {
 			return be.Error.Error
 		}
 		if be.Error.Message != "" {
-			return fmt.Errorf("%s", be.Error.Message)
+			return fmt.Errorf("%s", RedactProviderErrorMessage(be.Error.Message))
 		}
 	}
-	return fmt.Errorf("bifrost error: %s", be.String())
+	return fmt.Errorf("bifrost error: %s", RedactProviderErrorMessage(be.String()))
+}
+
+// requestContext identifies the provider endpoint this session's
+// completions target, for rendering failures with their request context.
+func (s *Session) requestContext() ProviderRequestContext {
+	baseURL := ""
+	if s.config != nil {
+		baseURL = s.config.BaseURL
+	}
+	return ChatRequestContext(s.Provider, baseURL)
+}
+
+// wrapBifrostError attaches request context (provider, effective base URL,
+// method/path, HTTP status when present) to a provider failure.
+// Never includes credentials or request payloads.
+func (s *Session) wrapBifrostError(be *schemas.BifrostError) error {
+	return s.requestContext().Wrap("POST", bifrostStatusCode(be), bifrostErrorToGoError(be))
+}
+
+func bifrostStatusCode(be *schemas.BifrostError) *int {
+	if be == nil {
+		return nil
+	}
+	return be.StatusCode
 }
 
 // responseChoice holds the result of an LLM generation
@@ -1305,7 +1329,7 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 		bifrostCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 		ch, bifrostErr := s.model.ChatCompletionStreamRequest(bifrostCtx, req)
 		if bifrostErr != nil {
-			return nil, bifrostErrorToGoError(bifrostErr)
+			return nil, s.wrapBifrostError(bifrostErr)
 		}
 
 		var content strings.Builder
@@ -1341,7 +1365,8 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 				} else {
 					errMsg = "unknown streaming error"
 				}
-				return nil, fmt.Errorf("streaming error: %s", errMsg)
+				return nil, s.requestContext().Wrap("POST", chunk.BifrostError.StatusCode,
+					fmt.Errorf("%s", errMsg))
 			}
 			if chunk.BifrostChatResponse == nil || len(chunk.BifrostChatResponse.Choices) == 0 {
 				// Check for usage on chunks without choices (some providers send usage separately)
@@ -1449,7 +1474,7 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 	bifrostCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 	resp, bifrostErr := s.model.ChatCompletionRequest(bifrostCtx, req)
 	if bifrostErr != nil {
-		return nil, bifrostErrorToGoError(bifrostErr)
+		return nil, s.wrapBifrostError(bifrostErr)
 	}
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("empty response choices")
