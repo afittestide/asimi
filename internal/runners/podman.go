@@ -367,6 +367,10 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	terminal := false
 	s.Terminal = &terminal
 	s.Env = map[string]string{"TERM": "dumb"}
+	for _, kv := range NonInteractiveGitEnv() {
+		name, val, _ := strings.Cut(kv, "=")
+		s.Env[name] = val
+	}
 	for _, name := range r.config.PassthroughEnv {
 		if val, ok := os.LookupEnv(name); ok {
 			s.Env[name] = val
@@ -482,6 +486,7 @@ func (r *PodmanRunner) sendContainerLaunched(containerID string) {
 // Returns the combined output and the exit code.
 func (r *PodmanRunner) execCommand(ctx context.Context, command string) (string, int, error) {
 	env := []string{"BASH_ENV=/root/.bashrc", "TERM=dumb"}
+	env = append(env, NonInteractiveGitEnv()...)
 	for _, name := range r.config.PassthroughEnv {
 		if val, ok := os.LookupEnv(name); ok {
 			env = append(env, fmt.Sprintf("%s=%s", name, val))

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"runtime"
 )
@@ -49,6 +50,9 @@ func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
 	} else {
 		cmd = exec.CommandContext(ctx, "bash", "-c", input.Command)
 	}
+	// Children must never emit interactive credential prompts; see
+	// NonInteractiveGitEnv for why.
+	cmd.Env = append(os.Environ(), NonInteractiveGitEnv()...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -30,6 +30,37 @@ func TestHostRunnerRunWithBypassApproval(t *testing.T) {
 	assert.Equal(t, "0", output.ExitCode)
 }
 
+// A spawned command must observe the non-interactive git env so no
+// child can emit a credential prompt.
+func TestHostRunnerForcesNonInteractiveGitEnv(t *testing.T) {
+	runner := NewHostRunner(0, t.TempDir())
+
+	output, err := runner.Run(context.Background(), Input{
+		Command:        "printenv GIT_TERMINAL_PROMPT; printenv GIT_ASKPASS; printenv SSH_ASKPASS; printenv GCM_INTERACTIVE",
+		BypassApproval: true,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "0", output.ExitCode)
+	assert.Contains(t, output.Output, "0")
+	assert.Contains(t, output.Output, "/bin/false")
+	assert.Contains(t, output.Output, "never")
+}
+
+// The fragment must not clobber env vars the child legitimately needs.
+func TestHostRunnerEnvPreservesPath(t *testing.T) {
+	runner := NewHostRunner(0, t.TempDir())
+
+	output, err := runner.Run(context.Background(), Input{
+		Command:        "printenv PATH",
+		BypassApproval: true,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "0", output.ExitCode)
+	assert.NotEmpty(t, output.Output)
+}
+
 func TestHostRunnerRunExitCode(t *testing.T) {
 	runner := NewHostRunner(0, t.TempDir())
 

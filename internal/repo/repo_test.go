@@ -3,6 +3,7 @@ package repo
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -493,4 +494,41 @@ func TestIsClean_InitializesDiffOnFirstCall(t *testing.T) {
 	// But after refreshing, IsClean reflects the dirty state
 	ri.RefreshDiff()
 	require.False(t, ri.IsClean(), "after RefreshDiff, IsClean must report dirty")
+}
+
+// Regression: git pre-commit hooks export GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/
+// GIT_QUARANTINE_PATH. runGitCommand must scrub them so child git commands
+// resolve against dir, not the hooking repo.
+func TestRunGitCommand_ScrubsGitHookEnv(t *testing.T) {
+	dir := t.TempDir()
+	_, err := runGitCommand(dir, "init")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.email", "test@example.com")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.name", "Test")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("one\n"), 0o644))
+
+	t.Setenv("GIT_DIR", "/nonexistent/.git")
+	t.Setenv("GIT_WORK_TREE", "/nonexistent")
+	t.Setenv("GIT_INDEX_FILE", "/nonexistent/.git/index")
+	t.Setenv("GIT_QUARANTINE_PATH", "/nonexistent/objects/incoming")
+
+	// Every command must succeed despite the poisoned environment; the
+	// operations must land in dir, not the GIT_DIR given above.
+	_, err = runGitCommand(dir, "add", "file.txt")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "commit", "-m", "init")
+	require.NoError(t, err)
+
+	out, err := runGitCommand(dir, "rev-parse", "--absolute-git-dir")
+	require.NoError(t, err)
+	require.Contains(t, strings.TrimSpace(string(out)), dir,
+		"git must operate on dir, not the GIT_DIR inherited from the environment")
+}
+
+func TestFilterEnv(t *testing.T) {
+	env := []string{"HOME=/home/x", "GIT_DIR=/bad/.git", "PATH=/bin", "GIT_WORK_TREE=/bad"}
+	got := filterEnv(env, "GIT_DIR", "GIT_WORK_TREE")
+	require.Equal(t, []string{"HOME=/home/x", "PATH=/bin"}, got)
 }

@@ -22,6 +22,40 @@ import (
 	"go.podman.io/podman/v6/pkg/bindings"
 )
 
+func TestNonInteractiveGitEnv(t *testing.T) {
+	required := map[string]string{
+		"GIT_TERMINAL_PROMPT": "0",
+		"GIT_ASKPASS":         "/bin/false",
+		"SSH_ASKPASS":         "/bin/false",
+		"SSH_ASKPASS_REQUIRE": "never",
+		"GCM_INTERACTIVE":     "never",
+	}
+
+	got := make(map[string]string)
+	for _, kv := range NonInteractiveGitEnv() {
+		name, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Errorf("malformed env entry %q, want NAME=VALUE", kv)
+			continue
+		}
+		got[name] = val
+	}
+
+	if len(got) != len(required) {
+		t.Errorf("NonInteractiveGitEnv has %d entries, want %d", len(got), len(required))
+	}
+	for name, wantVal := range required {
+		val, ok := got[name]
+		if !ok {
+			t.Errorf("missing %s", name)
+			continue
+		}
+		if val != wantVal {
+			t.Errorf("%s = %q, want %q", name, val, wantVal)
+		}
+	}
+}
+
 func TestNewPodmanRunner(t *testing.T) {
 	repoInfo := repo.RepoInfo{
 		ProjectRoot: t.TempDir(),

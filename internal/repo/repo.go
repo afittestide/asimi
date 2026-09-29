@@ -502,12 +502,33 @@ func collectDiffFromGit(repoPath string, opts []string) (int, int) {
 func runGitCommand(dir string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	// When git runs hooks, it exports GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE
+	// and GIT_QUARANTINE_PATH. Child git processes inherit them and resolve
+	// paths against the outer repo instead of dir, so scrub them.
+	cmd.Env = filterEnv(os.Environ(), "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_QUARANTINE_PATH")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return out, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return out, nil
 }
+
+// filterEnv returns env with the given variables removed.
+func filterEnv(env []string, keys ...string) []string {
+	drop := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		drop[k] = true
+	}
+	filtered := make([]string, 0, len(env))
+	for _, kv := range env {
+		if i := strings.IndexByte(kv, '='); i > 0 && drop[kv[:i]] {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	return filtered
+}
+
 func summarizeStatus(status gogit.Status) string {
 	if len(status) == 0 {
 		return ""
@@ -570,6 +591,9 @@ func summarizeStatus(status gogit.Status) string {
 // GitRemoteOriginURL returns the remote origin URL for the given working directory.
 func GitRemoteOriginURL(workingDir string) (string, error) {
 	cmd := exec.Command("git", "-C", workingDir, "config", "--get", "remote.origin.url")
+	// Scrub GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_QUARANTINE_PATH so a
+	// parent git hook's environment cannot redirect this query elsewhere.
+	cmd.Env = filterEnv(os.Environ(), "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_QUARANTINE_PATH")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
