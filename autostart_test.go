@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -93,6 +94,73 @@ func TestConnectOrStartDaemonFastPath(t *testing.T) {
 	defer c.Close()
 	if got != resolved {
 		t.Errorf("path = %q, want %q", got, resolved)
+	}
+}
+
+// TestDaemonLogPathHonorsASIMIHome verifies the daemon log lands under
+// ASIMI_HOME when set — the Harbor case, where cwd may be read-only.
+func TestDaemonLogPathHonorsASIMIHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+
+	p, err := daemonLogPath()
+	if err != nil {
+		t.Fatalf("daemonLogPath: %v", err)
+	}
+	want := filepath.Join(home, "asimi-daemon.log")
+	if p != want {
+		t.Errorf("daemonLogPath = %q, want %q", p, want)
+	}
+}
+
+// TestOpenDaemonLogRoundTrip exercises the open/MkdirAll path end to
+// end: the file is created, appendable, and (crucially for the spawn
+// path) capturable as a child's stdout.
+func TestOpenDaemonLogRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+
+	stdout, stderr, err := openDaemonLog()
+	if err != nil {
+		t.Fatalf("openDaemonLog: %v", err)
+	}
+	defer stdout.Close()
+	if stdout != stderr {
+		t.Errorf("expected both fds to alias the same log file")
+	}
+
+	if _, err := stdout.WriteString("daemon stray output\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	p, _ := daemonLogPath()
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !strings.Contains(string(data), "daemon stray output") {
+		t.Errorf("log file missing written content, got %q", data)
+	}
+}
+
+// TestOpenDaemonLogFallback verifies the failure contract: when the log
+// directory can't be resolved, we degrade to the terminal rather than
+// failing — starting the daemon beats logging its output.
+func TestOpenDaemonLogFallback(t *testing.T) {
+	// Pointing ASIMI_HOME at a regular file makes MkdirAll fail with
+	// "not a directory", exercising the error path without mocks.
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	t.Setenv("ASIMI_HOME", blocker)
+
+	out, errF, err := openDaemonLog()
+	if err == nil {
+		t.Fatal("expected an error when ASIMI_HOME is not a directory")
+	}
+	if out != os.Stdout || errF != os.Stderr {
+		t.Errorf("fallback should return os.Stdout/os.Stderr, got %v/%v", out, errF)
 	}
 }
 

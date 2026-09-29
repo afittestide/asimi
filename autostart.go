@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -118,9 +119,45 @@ func evictWedgedDaemon(path string) {
 	_ = os.Remove(pidPath)
 }
 
+// daemonLogPath resolves where the spawned daemon's stdout/stderr go:
+// asimi-daemon.log under logDir() (same resolution as initLogger:
+// $ASIMI_HOME, or cwd in --debug, else ~/.local/share/asimi).
+func daemonLogPath() (string, error) {
+	dir := logDir()
+	if dir == "" {
+		return "", fmt.Errorf("could not resolve log directory")
+	}
+	return filepath.Join(dir, "asimi-daemon.log"), nil
+}
+
+// openDaemonLog opens (append/create) the daemon log file, creating its
+// directory as needed. On any failure it returns os.Stdout/os.Stderr so
+// daemon startup never fails over logging — the previous behaviour is
+// the fallback, and the caller should log a warning on err != nil.
+func openDaemonLog() (stdout, stderr *os.File, err error) {
+	path, err := daemonLogPath()
+	if err != nil {
+		return os.Stdout, os.Stderr, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return os.Stdout, os.Stderr, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return os.Stdout, os.Stderr, err
+	}
+	return f, f, nil
+}
+
 // spawnDaemonAndWait starts `asimi daemon` as a child process, hands
 // it a readiness pipe via the ASIMI_READY_FD env var, and blocks until
 // the child writes a byte (up to autostartReadyTimeout).
+//
+// The daemon's stdout/stderr must not be the live terminal: the daemon
+// itself writes there (internal/daemon/server.go's ready line), and any
+// child it spawns — a host-fallback command, a nested git invocation
+// emitting a credential prompt — would paint directly over the TUI.
+// Both fds are redirected to daemonLogPath() instead.
 func spawnDaemonAndWait(ctx context.Context, socketPath string) error {
 	selfPath, err := os.Executable()
 	if err != nil {
@@ -140,10 +177,23 @@ func spawnDaemonAndWait(ctx context.Context, socketPath string) error {
 	cmd := exec.CommandContext(ctx, selfPath, args...)
 	cmd.Env = append(os.Environ(), "ASIMI_READY_FD=3")
 	cmd.ExtraFiles = []*os.File{readW}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	daemonOut, daemonErr, logErr := openDaemonLog()
+	if logErr != nil {
+		slog.Warn("could not open daemon log; daemon inherits terminal", "error", logErr)
+	}
+	cmd.Stdout = daemonOut
+	cmd.Stderr = daemonErr
+
+	closeDaemonLog := func() {
+		if logErr == nil {
+			_ = daemonOut.Close()
+			// daemonErr aliases daemonOut; closing once is enough.
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		_ = readW.Close()
+		closeDaemonLog()
 		return fmt.Errorf("spawn daemon: %w", err)
 	}
 	// Parent closes its copy of the write end so the child's close on
@@ -161,6 +211,11 @@ func spawnDaemonAndWait(ctx context.Context, socketPath string) error {
 		_, err := io.ReadFull(readR, buf)
 		ready <- err
 	}()
+
+	// The child holds its own dup of the log fds from the moment of
+	// Start; the parent's copies are closed once the readiness wait
+	// completes, in every arm of the select below.
+	defer closeDaemonLog()
 
 	select {
 	case err := <-ready:
