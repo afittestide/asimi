@@ -706,6 +706,7 @@ var modelContextSizes = []modelContextRule{
 	// DeepSeek v4 line: 1M.
 	{regexp.MustCompile(`deepseek-v4`), 1_000_000},
 	{regexp.MustCompile(`kimi-k3`), 1_000_000},
+	{regexp.MustCompile(`glm-5\.[23]`), 1_000_000},
 	// Anthropic Claude: 200k.
 	{regexp.MustCompile(`^[^:]+:(anthropic/)?claude-.*$`), 200_000},
 	// OpenAI gpt-4.1 line: 1M.
@@ -714,7 +715,6 @@ var modelContextSizes = []modelContextRule{
 	{regexp.MustCompile(`^[^:]+:(google/)?gemini-.*$`), 1_000_000},
 	// MiniMax via OpenRouter (slash form): 1M.
 	{regexp.MustCompile(`^[^:]+:minimax/minimax-m2\.[57]$`), 1_000_000},
-	{regexp.MustCompile(`^[^:]+:z-ai/glm-5\.[23]`), 1_000_000},
 	{regexp.MustCompile(`^[^:]+:mistralai/.*$`), 128_000},
 	{regexp.MustCompile(`^[^:]+:qwen/qwen3\.5-397b-a17b$`), 128_000},
 

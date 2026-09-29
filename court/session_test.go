@@ -1245,6 +1245,23 @@ func TestModelContextSize_OpenRouter(t *testing.T) {
 	}
 }
 
+func TestModelContextSize_GLM(t *testing.T) {
+	t.Parallel()
+
+	// The glm rule is deliberately unanchored (glm-5\.[23]) so it covers
+	// every delivery route of the model family, not just the OpenRouter
+	// z-ai/ form: a direct z-ai provider session has no "z-ai/" prefix in
+	// the model half, and glm-5.3 must ride the same 1M window as glm-5.2.
+	assert.Equal(t, 1_000_000, contextSizeFor(t, "z-ai", "glm-5.2"))
+	assert.Equal(t, 1_000_000, contextSizeFor(t, "z-ai", "glm-5.3"))
+	assert.Equal(t, 1_000_000, contextSizeFor(t, "openrouter", "z-ai/glm-5.3"))
+
+	// Near-miss variants stay on the provider fallback (128k for
+	// openrouter), proving the rule did not over-broaden.
+	assert.Equal(t, 128_000, contextSizeFor(t, "openrouter", "z-ai/glm-4.7"))
+	assert.Equal(t, 128_000, contextSizeFor(t, "openrouter", "z-ai/glm-5-air"))
+}
+
 func TestModelContextSize_SupersetMatches(t *testing.T) {
 	t.Parallel()
 
