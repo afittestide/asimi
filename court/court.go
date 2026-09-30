@@ -733,10 +733,21 @@ func (s *Court) SetContext(ctx context.Context, params types.SetContextParams) e
 		slug = repo.GetRepoInfoForRoot(params.ProjectRoot).Slug
 	}
 
+	// HasVCS is the single authoritative gitless-ground flag and SetContextParams
+	// does not carry it over the wire — re-derive it here so the RepoInfo pushed
+	// into the RitualRunner via ConfigureModel never treats a real git repository
+	// as gitless ground (which would skip staging/commit steps and lie in
+	// earth expressions).
+	var hasVCS bool
+	if params.ProjectRoot != "" {
+		hasVCS = repo.GetRepoInfoForRoot(params.ProjectRoot).HasVCS
+	}
+
 	repoInfo := repo.RepoInfo{
 		ProjectRoot:  params.ProjectRoot,
 		WorktreePath: params.WorktreePath,
 		Branch:       params.Branch,
+		HasVCS:       hasVCS,
 		Slug:         slug,
 	}
 

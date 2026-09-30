@@ -169,10 +169,10 @@ func ProvideStorage(params StorageParams) (StorageResult, error) {
 func ProvideRepoInfo(logger *slog.Logger) repo.RepoInfo {
 	logger.Info("detecting git repository")
 	repoInfo := repo.GetRepoInfo()
-	if repoInfo.ProjectRoot != "" {
+	if repoInfo.HasVCS {
 		logger.Info("git repository detected", "root", repoInfo.ProjectRoot, "branch", repoInfo.Branch)
 	} else {
-		logger.Info("no git repository found")
+		logger.Info(fmt.Sprintf("no git repository — using %s as project root", repoInfo.ProjectRoot))
 	}
 	return repoInfo
 }

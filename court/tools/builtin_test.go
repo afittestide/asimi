@@ -110,6 +110,25 @@ func TestRegisterBuiltinToolsNoRunnerNoShell(t *testing.T) {
 	assertNotHas(t, names, "run_shell_command")
 }
 
+// TestForgeSeesCreateManifest verifies the forge (rwxr---w- — intent Write,
+// no heaven Write) can see create_manifest. The forge's constitution makes
+// finishing without create_manifest calls treason, so the tool must be
+// visible through intent Write even though record_verdict stays heaven-only.
+func TestForgeSeesCreateManifest(t *testing.T) {
+	r := NewToolRegistry()
+	RegisterBuiltinTools(r, ToolRegistrationOpts{Ctx: testCtx()})
+
+	forgePerm, _ := ParsePermissions("rwxr---w-")
+	tools := r.ForPermissions(forgePerm)
+	names := toolNames(tools)
+
+	assertHas(t, names, "create_manifest")
+	// record_verdict must remain hidden from the forge — granting heaven
+	// Write would have exposed it; the intent Write registration must not.
+	assertNotHas(t, names, "record_verdict")
+	assertNotHas(t, names, "update_manifest_status")
+}
+
 func TestRegisterBuiltinToolsHeavenTools(t *testing.T) {
 	r := NewToolRegistry()
 	RegisterBuiltinTools(r, ToolRegistrationOpts{
@@ -147,11 +166,12 @@ func TestRegisterBuiltinToolsHeavenReadNoWrite(t *testing.T) {
 	assertHas(t, names, "get_manifest_by_commit")
 	// Heaven/Read+Write tool should be visible (shared Read flag)
 	assertHas(t, names, "asimisql")
-	// Heaven/Write tools — Sage has no heaven Write, but tools with
-	// only Write won't match. However, create_manifest is classified
-	// as heaven/Write. Sage has heaven Read. Since heaven Read ≠ heaven Write,
-	// the match fails for Write-only tools.
-	assertNotHas(t, names, "create_manifest")
+	// create_manifest is visible through heaven Write AND intent Write.
+	// Sage (r--r--rwx) has intent Write, so it now sees create_manifest —
+	// the same visibility any intent-Write minister gets.
+	assertHas(t, names, "create_manifest")
+	// Heaven/Write-only tools — Sage has no heaven Write and no intent
+	// Write match, so they stay hidden.
 	assertNotHas(t, names, "record_verdict")
 	assertNotHas(t, names, "update_manifest_status")
 }
@@ -389,13 +409,17 @@ func TestRegisterBuiltinToolsStrategistNoHeaven(t *testing.T) {
 		Ctx: testCtx(),
 	})
 
-	// Strategist: r-----rw- — NO heaven access at all
+	// Strategist: r-----rw- — NO heaven access, but intent Write.
 	strategistPerm, _ := ParsePermissions("r-----rw-")
 	tools := r.ForPermissions(strategistPerm)
 	names := toolNames(tools)
 
+	// create_manifest is dual-classified (heaven Write + intent Write), so an
+	// intent-Write strategist sees it; heaven-only tools stay hidden.
 	assertNotHas(t, names, "list_pending_manifests")
-	assertNotHas(t, names, "create_manifest")
+	assertHas(t, names, "create_manifest")
+	assertNotHas(t, names, "record_verdict")
+	assertNotHas(t, names, "update_manifest_status")
 }
 
 func TestRegisterBuiltinToolsEmptyOpts(t *testing.T) {

@@ -58,7 +58,7 @@ func TestStepDefRegistry(t *testing.T) {
 func TestResolveStepDef(t *testing.T) {
 	db := setupRitualTestDB(t)
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, nil, repo.RepoInfo{HasVCS: true})
 
 	// Test bash command resolution
 	entry, err := runner.resolveStepDef("!just test")
@@ -134,7 +134,7 @@ func TestRunGivenStep_Bash(t *testing.T) {
 	db := setupRitualTestDB(t)
 	registry := NewRitualRegistry()
 	mockRunner := &mockCmdRunner{output: "diff output\n", exitCode: "0"}
-	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-exec",
@@ -161,7 +161,7 @@ func TestRunGivenStep_BashFailure(t *testing.T) {
 	db := setupRitualTestDB(t)
 	registry := NewRitualRegistry()
 	failRunner := &mockCmdRunner{output: "FAIL\n", exitCode: "1"}
-	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-exec",
@@ -197,13 +197,116 @@ func TestRunGivenStep_BashFailure(t *testing.T) {
 	}
 }
 
+// TestRunGivenStep_MissingToolSkipsWithNote verifies the missing-tool path:
+// a bash given step failing with exit 127 and a "command not found" stderr
+// does NOT fail the step — the minister receives a note as context instead,
+// exec.Data records the situation, and the verdict gate stays the single
+// retry mechanism (edict 888: the ceremony must not bleed out hunting a
+// missing tool).
+func TestRunGivenStep_MissingToolSkipsWithNote(t *testing.T) {
+	db := setupRitualTestDB(t)
+	registry := NewRitualRegistry()
+	missingRunner := &mockCmdRunner{
+		output:   "/bin/sh: line 1: sqlite3: command not found\n",
+		exitCode: "127",
+	}
+	runner := NewRitualRunner(registry, nil, nil, db, missingRunner, nil, repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		ID:         "test-exec",
+		RitualName: "test",
+		EdictID:    100,
+	}
+
+	entry := StepDefEntry{
+		Kind:    StepDefBash,
+		Key:     "probe",
+		Command: "sqlite3 court.db 'SELECT 1'",
+	}
+
+	result, err := runner.runGivenStep(context.Background(), exec, entry)
+	if err != nil {
+		t.Fatalf("missing tool must not fail the given step, got: %v", err)
+	}
+	note, ok := result.(string)
+	if !ok || !strings.Contains(note, "tool missing") {
+		t.Errorf("expected a note mentioning the missing tool, got %v", result)
+	}
+	if !strings.Contains(note, "sqlite3") {
+		t.Errorf("note must name the missing binary, got %q", note)
+	}
+	if !strings.Contains(note, "not a test failure") {
+		t.Errorf("note must state it is not a test failure, got %q", note)
+	}
+	if exec.Data["probe_missing_tool"] == nil {
+		t.Error("exec.Data must record the missing-tool situation under <key>_missing_tool")
+	}
+}
+
+// TestRunGivenStep_Exit127WithoutMissingBinaryStillFails guards against
+// masking real failures: exit 127 whose stderr does NOT name a missing
+// binary must still fail the step.
+func TestRunGivenStep_Exit127WithoutMissingBinaryStillFails(t *testing.T) {
+	db := setupRitualTestDB(t)
+	registry := NewRitualRegistry()
+	failRunner := &mockCmdRunner{output: "some other 127 failure\n", exitCode: "127"}
+	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		ID:         "test-exec",
+		RitualName: "test",
+		EdictID:    100,
+	}
+
+	entry := StepDefEntry{
+		Kind:    StepDefBash,
+		Key:     "probe",
+		Command: "exit 127",
+	}
+
+	_, err := runner.runGivenStep(context.Background(), exec, entry)
+	if err == nil {
+		t.Fatal("exit 127 without a command-not-found stderr must still fail the given step")
+	}
+	if !strings.Contains(err.Error(), "exit 127") {
+		t.Errorf("expected exit code in error, got: %v", err)
+	}
+}
+
+// TestMissingBinaryRegex pins the stderr patterns the missing-tool detection
+// accepts: bash's "command not found" and sh's bare "not found" wording. The
+// real zsh format ("zsh:1: command not found: just") is NOT matched — known
+// gap, noted in the verdict; the ground runner hardcodes bash so bash/sh
+// wording is the operative contract.
+func TestMissingBinaryRegex(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   string
+	}{
+		{"bash wording via sh", "/bin/sh: line 1: sqlite3: command not found\n", "sqlite3"},
+		{"bash wording direct", "bash: sqlite3: command not found\n", "sqlite3"},
+		{"sh wording", "podman: not found\n", "podman"},
+		{"zsh wording (prescribed fix: extract binary after 'command not found:')", "zsh:1: command not found: just\n", "just"},
+		{"no match: plain failure", "panic: runtime error\n", ""},
+		{"no match: empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := missingBinary(tc.stderr); got != tc.want {
+				t.Errorf("missingBinary(%q) = %q, want %q", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunThenStep_Bash(t *testing.T) {
 	db := setupRitualTestDB(t)
 	registry := NewRitualRegistry()
 
 	// Success case
 	mockRunner := &mockCmdRunner{output: "ok\n", exitCode: "0"}
-	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-exec",
@@ -224,7 +327,7 @@ func TestRunThenStep_Bash(t *testing.T) {
 
 	// Failure case
 	failRunner := &mockCmdRunner{output: "FAIL\n", exitCode: "1"}
-	runner = NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{})
+	runner = NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	err = runner.runThenStep(context.Background(), exec, entry)
 	if err == nil {
@@ -261,7 +364,7 @@ func TestRunThenStep_Multiple(t *testing.T) {
 			{Output: "FAIL\n", ExitCode: "1"}, // second then
 		},
 	}
-	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, mockRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	ctx := context.Background()
 	exec, err := runner.Start(ctx, "multi-then", testEK(8), nil, nil)
@@ -287,7 +390,7 @@ func TestAwaitRulerSeal_StageManifestFiles(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, nil, repo.RepoInfo{HasVCS: true})
 
 	// Create test edict
 	edict := storage.Edict{
@@ -323,7 +426,7 @@ func TestAwaitRulerSeal_StageManifestFiles(t *testing.T) {
 			}
 		},
 	}
-	runner = NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{})
+	runner = NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	// Create execution
 	exec := &RitualExecution{
@@ -373,7 +476,7 @@ func TestAwaitRulerSeal_NoManifests(t *testing.T) {
 			t.Errorf("git add should not be called when no manifests exist, but got: %s", cmd)
 		},
 	}
-	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-await-ruler-seal-empty",
@@ -427,7 +530,7 @@ func TestAwaitRulerSeal_CommaSeparatedFilePaths(t *testing.T) {
 			}
 		},
 	}
-	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-await-ruler-seal-comma",
@@ -468,7 +571,7 @@ func TestCheckVerdictsPassed_AllApproved(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -516,7 +619,7 @@ func TestCheckVerdictsPassed_SomeRejected(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -571,7 +674,7 @@ func TestCheckVerdictsPassed_AllRejected(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -598,7 +701,7 @@ func TestCheckVerdictsPassed_NoManifests(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -648,7 +751,7 @@ func TestCheckVerdictsPassed_FailedVerdict(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -701,7 +804,7 @@ func TestCheckPrecedentApproved_AllApproved(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -772,7 +875,7 @@ func TestCheckPrecedentApproved_SomeRejected(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -802,7 +905,7 @@ func TestCheckPrecedentApproved_NoPrecedents(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -867,7 +970,7 @@ func TestCheckPrecedentApproved_RejectedThenApproved(t *testing.T) {
 	db.Model(&storage.CensorPrecedent{}).Where("precedent_id = ?", approvedPrec.PrecedentID).Update("created_at", approvedPrec.CreatedAt)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -931,7 +1034,7 @@ func TestCheckPrecedentApproved_RejectedIsLatest(t *testing.T) {
 	db.Model(&storage.CensorPrecedent{}).Where("precedent_id = ?", rejectedPrec.PrecedentID).Update("created_at", rejectedPrec.CreatedAt)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -994,7 +1097,7 @@ func TestCheckVerdictsPassed_FailedThenPassed(t *testing.T) {
 	db.Model(&storage.JudgeVerdict{}).Where("verdict_id = ?", passedVerdict.VerdictID).Update("created_at", passedVerdict.CreatedAt)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -1264,7 +1367,7 @@ func TestGetLings(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Call getLings
 	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
@@ -1296,7 +1399,7 @@ func TestGetLings_NoLings(t *testing.T) {
 	require.NoError(t, db.Create(edict).Error)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
 	_, err := runner.getLings(key)
@@ -1323,7 +1426,7 @@ func TestRecordLingCompleted(t *testing.T) {
 	require.NoError(t, db.Create(ling).Error)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Create execution with item containing ling_id
 	exec := &RitualExecution{
@@ -1352,7 +1455,7 @@ func TestRecordLingCompleted_NoLingID(t *testing.T) {
 	db := setupRitualTestDB(t)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Create execution without item
 	exec := &RitualExecution{
@@ -1370,7 +1473,7 @@ func TestRecordLingCompleted_LingNotFound(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&storage.Ling{}, &storage.Edict{}))
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Create execution with item containing a ling_id that doesn't exist in DB
 	exec := &RitualExecution{
@@ -1395,7 +1498,7 @@ func TestRecordLingCompleted_EmptyLingID(t *testing.T) {
 	db := setupRitualTestDB(t)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Create execution with item containing empty ling_id
 	exec := &RitualExecution{
@@ -1635,7 +1738,7 @@ func TestCheckVerdictsPassed_EdictLevelFailed(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -1674,7 +1777,7 @@ func TestCheckVerdictsPassed_EdictLevelPassed(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -1713,7 +1816,7 @@ func TestCheckVerdictsPassed_CrossEdictFailureDoesNotBlock(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// The gate for edict 2 must not see edict 1's failure.
 	exec := &RitualExecution{
@@ -1756,7 +1859,7 @@ func TestCheckVerdictsPassed_LegacyVerdictDoesNotBlock(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  7,
@@ -1807,7 +1910,7 @@ func TestCheckVerdictsPassed_EdictLevelLatestWins(t *testing.T) {
 	db.Model(&storage.JudgeVerdict{}).Where("verdict_id = ?", passedVerdict.VerdictID).Update("created_at", passedVerdict.CreatedAt)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -1879,7 +1982,7 @@ func TestCheckVerdictsPassed_SupersededFailedManifestDoesNotBlock(t *testing.T) 
 		Update("created_at", failedVerdict.CreatedAt.Add(time.Minute))
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -1946,7 +2049,7 @@ func TestCheckVerdictsPassed_CurrentManifestFailedVerdictBlocks(t *testing.T) {
 		Update("created_at", passedVerdict.CreatedAt.Add(time.Minute))
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2012,7 +2115,7 @@ func TestCheckVerdictsPassed_NullCreatedAtVerdictInvisible(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2047,7 +2150,7 @@ func TestCheckPrecedentApproved_EdictLevelRejected(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2087,7 +2190,7 @@ func TestCheckPrecedentApproved_EdictLevelApproved(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2126,7 +2229,7 @@ func TestCheckPrecedentApproved_CrossEdictRejectionDoesNotBlock(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Edict B (different edict) must NOT be blocked by A's rejection.
 	execB := &RitualExecution{
@@ -2208,7 +2311,7 @@ func TestCheckPrecedentApproved_EdictLevelLatestWinsPerEdict(t *testing.T) {
 	db.Model(&storage.CensorPrecedent{}).Where("precedent_id = ?", approved.PrecedentID).Update("created_at", approved.CreatedAt)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	// Edict 1's latest edict-level record is its own approval → passes.
 	exec1 := &RitualExecution{EdictID: 1, Username: "testuser", Project: "testproject"}
@@ -2269,7 +2372,7 @@ func TestCheckVerdictsPassed_PassedThenFailed(t *testing.T) {
 	db.Model(&storage.JudgeVerdict{}).Where("verdict_id = ?", failedVerdict.VerdictID).Update("created_at", failedVerdict.CreatedAt)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2291,7 +2394,7 @@ func TestCheckLingDAG_NoLings(t *testing.T) {
 	db := setupRitualTestDB(t)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2319,7 +2422,7 @@ func TestCheckLingDAG_ValidDAG(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2347,7 +2450,7 @@ func TestCheckLingDAG_CircularDependency(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2382,7 +2485,7 @@ func TestCheckLingDAG_IsolatesByEdictKey(t *testing.T) {
 	}
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		EdictID:  1,
@@ -2410,7 +2513,7 @@ func TestGetCourtStatus_ChancellorSealChecksChancellorMinisterID(t *testing.T) {
 	require.NoError(t, db.Create(&edict).Error)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	key := storage.EdictKey{ID: 1, Username: "testuser", Project: "testproject"}
 
@@ -2448,7 +2551,7 @@ func TestRunGivenStep_BashFailure_TruncatesOutput(t *testing.T) {
 	registry := NewRitualRegistry()
 	longOutput := strings.Repeat("x", 2000)
 	failRunner := &mockCmdRunner{output: longOutput, exitCode: "1"}
-	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-exec",
@@ -2481,7 +2584,7 @@ func TestRunThenStep_BashFailure_TruncatesOutput(t *testing.T) {
 	registry := NewRitualRegistry()
 	longOutput := strings.Repeat("y", 2000)
 	failRunner := &mockCmdRunner{output: longOutput, exitCode: "1"}
-	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, failRunner, nil, repo.RepoInfo{HasVCS: true})
 
 	exec := &RitualExecution{
 		ID:         "test-exec",
@@ -2516,7 +2619,7 @@ func TestGetCourtStatus_StaleRulerSealShowsActive(t *testing.T) {
 	require.NoError(t, db.Create(&edict).Error)
 
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	key := storage.EdictKey{ID: 1, Username: "testuser", Project: "testproject"}
 	sealSvc := storage.NewSealService(db)

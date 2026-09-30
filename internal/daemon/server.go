@@ -168,7 +168,14 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 			if err != nil {
 				return nil, wire.NewError(0, err.Error())
 			}
-			repoInfo := repo.RepoInfo{ProjectRoot: p.ProjectRoot, WorktreePath: p.WorktreePath, Branch: p.Branch, Slug: p.Project}
+			// HasVCS is the single authoritative gitless-ground flag and
+			// SetContextParams does not carry it over the wire — re-derive it
+			// so the RepoInfo never treats a real git repository as gitless.
+			var hasVCS bool
+			if p.ProjectRoot != "" {
+				hasVCS = repo.GetRepoInfoForRoot(p.ProjectRoot).HasVCS
+			}
+			repoInfo := repo.RepoInfo{ProjectRoot: p.ProjectRoot, WorktreePath: p.WorktreePath, Branch: p.Branch, HasVCS: hasVCS, Slug: p.Project}
 			ct, runner, err = createCourt(ctx, shared, connID, p, projectCfg, repoInfo, shared.NewSessionStore, p.IsolatedHost)
 			if err != nil {
 				return nil, wire.NewError(0, err.Error())

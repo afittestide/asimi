@@ -207,7 +207,34 @@ func TestGetRepoInfoForRoot_NonExistentDir(t *testing.T) {
 	require.Equal(t, "/nonexistent/path/that/does/not/exist", info.ProjectRoot)
 	require.Empty(t, info.Branch, "Branch should be empty for nonexistent dir")
 	require.False(t, info.IsWorktree)
-	require.Empty(t, info.Slug, "Slug should be empty when no git remote")
+	// Gitless ground still gets identity: the sanitized directory basename.
+	require.False(t, info.HasVCS, "HasVCS should be false without a git repository")
+	require.Equal(t, "exist", info.Slug,
+		"gitless directory yields the basename slug")
+}
+
+func TestGetRepoInfoForRoot_Gitless(t *testing.T) {
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	root := filepath.Join(t.TempDir(), "hello-world Trial")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+
+	info := GetRepoInfoForRoot(root)
+	require.False(t, info.HasVCS, "HasVCS should be false in a plain directory")
+	require.Empty(t, info.Branch, "Branch should stay empty on gitless ground")
+	require.False(t, info.IsMain, "no branch means not main")
+	require.Empty(t, info.BranchSlugOrDefault(),
+		"BranchSlugOrDefault must not report main when there is no repo")
+	require.Equal(t, "hello-world-trial", info.Slug,
+		"gitless slug derives from the sanitized directory basename")
+	require.True(t, info.Gitless())
+}
+
+func TestBranchSlugOrDefault(t *testing.T) {
+	require.Equal(t, "", (&RepoInfo{}).BranchSlugOrDefault(), "gitless: no branch")
+	require.Equal(t, "main", (&RepoInfo{HasVCS: true, Branch: ""}).BranchSlugOrDefault(),
+		"repo without a branch still defaults to main")
+	require.Equal(t, "feature-x", (&RepoInfo{HasVCS: true, Branch: "feature/x"}).BranchSlugOrDefault())
 }
 
 func TestBranchFromDetachedHead(t *testing.T) {
@@ -315,8 +342,12 @@ func TestProjectSlugLowercasesRemoteSegments(t *testing.T) {
 	require.NoError(t, err)
 	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
 
-	slug := projectSlug(dir)
+	slug := projectSlug(dir, true)
 	require.Equal(t, "myorg/myproject", slug)
+
+	// Gitless ground falls back to the sanitized directory basename.
+	gitless := t.TempDir()
+	require.Equal(t, SanitizeSegment(filepath.Base(gitless)), projectSlug(gitless, false))
 }
 
 // newTestRepo creates a RepoInfo backed by a real git repo in a temp dir.
@@ -351,6 +382,7 @@ func newTestRepo(t *testing.T) (*RepoInfo, string) {
 
 	ri := &RepoInfo{
 		ProjectRoot: dir,
+		HasVCS:      true,
 		repo:        repo,
 	}
 	ri.RefreshDiff()
@@ -415,7 +447,7 @@ func TestRefreshDiffWithTTL_InitializesWhenNotYetLoaded(t *testing.T) {
 	repo, err := gogit.PlainOpenWithOptions(dir, &gogit.PlainOpenOptions{DetectDotGit: true})
 	require.NoError(t, err)
 
-	ri := &RepoInfo{repo: repo}
+	ri := &RepoInfo{repo: repo, HasVCS: true}
 	require.False(t, ri.diffInitialized,
 		"newly created RepoInfo must not have diff initialized")
 
@@ -476,7 +508,7 @@ func TestIsClean_InitializesDiffOnFirstCall(t *testing.T) {
 	repo, err := gogit.PlainOpenWithOptions(dir, &gogit.PlainOpenOptions{DetectDotGit: true})
 	require.NoError(t, err)
 
-	ri := &RepoInfo{repo: repo}
+	ri := &RepoInfo{repo: repo, HasVCS: true}
 	require.False(t, ri.diffInitialized, "before RefreshDiff/IsClean, diff must not be initialized")
 
 	// Clean repo → true

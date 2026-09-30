@@ -120,16 +120,38 @@ func NewToolRegistry() *ToolRegistry {
 }
 
 // Register adds a tool with its permission classification to the registry.
-// Panics if a tool with the same name is already registered.
+// If a tool with the same name is already registered, the permissions are
+// merged (union of realm access flags) and the existing tool instance kept —
+// this allows a tool to be visible through multiple permission classes
+// (e.g. create_manifest under both heaven Write and intent Write) without
+// panicking.
 func (r *ToolRegistry) Register(tool Tool, perm Permissions) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	name := tool.Name()
-	if _, exists := r.entries[name]; exists {
-		panic(fmt.Sprintf("tool %q already registered", name))
+	if existing, exists := r.entries[name]; exists {
+		r.entries[name] = ToolPermission{Tool: existing.Tool, Permissions: mergePermissions(existing.Permissions, perm)}
+		return
 	}
 	r.entries[name] = ToolPermission{Tool: tool, Permissions: perm}
+}
+
+// mergePermissions returns the union of two permission classifications.
+func mergePermissions(a, b Permissions) Permissions {
+	return Permissions{
+		Earth:  mergeAccess(a.Earth, b.Earth),
+		Heaven: mergeAccess(a.Heaven, b.Heaven),
+		Intent: mergeAccess(a.Intent, b.Intent),
+	}
+}
+
+func mergeAccess(a, b Access) Access {
+	return Access{
+		Read:    a.Read || b.Read,
+		Write:   a.Write || b.Write,
+		Execute: a.Execute || b.Execute,
+	}
 }
 
 // Update replaces an existing tool registration with a new instance.
