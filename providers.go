@@ -198,7 +198,12 @@ func ProvideShellRunner(params ShellRunnerParams) runners.Runner {
 
 	var runner runners.Runner
 	if params.Config.Court.IsolatedHost {
-		runner = runners.NewHostRunner(0, params.RepoInfo.ProjectRoot)
+		hostRunner := runners.NewHostRunner(0, params.RepoInfo.ProjectRoot)
+		hostRunner.SetTimeouts(runners.ResolveHostTimeouts(
+			params.Config.RunShellCommand.TimeoutMinutes,
+			params.Config.Sandbox.ApprovalTimeout,
+		))
+		runner = hostRunner
 		params.Logger.Info("using host runner (isolated-host mode)")
 	} else {
 		runner = runners.InitShellRunner(&params.Config.Sandbox, params.RepoInfo)

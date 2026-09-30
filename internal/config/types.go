@@ -7,14 +7,22 @@ import (
 
 // Config represents the application configuration structure
 type Config struct {
-	Storage StorageConfig `koanf:"storage"`
-	Logging LoggingConfig `koanf:"logging"`
-	UI      UIConfig      `koanf:"ui"`
-	LLM     LLMConfig     `koanf:"llm"`
-	History HistoryConfig `koanf:"history"`
-	Session SessionConfig `koanf:"session"`
-	Sandbox SandboxConfig `koanf:"sandbox"`
-	Court   CourtConfig   `koanf:"court"`
+	Storage         StorageConfig         `koanf:"storage"`
+	Logging         LoggingConfig         `koanf:"logging"`
+	UI              UIConfig              `koanf:"ui"`
+	LLM             LLMConfig             `koanf:"llm"`
+	History         HistoryConfig         `koanf:"history"`
+	Session         SessionConfig         `koanf:"session"`
+	Sandbox         SandboxConfig         `koanf:"sandbox"`
+	RunShellCommand RunShellCommandConfig `koanf:"run_shell_command"`
+	Court           CourtConfig           `koanf:"court"`
+}
+
+// RunShellCommandConfig holds settings for the run_shell_command tool's
+// host execution path.
+type RunShellCommandConfig struct {
+	// TimeoutMinutes is the timeout for host commands in minutes (default: 10)
+	TimeoutMinutes int `koanf:"timeout_minutes"`
 }
 
 // StorageConfig holds storage configuration
@@ -94,6 +102,9 @@ type SandboxConfig struct {
 	// RunOnHost is a list of regex patterns for commands that should run on the host
 	// instead of in the container. These commands require user approval before execution.
 	RunOnHost []string `koanf:"run_on_host"`
+	// ApprovalTimeout is how long to wait for a user approval decision on a
+	// host command before failing the call (default: 120s)
+	ApprovalTimeout time.Duration `koanf:"approval_timeout"`
 	// SafeRunOnHost is a list of regex patterns for commands that can run on the host
 	// without requiring user approval (e.g., read-only commands like `gh issue view`)
 	SafeRunOnHost []string `koanf:"safe_run_on_host"`

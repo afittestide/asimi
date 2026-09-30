@@ -17,23 +17,32 @@ type RunShellCommand struct {
 	runner          runners.Runner
 	msgChan         *chan<- runners.Msg // pointer to Court.msgChan — single source of truth
 	projectRoot     string              // working directory for ephemeral HostRunner
+	timeouts        runners.HostTimeouts
 }
 
 // NewRunShellCommand creates a new RunShellCommand tool.
 // runner is the per-court shell runner (may be nil — tools that need it must check).
 // msgChan is the approval channel passed to ephemeral HostRunner instances (may be nil).
+// The optional timeouts argument carries the configured command/approval
+// deadlines for ephemeral HostRunner instances (zero values fall back to
+// runner defaults).
 func NewRunShellCommand(
 	hostChecker func(string) (bool, bool),
 	runner runners.Runner,
 	msgChan *chan<- runners.Msg,
 	projectRoot string,
+	timeouts ...runners.HostTimeouts,
 ) *RunShellCommand {
-	return &RunShellCommand{
+	t := &RunShellCommand{
 		shouldRunOnHost: hostChecker,
 		runner:          runner,
 		msgChan:         msgChan,
 		projectRoot:     projectRoot,
 	}
+	if len(timeouts) > 0 {
+		t.timeouts = timeouts[0]
+	}
+	return t
 }
 
 func (t *RunShellCommand) Name() string {
@@ -51,6 +60,15 @@ func (t *RunShellCommand) msgChanValue() chan<- runners.Msg {
 		return nil
 	}
 	return *t.msgChan
+}
+
+// newHostRunner builds an ephemeral HostRunner with the configured
+// command/approval timeouts and the shared approval channel.
+func (t *RunShellCommand) newHostRunner() *runners.HostRunner {
+	hostRunner := runners.NewHostRunner(0, t.projectRoot)
+	hostRunner.SetMessageChannel(t.msgChanValue())
+	hostRunner.SetTimeouts(t.timeouts)
+	return hostRunner
 }
 
 func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error) {
@@ -80,8 +98,7 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 		runnerInput.BypassApproval = !requiresApproval
 
 		// Create ephemeral host runner and run directly on host
-		hostRunner := runners.NewHostRunner(0, t.projectRoot)
-		hostRunner.SetMessageChannel(t.msgChanValue())
+		hostRunner := t.newHostRunner()
 		runnerOutput, err := hostRunner.Run(ctx, runnerInput)
 		output.Output = runnerOutput.Output
 		output.ExitCode = runnerOutput.ExitCode
@@ -111,8 +128,7 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 		// back to host execution without attempting a restart.
 		if _, isMissing := runErr.(runners.SandboxMissingError); isMissing {
 			slog.Warn("sandbox not available, running on host", "command", runnerInput.Command)
-			hostRunner := runners.NewHostRunner(0, t.projectRoot)
-			hostRunner.SetMessageChannel(t.msgChanValue())
+			hostRunner := t.newHostRunner()
 			bypassApproval := t.msgChan == nil || *t.msgChan == nil
 			hostOutput, hostErr := hostRunner.Run(ctx, runners.Input{
 				Command:        runnerInput.Command,
@@ -124,8 +140,7 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 			runErr = hostErr
 		} else if _, isSetupMissing := runErr.(runners.SandboxSetupMissingError); isSetupMissing {
 			slog.Warn("sandbox setup missing, running on host", "command", runnerInput.Command)
-			hostRunner := runners.NewHostRunner(0, t.projectRoot)
-			hostRunner.SetMessageChannel(t.msgChanValue())
+			hostRunner := t.newHostRunner()
 			bypassApproval := t.msgChan == nil || *t.msgChan == nil
 			hostOutput, hostErr := hostRunner.Run(ctx, runners.Input{
 				Command:        runnerInput.Command,

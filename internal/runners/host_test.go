@@ -212,3 +212,85 @@ func TestHostRunnerSetsWorkingDirectory(t *testing.T) {
 	assert.Contains(t, output.Output, testContent)
 	assert.Equal(t, "0", output.ExitCode)
 }
+
+// A never-exiting streaming command must hit the configured deadline and
+// return the timeout message with exit code 124 — a result, not an error,
+// mirroring PodmanRunner's semantics.
+func TestHostRunnerCommandTimeout(t *testing.T) {
+	runner := NewHostRunner(0, t.TempDir())
+	runner.SetTimeouts(HostTimeouts{Command: 100 * time.Millisecond})
+
+	start := time.Now()
+	output, err := runner.Run(context.Background(), Input{
+		Command:        "sleep infinity",
+		BypassApproval: true,
+	})
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	assert.Equal(t, "124", output.ExitCode)
+	assert.Contains(t, output.Output, "Command timed out after")
+	assert.Less(t, elapsed, 10*time.Second, "command should return at the deadline, not hang")
+}
+
+// timeout_minutes=0 (zero value) must fall back to the 10-minute default.
+func TestHostRunnerTimeoutDefaults(t *testing.T) {
+	runner := NewHostRunner(0, "")
+	assert.Equal(t, DefaultCommandTimeout, runner.timeout)
+	assert.Equal(t, DefaultApprovalTimeout, runner.approvalTimeout)
+
+	// Explicit zero/negative values also fall back to defaults.
+	runner.SetTimeouts(HostTimeouts{Command: 0, Approval: -time.Second})
+	assert.Equal(t, DefaultCommandTimeout, runner.timeout)
+	assert.Equal(t, DefaultApprovalTimeout, runner.approvalTimeout)
+}
+
+// An approval request that is never answered must fail with the
+// approval-timeout error after approval_timeout instead of blocking forever.
+func TestHostRunnerApprovalTimeout(t *testing.T) {
+	runner := NewHostRunner(0, "")
+	runner.SetTimeouts(HostTimeouts{Approval: 100 * time.Millisecond})
+	msgChan := make(chan Msg, 10)
+	runner.SetMessageChannel(msgChan)
+
+	start := time.Now()
+	_, err := runner.Run(context.Background(), Input{
+		Command:        "echo hello",
+		BypassApproval: false,
+	})
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "approval timed out after")
+	assert.Contains(t, err.Error(), "echo hello")
+	assert.Less(t, elapsed, 10*time.Second, "approval wait should return at the deadline, not hang")
+}
+
+// An approval arriving before the deadline still succeeds.
+func TestHostRunnerApprovalBeforeDeadline(t *testing.T) {
+	runner := NewHostRunner(0, "")
+	runner.SetTimeouts(HostTimeouts{Approval: 5 * time.Second})
+	msgChan := make(chan Msg, 10)
+	runner.SetMessageChannel(msgChan)
+
+	go func() {
+		select {
+		case msg := <-msgChan:
+			approvalReq, ok := msg.(ApprovalRequestMsg)
+			require.True(t, ok, "Expected ApprovalRequestMsg, got %T", msg)
+			time.Sleep(50 * time.Millisecond)
+			approvalReq.ResponseChan <- true
+		case <-time.After(5 * time.Second):
+			t.Error("Timeout waiting for approval request")
+		}
+	}()
+
+	output, err := runner.Run(context.Background(), Input{
+		Command:        "echo hello",
+		BypassApproval: false,
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, output.Output, "hello")
+	assert.Equal(t, "0", output.ExitCode)
+}
