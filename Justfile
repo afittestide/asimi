@@ -124,7 +124,7 @@ vuln:
 
 # Init and start the podman machine 
 init-podman:
-    podman machine init --disk-size 30 >/dev/null 2>&1 || true
+    podman machine init --disk-size 30 --memory 4096 >/dev/null 2>&1 || true
     podman machine start >/dev/null 2>&1 || true
 # Build the sandbox container
 build-sandbox: init-podman
