@@ -8,17 +8,47 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
+)
+
+const (
+	// DefaultCommandTimeout bounds host commands when no timeout is configured.
+	// It mirrors PodmanRunner's default so both runners share the same
+	// timeout discipline.
+	DefaultCommandTimeout = 10 * time.Minute
+	// DefaultApprovalTimeout bounds how long a host command waits for a
+	// user approval decision before failing.
+	DefaultApprovalTimeout = 2 * time.Minute
 )
 
 // HostRunner runs commands directly on the host system
 type HostRunner struct {
-	projectRoot string
-	msgChan     chan<- Msg
+	projectRoot     string
+	msgChan         chan<- Msg
+	timeout         time.Duration // per-command deadline (0 → DefaultCommandTimeout)
+	approvalTimeout time.Duration // approval wait deadline (0 → DefaultApprovalTimeout)
 }
 
 // NewHostRunner creates a new HostRunner
 func NewHostRunner(connID uint64, projectRoot string) *HostRunner {
-	return &HostRunner{projectRoot: projectRoot}
+	return &HostRunner{
+		projectRoot:     projectRoot,
+		timeout:         DefaultCommandTimeout,
+		approvalTimeout: DefaultApprovalTimeout,
+	}
+}
+
+// SetTimeouts configures the command and approval-wait deadlines. Zero or
+// negative values fall back to the respective defaults.
+func (r *HostRunner) SetTimeouts(timeouts HostTimeouts) {
+	if timeouts.Command <= 0 {
+		timeouts.Command = DefaultCommandTimeout
+	}
+	if timeouts.Approval <= 0 {
+		timeouts.Approval = DefaultApprovalTimeout
+	}
+	r.timeout = timeouts.Command
+	r.approvalTimeout = timeouts.Approval
 }
 
 func (r *HostRunner) SetMessageChannel(msgChan chan<- Msg) {
@@ -44,11 +74,16 @@ func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
 		}
 	}
 
+	// Bound the command with a deadline so a never-exiting streaming
+	// command cannot hang the caller forever (mirrors PodmanRunner).
+	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", input.Command)
+		cmd = exec.CommandContext(runCtx, "cmd.exe", "/c", input.Command)
 	} else {
-		cmd = exec.CommandContext(ctx, "bash", "-c", input.Command)
+		cmd = exec.CommandContext(runCtx, "bash", "-c", input.Command)
 	}
 	// Children must never emit interactive credential prompts; see
 	// NonInteractiveGitEnv for why.
@@ -66,6 +101,15 @@ func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
 	output.Output = stdout.String() + "\n" + stderr.String()
 
 	if runErr != nil {
+		// Deadline exceeded is a *result*, not an error — the LLM sees the
+		// timeout message and can adapt (exit code 124, like timeout(1)).
+		if runCtx.Err() == context.DeadlineExceeded {
+			slog.Warn("host command timed out",
+				"command", input.Command, "timeout", r.timeout)
+			output.Output = fmt.Sprintf("Command timed out after %v", r.timeout)
+			output.ExitCode = "124"
+			return output, nil
+		}
 		if ctx.Err() != nil {
 			output.ExitCode = "-1"
 			return output, ctx.Err()
@@ -134,11 +178,21 @@ func (r *HostRunner) requestApproval(ctx context.Context, command string) (bool,
 		return false, ctx.Err()
 	}
 
-	// Wait for the response
+	// Wait for the response, bounded by the approval timeout so a lost or
+	// unanswered prompt fails loudly instead of hanging the turn forever.
+	// responseChan is buffered (capacity 1), so a late human approval after
+	// timeout is safely dropped.
+	approvalCtx, cancel := context.WithTimeout(ctx, r.approvalTimeout)
+	defer cancel()
 	select {
 	case approved := <-responseChan:
 		return approved, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
+	case <-approvalCtx.Done():
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		slog.Warn("host command approval timed out",
+			"command", command, "timeout", r.approvalTimeout)
+		return false, fmt.Errorf("approval timed out after %v for command: %s", r.approvalTimeout, command)
 	}
 }

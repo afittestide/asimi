@@ -1627,3 +1627,47 @@ model = "mistral-large"
 	assert.Equal(t, "mistral", cfg.LLM.Provider)
 	assert.Equal(t, "mistral-test-key", cfg.LLM.APIKey)
 }
+
+// TestLoadProjectConfig_RunShellCommandTimeouts verifies the
+// [run_shell_command].timeout_minutes and [sandbox].approval_timeout keys
+// load from the project config.
+func TestLoadProjectConfig_RunShellCommandTimeouts(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+	projectConfig := `[run_shell_command]
+timeout_minutes = 25
+[sandbox]
+approval_timeout = "90s"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, 25, cfg.RunShellCommand.TimeoutMinutes)
+	assert.Equal(t, 90*time.Second, cfg.Sandbox.ApprovalTimeout)
+}
+
+// TestLoadProjectConfig_TimeoutDefaults verifies the defaults when the new
+// timeout keys are absent: 10 minutes for commands, 120s for approvals.
+func TestLoadProjectConfig_TimeoutDefaults(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	cfg, err := LoadProjectConfig(t.TempDir(), false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, 0, cfg.RunShellCommand.TimeoutMinutes) // 0 → runner default (10m)
+	assert.Equal(t, 120*time.Second, cfg.Sandbox.ApprovalTimeout)
+}

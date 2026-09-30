@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
@@ -151,6 +152,29 @@ func (e SandboxFallbackError) Error() string {
 
 func (e SandboxFallbackError) Unwrap() error { return e.Err }
 
+// HostTimeouts carries the host-runner deadline configuration. It is
+// passed through the tool layer so ephemeral HostRunner instances share
+// the same timeout discipline as PodmanRunner. Zero values mean "use
+// the runner defaults".
+type HostTimeouts struct {
+	// Command bounds each host command execution (run_shell_command.timeout_minutes).
+	Command time.Duration
+	// Approval bounds the wait for a user approval decision
+	// (sandbox.approval_timeout).
+	Approval time.Duration
+}
+
+// ResolveHostTimeouts maps the configured command timeout (in minutes)
+// and approval timeout onto HostTimeouts. It performs no fallback — zero
+// values pass through, and HostRunner.SetTimeouts applies the runner
+// defaults when it consumes them.
+func ResolveHostTimeouts(commandTimeoutMinutes int, approvalTimeout time.Duration) HostTimeouts {
+	return HostTimeouts{
+		Command:  time.Duration(commandTimeoutMinutes) * time.Minute,
+		Approval: approvalTimeout,
+	}
+}
+
 func InitShellRunner(config *Config, repoInfo repo.RepoInfo) Runner {
 	// Resolve image name using same default as NewPodmanRunner
 	imageName := config.ImageName
@@ -163,7 +187,12 @@ func InitShellRunner(config *Config, repoInfo repo.RepoInfo) Runner {
 		slog.Info("using podman shell runner", "image", imageName)
 		var fallback Runner
 		if config.AllowHostFallback {
-			fallback = NewHostRunner(uint64(os.Getpid()), repoInfo.ProjectRoot)
+			host := NewHostRunner(uint64(os.Getpid()), repoInfo.ProjectRoot)
+			host.SetTimeouts(HostTimeouts{
+				Command:  time.Duration(config.TimeoutMinutes) * time.Minute,
+				Approval: config.ApprovalTimeout,
+			})
+			fallback = host
 		}
 		runner := NewPodmanRunner(config, repoInfo, uint64(os.Getpid()), fallback)
 		SetRunner(runner)

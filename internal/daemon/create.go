@@ -34,7 +34,12 @@ func createCourt(
 ) (*court.Court, runners.Runner, error) {
 	var runner runners.Runner
 	if isolatedHost {
-		runner = runners.NewHostRunner(connID, repoInfo.ProjectRoot)
+		hostRunner := runners.NewHostRunner(connID, repoInfo.ProjectRoot)
+		hostRunner.SetTimeouts(runners.ResolveHostTimeouts(
+			projectCfg.RunShellCommand.TimeoutMinutes,
+			projectCfg.Sandbox.ApprovalTimeout,
+		))
+		runner = hostRunner
 	} else {
 		runner = runners.NewPodmanRunner(&projectCfg.Sandbox, repoInfo, connID, nil)
 	}
@@ -131,10 +136,11 @@ func reconfigureModel(ctx context.Context, ct *court.Court, hp types.SetContextP
 	}
 
 	sessionCfg := &court.SessionConfig{
-		LLM:        projectCfg.LLM,
-		Sandbox:    projectCfg.Sandbox,
-		AgentsFile: projectCfg.Session.AgentsFile,
-		WorkingDir: hp.ProjectRoot,
+		LLM:             projectCfg.LLM,
+		Sandbox:         projectCfg.Sandbox,
+		RunShellCommand: projectCfg.RunShellCommand,
+		AgentsFile:      projectCfg.Session.AgentsFile,
+		WorkingDir:      hp.ProjectRoot,
 	}
 
 	ct.ConfigureModel(bifrostClient, sessionCfg, repoInfo)

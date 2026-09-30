@@ -125,7 +125,8 @@ type Court struct {
 	tabCancels   map[string]context.CancelFunc
 
 	// sessionCfg holds the session-level config (sandbox, LLM, agents file)
-	// set via ConfigureModel. Used by CheckHostCommand for RunOnHost patterns.
+	// set via ConfigureModel. Used by CheckHostCommand for RunOnHost patterns
+	// and by hostTimeouts for host command/approval deadlines.
 	sessionCfg *SessionConfig
 
 	// isolatedHost, when true, runs all shell commands on the host
@@ -343,6 +344,7 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		Runner:             s.runner,
 		HostChecker:        hostChecker,
 		MsgChan:            &s.msgChan,
+		HostTimeouts:       s.hostTimeouts(),
 		ZhengmingRequester: s,
 		WaitForZhengming:   s.WaitForZhengming,
 		NotifyFn:           notifyFn,
@@ -386,7 +388,7 @@ func (s *Court) updateProjectRootTools(projectRoot string) {
 
 	// Earth/Execute — shell command execution (needs runner)
 	if s.runner != nil {
-		s.toolRegistry.Update(tools.NewRunShellCommand(s.hostChecker, s.runner, &s.msgChan, projectRoot))
+		s.toolRegistry.Update(tools.NewRunShellCommand(s.hostChecker, s.runner, &s.msgChan, projectRoot, s.hostTimeouts()))
 	}
 
 	s.logger.Debug("updated project-root-dependent tools", "projectRoot", projectRoot)
@@ -588,6 +590,18 @@ func (s *Court) GetMinister(id string) Minister {
 	return nil
 }
 
+// hostTimeouts resolves the host command/approval deadlines from the
+// session config, falling back to runner defaults when unset.
+func (s *Court) hostTimeouts() runners.HostTimeouts {
+	if s == nil || s.sessionCfg == nil {
+		return runners.HostTimeouts{}
+	}
+	return runners.ResolveHostTimeouts(
+		s.sessionCfg.RunShellCommand.TimeoutMinutes,
+		s.sessionCfg.Sandbox.ApprovalTimeout,
+	)
+}
+
 // ConfigureModel sets the LLM client for all ministers.
 // This should be called once the LLM client is initialized.
 func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoInfo repo.RepoInfo) {
@@ -741,11 +755,12 @@ func (s *Court) SetContext(ctx context.Context, params types.SetContextParams) e
 	}
 
 	sessionCfg := &SessionConfig{
-		LLM:           projectCfg.LLM,
-		Sandbox:       projectCfg.Sandbox,
-		AgentsFile:    projectCfg.Session.AgentsFile,
-		WorkingDir:    params.ProjectRoot,
-		AtifAgentName: params.AtifAgentName,
+		LLM:             projectCfg.LLM,
+		Sandbox:         projectCfg.Sandbox,
+		RunShellCommand: projectCfg.RunShellCommand,
+		AgentsFile:      projectCfg.Session.AgentsFile,
+		WorkingDir:      params.ProjectRoot,
+		AtifAgentName:   params.AtifAgentName,
 	}
 
 	s.ConfigureModel(bifrostClient, sessionCfg, repoInfo)

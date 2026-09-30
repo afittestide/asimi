@@ -199,11 +199,12 @@ type StreamMaxTokensReachedMsg struct {
 
 // SessionConfig holds configuration for minister sessions
 type SessionConfig struct {
-	LLM           internalconfig.LLMConfig
-	AgentsFile    string
-	Sandbox       internalconfig.SandboxConfig
-	WorkingDir    string
-	AtifAgentName string // non-empty enables ATIF trajectory recording
+	LLM             internalconfig.LLMConfig
+	AgentsFile      string
+	Sandbox         internalconfig.SandboxConfig
+	RunShellCommand internalconfig.RunShellCommandConfig
+	WorkingDir      string
+	AtifAgentName   string // non-empty enables ATIF trajectory recording
 }
 
 // Session represents a chat session for a minister

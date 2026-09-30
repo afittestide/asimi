@@ -21,6 +21,10 @@ type ToolRegistrationOpts struct {
 	MsgChan     *chan<- runners.Msg
 	HostChecker func(cmd string) (runOnHost, needsApproval bool)
 	DBPath      string
+	// HostTimeouts carries the configured host command/approval deadlines
+	// for ephemeral HostRunner instances (zero values → runner defaults).
+	// TODO: this is ugly the timeout is the same, regardless of host or sandbox and the timeout doesn't belog in this layer. we should get it from config `run_shell_command.timeout_minutes`
+	HostTimeouts runners.HostTimeouts
 
 	// Runtime-dispatch interfaces owned by the Court
 	ZhengmingRequester ZhengmingRequester
@@ -61,7 +65,7 @@ func registerEarthTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	r.Register(ReplaceTextTool{ProjectRoot: projectRoot}, earthWrite)
 
 	if opts.Runner != nil {
-		r.Register(NewRunShellCommand(opts.HostChecker, opts.Runner, opts.MsgChan, projectRoot), earthExec)
+		r.Register(NewRunShellCommand(opts.HostChecker, opts.Runner, opts.MsgChan, projectRoot, opts.HostTimeouts), earthExec)
 	}
 }
 

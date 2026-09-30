@@ -308,3 +308,35 @@ func (m *mockRunner) SetMessageChannel(msgChan chan<- runners.Msg) {
 func (m *mockRunner) HealthCheck(ctx context.Context) error {
 	return nil
 }
+
+// TestRunShellCommandTimeoutsReachHostRunner asserts the configured
+// HostTimeouts propagate into every ephemeral HostRunner path — including
+// the SandboxSetupMissingError fallback, which previously bypassed the
+// newHostRunner() helper and silently used the 10m/2m defaults.
+func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
+	timeouts := runners.HostTimeouts{Command: 100 * time.Millisecond, Approval: 100 * time.Millisecond}
+
+	// hostChecker routes every command to the host without approval
+	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	hostTool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), timeouts)
+
+	result, err := hostTool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
+	require.NoError(t, err)
+	var output runners.Output
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "124", output.ExitCode, "runOnHost path should hit the 100ms command deadline")
+	assert.Contains(t, output.Output, "Command timed out after")
+
+	// SandboxSetupMissingError fallback path (nil msgChan → bypass approval)
+	mockRunner := &mockRunner{
+		runFn: func(ctx context.Context, input runners.Input) (runners.Output, error) {
+			return runners.Output{}, runners.SandboxSetupMissingError{}
+		},
+	}
+	fallbackTool := NewRunShellCommand(nil, mockRunner, nil, t.TempDir(), timeouts)
+	result, err = fallbackTool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "124", output.ExitCode, "fallback path should hit the 100ms command deadline")
+	assert.Contains(t, output.Output, "Command timed out after")
+}

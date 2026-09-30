@@ -86,8 +86,9 @@ func DefaultConfig() Config {
 			SaveInterval: 300,
 		},
 		Sandbox: SandboxConfig{
-			RunOnHost:     []string{`^gh\s`, `^podman\s`},
-			SafeRunOnHost: []string{`^gh\s+(issue|pr)\s+(view|list)`},
+			RunOnHost:       []string{`^gh\s`, `^podman\s`},
+			SafeRunOnHost:   []string{`^gh\s+(issue|pr)\s+(view|list)`},
+			ApprovalTimeout: 120 * time.Second,
 		},
 	}
 }
