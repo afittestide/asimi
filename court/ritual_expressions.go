@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -256,6 +257,14 @@ func checkLingDAG(lingList []storage.Ling) error {
 func (r *RitualRunner) getHeavenSnapshot(ctx context.Context) (interface{}, error) {
 	repoInfo := r.repoInfo
 
+	if repoInfo.Gitless() {
+		return map[string]string{
+			"branch":        "",
+			"latest_commit": "",
+			"age":           "(no git repository — there is no heaven to snapshot)",
+		}, nil
+	}
+
 	// Get the main branch name (default to "main")
 	branch := repoInfo.BranchSlugOrDefault()
 
@@ -481,6 +490,11 @@ func (r *RitualRunner) arrangeGetLings(key storage.EdictKey) (interface{}, error
 	return result, nil
 }
 
+// gitlessEarthMarker is the explicit marker returned by earth expressions when
+// the project root has no git repository, so ministers cannot hallucinate git
+// state on gitless ground.
+const gitlessEarthMarker = "(no git repository — the borderlands are all)"
+
 // getEarthStatus captures the three parts of the Earth realm:
 // the capital (git log), the middle kingdom (git diff --staged), and the borderlands (git diff).
 func (r *RitualRunner) getEarthStatus(ctx context.Context) (map[string]string, error) {
@@ -488,6 +502,13 @@ func (r *RitualRunner) getEarthStatus(ctx context.Context) (map[string]string, e
 		"earth_capital":        "",
 		"earth_middle_kingdom": "",
 		"earth_borderlands":    "",
+	}
+
+	if r.repoInfo.Gitless() {
+		result["earth_capital"] = gitlessEarthMarker
+		result["earth_middle_kingdom"] = gitlessEarthMarker
+		result["earth_borderlands"] = gitlessEarthMarker
+		return result, nil
 	}
 
 	// Git operations always run on host (not in sandbox)
@@ -511,6 +532,12 @@ func (r *RitualRunner) getEarthStatus(ctx context.Context) (map[string]string, e
 
 // getBorderlands captures unstaged changes and untracked files.
 func (r *RitualRunner) getBorderlands(ctx context.Context) (interface{}, error) {
+	if r.repoInfo.Gitless() {
+		return map[string]string{
+			"borderlands:changes":   gitlessEarthMarker,
+			"borderlands:untracked": gitlessEarthMarker,
+		}, nil
+	}
 	result := map[string]string{
 		"borderlands:changes":   "",
 		"borderlands:untracked": "",
@@ -538,25 +565,37 @@ func (r *RitualRunner) getBorderlands(ctx context.Context) (interface{}, error) 
 // createBorderlandManifests creates forge manifests from unstaged changes.
 // It runs git diff --name-only to get changed files, then creates a ForgeManifest
 // for each one so the judge can verdict against them through the standard pipeline.
+// On gitless ground there is no diff, so it falls back to a file inventory of
+// the project root (skipping VCS, tooling, and build artifacts).
 func (r *RitualRunner) createBorderlandManifests(ctx context.Context, exec *RitualExecution) (interface{}, error) {
 	key := exec.EdictKey()
 
-	output, err := r.runner.Run(ctx, runners.Input{
-		Command:        "git diff --name-only",
-		Description:    "list borderland changed files",
-		BypassApproval: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("git diff --name-only: %w", err)
+	var files []string
+	if r.repoInfo.Gitless() {
+		var err error
+		files, err = inventoryProjectFiles(r.repoInfo.ProjectRoot)
+		if err != nil {
+			return nil, fmt.Errorf("file inventory: %w", err)
+		}
+	} else {
+		output, err := r.runner.Run(ctx, runners.Input{
+			Command:        "git diff --name-only",
+			Description:    "list borderland changed files",
+			BypassApproval: true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("git diff --name-only: %w", err)
+		}
+		for _, f := range strings.Split(strings.TrimSpace(output.Output), "\n") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				files = append(files, f)
+			}
+		}
 	}
 
-	files := strings.Split(strings.TrimSpace(output.Output), "\n")
 	var manifests []map[string]interface{}
 	for _, f := range files {
-		f = strings.TrimSpace(f)
-		if f == "" {
-			continue
-		}
 		manifestID := GenerateID("manifest", fmt.Sprintf("%d", key.ID), "borderland", f)
 		manifest := storage.ForgeManifest{
 			ManifestID: manifestID,
@@ -583,9 +622,72 @@ func (r *RitualRunner) createBorderlandManifests(ctx context.Context, exec *Ritu
 	return manifests, nil
 }
 
-// checkCleanWorkingDirectory verifies the working directory is clean (no unstaged changes)
+// gitlessExcludedDirs are directories skipped by the gitless file inventory:
+// VCS internals, asimi tooling, and common dependency/build artifact dirs.
+var gitlessExcludedDirs = map[string]bool{
+	".git":         true,
+	".agents":      true,
+	"node_modules": true,
+	"vendor":       true,
+	"dist":         true,
+	"build":        true,
+	"bin":          true,
+	"target":       true,
+	"__pycache__":  true,
+	".venv":        true,
+	"venv":         true,
+}
+
+// gitlessExcludedExts are build-artifact extensions skipped by the gitless
+// file inventory.
+var gitlessExcludedExts = map[string]bool{
+	".o": true, ".a": true, ".so": true, ".dylib": true, ".dll": true,
+	".exe": true, ".pyc": true, ".class": true, ".jar": true,
+}
+
+// inventoryProjectFiles walks the project root and returns tracked-relevant
+// source files, used as the borderland manifest source on gitless ground.
+func inventoryProjectFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			if gitlessExcludedDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if gitlessExcludedExts[strings.ToLower(filepath.Ext(d.Name()))] {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// checkCleanWorkingDirectory verifies the working directory is clean (no unstaged changes).
+// On gitless ground cleanliness is not defined — report the gitless state
+// explicitly instead of vacuously claiming a clean tree.
 func (r *RitualRunner) checkCleanWorkingDirectory(ctx context.Context) (interface{}, error) {
 	repoInfo := r.repoInfo
+	if repoInfo.Gitless() {
+		return map[string]string{
+			"status": "no git repository — the borderlands are all",
+		}, nil
+	}
 	if !repoInfo.IsClean() {
 		return nil, fmt.Errorf("working directory is not clean: %v", repoInfo)
 	}
@@ -915,6 +1017,11 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		return err
 	case "stage_infrastructure":
 		// Stage infrastructure files on the host (git runs on host, not in sandbox).
+		// On gitless ground there is nothing to stage — skip gracefully.
+		if r.repoInfo.Gitless() {
+			r.logger.Info("no git repository — the edict is sealed in the court ledger only; no commit was made")
+			return nil
+		}
 		// Only stage files that actually exist — AGENTS.md may not be present if
 		// the LLM chose a different conventions filename, and the core ritual
 		// should still succeed.
@@ -985,6 +1092,12 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		return ErrZhengmingPending
 	case "the changes are staged":
 		// Stage all changes in the working directory (Borderlands → Middle Kingdom)
+		if r.repoInfo.Gitless() {
+			// No heaven to ascend to — the borderlands are all there is.
+			// Nothing to stage; ascension stops after the chancellor's seal.
+			r.logger.Info("no git repository — the edict is sealed in the court ledger only; no commit was made")
+			return nil
+		}
 		if r.runner == nil {
 			return fmt.Errorf("no runner configured for staging changes")
 		}
@@ -1002,6 +1115,12 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		return nil
 	case "await_ruler_seal":
 		// Stage only files from manifests (not git add -A)
+		if r.repoInfo.Gitless() {
+			// No git repository — nothing to stage, no commit will be made.
+			// The edict is sealed in the court ledger only.
+			r.logger.Info("no git repository — the edict is sealed in the court ledger only; no commit was made")
+			return nil
+		}
 		var manifests []storage.ForgeManifest
 		if err := r.db.Where("edict_id = ? AND username = ? AND project = ?", thenKey.ID, thenKey.Username, thenKey.Project).Find(&manifests).Error; err != nil {
 			return fmt.Errorf("failed to query manifests: %w", err)
@@ -1311,6 +1430,53 @@ func storeGivenResult(exec *RitualExecution, key string, result interface{}) {
 // Ported from PR #135 (Nanook contribution): cmd_running/cmd_done
 // notifications for shell steps, complementary to ToolCallScheduled/Success.
 
+// missingBinaryPatterns match shell "command not found" stderr wording per
+// shell, in priority order: zsh ("zsh:1: command not found: just" — binary
+// after the wording), bash ("/bin/sh: line 1: just: command not found" —
+// binary before it), and bare ("podman: not found").
+var missingBinaryPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)^\s*\S+?:\d+:\s*command not found:\s*(\S+)`),
+	regexp.MustCompile(`(?m)^\s*\S*sh:\s*(?:line \d+: )?(\S+): command not found`),
+	regexp.MustCompile(`(?m)^\s*(\S+): not found\s*$`),
+}
+
+// missingBinary extracts the missing binary name from a command-not-found
+// stderr. Returns "" when the output does not name a missing binary.
+func missingBinary(stderr string) string {
+	for _, re := range missingBinaryPatterns {
+		if m := re.FindStringSubmatch(stderr); m != nil && m[1] != "" {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// runMissingToolNote builds a note block for the minister explaining that a
+// tool required by a given step is not installed. The verdict gate stays the
+// single retry mechanism: the judge reads the note and records its verdict.
+func runMissingToolNote(cmd string, stderr string) string {
+	var b strings.Builder
+	b.WriteString("(given step skipped — tool missing, this is not a test failure)\n")
+	b.WriteString(fmt.Sprintf("The command `%s` could not run: its binary is not installed on this ground.\n", cmd))
+	b.WriteString(strings.TrimRight(stderr, "\n"))
+	b.WriteString("\n\nDo NOT try to install tools, reverse-engineer binaries, or fix this.\n")
+	b.WriteString("Judge the edict on the evidence you have (manifests, file contents, this note),\n")
+	b.WriteString("then record your verdict with record_verdict as usual. The verdict gate,\n")
+	b.WriteString("not this note, decides whether the ritual retries the forge.\n")
+	return b.String()
+}
+
+// isMissingToolFailure reports whether a failed bash given step failed because
+// the command's binary is not installed (as opposed to the command itself
+// returning a non-zero exit). Only exit code 127 with a matching stderr line
+// counts — a genuine failure must still fail the step.
+func isMissingToolFailure(output runners.Output) bool {
+	if output.ExitCode != "127" {
+		return false
+	}
+	return missingBinary(output.Output) != ""
+}
+
 func (r *RitualRunner) runGivenStep(ctx context.Context, exec *RitualExecution, entry StepDefEntry) (interface{}, error) {
 	switch entry.Kind {
 	case StepDefBash:
@@ -1335,6 +1501,17 @@ func (r *RitualRunner) runGivenStep(ctx context.Context, exec *RitualExecution, 
 		})
 		if err != nil {
 			return nil, err
+		}
+		if isMissingToolFailure(output) {
+			// A missing binary is not a failure of the edict's work: hand
+			// the situation to the minister as context and let the step
+			// proceed. The verdict gate remains the single retry mechanism.
+			note := runMissingToolNote(cmd, output.Output)
+			r.logger.Warn("given step tool missing, continuing with note",
+				"step", entry.Key, "command", cmd, "binary", missingBinary(output.Output))
+			storeGivenResult(exec, entry.Key, note)
+			exec.Data[entry.Key+"_missing_tool"] = note
+			return note, nil
 		}
 		if output.ExitCode != "0" {
 			storeGivenResult(exec, entry.Key, output.Output)

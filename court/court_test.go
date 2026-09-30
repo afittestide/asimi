@@ -2472,3 +2472,41 @@ func TestTriggerLingIgnition_GateOnIgnites(t *testing.T) {
 	provider.mu.Unlock()
 	assert.Equal(t, 1, n, "exactly one minister session runs")
 }
+
+// TestSetContext_PreservesHasVCSDetection pins edict 888's single-authoritative
+// HasVCS detection through the SetContext path. SetContextParams carries no
+// HasVCS field, so SetContext must re-derive it (GetRepoInfoForRoot) instead
+// of rebuilding a RepoInfo literal with the flag zeroed — ConfigureModel
+// pushes that literal into the RitualRunner, and gitless ground skips
+// staging/commit steps and inventories the whole tree for borderland
+// manifests. A false gitless detection would silently break the seal chain
+// on ordinary git repositories.
+func TestSetContext_PreservesHasVCSDetection(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s.ritualGuard)
+	require.NotNil(t, s.ritualGuard.RitualRunner())
+
+	// Ground truth: a real git repository.
+	root := t.TempDir()
+	runGit(t, root, "init", "-q")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	groundTruth := repo.GetRepoInfoForRoot(root)
+	require.True(t, groundTruth.HasVCS, "precondition: git repository detected")
+
+	err := s.SetContext(context.Background(), types.SetContextParams{
+		ProjectRoot: root,
+		Branch:      groundTruth.Branch,
+		Project:     groundTruth.Slug,
+		APIKeys:     map[string]string{"anthropic": "sk-test-dummy"},
+	})
+	require.NoError(t, err)
+
+	runnerInfo := s.ritualGuard.RitualRunner().repoInfo
+	assert.True(t, runnerInfo.HasVCS,
+		"SetContext must preserve HasVCS for a real git repository")
+	assert.False(t, runnerInfo.Gitless(),
+		"ritual runner must not treat a git repository as gitless ground")
+}

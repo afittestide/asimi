@@ -478,6 +478,15 @@ func (m *TUIModel) SetSession(session *court.Session) {
 						}
 						return ""
 					}(),
+					// Preserve the authoritative gitless-ground detection —
+					// a zeroed HasVCS would make the RitualRunner treat a
+					// real git repository as gitless.
+					HasVCS: func() bool {
+						if m.repoInfo != nil {
+							return m.repoInfo.HasVCS
+						}
+						return false
+					}(),
 				}
 				m.court.ConfigureModel(model, cfg, repoInfo)
 			}

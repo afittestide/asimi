@@ -41,8 +41,11 @@ func TestIsClean_NilReceiver(t *testing.T) {
 }
 
 func TestIsClean_NilRepo(t *testing.T) {
-	// IsClean must not panic when repo field is nil, reporting clean
+	// IsClean must not panic when repo field is nil. A zero-value RepoInfo is
+	// gitless (HasVCS unset), and gitless ground is not "clean" — cleanliness
+	// is undefined there; callers must consult Gitless() explicitly.
 	r := &RepoInfo{}
 	require.NotPanics(t, func() { _ = r.IsClean() })
-	require.True(t, r.IsClean(), "repo with nil backing should return true (clean)")
+	require.False(t, r.IsClean(), "gitless zero-value RepoInfo must not vacuously report clean")
+	require.True(t, r.Gitless(), "zero-value RepoInfo is gitless")
 }

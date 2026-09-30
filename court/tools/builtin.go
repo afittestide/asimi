@@ -79,10 +79,17 @@ func registerHeavenTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	r.Register(GetManifestByCommitTool{Ctx: opts.Ctx}, heavenRead)
 
 	if opts.DBPath != "" {
-		r.Register(AsimiSQLTool{DBPath: opts.DBPath, ProjectRoot: opts.Ctx.ProjectRoot()}, heavenReadWrite)
+		r.Register(AsimiSQLTool{DB: opts.Ctx.DB, ProjectRoot: opts.Ctx.ProjectRoot()}, heavenReadWrite)
 	}
 
 	r.Register(CreateManifestTool{Ctx: opts.Ctx}, heavenWrite)
+	// The forge's constitution (internal/ministers/userconf/ministers.yaml)
+	// makes finishing without create_manifest calls treason, yet the forge has
+	// no heaven Write — only intent Write (人:-w-). Re-register with the intent
+	// Write classification merged in so forge ministers can record their own
+	// manifests. Register merges into the existing entry instead of panicking,
+	// so the judge's heavenWrite assertions stay valid.
+	r.Register(CreateManifestTool{Ctx: opts.Ctx}, Permissions{Intent: Access{Write: true}})
 	r.Register(RecordVerdictTool{Ctx: opts.Ctx}, heavenWrite)
 	r.Register(UpdateManifestStatusTool{Ctx: opts.Ctx}, heavenWrite)
 }

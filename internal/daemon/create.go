@@ -115,10 +115,19 @@ func reconfigureModel(ctx context.Context, ct *court.Court, hp types.SetContextP
 		projectCfg.LLM.ReasoningEffort = hp.ReasoningEffort
 	}
 
+	// HasVCS is the single authoritative gitless-ground flag and SetContextParams
+	// does not carry it over the wire — re-derive it so the RepoInfo never
+	// treats a real git repository as gitless ground.
+	var hasVCS bool
+	if hp.ProjectRoot != "" {
+		hasVCS = repo.GetRepoInfoForRoot(hp.ProjectRoot).HasVCS
+	}
+
 	repoInfo := repo.RepoInfo{
 		ProjectRoot:  hp.ProjectRoot,
 		WorktreePath: hp.WorktreePath,
 		Branch:       hp.Branch,
+		HasVCS:       hasVCS,
 		Slug:         hp.Project,
 	}
 

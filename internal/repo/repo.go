@@ -22,6 +22,7 @@ type RepoInfo struct {
 	ProjectRoot     string
 	WorktreePath    string
 	Branch          string
+	HasVCS          bool // true when a git repository was detected at ProjectRoot
 	IsWorktree      bool
 	IsMain          bool
 	Slug            string // Project slug (e.g., "owner/repo")
@@ -72,10 +73,12 @@ func GetRepoInfo() RepoInfo {
 	// Get current branch and status using go-git
 	branch := ""
 	status := ""
+	hasVCS := false
 	repo, err := gogit.PlainOpenWithOptions(cwd, &gogit.PlainOpenOptions{
 		DetectDotGit: true,
 	})
 	if err == nil {
+		hasVCS = true
 		ref, err := repo.Head()
 		if err == nil {
 			if ref.Name().IsBranch() {
@@ -109,9 +112,10 @@ func GetRepoInfo() RepoInfo {
 		ProjectRoot:  projectRoot,
 		WorktreePath: worktreePath,
 		Branch:       branch,
+		HasVCS:       hasVCS,
 		IsWorktree:   isWorktree,
 		IsMain:       isMain,
-		Slug:         projectSlug(projectRoot),
+		Slug:         projectSlug(projectRoot, hasVCS),
 		status:       status,
 		repo:         repo,
 	}
@@ -159,10 +163,12 @@ func GetRepoInfoForRoot(root string) RepoInfo {
 	// Get current branch and status using go-git
 	branch := ""
 	status := ""
+	hasVCS := false
 	repo, err := gogit.PlainOpenWithOptions(root, &gogit.PlainOpenOptions{
 		DetectDotGit: true,
 	})
 	if err == nil {
+		hasVCS = true
 		ref, err := repo.Head()
 		if err == nil {
 			if ref.Name().IsBranch() {
@@ -196,9 +202,10 @@ func GetRepoInfoForRoot(root string) RepoInfo {
 		ProjectRoot:  projectRoot,
 		WorktreePath: worktreePath,
 		Branch:       branch,
+		HasVCS:       hasVCS,
 		IsWorktree:   isWorktree,
 		IsMain:       isMain,
-		Slug:         projectSlug(projectRoot),
+		Slug:         projectSlug(projectRoot, hasVCS),
 		status:       status,
 		repo:         repo,
 	}
@@ -218,10 +225,15 @@ func (r *RepoInfo) GetStatus() string {
 	return r.status
 }
 
-// IsClean returns true if the working tree has no changes
+// IsClean returns true if the working tree has no changes.
+// On gitless ground there is no index or HEAD, so cleanliness is not defined;
+// callers should consult Gitless() instead of treating this as vacuously clean.
 func (r *RepoInfo) IsClean() bool {
 	if r == nil {
 		return true
+	}
+	if r.Gitless() {
+		return false
 	}
 	if !r.diffInitialized {
 		r.RefreshDiff()
@@ -294,6 +306,11 @@ func (r *RepoInfo) RefreshDiffWithTTL(ttl time.Duration) {
 }
 
 func (r *RepoInfo) BranchSlugOrDefault() string {
+	// On gitless ground there is no branch at all — do not report "main",
+	// which would conflate "no repository" with "the main branch".
+	if !r.HasVCS {
+		return ""
+	}
 	slug := SanitizeSegment(r.Branch)
 	// TODO: pick a better default branch for cases when working outside repo,
 	//       to avoid a collision make it illegal in git.
@@ -302,6 +319,14 @@ func (r *RepoInfo) BranchSlugOrDefault() string {
 	}
 
 	return slug
+}
+
+// Gitless reports whether the project root has no git repository.
+// Gitless ground is a first-class mode: identity falls back to the directory
+// basename, earth expressions state the condition explicitly, and ascension
+// rituals stop after the chancellor's seal with no git commands attempted.
+func (r *RepoInfo) Gitless() bool {
+	return r == nil || !r.HasVCS
 }
 
 // SanitizeSegment normalizes a string for use as a URL/storage segment.
@@ -466,24 +491,28 @@ func readShortStatus(repo *gogit.Repository) string {
 }
 
 // projectSlug returns the project slug (e.g., "owner/repo") from the git remote origin URL.
-// Returns an empty string if the project root is not a git repository or has no remote.
-func projectSlug(projectRoot string) string {
+// On gitless ground it falls back to the sanitized directory basename of the
+// project root, so gitless directories still get a valid, unique identity
+// (sandbox image names, court DB scoping) instead of an empty slug.
+func projectSlug(projectRoot string, hasVCS bool) string {
 	if projectRoot == "" {
 		return ""
 	}
 
-	remoteURL, err := GitRemoteOriginURL(projectRoot)
-	if err != nil || remoteURL == "" {
-		return ""
+	if hasVCS {
+		remoteURL, err := GitRemoteOriginURL(projectRoot)
+		if err == nil && remoteURL != "" {
+			owner, repo := ParseGitRemote(remoteURL)
+			if owner != "" && repo != "" {
+				// Canonical slug is always lowercase; Git remotes may carry uppercase.
+				// Preserve the "/" separator (required by podman image names).
+				return strings.ToLower(owner) + "/" + strings.ToLower(repo)
+			}
+		}
 	}
 
-	owner, repo := ParseGitRemote(remoteURL)
-	if owner == "" || repo == "" {
-		return ""
-	}
-	// Canonical slug is always lowercase; Git remotes may carry uppercase.
-	// Preserve the "/" separator (required by podman image names).
-	return strings.ToLower(owner) + "/" + strings.ToLower(repo)
+	// No VCS (or no usable remote): derive identity from the directory basename.
+	return SanitizeSegment(filepath.Base(projectRoot))
 }
 
 func collectDiffFromGit(repoPath string, opts []string) (int, int) {

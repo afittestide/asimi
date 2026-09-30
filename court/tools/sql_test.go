@@ -2,138 +2,106 @@ package tools
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-// TestAsimiSQLTool_LargeOutputNotTruncated demonstrates the bug:
-// AsimiSQLTool.Call() returns raw output without truncation, which can
-// cause the session's context to explode when tool outputs are added
-// to the message history.
-//
-// The truncation SHOULD happen in Session.executeToolCall(), but when
-// AsimiSQLTool is used through the scheduler, the raw output flows through
-// and needs to be truncated. This test verifies that truncation is applied.
-func TestAsimiSQLTool_LargeOutputNotTruncated(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "test.db")
-
-	// Create a minimal SQLite database
-	err := os.WriteFile(dbPath, []byte(""), 0644)
+// setupSQLTestDB opens an in-memory SQLite database via the same embedded
+// driver the app uses (no sqlite3 CLI binary required).
+func setupSQLTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-
-	// Check if sqlite3 is available - if not, skip
-	_, err = os.Stat("/usr/bin/sqlite3")
-	if os.IsNotExist(err) {
-		_, err = os.Stat("/usr/local/bin/sqlite3")
-	}
-	if os.IsNotExist(err) {
-		t.Skip("sqlite3 not available in this environment")
-	}
-
-	tool := AsimiSQLTool{DBPath: dbPath, ProjectRoot: tempDir}
-
-	// Generate a query that would return many rows (simulated large output)
-	// We'll test the truncation happens at the Session level, not here
-	query := "SELECT * FROM sqlite_master;"
-
-	result, err := tool.Call(context.Background(), `{"query":"`+query+`"}`)
-	require.NoError(t, err)
-
-	// The tool returns raw output - truncation should happen in Session.executeToolCall
-	// This test documents the current behavior: raw output is returned
-	assert.NotEmpty(t, result)
+	require.NoError(t, db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").Error)
+	require.NoError(t, db.Exec("INSERT INTO t (name) VALUES ('alpha'), ('beta')").Error)
+	return db
 }
 
-// TestAsimiSQLTool_OutputSizeVerification verifies that AsimiSQLTool's output
-// would be too large without truncation when querying large tables.
-//
-// This test demonstrates why truncation is critical:
-// Without truncation, a simple "SELECT * FROM large_table" could return
-// megabytes of data that would bloat the session context.
-func TestAsimiSQLTool_OutputSizeVerification(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "test.db")
+// TestAsimiSQLTool_SelectViaGORM verifies reads work through the embedded
+// driver with the JSON rows contract preserved.
+func TestAsimiSQLTool_SelectViaGORM(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
 
-	// Create empty DB file
-	err := os.WriteFile(dbPath, []byte(""), 0644)
+	result, err := tool.Call(context.Background(), `{"query":"SELECT id, name FROM t ORDER BY id"}`)
 	require.NoError(t, err)
+	assert.Contains(t, result, `"name":"alpha"`)
+	assert.Contains(t, result, `"name":"beta"`)
+}
 
-	// Check if sqlite3 is available - if not, skip
-	_, err = os.Stat("/usr/bin/sqlite3")
-	if os.IsNotExist(err) {
-		_, err = os.Stat("/usr/local/bin/sqlite3")
-	}
-	if os.IsNotExist(err) {
-		t.Skip("sqlite3 not available in this environment")
-	}
+// TestAsimiSQLTool_WriteViaGORM verifies writes execute and report affected rows.
+func TestAsimiSQLTool_WriteViaGORM(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
 
-	tool := AsimiSQLTool{DBPath: dbPath, ProjectRoot: tempDir}
-
-	// Test that an empty result is returned properly
-	result, err := tool.Call(context.Background(), `{"query":"SELECT name FROM sqlite_master"}`)
+	result, err := tool.Call(context.Background(), `{"query":"DELETE FROM t WHERE name = 'alpha'"}`)
 	require.NoError(t, err)
-
-	// Empty result should return status:ok
 	assert.Contains(t, result, `"status":"ok"`)
+	assert.Contains(t, result, `"rows_affected":1`)
+
+	var count int64
+	require.NoError(t, db.Raw("SELECT COUNT(*) FROM t").Scan(&count).Error)
+	assert.Equal(t, int64(1), count)
 }
 
-// TestAsimiSQLTool_ErrorsHandled verifies error handling
-func TestAsimiSQLTool_ErrorsHandled(t *testing.T) {
-	tempDir := t.TempDir()
-	tool := AsimiSQLTool{DBPath: "/nonexistent/path/db.sqlite", ProjectRoot: tempDir}
+// TestAsimiSQLTool_EmptySelectReturnsOk verifies the empty-result contract.
+func TestAsimiSQLTool_EmptySelectReturnsOk(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
 
-	// Invalid JSON input
-	_, err := tool.Call(context.Background(), "not json")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid input")
-
-	// Empty query
-	_, err = tool.Call(context.Background(), `{"query":""}`)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "query is required")
-}
-
-// TestAsimiSQLTool_NonZeroExitIncludesOutput verifies that when sqlite3
-// returns a non-zero exit code, the error message includes the actual
-// sqlite3 error output (not just the exit code).
-func TestAsimiSQLTool_NonZeroExitIncludesOutput(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "test.db")
-
-	// Create a minimal SQLite database
-	err := os.WriteFile(dbPath, []byte(""), 0644)
+	result, err := tool.Call(context.Background(), `{"query":"SELECT id FROM t WHERE name = 'missing'"}`)
 	require.NoError(t, err)
+	assert.Equal(t, `{"status":"ok"}`, result)
+}
 
-	// Check if sqlite3 is available - if not, skip
-	_, err = os.Stat("/usr/bin/sqlite3")
-	if os.IsNotExist(err) {
-		_, err = os.Stat("/usr/local/bin/sqlite3")
-	}
-	if os.IsNotExist(err) {
-		t.Skip("sqlite3 not available in this environment")
-	}
+// TestAsimiSQLTool_SQLErrorMessage verifies error messages keep the
+// "sqlite3 error:" prefix the callers rely on.
+func TestAsimiSQLTool_SQLErrorMessage(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
 
-	tool := AsimiSQLTool{DBPath: dbPath, ProjectRoot: tempDir}
-
-	// Query a nonexistent column — sqlite3 will fail with a descriptive error
-	_, err = tool.Call(context.Background(), `{"query":"SELECT nonexistent_column FROM sqlite_master"}`)
+	_, err := tool.Call(context.Background(), `{"query":"SELECT nonexistent_column FROM t"}`)
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sqlite3 error:")
+	assert.Contains(t, err.Error(), "no such column")
+}
 
-	// The error should contain the actual sqlite3 error message, not just "exit code"
-	errMsg := err.Error()
-	assert.Contains(t, errMsg, "sqlite3 error:")
-	assert.Contains(t, errMsg, "no such column")
-	assert.NotContains(t, errMsg, "exit code")
+// TestAsimiSQLTool_SingleStatement verifies the one-statement contract.
+func TestAsimiSQLTool_SingleStatement(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
+
+	_, err := tool.Call(context.Background(), `{"query":"SELECT 1; DROP TABLE t"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "one SQL statement")
+}
+
+// TestAsimiSQLTool_NilDB verifies a clear error when no handle is configured.
+func TestAsimiSQLTool_NilDB(t *testing.T) {
+	tool := AsimiSQLTool{ProjectRoot: t.TempDir()}
+	_, err := tool.Call(context.Background(), `{"query":"SELECT 1"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no database handle")
+}
+
+// TestAsimiSQLTool_RequiredQuery verifies empty-query rejection.
+func TestAsimiSQLTool_RequiredQuery(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
+
+	_, err := tool.Call(context.Background(), `{"query":""}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "query is required")
 }
 
 // TestAsimiSQLTool_Format verifies the Format method works correctly
 func TestAsimiSQLTool_Format(t *testing.T) {
-	tool := AsimiSQLTool{DBPath: "/test/path", ProjectRoot: t.TempDir()}
+	tool := AsimiSQLTool{ProjectRoot: t.TempDir()}
 
 	// Test with short query
 	result := tool.Format(`{"query":"SELECT * FROM edicts"}`, "output", nil)
@@ -153,12 +121,11 @@ func TestAsimiSQLTool_Format(t *testing.T) {
 
 // TestAsimiSQLTool_ParameterSchema verifies the tool's parameter schema
 func TestAsimiSQLTool_ParameterSchema(t *testing.T) {
-	tool := AsimiSQLTool{DBPath: "/test", ProjectRoot: t.TempDir()}
+	tool := AsimiSQLTool{ProjectRoot: t.TempDir()}
 
 	schema := tool.ParameterSchema()
 	assert.NotNil(t, schema)
 
-	// Verify structure
 	props, ok := schema["properties"].(map[string]any)
 	assert.True(t, ok)
 
@@ -172,7 +139,7 @@ func TestAsimiSQLTool_ParameterSchema(t *testing.T) {
 
 // TestAsimiSQLTool_NameAndDescription verifies tool metadata
 func TestAsimiSQLTool_NameAndDescription(t *testing.T) {
-	tool := AsimiSQLTool{DBPath: "/test", ProjectRoot: t.TempDir()}
+	tool := AsimiSQLTool{}
 
 	assert.Equal(t, "asimisql", tool.Name())
 
@@ -181,44 +148,26 @@ func TestAsimiSQLTool_NameAndDescription(t *testing.T) {
 	assert.Contains(t, desc, "Court database")
 }
 
-// TestAsimiSQLTool_ProjectRootPassedToHostRun verifies that when
-// AsimiSQLTool.Call is invoked, the projectRoot is correctly passed
-// through to HostRun, which sets it as the working directory for
-// command execution. We confirm this by placing the database in a
-// subdirectory and using a relative DB path — if projectRoot is
-// correct, sqlite3 resolves the relative path from that directory.
-func TestAsimiSQLTool_ProjectRootPassedToHostRun(t *testing.T) {
-	projectRoot := t.TempDir()
-	subDir := filepath.Join(projectRoot, "data")
-	err := os.MkdirAll(subDir, 0755)
+// TestAsimiSQLTool_RelativeDBPath verifies the DB handle is used as-is (the
+// daemon resolves the database path; the tool no longer shells out with a
+// working directory).
+func TestAsimiSQLTool_RelativeDBPath(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: filepath.Join(t.TempDir(), "data")}
+
+	result, err := tool.Call(context.Background(), `{"query":"SELECT name FROM t LIMIT 1"}`)
 	require.NoError(t, err)
+	assert.Contains(t, result, `"name":"alpha"`)
+}
 
-	// Place the DB in the subdirectory
-	dbPath := filepath.Join(subDir, "test.db")
-	err = os.WriteFile(dbPath, []byte(""), 0644)
-	require.NoError(t, err)
+// TestAsimiSQLTool_InvalidJSON pins the invalid-input rejection the GORM
+// rewrite must preserve: malformed tool input fails with the "invalid input"
+// prefix before any database access.
+func TestAsimiSQLTool_InvalidJSON(t *testing.T) {
+	db := setupSQLTestDB(t)
+	tool := AsimiSQLTool{DB: db, ProjectRoot: t.TempDir()}
 
-	// Check if sqlite3 is available - if not, skip
-	_, err = os.Stat("/usr/bin/sqlite3")
-	if os.IsNotExist(err) {
-		_, err = os.Stat("/usr/local/bin/sqlite3")
-	}
-	if os.IsNotExist(err) {
-		t.Skip("sqlite3 not available in this environment")
-	}
-
-	// Use a relative path from projectRoot
-	relDBPath := "data/test.db"
-	tool := AsimiSQLTool{DBPath: relDBPath, ProjectRoot: projectRoot}
-
-	// This query will succeed only if sqlite3 runs from projectRoot
-	// (so the relative path "data/test.db" resolves correctly)
-	result, err := tool.Call(context.Background(), `{"query":"SELECT name FROM sqlite_master"}`)
-	require.NoError(t, err)
-	assert.Contains(t, result, `"status":"ok"`)
-
-	// Sanity check: the same tool with a wrong projectRoot should fail
-	wrongTool := AsimiSQLTool{DBPath: relDBPath, ProjectRoot: t.TempDir()}
-	_, err = wrongTool.Call(context.Background(), `{"query":"SELECT name FROM sqlite_master"}`)
-	assert.Error(t, err, "expected error when projectRoot doesn't match relative DB path")
+	_, err := tool.Call(context.Background(), "not json")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid input")
 }

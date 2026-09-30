@@ -2,17 +2,21 @@ package tools
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/afittestide/asimi/internal/runners"
+	"gorm.io/gorm"
+
 	"github.com/afittestide/asimi/internal/utils"
 )
 
-// AsimiSQLTool executes SQL queries against the Court database.
+// AsimiSQLTool executes SQL queries against the Court database through the
+// embedded SQLite driver (via GORM raw SQL). It has no external dependency on
+// a sqlite3 CLI binary, which is absent in minimal containers.
 type AsimiSQLTool struct {
-	DBPath      string
+	DB          *gorm.DB
 	ProjectRoot string
 }
 
@@ -51,34 +55,79 @@ func (t AsimiSQLTool) Call(ctx context.Context, input string) (string, error) {
 		return "", fmt.Errorf("query is required")
 	}
 
-	// Execute via runner.Run for consistent execution pattern
-	runnerInput := runners.Input{
-		Command:        "sqlite3 " + t.DBPath + " '" + strings.ReplaceAll(params.Query, "'", "'\\''") + "'",
-		Description:    "Execute SQL query",
-		BypassApproval: true,
+	if t.DB == nil {
+		return "", fmt.Errorf("sqlite3 error: no database handle configured")
 	}
 
-	runnerOutput, err := runners.HostRun(ctx, runnerInput, t.ProjectRoot)
-	if err != nil {
-		if runnerOutput.Output != "" {
-			return "", fmt.Errorf("sqlite3 error: %s: %w", strings.TrimSpace(runnerOutput.Output), err)
+	query := strings.TrimSpace(params.Query)
+	// Single-statement guard: the previous sqlite3 CLI allowed one query per
+	// invocation; keep the same contract and avoid multi-statement injection.
+	if strings.Contains(strings.TrimSuffix(query, ";"), ";") {
+		return "", fmt.Errorf("sqlite3 error: exactly one SQL statement is required")
+	}
+
+	// Route by statement shape: SELECT/PRAGMA/EXPLAIN return rows, everything
+	// else is executed for its affected-rows effect.
+	upper := strings.ToUpper(query)
+	switch {
+	case strings.HasPrefix(upper, "SELECT"), strings.HasPrefix(upper, "PRAGMA"),
+		strings.HasPrefix(upper, "WITH"), strings.HasPrefix(upper, "EXPLAIN"):
+		rows, err := t.DB.WithContext(ctx).Raw(query).Rows()
+		if err != nil {
+			return "", fmt.Errorf("sqlite3 error: %w", err)
 		}
+		defer rows.Close()
+		return formatRows(rows)
+	default:
+		res := t.DB.WithContext(ctx).Exec(query)
+		if res.Error != nil {
+			return "", fmt.Errorf("sqlite3 error: %w", res.Error)
+		}
+		return fmt.Sprintf(`{"status":"ok","rows_affected":%d}`, res.RowsAffected), nil
+	}
+}
+
+// formatRows converts sql.Rows into a JSON array of column→value objects.
+func formatRows(rows *sql.Rows) (string, error) {
+	cols, err := rows.Columns()
+	if err != nil {
 		return "", fmt.Errorf("sqlite3 error: %w", err)
 	}
 
-	if runnerOutput.ExitCode != "0" {
-		msg := strings.TrimSpace(runnerOutput.Output)
-		if msg == "" {
-			return "", fmt.Errorf("sqlite3 error: exit code %s", runnerOutput.ExitCode)
+	results := make([]map[string]interface{}, 0, 16)
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
 		}
-		return "", fmt.Errorf("sqlite3 error: %s", msg)
+		if err := rows.Scan(ptrs...); err != nil {
+			return "", fmt.Errorf("sqlite3 error: %w", err)
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			v := values[i]
+			// []byte is not JSON-serializable by encoding/json (it base64s);
+			// convert to string for readability, nil stays null.
+			if b, ok := v.([]byte); ok {
+				v = string(b)
+			}
+			row[col] = v
+		}
+		results = append(results, row)
 	}
-
-	result := strings.TrimSpace(runnerOutput.Output)
-	if result == "" {
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("sqlite3 error: %w", err)
+	}
+	if len(results) == 0 {
 		return `{"status":"ok"}`, nil
 	}
-	return result, nil
+
+	out, err := json.Marshal(results)
+	if err != nil {
+		return "", fmt.Errorf("sqlite3 error: %w", err)
+	}
+	return string(out), nil
 }
 
 func (t AsimiSQLTool) Format(input, result string, err error) string {

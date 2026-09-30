@@ -322,17 +322,22 @@ func TestRegister(t *testing.T) {
 	}
 }
 
-func TestRegisterDuplicatePanics(t *testing.T) {
+func TestRegisterDuplicateMergesPermissions(t *testing.T) {
 	r := NewToolRegistry()
 	perm, _ := ParsePermissions("r-----rw-")
 	r.Register(mockTool{name: "dup"}, perm)
 
-	defer func() {
-		if rec := recover(); rec == nil {
-			t.Error("expected panic on duplicate registration")
-		}
-	}()
-	r.Register(mockTool{name: "dup"}, perm)
+	// Re-registering the same tool name with different permissions merges the
+	// classifications instead of panicking (this is how create_manifest is
+	// dual-classified under heaven Write and intent Write).
+	other, _ := ParsePermissions("r--r----")
+	r.Register(mockTool{name: "dup"}, other)
+
+	tools := r.ForPermissions(perm)
+	assertHas(t, toolNames(tools), "dup")
+	// The merged entry matches through the second classification too.
+	perm2, _ := ParsePermissions("r--------")
+	assertHas(t, toolNames(r.ForPermissions(perm2)), "dup")
 }
 
 // ---------------------------------------------------------------------------
