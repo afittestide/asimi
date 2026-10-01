@@ -1646,8 +1646,12 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 	// Load court history into the scratchpad for this step.
 	// The scratchpad is injected as a one-shot prefix to the next user message
 	// and cleared automatically, so it never pollutes the system prompt.
+	// Every participant also receives the full ritual script: IRL ritual
+	// performers rehearse for hours observing the other participants' motions,
+	// so a minister must know what the steps after its own will do with its
+	// output — and which commands (e.g. "!just test") the judge will run.
 	if exec.EdictID > 1 {
-		scratchpad := r.buildStepScratchpad(exec, step)
+		scratchpad := composeStepScratchpad(renderRitualScript(exec.def, step.Name), r.buildStepScratchpad(exec, step))
 		if scratchpad != "" {
 			actSession.SetScratchpad(scratchpad)
 		}
@@ -1925,6 +1929,80 @@ func (r *RitualRunner) buildStepScratchpad(exec *RitualExecution, step RitualSte
 		return ""
 	}
 	return "---\n# Court History\n" + strings.Join(parts, "\n")
+}
+
+// renderRitualScript renders the full choreography of the ritual as a
+// markdown script: every step in order — who performs it, what given
+// commands/data it receives, what it does, what must hold when it finishes,
+// and where failures route. It marks the step being performed so the
+// minister knows its place in the ceremony. This is the rehearsal: a
+// minister that knows the whole script never has to mine its own binary
+// (or guess) to learn what the judging step will do with its work.
+func renderRitualScript(def *RitualDef, currentStepName string) string {
+	if def == nil {
+		return ""
+	}
+	var buf strings.Builder
+	buf.WriteString(fmt.Sprintf("## Ritual Script: %s\n", def.Name))
+	if def.Description != "" {
+		buf.WriteString(def.Description + "\n")
+	}
+	buf.WriteString("\nThe full choreography — all ministers observe each other's motions:\n")
+	for i, step := range def.Steps {
+		marker := " "
+		if step.Name == currentStepName {
+			marker = "▶"
+		}
+		name := step.Name
+		if step.Fork != nil {
+			name = fmt.Sprintf("%s (fork over %s, batch_size %d)", name, step.Fork.Over, step.Fork.BatchSize)
+		}
+		buf.WriteString(fmt.Sprintf("\n%s %d. **%s**", marker, i+1, name))
+		if step.Minister != "" {
+			buf.WriteString(fmt.Sprintf(" — minister: %s", step.Minister))
+		}
+		if len(step.Given) > 0 {
+			buf.WriteString(fmt.Sprintf("\n   - given: %q", step.Given))
+		}
+		act := step.Act
+		if act == "" {
+			act = step.Task // Task is a legacy alias for Act
+		}
+		if act != "" {
+			summary := strings.Join(strings.Fields(act), " ")
+			if len(summary) > 200 {
+				summary = summary[:200] + "…"
+			}
+			buf.WriteString(fmt.Sprintf("\n   - act: %s", summary))
+		}
+		if len(step.Then) > 0 {
+			buf.WriteString(fmt.Sprintf("\n   - then: %v", step.Then))
+		}
+		if onFailure := step.resolveOnFailure(def); onFailure != "" {
+			line := fmt.Sprintf("\n   - on_failure: %s", onFailure)
+			if step.OnFailure == "goto" && step.OnFailureTarget != "" {
+				line += fmt.Sprintf(" → %s", step.OnFailureTarget)
+			}
+			buf.WriteString(line)
+		}
+	}
+	buf.WriteString("\n\nYou are performing the marked (▶) step. Steps after yours will consume your output — leave it in the shape they expect.")
+	return buf.String()
+}
+
+// composeStepScratchpad joins the ritual script and court history blocks,
+// skipping empty ones.
+func composeStepScratchpad(parts ...string) string {
+	nonEmpty := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	if len(nonEmpty) == 0 {
+		return ""
+	}
+	return strings.Join(nonEmpty, "\n\n")
 }
 
 // handleFailure handles step failure based on on_failure action

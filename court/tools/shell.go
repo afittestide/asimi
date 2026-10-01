@@ -17,21 +17,22 @@ type RunShellCommand struct {
 	runner          runners.Runner
 	msgChan         *chan<- runners.Msg // pointer to Court.msgChan — single source of truth
 	projectRoot     string              // working directory for ephemeral HostRunner
-	timeouts        runners.HostTimeouts
+	timeouts        func() runners.HostTimeouts
 }
 
 // NewRunShellCommand creates a new RunShellCommand tool.
 // runner is the per-court shell runner (may be nil — tools that need it must check).
 // msgChan is the approval channel passed to ephemeral HostRunner instances (may be nil).
-// The optional timeouts argument carries the configured command/approval
-// deadlines for ephemeral HostRunner instances (zero values fall back to
+// The optional timeouts argument is a lazy getter returning the configured
+// command/approval deadlines for ephemeral HostRunner instances; it is
+// re-read on every ephemeral host runner creation (zero values fall back to
 // runner defaults).
 func NewRunShellCommand(
 	hostChecker func(string) (bool, bool),
 	runner runners.Runner,
 	msgChan *chan<- runners.Msg,
 	projectRoot string,
-	timeouts ...runners.HostTimeouts,
+	timeouts ...func() runners.HostTimeouts,
 ) *RunShellCommand {
 	t := &RunShellCommand{
 		shouldRunOnHost: hostChecker,
@@ -67,7 +68,9 @@ func (t *RunShellCommand) msgChanValue() chan<- runners.Msg {
 func (t *RunShellCommand) newHostRunner() *runners.HostRunner {
 	hostRunner := runners.NewHostRunner(0, t.projectRoot)
 	hostRunner.SetMessageChannel(t.msgChanValue())
-	hostRunner.SetTimeouts(t.timeouts)
+	if t.timeouts != nil {
+		hostRunner.SetTimeouts(t.timeouts())
+	}
 	return hostRunner
 }
 

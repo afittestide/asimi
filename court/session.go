@@ -1274,6 +1274,11 @@ func (s *Session) SetScratchpad(content string) {
 	s.scratchpad = content
 }
 
+// GetScratchpad returns the transient scratchpad buffer ("" if unset).
+func (s *Session) GetScratchpad() string {
+	return s.scratchpad
+}
+
 // buildPromptWithContext builds a prompt that includes all file content
 func buildPromptWithContext(userPrompt string, contextFiles map[string]string) string {
 	if len(contextFiles) == 0 {

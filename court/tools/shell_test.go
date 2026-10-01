@@ -3,9 +3,11 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/stretchr/testify/assert"
@@ -315,10 +317,11 @@ func (m *mockRunner) HealthCheck(ctx context.Context) error {
 // newHostRunner() helper and silently used the 10m/2m defaults.
 func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
 	timeouts := runners.HostTimeouts{Command: 100 * time.Millisecond, Approval: 100 * time.Millisecond}
+	getTimeouts := func() runners.HostTimeouts { return timeouts }
 
 	// hostChecker routes every command to the host without approval
 	hostChecker := func(cmd string) (bool, bool) { return true, false }
-	hostTool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), timeouts)
+	hostTool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), getTimeouts)
 
 	result, err := hostTool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
 	require.NoError(t, err)
@@ -333,10 +336,77 @@ func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
 			return runners.Output{}, runners.SandboxSetupMissingError{}
 		},
 	}
-	fallbackTool := NewRunShellCommand(nil, mockRunner, nil, t.TempDir(), timeouts)
+	fallbackTool := NewRunShellCommand(nil, mockRunner, nil, t.TempDir(), getTimeouts)
 	result, err = fallbackTool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal([]byte(result), &output))
 	assert.Equal(t, "124", output.ExitCode, "fallback path should hit the 100ms command deadline")
 	assert.Contains(t, output.Output, "Command timed out after")
+}
+
+// TestRunShellCommand_TimeoutsGetterInvokedAtCallTime asserts the lazy
+// timeout getter is re-read on each ephemeral host runner creation, not
+// snapshotted at tool construction.
+func TestRunShellCommand_TimeoutsGetterInvokedAtCallTime(t *testing.T) {
+	var calls int
+	getTimeouts := func() runners.HostTimeouts {
+		calls++
+		// First call: default (no deadline). Second call: tight deadline.
+		if calls == 1 {
+			return runners.HostTimeouts{}
+		}
+		return runners.HostTimeouts{Command: 100 * time.Millisecond}
+	}
+	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	tool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), getTimeouts)
+
+	// First call — no configured deadline, sleep runs to completion (or at
+	// least isn't cut at 100ms).
+	result, err := tool.Call(context.Background(), `{"command":"sleep 0.5","description":"test"}`)
+	require.NoError(t, err)
+	var output runners.Output
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "0", output.ExitCode, "first call should use zero timeouts (runner defaults), not the later value")
+
+	// Second call — getter now returns a tight deadline.
+	result, err = tool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "124", output.ExitCode, "second call should hit the freshly configured 100ms command deadline")
+	assert.Contains(t, output.Output, "Command timed out after")
+	assert.GreaterOrEqual(t, calls, 2, "getter should have been invoked at Call time")
+}
+
+// TestRunShellCommand_NilTimeoutsGetterKeepsRunnerDefaults asserts the
+// zero-argument constructor path: a nil timeouts getter must leave the
+// ephemeral host runner on its constructor defaults (10m command / 2m
+// approval), and must not panic — newHostRunner guards SetTimeouts behind
+// a nil check, so invoking the getter under a nil guard would crash.
+func TestRunShellCommand_NilTimeoutsGetterKeepsRunnerDefaults(t *testing.T) {
+	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	tool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir())
+
+	hostRunner := tool.newHostRunner()
+	require.NotNil(t, hostRunner, "newHostRunner should always return a runner")
+
+	// runner is a *runners.HostRunner from another package — read its
+	// unexported deadline fields via the test-only unsafe-read idiom
+	// (reflect.New(...).Elem() gives an addressable value whose fields
+	// can be read even unexported).
+	runnerVal := reflect.ValueOf(hostRunner).Elem()
+	timeoutField := runnerVal.FieldByName("timeout")
+	approvalField := runnerVal.FieldByName("approvalTimeout")
+	require.True(t, timeoutField.IsValid(), "HostRunner should have timeout field")
+	require.True(t, approvalField.IsValid(), "HostRunner should have approvalTimeout field")
+	assert.Equal(t, runners.DefaultCommandTimeout, *(*time.Duration)(unsafe.Pointer(timeoutField.UnsafeAddr())),
+		"nil getter must not override the runner's default command deadline")
+	assert.Equal(t, runners.DefaultApprovalTimeout, *(*time.Duration)(unsafe.Pointer(approvalField.UnsafeAddr())),
+		"nil getter must not override the runner's default approval deadline")
+
+	// The guarded getter path must run without panicking.
+	result, err := tool.Call(context.Background(), `{"command":"echo asimi","description":"test"}`)
+	require.NoError(t, err)
+	var output runners.Output
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "0", output.ExitCode, "command should run to completion under runner defaults")
 }
