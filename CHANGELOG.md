@@ -5,6 +5,24 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.6] - 2026-10-01
+
+### Added
+
+- **Gitless ground as a first-class mode** — `RepoInfo` now carries `HasVCS` as the single authoritative VCS-detection flag, so Asimi runs cleanly in a plain directory with no git repository: the project slug falls back to the directory basename, branch slugs stay empty, earth expressions and heaven snapshots report the condition explicitly, borderland manifests are built from a file inventory, and the honest "no VCS detected" log line replaces the previous false "git repository detected" (e888)
+
+### Changed
+
+- **Host runner timeout discipline** — commands run outside the sandbox (`--isolated-host` / host runner) now run under a command deadline (default 10m) and bounded approval waits (default 2m), matching the Podman runner. Both are configurable via `[run_shell_command].timeout_minutes` and the sandbox `approval_timeout`, and are plumbed through `SessionConfig` into every ephemeral `HostRunner` construction path (e886, e889)
+- **Manifest permissions merge** — `create_manifest` is dual-registered under intent `Write` so the forge can record its own manifests; `registry.Register` now merges permissions instead of panicking on re-registration (e888)
+- **`asimisql` uses the embedded driver** — court queries now go through the embedded driver (`ToolContext` DB) instead of shelling out to a `sqlite3` CLI binary (e888)
+
+### Fixed
+
+- **`ask_ruler` inside a ritual** — answers submitted on a ritual tab are now delivered as the zhengming answer instead of being treated as a ritual interjection (which paused or aborted the step); the TUI tracks pending zhengming per routing channel and the Court refuses to mint interactive sessions for ritual channels (e894)
+- **Headless log noise** — headless mode (`-p`) now consumes tool-scheduling and stream-lifecycle events at debug level, so a headless run no longer floods its log with unhandled-event warnings (598d32e64)
+- **`bash` step commands that are not found** — a given step failing with exit 127 (`command not found`) now produces a note for the minister instead of failing the ritual step, leaving the verdict gate as the single retry mechanism and ending the harbor timeout spiral (e888)
+
 ## [0.13.5] - 2026-09-29
 
 ### Added
