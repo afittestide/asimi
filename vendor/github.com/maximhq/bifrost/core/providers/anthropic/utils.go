@@ -100,7 +100,7 @@ func ValidateToolsForProvider(tools []schemas.ResponsesTool, provider schemas.Mo
 	for _, tool := range tools {
 		switch tool.Type {
 		case schemas.ResponsesToolTypeWebSearch, schemas.ResponsesToolTypeWebSearchPreview:
-			if !features.WebSearch {
+			if !features.WebSearch && !features.WebSearchNova {
 				return fmt.Errorf("tool type '%s' is not supported by provider '%s'", tool.Type, provider)
 			}
 		case schemas.ResponsesToolTypeWebFetch:
@@ -108,7 +108,7 @@ func ValidateToolsForProvider(tools []schemas.ResponsesTool, provider schemas.Mo
 				return fmt.Errorf("tool type '%s' is not supported by provider '%s'", tool.Type, provider)
 			}
 		case schemas.ResponsesToolTypeCodeInterpreter:
-			if !features.CodeExecution {
+			if !features.CodeExecution && !features.CodeExecNova {
 				return fmt.Errorf("tool type '%s' is not supported by provider '%s'", tool.Type, provider)
 			}
 		case schemas.ResponsesToolTypeComputerUsePreview:
@@ -218,8 +218,21 @@ func stripUnsupportedAnthropicFields(req *AnthropicMessageRequest, provider sche
 			req.OutputConfig = nil
 		}
 	}
+	// output_config.effort — model-gated per
+	// https://platform.claude.com/docs/en/build-with-claude/effort. Models
+	// outside the supported set return: "This model does not support the
+	// effort parameter."
+	if req.OutputConfig != nil && req.OutputConfig.Effort != nil && !SupportsEffortParameter(model) {
+		req.OutputConfig.Effort = nil
+		if req.OutputConfig.Format == nil && req.OutputConfig.TaskBudget == nil {
+			req.OutputConfig = nil
+		}
+	}
 	if req.InferenceGeo != nil && !features.InferenceGeo {
 		req.InferenceGeo = nil
+	}
+	if req.ServiceTier != nil && !features.ServiceTier {
+		req.ServiceTier = nil
 	}
 	// cache_control.scope — strip on providers without PromptCachingScope
 	// support at every slot scope can live: top-level request, tools, system
@@ -359,6 +372,15 @@ func StripUnsupportedFieldsFromRawBody(jsonBody []byte, provider schemas.ModelPr
 
 	var err error
 
+	// diagnostics — undocumented Claude Code field; gated through the feature
+	// map like every other field. Only Anthropic direct keeps it (fail-closed).
+	if !features.Diagnostics && providerUtils.JSONFieldExists(jsonBody, "diagnostics") {
+		jsonBody, err = providerUtils.DeleteJSONField(jsonBody, "diagnostics")
+		if err != nil {
+			return nil, fmt.Errorf("strip raw diagnostics: %w", err)
+		}
+	}
+
 	// speed — provider AND model gate
 	if providerUtils.JSONFieldExists(jsonBody, "speed") {
 		if !features.FastMode || !SupportsFastMode(model) {
@@ -374,6 +396,14 @@ func StripUnsupportedFieldsFromRawBody(jsonBody []byte, provider schemas.ModelPr
 		jsonBody, err = providerUtils.DeleteJSONField(jsonBody, "inference_geo")
 		if err != nil {
 			return nil, fmt.Errorf("strip raw inference_geo: %w", err)
+		}
+	}
+
+	// service_tier — Vertex uses HTTP headers instead of a request body field
+	if !features.ServiceTier && providerUtils.JSONFieldExists(jsonBody, "service_tier") {
+		jsonBody, err = providerUtils.DeleteJSONField(jsonBody, "service_tier")
+		if err != nil {
+			return nil, fmt.Errorf("strip raw service_tier: %w", err)
 		}
 	}
 
@@ -432,6 +462,23 @@ func StripUnsupportedFieldsFromRawBody(jsonBody []byte, provider schemas.ModelPr
 		}
 		// Drop an empty parent so we don't serialize output_config:{} (matches
 		// typed-path behavior at lines 129-134).
+		if oc := providerUtils.GetJSONField(jsonBody, "output_config"); oc.IsObject() && len(oc.Map()) == 0 {
+			jsonBody, err = providerUtils.DeleteJSONField(jsonBody, "output_config")
+			if err != nil {
+				return nil, fmt.Errorf("strip raw output_config: %w", err)
+			}
+		}
+	}
+
+	// output_config.effort — model-gated per
+	// https://platform.claude.com/docs/en/build-with-claude/effort.
+	// Mirrors the typed path; same cleanup of an empty parent.
+	if providerUtils.JSONFieldExists(jsonBody, "output_config.effort") &&
+		!SupportsEffortParameter(model) {
+		jsonBody, err = providerUtils.DeleteJSONField(jsonBody, "output_config.effort")
+		if err != nil {
+			return nil, fmt.Errorf("strip raw output_config.effort: %w", err)
+		}
 		if oc := providerUtils.GetJSONField(jsonBody, "output_config"); oc.IsObject() && len(oc.Map()) == 0 {
 			jsonBody, err = providerUtils.DeleteJSONField(jsonBody, "output_config")
 			if err != nil {
@@ -503,6 +550,17 @@ func StripUnsupportedFieldsFromRawBody(jsonBody []byte, provider schemas.ModelPr
 	if toolsResult := providerUtils.GetJSONField(jsonBody, "tools"); toolsResult.Exists() && toolsResult.IsArray() {
 		for i := range toolsResult.Array() {
 			base := fmt.Sprintf("tools.%d", i)
+			// Server tools with a nested `model` field (e.g. advisor_20260301)
+			// expect a bare Anthropic model id. Strip the prefix when
+			// it's a known Bifrost provider; bare ids pass through unchanged.
+			if modelResult := providerUtils.GetJSONField(jsonBody, base+".model"); modelResult.Exists() && modelResult.Type == gjson.String {
+				if prefixProvider, bare := schemas.ParseModelString(modelResult.String(), ""); prefixProvider != "" {
+					jsonBody, err = providerUtils.SetJSONField(jsonBody, base+".model", bare)
+					if err != nil {
+						return nil, fmt.Errorf("strip raw %s.model prefix: %w", base, err)
+					}
+				}
+			}
 			if !features.AdvancedToolUse {
 				if providerUtils.JSONFieldExists(jsonBody, base+".defer_loading") {
 					jsonBody, err = providerUtils.DeleteJSONField(jsonBody, base+".defer_loading")
@@ -603,15 +661,16 @@ func StripUnsupportedFieldsFromRawBody(jsonBody []byte, provider schemas.ModelPr
 	return jsonBody, nil
 }
 
-// IsOpus47 returns true if the model is Claude Opus 4.7 or a later generation where:
+// IsOpus47Plus returns true if the model is Claude Opus 4.7 or later (currently 4.7 and 4.8) where:
 //   - Extended thinking (budget_tokens) is removed — only adaptive thinking is supported.
 //   - temperature, top_p, and top_k are not supported (setting them returns a 400).
-func IsOpus47(model string) bool {
+func IsOpus47Plus(model string) bool {
 	model = strings.ToLower(model)
 	if !strings.Contains(model, "opus") {
 		return false
 	}
-	return strings.Contains(model, "4-7") || strings.Contains(model, "4.7")
+	return strings.Contains(model, "4-7") || strings.Contains(model, "4.7") ||
+		strings.Contains(model, "4-8") || strings.Contains(model, "4.8")
 }
 
 // SupportsNativeEffort returns true if the model supports Anthropic's native output_config.effort parameter.
@@ -625,18 +684,90 @@ func SupportsNativeEffort(model string) bool {
 		strings.Contains(model, "4-6") || strings.Contains(model, "4.6")
 }
 
+// SupportsEffortParameter returns true if the model accepts the
+// output_config.effort parameter. Supported models: Claude Mythos Preview,
+// Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, and Opus 4.5.
+// All other models reject effort with a 400:
+//
+//	"This model does not support the effort parameter."
+//
+// This is intentionally separate from SupportsAdaptiveThinking: a model can
+// support the effort knob without supporting adaptive thinking (Opus 4.5),
+// and adaptive thinking is a distinct surface (thinking.type:"adaptive")
+// from effort. Future models may shift either flag independently.
+func SupportsEffortParameter(model string) bool {
+	m := strings.ToLower(model)
+	if strings.Contains(m, "mythos") {
+		return true
+	}
+	if strings.Contains(m, "haiku") {
+		return false
+	}
+	if strings.Contains(m, "opus") {
+		return strings.Contains(m, "4-5") || strings.Contains(m, "4.5") ||
+			strings.Contains(m, "4-6") || strings.Contains(m, "4.6") ||
+			strings.Contains(m, "4-7") || strings.Contains(m, "4.7") ||
+			strings.Contains(m, "4-8") || strings.Contains(m, "4.8")
+	}
+	if strings.Contains(m, "sonnet") {
+		return strings.Contains(m, "4-6") || strings.Contains(m, "4.6")
+	}
+	return false
+}
+
+// appendToSystemContent merges newContent into existing.
+// If existing is nil the new content is returned as-is (preserving ContentStr
+// vs ContentBlocks wire format). When both sides are non-empty both are
+// normalised to ContentBlocks and concatenated.
+func appendToSystemContent(existing *AnthropicContent, newContent AnthropicContent) *AnthropicContent {
+	newEmpty := (newContent.ContentStr == nil || *newContent.ContentStr == "") && len(newContent.ContentBlocks) == 0
+	if newEmpty {
+		return existing
+	}
+	if existing == nil {
+		return &AnthropicContent{ContentStr: newContent.ContentStr, ContentBlocks: newContent.ContentBlocks}
+	}
+	toBlocks := func(c AnthropicContent) []AnthropicContentBlock {
+		if c.ContentStr != nil && *c.ContentStr != "" {
+			return []AnthropicContentBlock{{Type: AnthropicContentBlockTypeText, Text: c.ContentStr}}
+		}
+		return c.ContentBlocks
+	}
+	merged := append(toBlocks(*existing), toBlocks(newContent)...)
+	if len(merged) == 0 {
+		return existing
+	}
+	return &AnthropicContent{ContentBlocks: merged}
+}
+
+// SupportsMidConversationSystem returns true if the provider+model combination
+// supports role:"system" entries inside the messages array (mid-conversation
+// system messages). Available on the Anthropic API only — not on Bedrock or
+// Vertex — and only for Claude Opus 4.8+. No beta header is required.
+//
+// Source: https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages
+func SupportsMidConversationSystem(provider schemas.ModelProvider, model string) bool {
+	if provider != schemas.Anthropic {
+		return false
+	}
+	m := strings.ToLower(model)
+	return strings.Contains(m, "opus") &&
+		(strings.Contains(m, "4-8") || strings.Contains(m, "4.8"))
+}
+
 // SupportsFastMode returns true if the model supports speed:"fast" (research
-// preview). Per Anthropic's fast-mode docs, only Opus 4.6 supports it;
-// requests carrying speed:"fast" to any other model are rejected with 400.
+// preview). Supported on Opus 4.6, Opus 4.7, and Opus 4.8; requests carrying
+// speed:"fast" to any other model are rejected with 400.
 // Beta header: fast-mode-2026-02-01.
 //
 // Source: https://platform.claude.com/docs/en/build-with-claude/fast-mode
 func SupportsFastMode(model string) bool {
-	model = strings.ToLower(model)
-	if !strings.Contains(model, "opus") {
-		return false
+	if IsOpus47Plus(model) {
+		return true
 	}
-	return strings.Contains(model, "4-6") || strings.Contains(model, "4.6")
+	m := strings.ToLower(model)
+	return strings.Contains(m, "opus") &&
+		(strings.Contains(m, "4-6") || strings.Contains(m, "4.6"))
 }
 
 // SupportsAdaptiveThinking returns true if the model supports thinking.type: "adaptive".
@@ -644,7 +775,7 @@ func SupportsFastMode(model string) bool {
 // On Opus 4.7+ adaptive is the only thinking-on mode; on Opus 4.6 and Sonnet 4.6 it
 // coexists with the deprecated budget_tokens-based extended thinking.
 func SupportsAdaptiveThinking(model string) bool {
-	if IsOpus47(model) {
+	if IsOpus47Plus(model) {
 		return true
 	}
 	model = strings.ToLower(model)
@@ -652,6 +783,115 @@ func SupportsAdaptiveThinking(model string) bool {
 		return false
 	}
 	return strings.Contains(model, "opus") || strings.Contains(model, "sonnet")
+}
+
+// Computer-use tool generations.
+//   - "20251124" — Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5
+//   - "20250124" — everything else (Sonnet 4.5, Haiku 4.5, Opus 4.1, Sonnet 4, Opus 4, Sonnet 3.7)
+//
+// The bash tool is generation-invariant (always bash_20250124).
+const (
+	ComputerUseGen20251124 = "20251124"
+	ComputerUseGen20250124 = "20250124"
+)
+
+// ComputerUseGeneration returns the tool-version generation a Claude model
+// uses for computer-use / text-editor tools. This drives:
+//   - Which beta header to inject (computer-use-2025-11-24 vs 2025-01-24).
+//   - Which computer_*/text_editor_* type the upstream API will accept.
+//   - Which `name` literal Anthropic's Pydantic validator demands for text_editor.
+func ComputerUseGeneration(model string) string {
+	m := strings.ToLower(model)
+	// Opus 4.7+ falls into the new generation.
+	if IsOpus47Plus(m) {
+		return ComputerUseGen20251124
+	}
+	// Opus 4.6 / Sonnet 4.6 / Opus 4.5 also use the new generation.
+	if strings.Contains(m, "opus") {
+		if strings.Contains(m, "4-5") || strings.Contains(m, "4.5") ||
+			strings.Contains(m, "4-6") || strings.Contains(m, "4.6") {
+			return ComputerUseGen20251124
+		}
+	}
+	if strings.Contains(m, "sonnet") {
+		if strings.Contains(m, "4-6") || strings.Contains(m, "4.6") {
+			return ComputerUseGen20251124
+		}
+	}
+	return ComputerUseGen20250124
+}
+
+// TextEditorGeneration returns the text_editor tool-version generation for a model.
+// Differs from ComputerUseGeneration because Anthropic's per-tool support matrix
+// is not always uniform - e.g., sonnet-4-5 supports old-gen computer_20250124 but
+// requires new-gen text_editor_20250728+.
+//
+// Models requiring new-gen text_editor:
+//   - Opus 4.7+ (matches IsOpus47Plus)
+//   - Opus 4.5 / 4.6
+//   - Sonnet 4.5 / 4.6 (sonnet-4-5 differs from ComputerUseGeneration which keeps it old-gen)
+func TextEditorGeneration(model string) string {
+	m := strings.ToLower(model)
+	if IsOpus47Plus(m) {
+		return ComputerUseGen20251124
+	}
+	if strings.Contains(m, "opus") {
+		if strings.Contains(m, "4-5") || strings.Contains(m, "4.5") ||
+			strings.Contains(m, "4-6") || strings.Contains(m, "4.6") {
+			return ComputerUseGen20251124
+		}
+	}
+	if strings.Contains(m, "sonnet") {
+		if strings.Contains(m, "4-5") || strings.Contains(m, "4.5") ||
+			strings.Contains(m, "4-6") || strings.Contains(m, "4.6") {
+			return ComputerUseGen20251124
+		}
+	}
+	return ComputerUseGen20250124
+}
+
+// NormalizedToolSpec returns the canonical {type, name} pair Anthropic's API
+// expects for a server tool, given the model's computer-use generation.
+// baseTool is the family name with no version suffix: "computer", "text_editor", or "bash".
+// Returns ("", "") if baseTool is unknown.
+func NormalizedToolSpec(generation, baseTool string) (toolType, toolName string) {
+	switch baseTool {
+	case "computer":
+		if generation == ComputerUseGen20251124 {
+			return string(AnthropicToolTypeComputer20251124), "computer"
+		}
+		return string(AnthropicToolTypeComputer20250124), "computer"
+	case "bash":
+		// bash_20250124 is generation-invariant per Anthropic's docs.
+		return string(AnthropicToolTypeBash20250124), "bash"
+	case "text_editor":
+		if generation == ComputerUseGen20251124 {
+			return string(AnthropicToolTypeTextEditor20250728), "str_replace_based_edit_tool"
+		}
+		return string(AnthropicToolTypeTextEditor20250124), "str_replace_editor"
+	}
+	return "", ""
+}
+
+// computerUseBaseTool extracts the family name from a versioned tool type.
+// Returns "" for tool types that are not part of the computer-use family.
+//
+// Examples:
+//
+//	computer_20251124       -> "computer"
+//	text_editor_20250728    -> "text_editor"
+//	bash_20250124           -> "bash"
+//	web_search_20250305     -> ""
+func computerUseBaseTool(toolType string) string {
+	switch {
+	case strings.HasPrefix(toolType, "computer_"):
+		return "computer"
+	case strings.HasPrefix(toolType, "text_editor_"):
+		return "text_editor"
+	case strings.HasPrefix(toolType, "bash_"):
+		return "bash"
+	}
+	return ""
 }
 
 // MapBifrostEffortToAnthropic maps a Bifrost effort level to an Anthropic effort level.
@@ -943,6 +1183,10 @@ var providerToolVersionRemaps = map[schemas.ModelProvider][]ToolVersionRemap{
 	schemas.Vertex: {
 		// Vertex only supports basic web search, not dynamic filtering
 		{From: string(AnthropicToolTypeWebSearch20260209), To: string(AnthropicToolTypeWebSearch20250305)},
+		// Vertex AI's Anthropic surface lags Anthropic-direct on computer-use tool versions
+		// — computer_20251124 not yet accepted. Downgrade to the GA tag (name is the same
+		// "computer" for both, so no name rewrite needed).
+		{From: string(AnthropicToolTypeComputer20251124), To: string(AnthropicToolTypeComputer20250124)},
 		// Vertex does not support web fetch at all — no remap, these should error
 		// Vertex does not support code execution — no remap, these should error
 	},
@@ -985,8 +1229,11 @@ func doesWebSearchOrFetchAutoInjectCodeExecution(toolType string) bool {
 	return true
 }
 
-// StripEmptyThinkingBlocks removes thinking content blocks where
-// "thinking" is an empty string. Anthropic rejects such blocks with a 400.
+// StripEmptyThinkingBlocks removes thinking content blocks that would be
+// rejected by Anthropic: those with an empty "thinking" field, or those
+// with an empty "signature" field. An empty signature means the block came
+// from a non-Anthropic upstream (OpenAI never emits signatures; Anthropic
+// always does), so it is unsafe to replay to Anthropic.
 func StripEmptyThinkingBlocks(jsonBody []byte) ([]byte, error) {
 	messagesResult := providerUtils.GetJSONField(jsonBody, "messages")
 	if !messagesResult.Exists() || !messagesResult.IsArray() {
@@ -1000,7 +1247,8 @@ func StripEmptyThinkingBlocks(jsonBody []byte) ([]byte, error) {
 		}
 		var toStrip []int
 		for ci, block := range contentResult.Array() {
-			if block.Get("type").String() == "thinking" && block.Get("thinking").String() == "" {
+			if block.Get("type").String() == "thinking" &&
+				(block.Get("thinking").String() == "" || block.Get("signature").String() == "") {
 				toStrip = append(toStrip, ci)
 			}
 		}
@@ -1010,7 +1258,6 @@ func StripEmptyThinkingBlocks(jsonBody []byte) ([]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("failed to strip empty thinking block at %s: %w", path, err)
 			}
-
 		}
 	}
 	return jsonBody, nil
@@ -1080,12 +1327,28 @@ func StripAutoInjectableTools(jsonBody []byte) ([]byte, error) {
 }
 
 // RemapRawToolVersionsForProvider inspects tools in a raw JSON body and remaps
-// unsupported tool versions to supported ones for the target provider.
-// Returns an error if a tool type is fundamentally unsupported (no remap possible).
-func RemapRawToolVersionsForProvider(jsonBody []byte, provider schemas.ModelProvider) ([]byte, error) {
+// unsupported tool versions to supported ones for the target provider, and
+// normalizes computer-use / text-editor / bash tool {type, name} pairs to match
+// the model's required generation. Returns an error if a tool type is
+// fundamentally unsupported (no remap possible).
+//
+// model is the request's "model" field; it drives ComputerUseGeneration so that
+// (e.g.) a request pairing claude-sonnet-4-6 with text_editor_20250124 gets
+// rewritten to text_editor_20250728 + str_replace_based_edit_tool before
+// hitting Anthropic's strict Pydantic validator.
+func RemapRawToolVersionsForProvider(jsonBody []byte, provider schemas.ModelProvider, model string) ([]byte, error) {
 	toolsResult := providerUtils.GetJSONField(jsonBody, "tools")
 	if !toolsResult.Exists() || !toolsResult.IsArray() {
 		return jsonBody, nil
+	}
+
+	// Fall back to body-embedded model when caller didn't pass one. Mirrors
+	// the same fallback in StripUnsupportedFieldsFromRawBody so both helpers
+	// pick the same generation when invoked without an explicit model.
+	if model == "" {
+		if modelResult := providerUtils.GetJSONField(jsonBody, "model"); modelResult.Exists() {
+			model = modelResult.String()
+		}
 	}
 
 	var err error
@@ -1103,12 +1366,51 @@ func RemapRawToolVersionsForProvider(jsonBody []byte, provider schemas.ModelProv
 		}
 	}
 
-	// Apply version remaps
+	// Normalize computer-use / text-editor / bash tools to the canonical
+	// (type, name) pair for the model's generation. Runs before
+	// providerToolVersionRemaps so downgrades still work for non-Anthropic
+	// providers that share the schema.
+	computerGeneration := ComputerUseGeneration(model)
+	textEditorGeneration := TextEditorGeneration(model)
+	for i, tool := range tools {
+		toolType := tool.Get("type").String()
+		baseTool := computerUseBaseTool(toolType)
+		if baseTool == "" {
+			continue
+		}
+		generation := computerGeneration
+		if baseTool == "text_editor" {
+			generation = textEditorGeneration
+		}
+		wantType, wantName := NormalizedToolSpec(generation, baseTool)
+		if wantType == "" {
+			continue
+		}
+		if toolType != wantType {
+			path := fmt.Sprintf("tools.%d.type", i)
+			jsonBody, err = providerUtils.SetJSONField(jsonBody, path, wantType)
+			if err != nil {
+				return nil, fmt.Errorf("failed to normalize tool type: %w", err)
+			}
+		}
+		// Only set name if the tool has one (custom tools use input_schema; computer-use family always has a name).
+		if existingName := tool.Get("name").String(); existingName != "" && existingName != wantName {
+			path := fmt.Sprintf("tools.%d.name", i)
+			jsonBody, err = providerUtils.SetJSONField(jsonBody, path, wantName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to normalize tool name: %w", err)
+			}
+		}
+	}
+
+	// Apply provider-specific version remaps (e.g. web_search downgrades for non-Anthropic providers)
 	remaps, ok := providerToolVersionRemaps[provider]
 	if !ok {
 		return jsonBody, nil
 	}
 
+	// Re-fetch tools array since paths may have changed via SetJSONField above
+	tools = providerUtils.GetJSONField(jsonBody, "tools").Array()
 	for i, tool := range tools {
 		toolType := tool.Get("type").String()
 		for _, remap := range remaps {
@@ -1609,6 +1911,60 @@ func convertMapToToolFunctionParameters(m map[string]interface{}) *schemas.ToolF
 }
 
 // ConvertAnthropicFinishReasonToBifrost converts provider finish reasons to Bifrost format
+// MapAnthropicRequestServiceTierToBifrost maps Anthropic request service_tier values back to Bifrost/OpenAI values.
+// Anthropic request values: "auto" or "standard_only".
+func MapAnthropicRequestServiceTierToBifrost(tier string) schemas.BifrostServiceTier {
+	switch tier {
+	case "standard_only":
+		return schemas.BifrostServiceTierDefault
+	case "auto":
+		return schemas.BifrostServiceTierAuto
+	default:
+		return schemas.BifrostServiceTierAuto
+	}
+}
+
+// MapBifrostServiceTierToAnthropicRequest maps OpenAI-compatible service_tier request values to Anthropic's two allowed values.
+// Anthropic only supports "auto" (use priority if available) or "standard_only" (always standard).
+func MapBifrostServiceTierToAnthropicRequest(tier schemas.BifrostServiceTier) string {
+	switch tier {
+	case schemas.BifrostServiceTierAuto, schemas.BifrostServiceTierPriority:
+		return "auto"
+	case schemas.BifrostServiceTierDefault, schemas.BifrostServiceTierFlex:
+		return "standard_only"
+	default:
+		return "auto"
+	}
+}
+
+// MapAnthropicServiceTierToBifrost maps Anthropic response service_tier values to OpenAI-compatible Bifrost values.
+// Anthropic response values: "standard", "priority", "batch".
+func MapAnthropicServiceTierToBifrost(tier string) schemas.BifrostServiceTier {
+	switch tier {
+	case "standard":
+		return schemas.BifrostServiceTierDefault
+	case "priority":
+		return schemas.BifrostServiceTierPriority
+	default:
+		return schemas.BifrostServiceTier(tier)
+	}
+}
+
+// MapBifrostServiceTierToAnthropicResponse maps Bifrost/OpenAI response service_tier values back to Anthropic wire format.
+// Used when re-encoding a Bifrost response into Anthropic format.
+func MapBifrostServiceTierToAnthropicResponse(tier schemas.BifrostServiceTier) string {
+	switch tier {
+	case schemas.BifrostServiceTierDefault:
+		return "standard"
+	case schemas.BifrostServiceTierPriority:
+		return "priority"
+	case schemas.BifrostServiceTierAuto, schemas.BifrostServiceTierFlex:
+		return "standard"
+	default:
+		return string(tier)
+	}
+}
+
 func ConvertAnthropicFinishReasonToBifrost(providerReason AnthropicStopReason) string {
 	if bifrostReason, ok := anthropicFinishReasonToBifrost[providerReason]; ok {
 		return bifrostReason
@@ -1718,6 +2074,7 @@ func ConvertToAnthropicDocumentBlock(block schemas.ChatContentBlock) AnthropicCo
 		// Check if it's plain text based on file type
 		if file.FileType != nil && (*file.FileType == "text/plain" || *file.FileType == "txt") {
 			documentBlock.Source.SourceObj.Type = "text"
+			documentBlock.Source.SourceObj.MediaType = schemas.Ptr("text/plain")
 			documentBlock.Source.SourceObj.Data = &fileData
 			return documentBlock
 		}
@@ -2414,6 +2771,14 @@ func convertResponsesTextConfigToAnthropicOutputFormat(textConfig *schemas.Respo
 
 		if len(format.JSONSchema.Required) > 0 {
 			schema["required"] = format.JSONSchema.Required
+		}
+
+		if format.JSONSchema.Defs != nil {
+			schema["$defs"] = *format.JSONSchema.Defs
+		}
+
+		if format.JSONSchema.Definitions != nil {
+			schema["definitions"] = *format.JSONSchema.Definitions
 		}
 
 		if format.JSONSchema.Type != nil && *format.JSONSchema.Type == "object" {

@@ -5,10 +5,6 @@ package s3
 import (
 	"context"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"sync"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream/eventstreamapi"
@@ -17,6 +13,8 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	smithysync "github.com/aws/smithy-go/sync"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"io"
+	"sync"
 )
 
 // SelectObjectContentEventStreamReader provides the interface for reading events
@@ -229,7 +227,7 @@ func (m *awsRestxml_deserializeOpEventStreamSelectObjectContent) HandleDeseriali
 
 func (*awsRestxml_deserializeOpEventStreamSelectObjectContent) closeResponseBody(out middleware.DeserializeOutput) {
 	if resp, ok := out.RawResponse.(*smithyhttp.Response); ok && resp != nil && resp.Body != nil {
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
 }

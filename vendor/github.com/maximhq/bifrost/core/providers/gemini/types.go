@@ -111,13 +111,15 @@ type GeminiGenerationRequest struct {
 	ToolConfig        *ToolConfig              `json:"toolConfig,omitempty"`
 	Labels            map[string]string        `json:"labels,omitempty"`
 	CachedContent     string                   `json:"cachedContent,omitempty"`
-	Stream            bool                     `json:"-"` // Internal field to track streaming requests
-	IsEmbedding       bool                     `json:"-"` // Internal field to track if this is an embedding request
-	IsTranscription   bool                     `json:"-"` // Internal field to track if this is a transcription request
-	IsSpeech          bool                     `json:"-"` // Internal field to track if this is a speech request
-	IsImageGeneration bool                     `json:"-"` // Internal field to track if this is an image generation request
-	IsImageEdit       bool                     `json:"-"` // Internal field to track if this is an image edit request
-	IsCountTokens     bool                     `json:"-"` // Internal field to track if this is a count tokens request
+	// Optional. The service tier to use for the request. For example, ServiceTier.FLEX.
+	ServiceTier       ServiceTier `json:"serviceTier,omitempty"`
+	Stream            bool        `json:"-"` // Internal field to track streaming requests
+	IsEmbedding       bool        `json:"-"` // Internal field to track if this is an embedding request
+	IsTranscription   bool        `json:"-"` // Internal field to track if this is a transcription request
+	IsSpeech          bool        `json:"-"` // Internal field to track if this is a speech request
+	IsImageGeneration bool        `json:"-"` // Internal field to track if this is an image generation request
+	IsImageEdit       bool        `json:"-"` // Internal field to track if this is an image edit request
+	IsCountTokens     bool        `json:"-"` // Internal field to track if this is a count tokens request
 
 	// Imagen-specific fields for :predict endpoint
 	Instances  []ImagenInstance        `json:"instances,omitempty"`
@@ -811,6 +813,30 @@ func (t *Tool) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Pricing and performance service tier.
+type ServiceTier string
+
+const (
+	// Default service tier, which is standard.
+	ServiceTierUnspecified ServiceTier = "unspecified"
+	// Flex service tier.
+	ServiceTierFlex ServiceTier = "flex"
+	// Standard service tier.
+	ServiceTierStandard ServiceTier = "standard"
+	// Priority service tier.
+	ServiceTierPriority ServiceTier = "priority"
+)
+
+type TrafficType string
+
+const (
+	TrafficTypeUnspecified           TrafficType = "TRAFFIC_TYPE_UNSPECIFIED"
+	TrafficTypeOnDemand              TrafficType = "ON_DEMAND"
+	TrafficTypeOnDemandPriority      TrafficType = "ON_DEMAND_PRIORITY"
+	TrafficTypeOnDemandFlex          TrafficType = "ON_DEMAND_FLEX"
+	TrafficTypeProvisionedThroughput TrafficType = "PROVISIONED_THROUGHPUT"
+)
+
 // GenerationConfig represents generation configuration. You can find API default values and more details at https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference#generationconfig
 // and https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/content-generation-parameters.
 type GenerationConfig struct {
@@ -969,6 +995,73 @@ type Schema struct {
 	Title string `json:"title,omitempty"`
 	// Optional. The type of the data.
 	Type Type `json:"type,omitempty"`
+}
+
+type flexibleSchemaInt64 int64
+
+var schemaIntegerJSON = sonic.Config{UseInt64: true}.Froze()
+
+func (i *flexibleSchemaInt64) UnmarshalJSON(data []byte) error {
+	var value any
+	if err := schemaIntegerJSON.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("invalid schema integer constraint: %w", err)
+	}
+
+	switch typedValue := value.(type) {
+	case nil:
+		return nil
+	case int64:
+		*i = flexibleSchemaInt64(typedValue)
+		return nil
+	case string:
+		parsed, err := strconv.ParseInt(typedValue, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid schema integer constraint %q: %w", typedValue, err)
+		}
+		*i = flexibleSchemaInt64(parsed)
+		return nil
+	default:
+		return fmt.Errorf("invalid schema integer constraint %v", typedValue)
+	}
+}
+
+func schemaInt64Ptr(value *flexibleSchemaInt64) *int64 {
+	if value == nil {
+		return nil
+	}
+	out := int64(*value)
+	return &out
+}
+
+// UnmarshalJSON accepts both the quoted integer format emitted by this struct's
+// JSON tags and standard numeric JSON Schema constraints used by SDKs.
+func (s *Schema) UnmarshalJSON(data []byte) error {
+	type schemaAlias Schema
+	type schemaWithFlexibleConstraints struct {
+		*schemaAlias
+		MaxItems      *flexibleSchemaInt64 `json:"maxItems,omitempty"`
+		MaxLength     *flexibleSchemaInt64 `json:"maxLength,omitempty"`
+		MaxProperties *flexibleSchemaInt64 `json:"maxProperties,omitempty"`
+		MinItems      *flexibleSchemaInt64 `json:"minItems,omitempty"`
+		MinLength     *flexibleSchemaInt64 `json:"minLength,omitempty"`
+		MinProperties *flexibleSchemaInt64 `json:"minProperties,omitempty"`
+	}
+
+	var aux schemaAlias
+	withConstraints := schemaWithFlexibleConstraints{schemaAlias: &aux}
+	if err := sonic.Unmarshal(data, &withConstraints); err != nil {
+		return err
+	}
+
+	*s = Schema(aux)
+	s.MaxItems = schemaInt64Ptr(withConstraints.MaxItems)
+	s.MaxLength = schemaInt64Ptr(withConstraints.MaxLength)
+	s.MaxProperties = schemaInt64Ptr(withConstraints.MaxProperties)
+	s.MinItems = schemaInt64Ptr(withConstraints.MinItems)
+	s.MinLength = schemaInt64Ptr(withConstraints.MinLength)
+	s.MinProperties = schemaInt64Ptr(withConstraints.MinProperties)
+
+	return nil
 }
 
 // Type represents the type of the data.
@@ -1166,6 +1259,7 @@ type GeminiEmbeddingRequest struct {
 	Title                *string                `json:"title,omitempty"`
 	OutputDimensionality *int                   `json:"outputDimensionality,omitempty"`
 	Model                string                 `json:"model,omitempty"`
+	Fallbacks            []string               `json:"fallbacks,omitempty"`
 	ExtraParams          map[string]interface{} `json:"-"` // Optional: Extra parameters
 }
 
@@ -1457,6 +1551,11 @@ type FunctionResponse struct {
 type GeminiEmbeddingResponse struct {
 	Embeddings []GeminiEmbedding     `json:"embeddings"`
 	Metadata   *EmbedContentMetadata `json:"metadata,omitempty"`
+}
+
+// GeminiEmbedContentResponse is the wire format for a single :embedContent response.
+type GeminiEmbedContentResponse struct {
+	Embedding GeminiEmbedding `json:"embedding"`
 }
 
 // GeminiEmbedding represents a single embedding in the response
@@ -1870,7 +1969,7 @@ type ModalityTokenCount struct {
 	// Optional. The modality associated with this token count.
 	Modality Modality `json:"modality,omitempty"`
 	// Number of tokens.
-	TokenCount int32 `json:"tokenCount,omitempty"`
+	TokenCount int32 `json:"tokenCount"`
 }
 
 // GenerateContentResponseUsageMetadata represents usage metadata about response(s).
@@ -1898,7 +1997,9 @@ type GenerateContentResponseUsageMetadata struct {
 	TotalTokenCount int32 `json:"totalTokenCount,omitempty"`
 	// Output only. Traffic type. This shows whether a request consumes Pay-As-You-Go or
 	// Provisioned Throughput quota.
-	TrafficType string `json:"trafficType,omitempty"`
+	TrafficType TrafficType `json:"trafficType,omitempty"`
+	// Output only. The service tier used to serve the request.
+	ServiceTier ServiceTier `json:"serviceTier,omitempty"`
 }
 
 // GenerateContentResponse represents response message for PredictionService.GenerateContent.
@@ -2308,7 +2409,8 @@ type GeminiVideoGenerationRequest struct {
 	Model       string                          `json:"model,omitempty"` // Model field for explicit model specification
 	Instances   []GeminiVideoGenerationInstance `json:"instances"`
 	Parameters  *VideoGenerationParameters      `json:"parameters,omitempty"` // Optional parameters including reference images
-	ExtraParams map[string]interface{}          `json:"-"`                    // Optional: Extra parameters
+	Fallbacks   []string                        `json:"fallbacks,omitempty"`
+	ExtraParams map[string]interface{}          `json:"-"` // Optional: Extra parameters
 }
 
 func (r *GeminiVideoGenerationRequest) GetExtraParams() map[string]interface{} {

@@ -5,9 +5,6 @@ package sts
 import (
 	"context"
 	"fmt"
-	"slices"
-	"strings"
-
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	smithy "github.com/aws/smithy-go"
 	smithyauth "github.com/aws/smithy-go/auth"
@@ -15,6 +12,8 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	"github.com/aws/smithy-go/tracing"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"slices"
+	"strings"
 )
 
 func bindAuthParamsRegion(_ interface{}, params *AuthResolverParameters, _ interface{}, options Options) error {
@@ -207,7 +206,7 @@ func (m *resolveAuthSchemeMiddleware) selectScheme(options []*smithyauth.Option)
 		}
 
 		for _, scheme := range m.options.AuthSchemes {
-			if scheme.SchemeID() != option.SchemeID {
+			if !matchSchemeID(scheme.SchemeID(), option.SchemeID) {
 				continue
 			}
 
@@ -218,6 +217,16 @@ func (m *resolveAuthSchemeMiddleware) selectScheme(options []*smithyauth.Option)
 	}
 
 	return nil, false
+}
+
+func matchSchemeID(registered, option string) bool {
+	if registered == option {
+		return true
+	}
+	if i := strings.LastIndex(registered, "#"); i != -1 {
+		return registered[i+1:] == option
+	}
+	return false
 }
 
 func sortAuthOptions(options []*smithyauth.Option, preferred []string) []*smithyauth.Option {

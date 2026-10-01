@@ -1,10 +1,29 @@
-- feat: add `IsAPIKeyAuthContextKey` and `IsLocalAdminContextKey` context keys for middleware to short-circuit on API-key auth and bypass RBAC when auth is fully disabled
-- feat: add `NormalizeSchemaForAnthropicRaw` (gjson/sjson) so JSON schema normalization avoids a `map[string]interface{}` round-trip
-- feat: add `extractJSONSchemaObject` helper in Bedrock utils to unify composite and decomposed JSON schema fields for OpenAI-compat structured output
-- fix: skip model catalog routing if loadbalancer or governance routing has already set the provider in anthropic integration
-- fix: set extra params passthrough for SGL provider so SGLang vLLM-style extra-body parameters are no longer dropped (thanks [@hensapir](https://github.com/hensapir)!)
-- fix: suppress non-tool content events in Bedrock structured-output streaming so prose/preamble no longer corrupts the assembled JSON
-- fix: enrich `NewUnsupportedOperationError` with provider and request type in `ExtraFields`
-- fix: allow zero-millisecond streaming latency values (was previously rejected as invalid)
-- fix: add `String()` method on `BifrostError` so logged errors no longer dump raw bytes as decimal
-- chore: re-enable Vertex `ContextEditing` and `ContextManagementField`; disable Azure `TaskBudgets` in the feature-support matrix; add `claude-4.6-sonnet` mapping for the Bedrock test account
+- feat: OpenAI compaction support (#4053)
+- feat: multiple customers logs and usage tracking (#4066)
+- feat: multiple team and business unit support in logstore (#4041)
+- feat: `request_headers` pattern capture for OTel and Maxim plugins with wildcard support (#4012)
+- feat: xAI `x_search` tool support (#3976)
+- feat: fetch URL validation with private-network config and link-local blocking (#3947, #3991)
+- feat: `file://` scheme support for pricing URLs (#4045)
+- feat: filter `ListAllModels` provider fan-out by virtual key's allowed providers (#3796)
+- fix: harden fetch URL IP checks against SSRF (#4092)
+- fix: broaden Mantle model matching to all `gpt` variants (#4091)
+- fix: strip thinking block if signature is empty (#4079)
+- fix: remove usage from `responses.created` event in OpenAI stream (#4080)
+- fix: set prompt cache key from Anthropic integration (#4086)
+- fix: map upstream connection failures to 502 instead of 400 (#3929) (thanks [@chris-colinsky](https://github.com/chris-colinsky)!)
+- fix(gemini): accept numeric schema integer constraints (#3994) (thanks [@yanhao98](https://github.com/yanhao98)!)
+- fix: handle compaction message type (#3966)
+- fix: OpenAI integration content string handling (#3949)
+- fix: capture resolved provider from the load balancer for logging (#3930)
+- fix: add content type to provider response header filter (#4024)
+- fix: strip provider response headers (#3955)
+- fix: drain non-SSE stream reader (#3956)
+- fix: stale connection retries (#3967)
+- fix: Azure diagnostic property strip for Claude models (#3925)
+- fix: passthrough budgets (#3941)
+- fix: bedrock outputAssessments type correction (#4028)
+- fix: add Model field to TextCompletionChunkResponse (#3970) (thanks [@kuishou68](https://github.com/kuishou68)!)
+- fix: accept orphaned tool results in OpenAI to Anthropic conversion flow (#3919)
+- fix(mcp): allow inline stdio env assignments (#3861) (thanks [@Shushmitaaaa](https://github.com/Shushmitaaaa)!)
+- chore: bumped transitive golang.org/x dependencies (crypto, net, sys, text) for Docker Scout CVE remediation (#3900)

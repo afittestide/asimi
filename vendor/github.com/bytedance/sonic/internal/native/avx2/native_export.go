@@ -46,5 +46,4 @@ func Use() {
 	loader.WrapGoC(_text_vstring, _cfunc_vstring, []loader.GoC{{"_vstring", &S_vstring, &F_vstring}}, "avx2", "avx2/vstring.c")
 	loader.WrapGoC(_text_value, _cfunc_value, []loader.GoC{{"_value", &S_value, &F_value}}, "avx2", "avx2/value.c")
 	loader.WrapGoC(_text_parse_with_padding, _cfunc_parse_with_padding, []loader.GoC{{"_parse_with_padding", &S_parse_with_padding, &F_parse_with_padding}}, "avx2", "avx2/parser.c")
-	loader.WrapGoC(_text_lookup_small_key, _cfunc_lookup_small_key, []loader.GoC{{"_lookup_small_key", &S_lookup_small_key, &F_lookup_small_key}}, "avx2", "avx2/lookup.c")
 }

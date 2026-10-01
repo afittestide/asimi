@@ -27,7 +27,7 @@ func (s *headerScanner) next() bool {
 
 		i := bytes.Index(s.b, strCRLFCRLF)
 		if i < 0 {
-			s.err = errNeedMore
+			s.err = ErrNeedMore
 			return false
 		}
 		i += 4
@@ -165,4 +165,15 @@ func trim(s []byte) []byte {
 		n--
 	}
 	return s[i:n]
+}
+
+func trimTrailingSpace(s []byte) []byte {
+	for len(s) > 0 {
+		c := s[len(s)-1]
+		if c != ' ' && c != '\t' {
+			break
+		}
+		s = s[:len(s)-1]
+	}
+	return s
 }

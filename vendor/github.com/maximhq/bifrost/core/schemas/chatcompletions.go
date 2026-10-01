@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // BifrostChatRequest is the request struct for chat completion requests
@@ -36,7 +39,7 @@ type BifrostChatResponse struct {
 	Created           int                        `json:"created"` // The Unix timestamp (in seconds).
 	Model             string                     `json:"model"`
 	Object            string                     `json:"object"` // "chat.completion" or "chat.completion.chunk"
-	ServiceTier       *string                    `json:"service_tier,omitempty"`
+	ServiceTier       *BifrostServiceTier        `json:"service_tier,omitempty"`
 	SystemFingerprint string                     `json:"system_fingerprint"`
 	Usage             *BifrostLLMUsage           `json:"usage"`
 	ExtraFields       BifrostResponseExtraFields `json:"extra_fields"`
@@ -202,7 +205,7 @@ type ChatParameters struct {
 	ResponseFormat       *interface{}          `json:"response_format,omitempty"`        // Format for the response
 	SafetyIdentifier     *string               `json:"safety_identifier,omitempty"`      // Safety identifier
 	Seed                 *int                  `json:"seed,omitempty"`
-	ServiceTier          *string               `json:"service_tier,omitempty"`
+	ServiceTier          *BifrostServiceTier   `json:"service_tier,omitempty"`
 	StreamOptions        *ChatStreamOptions    `json:"stream_options,omitempty"`
 	Stop                 []string              `json:"stop,omitempty"`
 	Store                *bool                 `json:"store,omitempty"`
@@ -238,11 +241,12 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 	// Alias to avoid recursion
 	type Alias ChatParameters
 
-	// Aux struct adds reasoning_effort for decoding
+	// Aux struct adds flat reasoning_* shorthands for decoding
 	var aux struct {
 		*Alias
 		ReasoningEffort    *string `json:"reasoning_effort"` // only for input
 		ReasoningMaxTokens *int    `json:"reasoning_max_tokens"`
+		ReasoningDisplay   *string `json:"reasoning_display"`
 	}
 
 	aux.Alias = (*Alias)(cp)
@@ -261,8 +265,11 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 	if aux.ReasoningMaxTokens != nil && aux.Reasoning != nil && aux.Reasoning.MaxTokens != nil {
 		return fmt.Errorf("both reasoning_max_tokens and reasoning.max_tokens cannot be present at the same time")
 	}
+	if aux.ReasoningDisplay != nil && aux.Reasoning != nil && aux.Reasoning.Display != nil {
+		return fmt.Errorf("both reasoning_display and reasoning.display cannot be present at the same time")
+	}
 
-	if aux.ReasoningEffort != nil || aux.ReasoningMaxTokens != nil {
+	if aux.ReasoningEffort != nil || aux.ReasoningMaxTokens != nil || aux.ReasoningDisplay != nil {
 		if cp.Reasoning == nil {
 			cp.Reasoning = &ChatReasoning{}
 		}
@@ -272,6 +279,9 @@ func (cp *ChatParameters) UnmarshalJSON(data []byte) error {
 		}
 		if aux.ReasoningMaxTokens != nil {
 			cp.Reasoning.MaxTokens = aux.ReasoningMaxTokens
+		}
+		if aux.ReasoningDisplay != nil {
+			cp.Reasoning.Display = aux.ReasoningDisplay
 		}
 	}
 	// ExtraParams etc. are already handled by the alias
@@ -1116,6 +1126,102 @@ type ChatContentBlock struct {
 	CachePoint *CachePoint `json:"cachePoint,omitempty"`
 }
 
+// UnmarshalJSON normalizes Anthropic-style document content blocks
+// (`{"type":"document","source":{...}}`) into bifrost's canonical file shape
+// (`{"type":"file","file":{file_data|file_url, file_type}}`) before the default
+// unmarshal runs. This lets every code path - native /v1/chat/completions, drop-in
+// routes, programmatic JSON callers - reuse the existing ChatContentBlockTypeFile
+// branch in provider converters without per-handler shims.
+//
+// Source variants mapped:
+//   - {type:"base64", media_type, data}  -> File.FileData (raw base64), File.FileType (media_type)
+//   - {type:"url",    url}               -> File.FileURL,               provider fetches at convert time
+//   - {type:"text",   media_type, data}  -> File.FileData (plain text), File.FileType (media_type)
+//   - {type:"file",   file_id}           -> File.FileID
+//
+// Sibling fields (citations, cache_control, cachePoint, title) are preserved.
+// Other type values pass through to the default unmarshal unchanged.
+func (c *ChatContentBlock) UnmarshalJSON(data []byte) error {
+	// Alias type avoids infinite recursion when delegating to default unmarshal.
+	type alias ChatContentBlock
+
+	if blockType := gjson.GetBytes(data, "type"); blockType.Type == gjson.String && blockType.String() == "document" {
+		rewritten, err := rewriteDocumentBlock(data)
+		if err != nil {
+			return err
+		}
+		data = rewritten
+	}
+
+	var a alias
+	if err := Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*c = ChatContentBlock(a)
+	return nil
+}
+
+// rewriteDocumentBlock converts an Anthropic-style document content block into
+// the canonical {type:"file", file:{...}} shape. Sibling fields (citations,
+// cache_control, cachePoint) survive untouched.
+func rewriteDocumentBlock(data []byte) ([]byte, error) {
+	srcType := gjson.GetBytes(data, "source.type").String()
+
+	out, err := sjson.SetBytes(data, "type", "file")
+	if err != nil {
+		return nil, fmt.Errorf("document rewrite: set type: %w", err)
+	}
+	out, err = sjson.DeleteBytes(out, "source")
+	if err != nil {
+		return nil, fmt.Errorf("document rewrite: drop source: %w", err)
+	}
+
+	switch srcType {
+	case "base64", "text":
+		mediaType := gjson.GetBytes(data, "source.media_type").String()
+		dataField := gjson.GetBytes(data, "source.data").String()
+		if dataField == "" {
+			return nil, fmt.Errorf("document rewrite: source.data is required for source.type=%q", srcType)
+		}
+		if out, err = sjson.SetBytes(out, "file.file_data", dataField); err != nil {
+			return nil, fmt.Errorf("document rewrite: set file_data: %w", err)
+		}
+		if mediaType != "" {
+			if out, err = sjson.SetBytes(out, "file.file_type", mediaType); err != nil {
+				return nil, fmt.Errorf("document rewrite: set file_type: %w", err)
+			}
+		}
+	case "url":
+		urlField := gjson.GetBytes(data, "source.url").String()
+		if urlField == "" {
+			return nil, fmt.Errorf("document rewrite: source.url is required for source.type=url")
+		}
+		if out, err = sjson.SetBytes(out, "file.file_url", urlField); err != nil {
+			return nil, fmt.Errorf("document rewrite: set file_url: %w", err)
+		}
+	case "file":
+		fileID := gjson.GetBytes(data, "source.file_id").String()
+		if fileID == "" {
+			return nil, fmt.Errorf("document rewrite: source.file_id is required for source.type=file")
+		}
+		if out, err = sjson.SetBytes(out, "file.file_id", fileID); err != nil {
+			return nil, fmt.Errorf("document rewrite: set file_id: %w", err)
+		}
+	case "content":
+		return nil, fmt.Errorf("document rewrite: source.type=content (Anthropic inline content array) is not supported; use base64/text/url/file")
+	default:
+		return nil, fmt.Errorf("document rewrite: unsupported source.type %q", srcType)
+	}
+
+	if name := gjson.GetBytes(data, "title"); name.Exists() {
+		if out, err = sjson.SetBytes(out, "file.filename", name.String()); err != nil {
+			return nil, fmt.Errorf("document rewrite: set filename: %w", err)
+		}
+	}
+
+	return out, nil
+}
+
 // CachePoint represents a cache point marker (Bedrock-specific)
 type CachePoint struct {
 	Type string `json:"type"` // "default"
@@ -1374,6 +1480,18 @@ const (
 	BifrostFinishReasonStop      BifrostFinishReason = "stop"
 	BifrostFinishReasonLength    BifrostFinishReason = "length"
 	BifrostFinishReasonToolCalls BifrostFinishReason = "tool_calls"
+)
+
+// BifrostServiceTier represents the service tier for a request/response.
+type BifrostServiceTier string
+
+// BifrostServiceTier values
+const (
+	BifrostServiceTierAuto        BifrostServiceTier = "auto"
+	BifrostServiceTierDefault     BifrostServiceTier = "default"
+	BifrostServiceTierFlex        BifrostServiceTier = "flex"
+	BifrostServiceTierPriority    BifrostServiceTier = "priority"
+	BifrostServiceTierProvisioned BifrostServiceTier = "provisioned"
 )
 
 type BifrostReasoningDetailsType string

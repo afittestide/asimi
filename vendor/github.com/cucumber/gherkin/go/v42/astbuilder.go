@@ -1,9 +1,8 @@
 package gherkin
 
 import (
+	"github.com/cucumber/messages/go/v34"
 	"strings"
-
-	messages "github.com/cucumber/messages/go/v34"
 )
 
 type AstBuilder interface {

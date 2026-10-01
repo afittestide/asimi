@@ -7,9 +7,8 @@
 package libc // import "modernc.org/libc"
 
 import (
-	"runtime"
-
 	"golang.org/x/sys/unix"
+	"runtime"
 )
 
 func ___syscall_cp(tls *TLS, n, a, b, c, d, e, f long) long {

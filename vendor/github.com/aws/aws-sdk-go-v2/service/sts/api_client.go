@@ -6,17 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
-	"sync/atomic"
-	"time"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/defaults"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/query"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	internalauth "github.com/aws/aws-sdk-go-v2/internal/auth"
 	internalauthsmithy "github.com/aws/aws-sdk-go-v2/internal/auth/smithy"
@@ -31,6 +26,10 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	"github.com/aws/smithy-go/tracing"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"net"
+	"net/http"
+	"sync/atomic"
+	"time"
 )
 
 const ServiceID = "STS"
@@ -224,6 +223,8 @@ func New(options Options, optFns ...func(*Options)) *Client {
 	finalizeRetryMaxAttempts(&options)
 
 	ignoreAnonymousAuth(&options)
+
+	finalizeSTSRetryableErrors(&options)
 
 	wrapWithAnonymousAuth(&options)
 
@@ -835,6 +836,10 @@ func addCredentialSource(stack *middleware.Stack, options Options) error {
 
 	mw := setCredentialSourceMiddleware{ua: ua, options: options}
 	return stack.Build.Insert(&mw, "UserAgent", middleware.Before)
+}
+
+func finalizeSTSRetryableErrors(o *Options) {
+	o.Retryer = retry.AddWithErrorCodes(o.Retryer, "IDPCommunicationError")
 }
 
 func resolveTracerProvider(options *Options) {

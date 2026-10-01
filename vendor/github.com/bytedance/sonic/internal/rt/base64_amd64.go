@@ -4,9 +4,8 @@
 package rt
 
 import (
-	_ "unsafe"
-
 	"github.com/cloudwego/base64x"
+	_ "unsafe"
 )
 
 func DecodeBase64(raw []byte) ([]byte, error) {

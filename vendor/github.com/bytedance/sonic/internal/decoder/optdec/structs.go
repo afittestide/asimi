@@ -15,7 +15,7 @@ type fieldEntry struct {
 }
 
 type structDecoder struct {
-	fieldMap   caching.FieldLookup
+	fieldMap   *caching.FieldCache
 	fields     []fieldEntry
 	structName string
 	typ        reflect.Type

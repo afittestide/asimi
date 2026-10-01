@@ -80,11 +80,19 @@
         - "!just test  # test_results"
         - "!just lint  # lint_results"
         - "!just build  # build_result"
+        - "!just vuln  # vuln_results"
       act: |
         Verify that tests pass, linter is clean, and the project builds.
         Confirm the CHANGELOG version matches the version in asimi_version.go.
         Confirm the git tag for {{ .version }} does not already exist.
         If anything fails, report clearly and do not proceed.
+
+        Release gate — vulnerability scan. The release MUST NOT proceed if
+        `just vuln` reports any reachable vulnerabilities. Note that
+        `just test` runs `just vuln` only when CI is set (justfile); the ritual
+        runs locally with CI unset, so this explicit `just vuln` invocation is
+        the load-bearing gate. Treat a non-zero govulncheck exit as a FAILED
+        gate even if the test/build results above are clean.
 
         Use record_verdict to record pass/fail.
       then:

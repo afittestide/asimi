@@ -169,7 +169,7 @@ func (c *compiler) compileStructBody(vt reflect.Type) decFunc {
 		})
 	}
 	return &structDecoder{
-		fieldMap:   caching.NewFieldLookup(fv),
+		fieldMap:   caching.NewFieldCache(fv),
 		fields:     entries,
 		structName: vt.Name(),
 		typ:        vt,

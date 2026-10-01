@@ -5,9 +5,8 @@ package s3
 import (
 	"context"
 	"fmt"
-
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	internalChecksum "github.com/aws/aws-sdk-go-v2/service/internal/checksum"
 	s3cust "github.com/aws/aws-sdk-go-v2/service/s3/internal/customizations"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -136,9 +135,19 @@ type PutBucketPolicyInput struct {
 	//
 	//   - CRC64NVME
 	//
+	//   - MD5
+	//
 	//   - SHA1
 	//
 	//   - SHA256
+	//
+	//   - SHA512
+	//
+	//   - XXHASH3
+	//
+	//   - XXHASH64
+	//
+	//   - XXHASH128
 	//
 	// For more information, see [Checking object integrity] in the Amazon S3 User Guide.
 	//

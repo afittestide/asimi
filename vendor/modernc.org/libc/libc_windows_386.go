@@ -5,12 +5,11 @@
 package libc // import "modernc.org/libc"
 
 import (
+	"golang.org/x/sys/windows"
 	"os"
 	"strings"
 	gotime "time"
 	"unsafe"
-
-	"golang.org/x/sys/windows"
 
 	"modernc.org/libc/errno"
 	"modernc.org/libc/sys/stat"

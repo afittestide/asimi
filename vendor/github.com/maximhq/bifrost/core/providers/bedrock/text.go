@@ -126,7 +126,8 @@ func (response *BedrockAnthropicTextResponse) ToBifrostTextCompletionResponse() 
 				FinishReason: &response.StopReason,
 			},
 		},
-		ExtraFields: schemas.BifrostResponseExtraFields{},
+		ExtraFields: schemas.BifrostResponseExtraFields{
+		},
 	}
 }
 
@@ -148,9 +149,10 @@ func (response *BedrockMistralTextResponse) ToBifrostTextCompletionResponse() *s
 	}
 
 	return &schemas.BifrostTextCompletionResponse{
-		Object:      "text_completion",
-		Choices:     choices,
-		ExtraFields: schemas.BifrostResponseExtraFields{},
+		Object:  "text_completion",
+		Choices: choices,
+		ExtraFields: schemas.BifrostResponseExtraFields{
+		},
 	}
 }
 

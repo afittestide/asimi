@@ -110,7 +110,7 @@ bootstrap:
     go install golang.org/x/tools/cmd/goimports@latest
     go install golang.org/x/vuln/cmd/govulncheck@latest
 
-# Run vulnerability scanning (fails in CI if vulnerabilities found)
+# Run vulnerability scanning (fails on any finding not in security/vuln-allowlist.txt)
 vuln:
     #!/usr/bin/env bash
     set -o pipefail
@@ -118,9 +118,47 @@ vuln:
         echo "ERROR: govulncheck is not installed. Run 'just bootstrap' first."
         exit 1
     fi
+    allowlist="security/vuln-allowlist.txt"
     go build -tags containers_image_openpgp -o /tmp/asimi-vuln .
-    govulncheck -mode=binary /tmp/asimi-vuln
+    out=$(govulncheck -mode=binary /tmp/asimi-vuln 2>&1)
+    status=$?
     rm -f /tmp/asimi-vuln
+    if [ "$status" -eq 0 ]; then
+        echo "$out"
+        exit 0
+    fi
+    # Collect accepted IDs (one per line, '#' comments ignored).
+    accepted=""
+    if [ -f "$allowlist" ]; then
+        accepted=$(grep -v '^[[:space:]]*#' "$allowlist" | grep -v '^[[:space:]]*$' || true)
+    fi
+    # Find the vulnerability IDs the scan actually reported.
+    found=$(echo "$out" | grep -oE 'GO-[0-9]{4}-[0-9]+' | sort -u)
+    unaccepted=""
+    for id in $found; do
+        if ! echo "$accepted" | grep -qx "$id"; then
+            unaccepted="$unaccepted $id"
+        fi
+    done
+    # A stale allowlist entry (no longer reported) is also a failure: it means
+    # the acceptance should be re-reviewed. But it does not block the release.
+    stale=""
+    for id in $accepted; do
+        if ! echo "$found" | grep -qx "$id"; then
+            stale="$stale $id"
+        fi
+    done
+    echo "$out"
+    echo
+    if [ -n "$unaccepted" ]; then
+        echo "VULN GATE FAILED: unaccepted vulnerabilities:$unaccepted"
+        echo "Fix them, or add a justified entry to $allowlist (see docs/security.md)."
+        exit 1
+    fi
+    if [ -n "$stale" ]; then
+        echo "NOTE: allowlist entries no longer reported (re-review and remove):$stale"
+    fi
+    echo "VULN GATE PASSED: all reported findings are accepted in $allowlist."
 
 # Init and start the podman machine 
 init-podman:
