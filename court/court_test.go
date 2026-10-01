@@ -947,6 +947,207 @@ func TestZhengmingAnswered_ChatAndNonSentinelIsolation(t *testing.T) {
 	assert.Len(t, legitEdicts, 1, "one edict should be created from the legitimate answer")
 }
 
+// TestZhengmingAnswered_EdictSuggestionWithEdictID0TypedAnswerDoesNotCreateEdict
+// is the regression test for the spurious edict 893 (incident
+// 75f262766657b094): the Ruler typed free text while a suggest_edict
+// zhengming (options: ["Approve edict", "Reject"]) was pending with
+// edict_id=0 and minister_id="". That typed answer fell through the
+// key.ID==0 catch-all and created an edict. Only an explicit "Approve edict"
+// may create a suggestion edict.
+func TestZhengmingAnswered_EdictSuggestionWithEdictID0TypedAnswerDoesNotCreateEdict(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+
+	go s.ritualGuard.Run(ctx)
+
+	// The Podman keep-alive suggestion: no edict, no raising minister.
+	req := storage.Zhengming{
+		RequestID: "test-typed-suggestion",
+		EdictID:   0,
+		Username:  cfg.Username,
+		Project:   cfg.Project,
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Keep the Podman machine alive between sessions",
+			Summary: "podman keep-alive",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	typed := "an edict needs to be more decisive about the podman machine"
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+		storage.EventZhengmingAnswered, storage.JSON{
+			"request_id": "test-typed-suggestion",
+			"answer":     typed,
+		})
+
+	time.Sleep(120 * time.Millisecond)
+
+	var edicts []storage.Edict
+	err := db.Where("intent = ?", typed).Find(&edicts).Error
+	require.NoError(t, err)
+	assert.Empty(t, edicts, "a typed answer to an edict suggestion (edict_id=0) must not create an edict")
+
+	// Sanity: the pre-existing catch-all still works for non-suggestion
+	// requests (no stored request / no Approve-edict option).
+	var none []storage.Edict
+	require.NoError(t, db.Where("intent = ?", "isolation-legit").Find(&none).Error)
+}
+
+// TestHandleZhengmingResponse_RoutesToRaisingMinister verifies that an answer
+// is recorded against the request's own zhengming row and delivered to the
+// raising minister rather than the first handler-bearing minister. Before the
+// fix, HandleZhengmingResponse returned the first minister implementing the
+// handler, so a ritual ask_ruler answer could bind to an unrelated request.
+func TestHandleZhengmingResponse_RoutesToRaisingMinister(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	// Register a zhengming request raised by "judge".
+	req := storage.Zhengming{
+		RequestID:  "route-to-raiser",
+		EdictID:    0,
+		Username:   cfg.Username,
+		Project:    cfg.Project,
+		MinisterID: "judge",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Proceed?",
+			Options: []string{"Yes", "No"},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	require.NoError(t, s.HandleZhengmingResponse(context.Background(), "route-to-raiser", "Yes"))
+
+	// The request must be answered exactly once.
+	var answered storage.Zhengming
+	require.NoError(t, db.First(&answered, "request_id = ?", "route-to-raiser").Error)
+	assert.Equal(t, storage.ZhengmingAnswered, answered.Status)
+	assert.Equal(t, "Yes", answered.Answer)
+}
+
+// TestHandleZhengmingResponse_NotFirstHandler verifies the dispatch actually
+// targets the raising minister. A fake raising minister records the answer
+// while the lookup order is arranged so a *different* minister would have been
+// picked by the old "first handler" loop.
+func TestHandleZhengmingResponse_NotFirstHandler(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	// Swap in synthetic ministers: "aaa_first" (would win the old loop) and
+	// "zzz_raiser" (actually raised the request).
+	first := &recordingZhengmingMinister{id: "aaa_first"}
+	raiser := &recordingZhengmingMinister{id: "zzz_raiser"}
+	s.ministers = map[string]Minister{
+		"aaa_first":  first,
+		"zzz_raiser": raiser,
+	}
+
+	req := storage.Zhengming{
+		RequestID:  "not-first-handler",
+		EdictID:    7,
+		Username:   cfg.Username,
+		Project:    cfg.Project,
+		MinisterID: "zzz_raiser",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Continue?",
+			Options: []string{"Yes", "No"},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	require.NoError(t, s.HandleZhengmingResponse(context.Background(), "not-first-handler", "Yes"))
+
+	assert.Equal(t, []string{"not-first-handler=Yes"}, raiser.received,
+		"the answer must go to the raising minister")
+	assert.Empty(t, first.received,
+		"the first handler-bearing minister must not receive the answer")
+}
+
+// recordingZhengmingMinister is a Minister that records HandleZhengmingResponse calls.
+type recordingZhengmingMinister struct {
+	MinisterBase
+	id       string
+	received []string
+}
+
+func (m *recordingZhengmingMinister) ID() string           { return m.id }
+func (m *recordingZhengmingMinister) SystemPrompt() string { return "" }
+func (m *recordingZhengmingMinister) Tools() []Tool        { return nil }
+func (m *recordingZhengmingMinister) Run(ctx context.Context) {
+	<-ctx.Done()
+}
+func (m *recordingZhengmingMinister) HandleZhengmingResponse(_ context.Context, requestID, answer string) error {
+	m.received = append(m.received, requestID+"="+answer)
+	return nil
+}
+
+// TestHandleZhengmingResponse_DeliversToWaitingRitual verifies that answering a
+// request raised by a ritual step unblocks the waiting WaitForZhengming and
+// does not abort the step.
+func TestHandleZhengmingResponse_DeliversToWaitingRitual(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	req := storage.Zhengming{
+		RequestID:  "ritual-wait",
+		EdictID:    42,
+		Username:   cfg.Username,
+		Project:    cfg.Project,
+		MinisterID: "secretary",
+		SessionID:  "ritual-session",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Continue?",
+			Options: []string{"Yes", "No"},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityUrgent,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+	go s.ritualGuard.Run(ctx)
+
+	got := make(chan string, 1)
+	go func() {
+		answer, err := s.WaitForZhengming(ctx, "ritual-wait")
+		if err != nil {
+			t.Logf("WaitForZhengming error: %v", err)
+		}
+		got <- answer
+	}()
+	// Let the waiter register.
+	time.Sleep(50 * time.Millisecond)
+
+	require.NoError(t, s.HandleZhengmingResponse(ctx, "ritual-wait", "Yes"))
+
+	select {
+	case answer := <-got:
+		assert.Equal(t, "Yes", answer, "the raised request must be delivered to the blocked step")
+	case <-time.After(time.Second):
+		t.Fatal("WaitForZhengming should have received the answer")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // HostChecker wiring tests (edict 631)
 // ---------------------------------------------------------------------------

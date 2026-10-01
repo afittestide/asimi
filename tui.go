@@ -106,6 +106,11 @@ type TUIModel struct {
 	// a zhengming prompt. The next submitted prompt is delivered as the
 	// zhengming answer to this request instead of starting a new turn.
 	pendingZhengmingChatRequestID string
+	// pendingZhengmingByChannel maps a zhengming request's routing channel
+	// (e.g. a ritual tab "e892") to its request ID. A prompt submitted on that
+	// channel is delivered as the zhengming answer rather than being treated
+	// as a ritual interjection (which would pause/abort the ritual step).
+	pendingZhengmingByChannel map[string]string
 	// Pending API key input: set when user selects a login_required non-OpenAI provider
 	pendingAPIKeyProvider string
 	// Pending model name entry: set when user selects a manual_entry model
@@ -1611,6 +1616,48 @@ func ritualTabLabel(channelID string) string {
 	return channelID
 }
 
+// setPendingZhengming records that a zhengming request is awaiting an answer
+// on the given routing channel (e.g. a ritual tab "e892").
+func (m *TUIModel) setPendingZhengming(channelID, requestID string) {
+	if channelID == "" || requestID == "" {
+		return
+	}
+	if m.pendingZhengmingByChannel == nil {
+		m.pendingZhengmingByChannel = make(map[string]string)
+	}
+	m.pendingZhengmingByChannel[channelID] = requestID
+}
+
+// clearPendingZhengming forgets any pending zhengming registered for channelID.
+func (m *TUIModel) clearPendingZhengming(channelID string) {
+	if channelID == "" || m.pendingZhengmingByChannel == nil {
+		return
+	}
+	delete(m.pendingZhengmingByChannel, channelID)
+}
+
+// clearPendingZhengmingByRequest forgets any channel mapping pointing at
+// requestID — called when the request is answered through another path.
+func (m *TUIModel) clearPendingZhengmingByRequest(requestID string) {
+	if requestID == "" {
+		return
+	}
+	for channelID, id := range m.pendingZhengmingByChannel {
+		if id == requestID {
+			delete(m.pendingZhengmingByChannel, channelID)
+		}
+	}
+}
+
+// pendingZhengmingFor returns the request ID awaiting an answer on channelID,
+// or "" when no zhengming is pending for that channel.
+func (m *TUIModel) pendingZhengmingFor(channelID string) string {
+	if channelID == "" {
+		return ""
+	}
+	return m.pendingZhengmingByChannel[channelID]
+}
+
 // friendlyConnError converts a raw RPC connection error string into a
 // user-friendly message.
 func friendlyConnError(err error) string {
@@ -1683,6 +1730,16 @@ func (m *TUIModel) submitToCourt(ctx context.Context, prompt string, contextFile
 	// with the minister. Stream output routes back to the ritual tab via
 	// ChannelID = tab.Target (e.g. "e633").
 	if tab.Type == "ritual" && isRitualChannel(tab.Target) {
+		// A zhengming raised by the running step (e.g. ask_ruler) is awaiting
+		// the Ruler's answer on this channel. Deliver the typed text as that
+		// answer instead of pausing the ritual — pausing cancels the blocked
+		// step's context and aborts the ritual (incident 75f262766657b094).
+		if requestID := m.pendingZhengmingFor(tab.Target); requestID != "" {
+			m.clearPendingZhengming(tab.Target)
+			go m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{prompt}})
+			return nil
+		}
+
 		ministerID := tab.CurrentMinister
 		if ministerID == "" {
 			ministerID = "secretary" // fallback
@@ -2072,10 +2129,27 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		content := msg.Prompt
 
+		// A zhengming is pending on the active ritual tab: deliver the typed
+		// text as the answer before anything else. Do not pause the ritual,
+		// load a session, or submit a prompt — the blocked ask_ruler resumes
+		// when answered. Checked ahead of the chat-capture sentinel so a
+		// stale sentinel cannot bind the reply to the wrong request.
+		if tab := m.tabs.ActiveTab(); tab != nil && isRitualChannel(tab.Target) {
+			if requestID := m.pendingZhengmingFor(tab.Target); requestID != "" {
+				m.clearPendingZhengming(tab.Target)
+				m.pendingZhengmingChatRequestID = ""
+				m.tabs.ChatByTab(tab.Target).AddUserMessage(content)
+				m.tabs.ChatByTab(tab.Target).AddToRawHistory("USER", content)
+				m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{content}})
+				return m, nil
+			}
+		}
+
 		// Chat-capture armed: the Ruler selected "Chat" in a zhengming prompt,
 		if m.pendingZhengmingChatRequestID != "" {
 			requestID := m.pendingZhengmingChatRequestID
 			m.pendingZhengmingChatRequestID = ""
+			m.clearPendingZhengmingByRequest(requestID)
 			m.tabs.Content().Chat.AddUserMessage(content)
 			m.tabs.Content().Chat.AddToRawHistory("USER", content)
 			m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{content}})
@@ -2612,12 +2686,19 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if chat := m.tabs.ChatByTab(target); chat != nil {
 				chat.ScrollToBottom()
 			}
+			// Remember the request against the ritual tab so a typed reply
+			// is delivered as the answer instead of being treated as a
+			// ritual interjection (which would pause/abort the step).
+			if isRitualChannel(target) {
+				m.setPendingZhengming(target, msg.RequestID)
+			}
 		}
 		m.prompt().HandleZhengmingPending(msg)
 		return m, nil
 
 	case AnsweredMsg:
 		m.prompt().ExitAnsweringMode()
+		m.clearPendingZhengmingByRequest(msg.RequestID)
 		// Check if this is an edict action menu response
 		if edictID, ok := parseEdictActionRequestID(msg.RequestID); ok {
 			return m, dispatchEdictAction(&m, edictID, msg.Answers)
@@ -2631,6 +2712,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if _, ok := parseEdictActionRequestID(msg.RequestID); ok {
 			return m, reloadEdictsListCmd(&m)
 		}
+		m.clearPendingZhengmingByRequest(msg.RequestID)
 		go m.handleAnsweringComplete(AnsweredMsg{RequestID: msg.RequestID, Answers: []string{tools.AnswerChat}})
 		return m, nil
 

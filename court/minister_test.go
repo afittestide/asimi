@@ -446,6 +446,77 @@ func TestProcessPrompt_NewSessionDoesNotOverwriteExistingEdictSessionID(t *testi
 		"edict session_id should not be overwritten when it already has one")
 }
 
+// TestProcessPrompt_RitualChannelCreatesNoMinisterTab verifies that a prompt
+// addressed to a ritual channel ("e<N>") with no existing session does not
+// persist an interactive session whose TabType is the minister ID. Before the
+// fix this minted the spurious "judge" session from the e892 incident.
+func TestProcessPrompt_RitualChannelCreatesNoMinisterTab(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockLLM := mocks.NewLLMProvider()
+	base := NewMinisterBase(db, nil, nil, "testuser", "testproject", nil)
+	sage := NewChancellor(base)
+	sage.SetMinisterConfig(mockLLM, &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}, repo.RepoInfo{})
+	sage.SetNotify(func(any) {})
+
+	// Attach a persister that records every save so we can assert nothing
+	// was persisted under a minister TabType.
+	persister := &recordingPersister{}
+	base.SetSessionPersister(persister)
+
+	prompt := &Prompt{
+		EdictKey:  storage.EdictKey{ID: 892, Username: "testuser", Project: "testproject"},
+		Message:   "ping",
+		ChannelID: "e892",
+	}
+	base.ProcessPrompt(ctx, sage, prompt)
+
+	// The session may exist in memory (to serve the prompt) but it must not
+	// carry the minister's TabType, so it never shows up as a judge tab.
+	sess := base.GetSession("e892")
+	require.NotNil(t, sess, "the ritual-channel session should be created to serve the prompt")
+	assert.NotEqual(t, "chancellor", sess.TabType,
+		"a ritual-channel session must not be tagged as the minister's interactive tab")
+	assert.Empty(t, sess.TabType, "TabType must stay empty for ritual channels")
+
+	// No persister was attached, so nothing was persisted as a minister tab.
+	assert.Zero(t, persister.calls, "ritual-channel sessions must not be persisted as minister tabs")
+}
+
+// TestProcessPrompt_InteractiveChannelStillPersistsMinisterTab verifies the
+// complement: a genuine interactive minister tab (no "e<N>" channel) still
+// gets a TabType and the persister, preserving interactive behavior.
+func TestProcessPrompt_InteractiveChannelStillPersistsMinisterTab(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockLLM := mocks.NewLLMProvider()
+	base := NewMinisterBase(db, nil, nil, "testuser", "testproject", nil)
+	sage := NewChancellor(base)
+	sage.SetMinisterConfig(mockLLM, &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}, repo.RepoInfo{})
+	sage.SetNotify(func(any) {})
+
+	persister := &recordingPersister{}
+	base.SetSessionPersister(persister)
+
+	prompt := &Prompt{
+		EdictKey:  storage.EdictKey{ID: 0, Username: "testuser", Project: "testproject"},
+		Message:   "hello",
+		ChannelID: "chancellor",
+	}
+	base.ProcessPrompt(ctx, sage, prompt)
+
+	sess := base.GetSession("chancellor")
+	require.NotNil(t, sess)
+	assert.Equal(t, "chancellor", sess.TabType,
+		"an interactive minister session keeps its TabType")
+	assert.Equal(t, "chancellor", persister.lastTabType,
+		"the interactive session is persisted under the minister's tab type")
+}
+
 func TestStrategist_CircularDependencyDetection(t *testing.T) {
 	// Create ling with circular dependency
 	ling := []storage.Ling{

@@ -263,12 +263,22 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 			return
 		}
 
-		// 3. Handle system ritual path (e.g., wakeup) — no edict, user chose a path forward
+		// 3. Handle system ritual path (e.g., wakeup) — no edict, user chose a path forward.
+		// Guard: a free-text ("Chat") answer to an edict-suggestion request
+		// must NOT spawn an edict. Only an explicit "Approve edict" (handled
+		// in case 2 above) creates one. Without this guard the Ruler's typed
+		// reply to a suggestion zhengming falls through here and creates a
+		// spurious edict (incident 75f262766657b094, edicts 892/893).
 		if key.ID == 0 && answer != "" {
 			var req storage.Zhengming
 			sessionID := ""
-			if err := s.db.First(&req, "request_id = ?", requestID).Error; err == nil {
+			known := s.db.First(&req, "request_id = ?", requestID).Error == nil
+			if known {
 				sessionID = req.SessionID
+			}
+			if known && isEdictSuggestionRequest(&req) {
+				s.logger.Info("ignoring non-approval answer to edict suggestion", "request_id", requestID, "answer", answer)
+				return
 			}
 			if edict, err := s.CreateEdict("", answer, sessionID); err != nil {
 				s.logger.Warn("failed to create edict from zhengming answer", "error", err)
@@ -1375,8 +1385,23 @@ func (s *Court) RunShellCommand(ctx context.Context, input runners.Input) (runne
 	return s.runner.Run(ctx, input)
 }
 
-// HandleZhengmingResponse dispatches a user's zhengming answer to the first
-// minister that knows how to handle one.
+// isEdictSuggestionRequest reports whether a zhengming request is an edict
+// suggestion (as created by suggest_edict): a single question whose first
+// option approves edict creation. Answers to such requests only create or
+// refine an edict when they explicitly equal "Approve edict".
+func isEdictSuggestionRequest(req *storage.Zhengming) bool {
+	if req == nil || len(req.Questions) == 0 || len(req.Questions[0].Options) == 0 {
+		return false
+	}
+	return req.Questions[0].Options[0] == tools.AnswerApproveEdict
+}
+
+// HandleZhengmingResponse dispatches a user's zhengming answer to the minister
+// that raised the request, identified by the stored storage.Zhengming record
+// (MinisterID). Falling back to the first handler-bearing minister would bind
+// the answer to the wrong request when several zhengming requests are pending
+// (e.g. a ritual ask_ruler answer being recorded against an unrelated
+// suggestion).
 func (s *Court) HandleZhengmingResponse(ctx context.Context, requestID, answer string) error {
 	if s == nil {
 		return fmt.Errorf("court not initialized")
@@ -1384,6 +1409,19 @@ func (s *Court) HandleZhengmingResponse(ctx context.Context, requestID, answer s
 	type zhengmingHandler interface {
 		HandleZhengmingResponse(ctx context.Context, requestID, answer string) error
 	}
+
+	// Route to the raising minister when the request is on record.
+	var req storage.Zhengming
+	if err := s.db.First(&req, "request_id = ?", requestID).Error; err == nil && req.MinisterID != "" {
+		if m := s.GetMinister(req.MinisterID); m != nil {
+			if h, ok := m.(zhengmingHandler); ok {
+				return h.HandleZhengmingResponse(ctx, requestID, answer)
+			}
+		}
+	}
+
+	// Unknown request (or raising minister gone) — fall back to the first
+	// minister that knows how to handle a zhengming response.
 	for _, m := range s.Ministers() {
 		if h, ok := m.(zhengmingHandler); ok {
 			return h.HandleZhengmingResponse(ctx, requestID, answer)

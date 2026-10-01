@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -165,6 +166,17 @@ func (rg *RitualGuard) PublishEvent(key storage.EdictKey, eventType storage.Cour
 // including edict 1 (court infrastructure), which uses "e1".
 func ritualChannelID(edictID uint) string {
 	return fmt.Sprintf("e%d", edictID)
+}
+
+// isRitualChannelID reports whether channelID is a per-edict ritual channel
+// ("e<digits>"). Mirrors the TUI's isRitualChannel so the Court can refuse to
+// mint interactive sessions for ritual channels.
+func isRitualChannelID(channelID string) bool {
+	if len(channelID) < 2 || channelID[0] != 'e' {
+		return false
+	}
+	_, err := strconv.ParseUint(channelID[1:], 10, 64)
+	return err == nil
 }
 
 // startRitual starts and runs a ritual using the edict's own streaming context.

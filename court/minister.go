@@ -373,10 +373,17 @@ func (m *MinisterBase) ProcessPrompt(ctx context.Context, minister Minister, pro
 			m.notify(StreamErrorMsg{ChannelID: channelID, Err: fmt.Errorf("failed to create session: %w", err)})
 			return
 		}
-		sess.TabType = m.ministerID
-		sess.SetPersister(m.persister)
+		// A session addressed to a ritual channel ("e<N>") is scoped to that
+		// edict's tab, not a minister's interactive tab. Leave TabType empty
+		// and skip the persister so it never lands in the sessions table as a
+		// bogus "<minister>" tab — that is what produced the spurious judge
+		// session when a zhengming answer was misrouted to the ritual channel.
+		if !isRitualChannelID(channelID) {
+			sess.TabType = m.ministerID
+			sess.SetPersister(m.persister)
+		}
 		m.sessions[channelID] = sess
-		m.logger.Info("created interactive session", "minister_id", m.ministerID, "channel_id", channelID)
+		m.logger.Info("created session", "minister_id", m.ministerID, "channel_id", channelID)
 
 		// Link the new session to the edict so future prompts on the same
 		// edict tab can restore it. Only runs when a new session is created
