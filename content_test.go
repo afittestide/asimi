@@ -463,3 +463,50 @@ func TestSwitchToZhengmingTarget(t *testing.T) {
 		})
 	}
 }
+
+// TestSubmitPrompt_RitualTabPendingZhengming_DeliveredAsAnswer verifies the
+// e892 scenario: while a zhengming raised by a running ritual step is pending
+// on the ritual tab, the next submitted prompt is delivered as the zhengming
+// answer. The ritual is not paused, no session is loaded, and no prompt is
+// submitted (which would create a bogus minister session).
+func TestSubmitPrompt_RitualTabPendingZhengming_DeliveredAsAnswer(t *testing.T) {
+	mock := &mockCourtClient{
+		pauseRitualFn: func(string) bool { return true },
+	}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e892", "ritual", "e892")
+	tab := model.tabs.TabByTarget("e892")
+	require.NotNil(t, tab)
+	tab.CurrentMinister = "judge"
+	model.tabs.SwitchTo(len(model.tabs.tabs) - 1)
+
+	// Simulate the ask_ruler zhengming raised by the ritual step.
+	model.setPendingZhengming("e892", "req-ritual-1")
+	chatBefore := len(model.tabs.ChatByTab("e892").Messages)
+
+	newModel, _ := model.handleCustomMessages(SubmitPromptMsg{Prompt: "my typed reply"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	// Delivered to the court as the zhengming answer.
+	require.Len(t, mock.zhengmingResponses, 1, "typed text should be delivered as the zhengming answer")
+	assert.Equal(t, "req-ritual-1", mock.zhengmingResponses[0].requestID)
+	assert.Equal(t, "my typed reply", mock.zhengmingResponses[0].answer)
+
+	// The ritual must not be paused, no session loaded, no prompt submitted.
+	assert.Empty(t, mock.pausedChannels, "PauseRitual must not be called for a zhengming answer")
+	assert.Empty(t, updated.creatingTab, "no LoadSession should be triggered")
+	assert.Empty(t, updated.pendingPrompt, "no pending prompt should be set")
+	assert.Zero(t, mock.submitPromptCalls, "no prompt should be submitted to a minister")
+
+	// The tab's chat keeps its history (only the user's reply is appended).
+	chat := updated.tabs.ChatByTab("e892")
+	assert.Equal(t, chatBefore+1, len(chat.Messages),
+		"only the user's reply is appended; the tab chat is not replaced")
+
+	// The pending mapping is cleared after the answer.
+	assert.Empty(t, updated.pendingZhengmingFor("e892"))
+}

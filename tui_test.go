@@ -6623,6 +6623,75 @@ func TestSubmitToCourt_RitualTabNoActiveEdictNotFound(t *testing.T) {
 	assert.Equal(t, 0, mock.submitPromptCalls)
 }
 
+// TestSubmitToCourt_RitualTabPendingZhengming_DeliveredAsAnswer covers the
+// Enter-key path (handleEnterKey -> submitToCourt) for the e892 incident: while
+// an ask_ruler zhengming raised by a running ritual step is pending on the
+// ritual tab, the typed text must be delivered as the zhengming answer. The
+// ritual must not be paused (which would cancel the blocked step) and no
+// minister prompt may be submitted (which would mint a bogus minister session).
+func TestSubmitToCourt_RitualTabPendingZhengming_DeliveredAsAnswer(t *testing.T) {
+	mock := &mockCourtClient{
+		pauseRitualFn: func(string) bool { return true },
+	}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e892", "ritual", "e892")
+	tab := model.tabs.TabByTarget("e892")
+	require.NotNil(t, tab)
+	tab.CurrentMinister = "judge"
+	model.tabs.SwitchTo(len(model.tabs.tabs) - 1)
+
+	model.setPendingZhengming("e892", "req-ritual-1")
+
+	cmd := model.submitToCourt(context.Background(), "my typed reply", nil)
+
+	// The guard returns nil (no LoadSession / no stream) and delivers in a
+	// goroutine, so poll briefly for the court call.
+	require.Nil(t, cmd)
+	require.Eventually(t, func() bool {
+		return len(mock.zhengmingResponses) == 1
+	}, time.Second, 5*time.Millisecond, "typed text should be delivered as the zhengming answer")
+
+	assert.Equal(t, "req-ritual-1", mock.zhengmingResponses[0].requestID)
+	assert.Equal(t, "my typed reply", mock.zhengmingResponses[0].answer)
+
+	// The ritual must not be paused and no minister prompt submitted.
+	assert.Empty(t, mock.pausedChannels, "PauseRitual must not be called for a zhengming answer")
+	assert.Zero(t, mock.submitPromptCalls, "no prompt should be submitted to a minister")
+	assert.Empty(t, model.pendingPrompt, "no interjection prompt should be pended")
+
+	// The pending mapping is consumed.
+	assert.Empty(t, model.pendingZhengmingFor("e892"))
+}
+
+// TestSubmitToCourt_RitualTabNoPendingZhengming_StillPauses is the control:
+// without a pending zhengming, a ritual-tab submission keeps the interjection
+// behavior (pause the ritual / submit to the running minister).
+func TestSubmitToCourt_RitualTabNoPendingZhengming_StillPauses(t *testing.T) {
+	mock := &mockCourtClient{
+		pauseRitualFn: func(string) bool { return true },
+	}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e892", "ritual", "e892")
+	tab := model.tabs.TabByTarget("e892")
+	require.NotNil(t, tab)
+	tab.CurrentMinister = "judge"
+	model.tabs.SwitchTo(len(model.tabs.tabs) - 1)
+
+	_ = model.submitToCourt(context.Background(), "interject", nil)
+	drainResumePager(model)
+
+	assert.Equal(t, []string{"e892"}, mock.pausedChannels,
+		"a ritual interjection without a pending zhengming still pauses the ritual")
+	assert.Empty(t, mock.zhengmingResponses,
+		"no zhengming answer may be recorded when none is pending")
+}
+
 func TestHandleSessionSelected_RitualTabRestoration(t *testing.T) {
 	mock := &mockCourtClient{}
 	model := newTestModel(t)
