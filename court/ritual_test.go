@@ -4668,6 +4668,253 @@ func TestBuildStepScratchpad_EmptySealsLings(t *testing.T) {
 	require.Empty(t, scratchpad, "expected empty scratchpad when no court history exists")
 }
 
+// TestExecuteMinisterStep_SetsRitualScriptScratchpad verifies the integration:
+// when a step runs for a real edict (EdictID > 1), executeMinisterStep loads
+// the full ritual script (plus court history) into the step's act session as a
+// one-shot scratchpad, so the minister sees the whole choreography — who acts,
+// what given commands the judge will run, where failures route — and knows
+// which step (▶) is its own.
+func TestExecuteMinisterStep_SetsRitualScriptScratchpad(t *testing.T) {
+	db := setupRitualTestDB(t)
+	key := testEK(891)
+
+	ritual := &RitualDef{
+		Name:        "swift-strike",
+		Description: "A tight loop for implementing edicts",
+		Steps: []RitualStep{
+			{
+				Name:     "forging",
+				Minister: "forge",
+				Act:      "Implement the changes for the edict: {{ .edict }}",
+			},
+			{
+				Name:            "judging",
+				Minister:        "judge",
+				Given:           []string{"!just test"},
+				Act:             "Verify tests were not weakened. When judgement is done, call record_verdict",
+				Then:            []string{"the verdicts are passed"},
+				OnFailure:       "goto",
+				OnFailureTarget: "forging",
+			},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	// A minimal judge minister; the assertions below read the composed
+	// scratchpad from the act session (see after executeMinisterStep).
+	judgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "judge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "verdict: passed",
+	}
+	ctx := context.Background()
+	go judgeM.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{"judge": judgeM},
+		logger:    slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(ctx, "swift-strike", key, nil, nil)
+	require.NoError(t, err, "failed to start ritual")
+	exec.State = RitualStateRunning
+
+	// Execute the second step directly: executeMinisterStep must compose the
+	// ritual script for the judging step and set it as a one-shot scratchpad
+	// on the step's act session.
+	_, err = runner.executeMinisterStep(ctx, exec, ritual.Steps[1])
+	require.NoError(t, err, "executeMinisterStep failed")
+
+	// The composed scratchpad must be sitting on the act session, ready to be
+	// injected as a prefix to the next user message.
+	actSession := exec.stepStates[exec.CurrentStep].Session
+	require.NotNil(t, actSession, "act session should exist for the judging step")
+	script := actSession.GetScratchpad()
+
+	// The whole choreography is present: header, description, every step in
+	// order with its minister.
+	require.Contains(t, script, "## Ritual Script: swift-strike")
+	require.Contains(t, script, "A tight loop for implementing edicts")
+	require.Contains(t, script, "1. **forging** — minister: forge")
+	require.Contains(t, script, "2. **judging** — minister: judge")
+
+	// Given commands verbatim — the forge must see "!just test".
+	require.Contains(t, script, `given: ["!just test"]`)
+
+	// Failure routing of the judging step itself.
+	require.Contains(t, script, "on_failure: goto → forging")
+
+	// The step being performed is marked.
+	require.Contains(t, script, "▶ 2. **judging**")
+
+	// The closing instruction that subsequent steps consume this output.
+	require.Contains(t, script, "Steps after yours will consume your output")
+}
+
+// TestExecuteMinisterStep_EmptyScratchpadInjectsNothing verifies the no-behavior-
+// change invariant: when the composition is empty (here: EdictID > 1 with no
+// ritual definition), no scratchpad reaches the minister and the act proceeds.
+func TestExecuteMinisterStep_EmptyScratchpadInjectsNothing(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "empty-script",
+		Steps: []RitualStep{
+			{Name: "step1", Minister: "forge", Act: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "done",
+	}
+	ctx := context.Background()
+	go forgeM.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{"forge": forgeM},
+		logger:    slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(ctx, "empty-script", testEK(2), nil, nil)
+	require.NoError(t, err, "failed to start ritual")
+	exec.State = RitualStateRunning
+	exec.def = nil // no ritual definition → no script; empty court history
+
+	_, err = runner.executeMinisterStep(ctx, exec, ritual.Steps[0])
+	require.NoError(t, err, "executeMinisterStep failed")
+
+	// Nothing was injected: the composition was empty, so SetScratchpad was
+	// never called and the act session holds no scratchpad.
+	actSession := exec.stepStates[exec.CurrentStep].Session
+	require.NotNil(t, actSession, "act session should exist for the step")
+	require.Empty(t, actSession.GetScratchpad(),
+		"no scratchpad should reach the act session when composition is empty")
+
+	// The step ran to completion: the minister's result came back without error.
+}
+
+// TestRenderRitualScript verifies the full ritual choreography is rendered
+// with the current step marked, so every minister knows the whole ceremony
+// (who acts, what given commands run, where failures route) without having
+// to rediscover the ritual definition.
+func TestRenderRitualScript(t *testing.T) {
+	def := &RitualDef{
+		Name:        "swift-strike",
+		Description: "A tight loop for implementing edicts",
+		Steps: []RitualStep{
+			{
+				Name:       "forging",
+				Minister:   "forge",
+				Act:        "Implement the changes for the edict:\n{{ .edict }}",
+				OnFailure:  "retry",
+				MaxRetries: 3,
+			},
+			{
+				Name:            "judging",
+				Minister:        "judge",
+				Given:           []string{"!just test"},
+				Act:             "Verify tests were not weakened. When judgement is done, call record_verdict",
+				Then:            []string{"the verdicts are passed", "record the judge's seal"},
+				OnFailure:       "goto",
+				OnFailureTarget: "forging",
+			},
+			{
+				Name:     "reviewing",
+				Minister: "chancellor",
+				Act:      "Review the code changes for the edict.",
+			},
+		},
+	}
+
+	script := renderRitualScript(def, "judging")
+
+	// Header and description
+	require.Contains(t, script, "## Ritual Script: swift-strike")
+	require.Contains(t, script, "A tight loop for implementing edicts")
+
+	// All steps present, in order
+	require.Contains(t, script, "1. **forging** — minister: forge")
+	require.Contains(t, script, "2. **judging** — minister: judge")
+	require.Contains(t, script, "3. **reviewing** — minister: chancellor")
+
+	// Given commands are shown verbatim (the judge's "!just test" is what
+	// the forge needs to know to make tests runnable)
+	require.Contains(t, script, `given: ["!just test"]`)
+
+	// Act summaries are collapsed to a single line
+	require.Contains(t, script, "act: Implement the changes for the edict: {{ .edict }}")
+
+	// Then conditions and failure routing
+	require.Contains(t, script, "then: [the verdicts are passed record the judge's seal]")
+	require.Contains(t, script, "on_failure: retry")
+	require.Contains(t, script, "on_failure: goto → forging")
+
+	// Current step is marked; others are not
+	require.Contains(t, script, "▶ 2. **judging**")
+	require.NotContains(t, script, "▶ 1. **forging**")
+	require.NotContains(t, script, "▶ 3. **reviewing**")
+
+	// Closing instruction
+	require.Contains(t, script, "You are performing the marked (▶) step")
+}
+
+// TestRenderRitualScript_NilDef verifies a nil ritual definition renders as
+// empty so the scratchpad composition falls back to court history alone.
+func TestRenderRitualScript_NilDef(t *testing.T) {
+	require.Empty(t, renderRitualScript(nil, "forging"))
+}
+
+// TestRenderRitualScript_TaskAlias verifies steps using the legacy `task:`
+// alias get their act rendered.
+func TestRenderRitualScript_TaskAlias(t *testing.T) {
+	def := &RitualDef{
+		Name: "legacy",
+		Steps: []RitualStep{
+			{Name: "s1", Minister: "forge", Task: "do the thing"},
+		},
+	}
+	script := renderRitualScript(def, "s1")
+	require.Contains(t, script, "act: do the thing")
+}
+
+// TestComposeStepScratchpad verifies empty parts are skipped and the
+// composition is empty when everything is empty.
+func TestComposeStepScratchpad(t *testing.T) {
+	require.Empty(t, composeStepScratchpad("", ""))
+	require.Equal(t, "a", composeStepScratchpad("", "a", ""))
+	require.Equal(t, "a\n\nb", composeStepScratchpad("a", "", "b"))
+}
+
+// TestRenderRitualScript_ForkStep verifies fork steps render their fork
+// parameters.
+func TestRenderRitualScript_ForkStep(t *testing.T) {
+	def := &RitualDef{
+		Name: "castle-siege",
+		Steps: []RitualStep{
+			{
+				Name:     "implementing",
+				Minister: "war",
+				Fork:     &ForkDef{Over: "lings", BatchSize: 1},
+			},
+		},
+	}
+	script := renderRitualScript(def, "implementing")
+	require.Contains(t, script, "1. **implementing (fork over lings, batch_size 1)** — minister: war")
+}
+
 // TestRitualPauseBetweenSteps verifies that pausing a ritual between steps
 // (when no step is actively running) blocks the main loop in waitIfPaused
 // and resumes correctly when ResumeRitual is called.

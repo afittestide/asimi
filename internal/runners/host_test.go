@@ -213,16 +213,18 @@ func TestHostRunnerSetsWorkingDirectory(t *testing.T) {
 	assert.Equal(t, "0", output.ExitCode)
 }
 
-// A never-exiting streaming command must hit the configured deadline and
-// return the timeout message with exit code 124 — a result, not an error,
-// mirroring PodmanRunner's semantics.
+// A long-running command must hit the configured deadline and return the
+// timeout message with exit code 124 — a result, not an error, mirroring
+// PodmanRunner's semantics. sleep 5, not `sleep infinity`: BSD sleep
+// rejects `infinity`; 5s is far beyond the 100ms deadline yet bounded if
+// the deadline ever breaks.
 func TestHostRunnerCommandTimeout(t *testing.T) {
 	runner := NewHostRunner(0, t.TempDir())
 	runner.SetTimeouts(HostTimeouts{Command: 100 * time.Millisecond})
 
 	start := time.Now()
 	output, err := runner.Run(context.Background(), Input{
-		Command:        "sleep infinity",
+		Command:        "sleep 5",
 		BypassApproval: true,
 	})
 	elapsed := time.Since(start)

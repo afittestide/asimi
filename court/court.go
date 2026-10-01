@@ -344,7 +344,7 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		Runner:             s.runner,
 		HostChecker:        hostChecker,
 		MsgChan:            &s.msgChan,
-		HostTimeouts:       s.hostTimeouts(),
+		Timeouts:           s.hostTimeouts,
 		ZhengmingRequester: s,
 		WaitForZhengming:   s.WaitForZhengming,
 		NotifyFn:           notifyFn,
@@ -388,7 +388,7 @@ func (s *Court) updateProjectRootTools(projectRoot string) {
 
 	// Earth/Execute — shell command execution (needs runner)
 	if s.runner != nil {
-		s.toolRegistry.Update(tools.NewRunShellCommand(s.hostChecker, s.runner, &s.msgChan, projectRoot, s.hostTimeouts()))
+		s.toolRegistry.Update(tools.NewRunShellCommand(s.hostChecker, s.runner, &s.msgChan, projectRoot, s.hostTimeouts))
 	}
 
 	s.logger.Debug("updated project-root-dependent tools", "projectRoot", projectRoot)

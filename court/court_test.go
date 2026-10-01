@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"reflect"
 
@@ -2011,6 +2012,115 @@ func TestCourt_CheckHostCommand_SafeRunOnHost(t *testing.T) {
 	runOnHost, needsApproval = s.CheckHostCommand("ls -la")
 	assert.False(t, runOnHost, "non-matching command should return runOnHost=false")
 	assert.False(t, needsApproval, "non-matching command should return needsApproval=false")
+}
+
+// TestBuildToolRegistry_LazyTimeouts asserts that the shell tool's timeout
+// getter is resolved lazily from session config: buildToolRegistry runs
+// before ConfigureModel sets sessionCfg, so a value snapshot would capture
+// zero timeouts and configured run_shell_command.timeout_minutes /
+// sandbox.approval_timeout would silently fall back to runner defaults in
+// daemon mode. The getter must make ConfigureModel's config effective
+// without re-registration.
+func TestBuildToolRegistry_LazyTimeouts(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	// A runner is required for run_shell_command registration.
+	s := NewCourt(db, cfg, &msgForwardingRunner{}, nil)
+	require.NotNil(t, s)
+
+	// Grab the registered shell tool before ConfigureModel — this mirrors
+	// the daemon lifecycle where buildToolRegistry runs with sessionCfg nil.
+	forgePerm, _ := tools.ParsePermissions("rwxr---w-")
+	ts := s.toolRegistry.ForPermissions(forgePerm)
+	var shellTool *tools.RunShellCommand
+	for _, tool := range ts {
+		if st, ok := tool.(*tools.RunShellCommand); ok {
+			shellTool = st
+			break
+		}
+	}
+	require.NotNil(t, shellTool, "run_shell_command should be registered after NewCourt")
+
+	// timeouts is an unexported field — reach it via reflection, same as
+	// the hostChecker/msgChan assertions above. reflect.New(...).Elem()
+	// gives an addressable value whose fields can be read even unexported.
+	shellVal := reflect.ValueOf(shellTool).Elem()
+	timeoutsGetter := shellVal.FieldByName("timeouts")
+	require.True(t, timeoutsGetter.IsValid(), "RunShellCommand should have timeouts field")
+	require.False(t, timeoutsGetter.IsNil(), "shell tool's timeouts getter must be non-nil after NewCourt")
+	getTimeouts := func() runners.HostTimeouts {
+		// The unexported field can't be Interface()'d; read the func value
+		// through its address directly (test-only).
+		fn := *(*func() runners.HostTimeouts)(unsafe.Pointer(timeoutsGetter.UnsafeAddr()))
+		return fn()
+	}
+
+	// Before ConfigureModel, the getter must resolve to zero values
+	// (runner defaults apply).
+	before := getTimeouts()
+	assert.Zero(t, before.Command, "no session config yet — command timeout should be zero")
+	assert.Zero(t, before.Approval, "no session config yet — approval timeout should be zero")
+
+	// ConfigureModel sets sessionCfg; the same tool instance must now
+	// resolve the configured deadlines without any re-registration.
+	s.ConfigureModel(nil, &SessionConfig{
+		RunShellCommand: config.RunShellCommandConfig{TimeoutMinutes: 7},
+		Sandbox:         config.SandboxConfig{ApprovalTimeout: 3 * time.Second},
+	}, repo.RepoInfo{})
+
+	after := getTimeouts()
+	assert.Equal(t, 7*time.Minute, after.Command, "configured run_shell_command.timeout_minutes should be visible through the lazy getter")
+	assert.Equal(t, 3*time.Second, after.Approval, "configured sandbox.approval_timeout should be visible through the lazy getter")
+}
+
+// TestUpdateProjectRootTools_PreservesLazyTimeoutsGetter asserts the second
+// production wiring site: updateProjectRootTools re-registers the shell tool
+// (running before ConfigureModel in daemon mode) and must pass the lazy
+// getter — not a s.hostTimeouts() value snapshot — so configured timeouts
+// remain effective after re-registration.
+func TestUpdateProjectRootTools_PreservesLazyTimeoutsGetter(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, &msgForwardingRunner{}, nil)
+	require.NotNil(t, s)
+
+	s.updateProjectRootTools("/tmp")
+
+	forgePerm, _ := tools.ParsePermissions("rwxr---w-")
+	ts := s.toolRegistry.ForPermissions(forgePerm)
+	var shellTool *tools.RunShellCommand
+	for _, tool := range ts {
+		if st, ok := tool.(*tools.RunShellCommand); ok {
+			shellTool = st
+			break
+		}
+	}
+	require.NotNil(t, shellTool, "run_shell_command should be registered after updateProjectRootTools")
+
+	// Same test-only unsafe-read idiom as TestBuildToolRegistry_LazyTimeouts:
+	// the unexported func field can't be reached via Interface().
+	shellVal := reflect.ValueOf(shellTool).Elem()
+	timeoutsGetter := shellVal.FieldByName("timeouts")
+	require.True(t, timeoutsGetter.IsValid(), "RunShellCommand should have timeouts field")
+	require.False(t, timeoutsGetter.IsNil(), "re-registered shell tool must carry a non-nil timeouts getter")
+	fn := *(*func() runners.HostTimeouts)(unsafe.Pointer(timeoutsGetter.UnsafeAddr()))
+	assert.NotNil(t, fn(), "getter must resolve to the court's hostTimeouts resolver")
+
+	// The getter must be lazy: before any session config exists it resolves
+	// to zero values (runner defaults apply), and after ConfigureModel the
+	// same tool instance must see the configured deadlines.
+	before := fn()
+	assert.Zero(t, before.Command, "no session config yet — command timeout should be zero")
+	assert.Zero(t, before.Approval, "no session config yet — approval timeout should be zero")
+
+	s.ConfigureModel(nil, &SessionConfig{
+		RunShellCommand: config.RunShellCommandConfig{TimeoutMinutes: 5},
+		Sandbox:         config.SandboxConfig{ApprovalTimeout: 4 * time.Second},
+	}, repo.RepoInfo{})
+
+	after := fn()
+	assert.Equal(t, 5*time.Minute, after.Command, "configured timeout_minutes must survive re-registration via the lazy getter")
+	assert.Equal(t, 4*time.Second, after.Approval, "configured approval_timeout must survive re-registration via the lazy getter")
 }
 
 // TestCourt_CancelZhengmingDispatch verifies that CancelZhengmingDispatch
