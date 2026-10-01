@@ -323,7 +323,9 @@ func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
 	hostChecker := func(cmd string) (bool, bool) { return true, false }
 	hostTool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), getTimeouts)
 
-	result, err := hostTool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
+	// sleep 5, not `sleep infinity`: BSD sleep rejects `infinity`. 5s is
+	// far beyond the 100ms deadline yet bounded if the deadline ever breaks.
+	result, err := hostTool.Call(context.Background(), `{"command":"sleep 5","description":"test"}`)
 	require.NoError(t, err)
 	var output runners.Output
 	require.NoError(t, json.Unmarshal([]byte(result), &output))
@@ -337,7 +339,7 @@ func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
 		},
 	}
 	fallbackTool := NewRunShellCommand(nil, mockRunner, nil, t.TempDir(), getTimeouts)
-	result, err = fallbackTool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
+	result, err = fallbackTool.Call(context.Background(), `{"command":"sleep 5","description":"test"}`)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal([]byte(result), &output))
 	assert.Equal(t, "124", output.ExitCode, "fallback path should hit the 100ms command deadline")
@@ -369,7 +371,7 @@ func TestRunShellCommand_TimeoutsGetterInvokedAtCallTime(t *testing.T) {
 	assert.Equal(t, "0", output.ExitCode, "first call should use zero timeouts (runner defaults), not the later value")
 
 	// Second call — getter now returns a tight deadline.
-	result, err = tool.Call(context.Background(), `{"command":"sleep infinity","description":"test"}`)
+	result, err = tool.Call(context.Background(), `{"command":"sleep 5","description":"test"}`)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal([]byte(result), &output))
 	assert.Equal(t, "124", output.ExitCode, "second call should hit the freshly configured 100ms command deadline")

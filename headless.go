@@ -165,6 +165,8 @@ type headlessSink struct {
 	pendingSuggestions int           // number of edict suggestions awaiting edict creation
 	stdin              io.Reader     // for interactive zhengming prompts
 	stdout             io.Writer     // for interactive zhengming menus
+	streaming          bool          // true while the LLM is streaming (StreamStart→StreamComplete)
+	streamingEdictID   uint          // edict bound to the active stream, 0 when none (from StreamStartMsg)
 }
 
 func newHeadlessSink(c *court.Court) *headlessSink {
@@ -263,6 +265,35 @@ func (s *headlessSink) handle(msg any) {
 
 	case runners.ToolCallErrorMsg:
 		fmt.Printf("\n[%s error] %s\n", m.ToolName, m.Error)
+
+	case runners.ToolCallScheduledMsg:
+		// Progress-only signal (the TUI shows a spinner); headless prints
+		// the outcome via ToolCallSuccessMsg/ToolCallErrorMsg. Consume at
+		// debug level so a swift-strike ritual doesn't flood the log with
+		// unhandled-event warnings.
+		slog.Debug("headless: tool call scheduled", "tool", m.ToolName)
+
+	case runners.ToolCallExecutingMsg:
+		slog.Debug("headless: tool call executing", "tool", m.ToolName)
+
+	case court.StreamStartMsg:
+		// Mirror the TUI's streaming-tab tracking: mark the stream active and
+		// capture the edict ID for future use. Never warn — this is routine.
+		s.streaming = true
+		s.streamingEdictID = m.EdictID
+		slog.Debug("headless: stream started", "edict_id", m.EdictID)
+
+	case court.StreamCompleteMsg:
+		s.streaming = false
+		s.streamingEdictID = 0
+		slog.Debug("headless: stream completed")
+
+	case court.StreamInterruptedMsg:
+		// The session already stopped; just reset streaming state (the
+		// partial content was already printed via StreamChunkMsg).
+		s.streaming = false
+		s.streamingEdictID = 0
+		slog.Debug("headless: stream interrupted")
 
 	default:
 		// Unhandled message types used to be silently dropped (e.g. the
