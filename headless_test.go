@@ -207,6 +207,90 @@ func TestHeadlessSink_ToolCallError_PrintsError(t *testing.T) {
 	}
 }
 
+// captureWarnHandler is a slog handler that records WARN-level records so
+// tests can assert that expected messages do NOT warn.
+type captureWarnHandler struct {
+	mu      sync.Mutex
+	warned  []string
+	records []slog.Record
+}
+
+func (h *captureWarnHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelInfo
+}
+func (h *captureWarnHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	if r.Level >= slog.LevelWarn {
+		h.warned = append(h.warned, r.Message)
+	}
+	return nil
+}
+func (h *captureWarnHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *captureWarnHandler) WithGroup(name string) slog.Handler       { return h }
+
+// newCaptureSink builds a headless sink whose slog warnings are captured.
+func newCaptureSink(t *testing.T) (*headlessSink, *captureWarnHandler) {
+	t.Helper()
+	h := &captureWarnHandler{}
+	orig := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return newHeadlessSink(nil), h
+}
+
+// TestHeadlessSink_StreamAndToolProgress_NoWarnings verifies that the four
+// known progress event types (StreamStartMsg, StreamCompleteMsg,
+// ToolCallScheduledMsg, ToolCallExecutingMsg) are consumed intentionally —
+// none of them may hit the default WARN branch, which previously flooded the
+// log during swift-strike rituals.
+func TestHeadlessSink_StreamAndToolProgress_NoWarnings(t *testing.T) {
+	sink, h := newCaptureSink(t)
+
+	sink.handle(court.StreamStartMsg{ChannelID: "secretary", EdictID: 3})
+	require.True(t, sink.streaming, "StreamStartMsg should set streaming")
+	require.Equal(t, uint(3), sink.streamingEdictID, "StreamStartMsg should capture the edict ID")
+
+	sink.handle(runners.ToolCallScheduledMsg{ToolName: "read_file"})
+	sink.handle(runners.ToolCallExecutingMsg{ToolName: "read_file"})
+
+	// Mid-stream nothing signals done.
+	select {
+	case code := <-sink.done:
+		t.Fatalf("should not signal done on progress events, got code %d", code)
+	default:
+	}
+
+	sink.handle(court.StreamCompleteMsg{ChannelID: "secretary"})
+	require.False(t, sink.streaming, "StreamCompleteMsg should clear streaming")
+	require.Zero(t, sink.streamingEdictID, "StreamCompleteMsg should clear the streaming edict ID")
+
+	// A later interrupted stream resets state the same way.
+	sink.handle(court.StreamStartMsg{ChannelID: "secretary", EdictID: 4})
+	require.True(t, sink.streaming, "StreamStartMsg should set streaming again")
+	sink.handle(court.StreamInterruptedMsg{ChannelID: "secretary", PartialContent: "part"})
+	require.False(t, sink.streaming, "StreamInterruptedMsg should clear streaming")
+	require.Zero(t, sink.streamingEdictID, "StreamInterruptedMsg should clear the streaming edict ID")
+
+	assert.Empty(t, h.warned, "known progress events must not warn; got warnings: %v", h.warned)
+	select {
+	case <-sink.done:
+		t.Fatal("should not signal done on stream/tool progress events")
+	default:
+	}
+}
+
+// TestHeadlessSink_UnknownMessage_StillWarns guards the other side of the
+// contract: the default branch must stay loud for genuinely unknown types
+// (e.g. the old EditorRequest hang), even after the known types got cases.
+func TestHeadlessSink_UnknownMessage_StillWarns(t *testing.T) {
+	sink, h := newCaptureSink(t)
+	sink.handle(struct{ X int }{X: 1})
+	assert.Contains(t, h.warned, "headless: unhandled event",
+		"genuinely unknown message types must keep warning")
+}
+
 // TestHeadlessSink_MinisterInvokingAndCompleted verifies that
 // MinisterInvokingMsg and MinisterCompletedMsg are handled without panic.
 func TestHeadlessSink_MinisterInvokingAndCompleted(t *testing.T) {
