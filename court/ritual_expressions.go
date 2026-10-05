@@ -1291,14 +1291,31 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		}
 		return nil
 	case "check_precedent_approved":
-		// Check censor precedents using latest-wins per manifest:
-		// For each manifest, only the most recent precedent (by created_at) matters.
-		// Fail only if the latest precedent for any manifest is rejected.
+		// Check censor precedents using latest-wins per manifest, but ONLY over
+		// CURRENT manifests — the same latest-per-(edict, username, project,
+		// file_path) set the verdict gate uses. A reforge mints a NEW manifest_id
+		// for the same file_path, so keying latest-wins by manifest_id alone
+		// would keep a rejected precedent on a superseded manifest as "latest"
+		// forever, and the edict could never ascend (the e874/e876 defect; the
+		// sibling of the e883/e885 verdict bug).
+		//
+		// No weakening: a rejected precedent on a CURRENT manifest still blocks.
+		//
+		// Precedent rows with NULL created_at are structurally invisible to the
+		// gate: SQL NULL never satisfies cp.created_at = MAX(...) — the same
+		// e874-style contract the verdict gate documents.
 		var rejectedPrecedents []storage.CensorPrecedent
 		if err := r.db.Raw(`
 			SELECT cp.* FROM censor_precedents cp
 			JOIN forge_manifests fm ON fm.manifest_id = cp.manifest_id
 			WHERE fm.edict_id = ? AND fm.username = ? AND fm.project = ?
+			  AND fm.created_at = (
+			    SELECT MAX(fm2.created_at) FROM forge_manifests fm2
+			    WHERE fm2.edict_id = fm.edict_id
+			      AND fm2.username = fm.username
+			      AND fm2.project = fm.project
+			      AND fm2.file_path = fm.file_path
+			  )
 			  AND cp.created_at = (
 			    SELECT MAX(cp2.created_at) FROM censor_precedents cp2
 			    WHERE cp2.manifest_id = cp.manifest_id

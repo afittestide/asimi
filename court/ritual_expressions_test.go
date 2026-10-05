@@ -1051,6 +1051,155 @@ func TestCheckPrecedentApproved_RejectedIsLatest(t *testing.T) {
 	}
 }
 
+// TestCheckPrecedentApproved_SupersededRejectedManifestDoesNotBlock is the e876
+// regression test for the cross-reforge gate bug: an OLDER manifest for the same
+// file_path carrying a rejected precedent must not block once a NEWER manifest
+// for that file_path exists and is approved. Latest-wins keyed by manifest_id
+// alone leaves the round-1 rejection "latest for its manifest" forever, so the
+// edict could never ascend (observed on e874).
+func TestCheckPrecedentApproved_SupersededRejectedManifestDoesNotBlock(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.CensorPrecedent{}); err != nil {
+		t.Fatalf("Failed to migrate CensorPrecedent: %v", err)
+	}
+
+	oldManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "1", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestRejected,
+	}
+	newManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "2", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	for _, m := range []*storage.ForgeManifest{&oldManifest, &newManifest} {
+		if err := db.Create(m).Error; err != nil {
+			t.Fatalf("Failed to create manifest: %v", err)
+		}
+	}
+	db.Model(&storage.ForgeManifest{}).Where("manifest_id = ?", newManifest.ManifestID).
+		Update("created_at", oldManifest.CreatedAt.Add(time.Minute))
+
+	rejectedPrec := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "1", "test", "file.go"),
+		ManifestID:  oldManifest.ManifestID,
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "edict_comment_requirements",
+		Ruling:      storage.PrecedentRejected,
+	}
+	approvedPrec := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "2", "test", "file.go"),
+		ManifestID:  newManifest.ManifestID,
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "chancellor_code_review",
+		Ruling:      storage.PrecedentApproved,
+	}
+	for _, p := range []*storage.CensorPrecedent{&rejectedPrec, &approvedPrec} {
+		if err := db.Create(p).Error; err != nil {
+			t.Fatalf("Failed to create precedent: %v", err)
+		}
+	}
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "check_precedent_approved"); err != nil {
+		t.Errorf("Expected superseded manifest's rejected precedent not to block, got: %v", err)
+	}
+}
+
+// TestCheckPrecedentApproved_CurrentManifestRejectedPrecedentBlocks pins the
+// no-weakening half of e876: a rejected precedent on the CURRENT (latest)
+// manifest for a file_path must still fail the gate.
+func TestCheckPrecedentApproved_CurrentManifestRejectedPrecedentBlocks(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	if err := db.AutoMigrate(&storage.CensorPrecedent{}); err != nil {
+		t.Fatalf("Failed to migrate CensorPrecedent: %v", err)
+	}
+
+	oldManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "1", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	newManifest := storage.ForgeManifest{
+		ManifestID: GenerateID("manifest", "2", "test", "file.go"),
+		EdictID:    1,
+		Username:   "testuser",
+		Project:    "testproject",
+		FilePath:   "file.go",
+		Status:     storage.ManifestQuenched,
+	}
+	for _, m := range []*storage.ForgeManifest{&oldManifest, &newManifest} {
+		if err := db.Create(m).Error; err != nil {
+			t.Fatalf("Failed to create manifest: %v", err)
+		}
+	}
+	db.Model(&storage.ForgeManifest{}).Where("manifest_id = ?", newManifest.ManifestID).
+		Update("created_at", oldManifest.CreatedAt.Add(time.Minute))
+
+	approvedPrec := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "1", "test", "file.go"),
+		ManifestID:  oldManifest.ManifestID,
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "style",
+		Ruling:      storage.PrecedentApproved,
+	}
+	rejectedPrec := storage.CensorPrecedent{
+		PrecedentID: GenerateID("precedent", "2", "test", "file.go"),
+		ManifestID:  newManifest.ManifestID,
+		EdictID:     1,
+		Username:    "testuser",
+		Project:     "testproject",
+		Principle:   "security",
+		Ruling:      storage.PrecedentRejected,
+	}
+	for _, p := range []*storage.CensorPrecedent{&approvedPrec, &rejectedPrec} {
+		if err := db.Create(p).Error; err != nil {
+			t.Fatalf("Failed to create precedent: %v", err)
+		}
+	}
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+	err := runner.runThen(context.Background(), exec, "check_precedent_approved")
+	if err == nil {
+		t.Error("Expected error when the current manifest's latest precedent is rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "precedent check failed") {
+		t.Errorf("Expected error to contain 'precedent check failed', got: %v", err)
+	}
+}
+
 // TestCheckVerdictsPassed_FailedThenPassed verifies latest-wins: a passed
 // verdict after a failed one should pass.
 func TestCheckVerdictsPassed_FailedThenPassed(t *testing.T) {
