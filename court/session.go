@@ -1722,6 +1722,18 @@ func (s *Session) processToolCalls(ctx context.Context, toolCalls []schemas.Chat
 		ensureToolCallID(tc, i)
 		argsJSON := tc.Function.Arguments
 
+		// Malformed arguments poison history: providers reject a tool_call
+		// whose function.arguments is not valid JSON on every later request,
+		// wedging the session. Normalize in place — toolCalls shares backing
+		// storage with the assistant message appended by appendMessage — and
+		// remember the original for the error result.
+		argsInvalid := !json.Valid([]byte(argsJSON))
+		originalArgs := argsJSON
+		if argsInvalid {
+			tc.Function.Arguments = "{}"
+			argsJSON = "{}"
+		}
+
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
@@ -1759,6 +1771,18 @@ func (s *Session) processToolCalls(ctx context.Context, toolCalls []schemas.Chat
 			}
 			results[i] = &msg
 			return collectMessages(results), false
+		}
+
+		// The call had malformed arguments; report the error instead of
+		// dispatching the normalized "{}" so the model learns the call failed.
+		if argsInvalid {
+			msg := schemas.ChatMessage{
+				Role:            schemas.ChatMessageRoleTool,
+				Content:         textContent(fmt.Sprintf("Error: invalid input: arguments were not valid JSON and were replaced with {}: %s", originalArgs)),
+				ChatToolMessage: &schemas.ChatToolMessage{ToolCallID: tc.ID},
+			}
+			results[i] = &msg
+			continue
 		}
 
 		tool, ok := s.toolCatalog[name]

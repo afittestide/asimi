@@ -2,6 +2,7 @@ package court
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -829,6 +830,59 @@ func TestSession_AskWithStreaming_NilModel(t *testing.T) {
 	assert.Empty(t, resp)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "LLM model not configured")
+}
+
+func TestSession_ProcessToolCalls_InvalidArgumentsNormalized(t *testing.T) {
+	t.Parallel()
+
+	tool := &mockTool{name: "valid_tool", output: "result"}
+	sess, err := NewSession(nil, &SessionConfig{}, []Tool{tool}, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	toolCalls := []schemas.ChatAssistantMessageToolCall{{
+		ID:   strPtr("tc1"),
+		Type: strPtr("function"),
+		Function: schemas.ChatAssistantMessageToolCallFunction{
+			Name:      strPtr("valid_tool"),
+			Arguments: "not json",
+		},
+	}}
+
+	// Mirror the production sequence: appendMessage commits the assistant
+	// message (copying the toolCalls slice header — the same backing array)
+	// before processToolCalls normalizes it in place.
+	sess.appendMessage(&responseChoice{ToolCalls: toolCalls})
+
+	messages, shouldReturn := sess.processToolCalls(context.Background(), toolCalls)
+
+	assert.False(t, shouldReturn)
+	require.Len(t, messages, 1)
+
+	// (a) a tool error result is returned, (b) including the original input
+	content := msgContentStr(messages[0])
+	assert.Contains(t, content, "invalid input")
+	assert.Contains(t, content, "not json")
+
+	// (c) the malformed call was not dispatched with the normalized "{}"
+	assert.False(t, tool.called.Load())
+
+	// (d) the slice now carries valid JSON so it can never poison history
+	assert.Equal(t, "{}", toolCalls[0].Function.Arguments)
+	assert.True(t, json.Valid([]byte(toolCalls[0].Function.Arguments)))
+
+	// Structural pairing is preserved: the error result references the call ID.
+	require.NotNil(t, messages[0].ChatToolMessage)
+	require.NotNil(t, messages[0].ChatToolMessage.ToolCallID)
+	assert.Equal(t, "tc1", *messages[0].ChatToolMessage.ToolCallID)
+
+	// The retained assistant message in s.messages shares backing storage with
+	// toolCalls and must now carry valid JSON — the core guarantee of edict 854.
+	require.NotEmpty(t, sess.messages)
+	last := sess.messages[len(sess.messages)-1]
+	require.NotNil(t, last.ChatAssistantMessage)
+	require.Len(t, last.ChatAssistantMessage.ToolCalls, 1)
+	assert.Equal(t, "{}", last.ChatAssistantMessage.ToolCalls[0].Function.Arguments)
+	assert.True(t, json.Valid([]byte(last.ChatAssistantMessage.ToolCalls[0].Function.Arguments)))
 }
 
 func TestSession_ProcessToolCalls_LoopDetected(t *testing.T) {
