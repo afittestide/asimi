@@ -216,6 +216,19 @@ func TestTianLedgerTool_OffsetPagination(t *testing.T) {
 	if !strings.Contains(page3, "No Tian events found") {
 		t.Errorf("offset past end should return empty message, got: %q", page3)
 	}
+
+	// A negative offset must be clamped to 0 (no SQL negative-offset error).
+	page4, err := tool.Call(ctx, `{"offset": -5}`)
+	if err != nil {
+		t.Fatalf("negative offset should be clamped, got error: %v", err)
+	}
+	var neg []tianEventSummary
+	if err := json.Unmarshal([]byte(page4), &neg); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if len(neg) != 4 {
+		t.Fatalf("negative offset: got %d events, want all 4", len(neg))
+	}
 }
 
 func TestTianLedgerTool_OrderedByCreatedAtDesc(t *testing.T) {
@@ -472,6 +485,42 @@ func TestTianLedgerTool_SummaryTruncatesTail(t *testing.T) {
 	}
 	if events[0].Payload["error"] != "none" {
 		t.Errorf("error key = %v, want %q", events[0].Payload["error"], "none")
+	}
+}
+
+func TestTianLedgerTool_ShortBodyPassesThroughVerbatim(t *testing.T) {
+	db := setupTianEventsTestDB(t)
+	ctx := context.Background()
+
+	// A body shorter than the effective limit must be returned byte-for-byte:
+	// no leading ellipsis and no truncation suffix. With OutputLimit unset the
+	// tool must fall back to config.DefaultOutputLimit, not to zero/truncate-all.
+	shortBody := "short verdict"
+	seedTianEvent(t, db, 5, "ritual_completed", storage.JSON{"last_step_output": shortBody})
+
+	tool := TianLedgerTool{Ctx: ToolContext{
+		DB:       db,
+		Username: "testuser",
+		Project:  "testproject",
+	}}
+
+	result, err := tool.Call(ctx, `{}`)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+	var events []tianEventSummary
+	if err := json.Unmarshal([]byte(result), &events); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	got, _ := events[0].Payload["last_step_output"].(string)
+	if got != shortBody {
+		t.Errorf("short body = %q, want verbatim %q", got, shortBody)
+	}
+	if strings.HasSuffix(got, tianEventTruncationSuffix) {
+		t.Errorf("short body must not carry the truncation suffix: %q", got)
 	}
 }
 
