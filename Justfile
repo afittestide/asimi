@@ -45,17 +45,36 @@ run:
     go build -tags containers_image_openpgp .
     ./asimi --debug
 
-# Run all tests (CI mode when CI env var is set)
+# Run all tests (CI mode when CI env var is set).
+# The suite also runs under the race detector — a data race is not visible to
+# the plain `go test` run, so the `test-race` recipe is the permanent gate.
+# `set -e` is load-bearing: `just test-race` is not the final command, so
+# without it a failing race step would be silently swallowed and the recipe
+# would still exit 0.
 test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export GOTOOLCHAIN=auto
+    if [ -n "${CI:-}" ]; then
+        go test -tags containers_image_openpgp -timeout 5m -v ./...
+    else
+        go test -tags containers_image_openpgp -timeout 5m ./... | tee test.out
+    fi
+    just test-race
+    if [ -n "${CI:-}" ]; then
+        just vuln
+    fi
+
+# Run tests under the race detector. Data races are invisible to the plain
+# `test` recipe and must be caught before a release. Scoped by default to the
+# court package — where the ritual/fork concurrency lives — because -race needs
+# CGO and the full ./... tree OOM-kills the compiler in the 2GiB sandbox.
+# Override with: just test-race ./court/ ./internal/runners/
+test-race *packages="./court/":
     #!/usr/bin/env bash
     set -o pipefail
     export GOTOOLCHAIN=auto
-    if [ -n "$CI" ]; then
-        go test -tags containers_image_openpgp -timeout 5m -v ./...
-        just vuln
-    else
-        go test -tags containers_image_openpgp -timeout 1m ./... | tee test.out
-    fi
+    go test -race -tags containers_image_openpgp -timeout 10m {{packages}}
 
 # Run performance benchmarks and guardrail tests
 test-performance:

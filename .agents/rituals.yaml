@@ -78,6 +78,7 @@
       given:
         - the earth status
         - "!just test  # test_results"
+        - "!just test-race  # race_results"
         - "!just lint  # lint_results"
         - "!just build  # build_result"
         - "!just vuln  # vuln_results"
@@ -86,6 +87,11 @@
         Confirm the CHANGELOG version matches the version in asimi_version.go.
         Confirm the git tag for {{ .version }} does not already exist.
         If anything fails, report clearly and do not proceed.
+
+        Release gate — race detector. The release MUST NOT proceed if
+        `just test-race` reports any data race (a non-zero exit is a FAILED
+        gate). Data races are invisible to the plain `just test`, which does
+        not use -race, so this invocation is the load-bearing concurrency gate.
 
         Release gate — vulnerability scan. The release MUST NOT proceed if
         `just vuln` reports any reachable vulnerabilities. Note that
