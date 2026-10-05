@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -282,6 +283,14 @@ func (s *Court) ConsultMinister(ctx context.Context, callerMinisterID, ministerI
 // StartRitual emits a ritual_enacted event for the RitualGuard to handle
 // asynchronously.
 func (s *Court) StartRitual(name string, key storage.EdictKey, inputs map[string]string) error {
+	reg := s.GetRitualRegistry()
+	if reg == nil {
+		return fmt.Errorf("unknown ritual %q; no rituals loaded", name)
+	}
+	if reg.Get(name) == nil {
+		return fmt.Errorf("unknown ritual %q; available rituals: %s", name, strings.Join(reg.List(), ", "))
+	}
+
 	if inputs == nil {
 		inputs = make(map[string]string)
 	}

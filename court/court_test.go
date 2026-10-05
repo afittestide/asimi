@@ -1196,12 +1196,13 @@ func TestCourt_ImplementsRuntimeDispatchInterfaces(t *testing.T) {
 }
 
 // TestCourt_StartRitual_EmitsEvent verifies that Court.StartRitual publishes
-// a ritual_enacted event through the event system.
+// a ritual_enacted event through the event system for a registered ritual.
 func TestCourt_StartRitual_EmitsEvent(t *testing.T) {
 	db := setupMinisterTestDB(t)
 	cfg := config.DefaultCourtConfig()
 	s := NewCourt(db, cfg, nil, nil)
 	require.NotNil(t, s)
+	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "test-ritual"}))
 
 	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
 	err := s.StartRitual("test-ritual", key, map[string]string{"foo": "bar"})
@@ -1211,6 +1212,24 @@ func TestCourt_StartRitual_EmitsEvent(t *testing.T) {
 	var events []storage.TianEvent
 	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
 	require.Len(t, events, 1, "expected one ritual_enacted event")
+}
+
+// TestCourt_StartRitual_UnknownRitual verifies that Court.StartRitual rejects
+// an unknown ritual name and publishes no ritual_enacted event.
+func TestCourt_StartRitual_UnknownRitual(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+
+	key := storage.EdictKey{ID: 43, Username: cfg.Username, Project: cfg.Project}
+	err := s.StartRitual("no-such-ritual", key, map[string]string{"foo": "bar"})
+	require.Error(t, err)
+
+	// Verify no event was published to the Tian ledger
+	var events []storage.TianEvent
+	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
+	require.Empty(t, events, "unknown ritual must not emit a ritual_enacted event")
 }
 
 // TestCourt_CheckHostCommand_NoConfig verifies that CheckHostCommand returns
