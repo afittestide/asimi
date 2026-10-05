@@ -422,7 +422,7 @@ func TestTUIModelKeyboardInteraction(t *testing.T) {
 			{ID: "model-a", DisplayName: "Model A", Provider: "anthropic", Status: "ready"},
 			{ID: "model-b", DisplayName: "Model B", Provider: "anthropic", Status: "active"},
 			{ID: "model-c", DisplayName: "Model C", Provider: "anthropic", Status: "ready"},
-		}, "model-b")
+		}, "model-b", nil)
 		require.NotNil(t, cmd)
 		msg := cmd()
 		newModel, cmd := model.Update(msg)
@@ -4542,6 +4542,75 @@ func TestInputResponseMsg_ModelNameEmptyIsNoOp(t *testing.T) {
 
 	assert.Equal(t, "", updated.pendingModelNameProvider,
 		"pendingModelNameProvider should be cleared after handling")
+	assert.Nil(t, cmd, "expected no command when input is empty (cancelled)")
+}
+
+// TestEnterModelNameRawMsg_EntersRawPrompt verifies that the pinned picker row's
+// message sets the raw-entry flag and opens the "provider/model" prompt.
+func TestEnterModelNameRawMsg_EntersRawPrompt(t *testing.T) {
+	model := newTestModel(t)
+
+	newModel, cmd := model.handleCustomMessages(enterModelNameRawMsg{})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	assert.True(t, updated.pendingModelNameRaw, "pendingModelNameRaw should be set")
+	assert.True(t, updated.commandLine.IsInInputMode(), "command line should be in input mode")
+	assert.Contains(t, updated.commandLine.inputPrompt, "provider/model",
+		"prompt should instruct the provider/model form")
+	assert.NotNil(t, cmd, "expected a command to be returned")
+}
+
+// TestInputResponseMsg_RoutesToRawModelEntry verifies that a raw "provider/model"
+// submission from the pinned row is resolved into a modelSelectedMsg.
+func TestInputResponseMsg_RoutesToRawModelEntry(t *testing.T) {
+	model := newTestModel(t)
+	model.pendingModelNameRaw = true
+
+	newModel, cmd := model.handleCustomMessages(inputResponseMsg{text: "openai/gpt-4o"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	assert.False(t, updated.pendingModelNameRaw, "pendingModelNameRaw should be cleared after handling")
+
+	require.NotNil(t, cmd)
+	result := cmd()
+	selected, ok := result.(modelSelectedMsg)
+	require.True(t, ok, "expected modelSelectedMsg, got %T", result)
+	require.NotNil(t, selected.model)
+	assert.Equal(t, "openai", selected.model.Provider)
+	assert.Equal(t, "gpt-4o", selected.model.ID)
+}
+
+// TestInputResponseMsg_RawEntryUnknownProviderToast verifies an unknown provider
+// typed into the raw prompt is rejected with an error toast, not a selection.
+func TestInputResponseMsg_RawEntryUnknownProviderToast(t *testing.T) {
+	model := newTestModel(t)
+	model.pendingModelNameRaw = true
+
+	newModel, cmd := model.handleCustomMessages(inputResponseMsg{text: "not-a-provider/some-model"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.False(t, updated.pendingModelNameRaw, "pendingModelNameRaw should be cleared after handling")
+
+	require.NotNil(t, cmd)
+	result := cmd()
+	toast, ok := result.(toastMsg)
+	require.True(t, ok, "expected toastMsg, got %T", result)
+	assert.Equal(t, "error", toast.msgType)
+	assert.Contains(t, toast.message, "Unknown provider")
+}
+
+// TestInputResponseMsg_RawEntryEmptyIsNoOp verifies cancellation of the raw
+// prompt emits no selection.
+func TestInputResponseMsg_RawEntryEmptyIsNoOp(t *testing.T) {
+	model := newTestModel(t)
+	model.pendingModelNameRaw = true
+
+	newModel, cmd := model.handleCustomMessages(inputResponseMsg{text: ""})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.False(t, updated.pendingModelNameRaw, "pendingModelNameRaw should be cleared after handling")
 	assert.Nil(t, cmd, "expected no command when input is empty (cancelled)")
 }
 

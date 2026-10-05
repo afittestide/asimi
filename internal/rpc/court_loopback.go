@@ -63,13 +63,30 @@ func (l *LoopbackCourt) CancellableStreamCtx(channelID string) context.Context {
 	return l.Local.CancellableStreamCtx(channelID)
 }
 
-// ListModels delegates to the local court since the bifrost client
-// lives in-process.
+// ListModels routes through the wire to the court that owns the LLM
+// client. The local fallback exists only for a CourtClient-less
+// LoopbackCourt.
 func (l *LoopbackCourt) ListModels(provider string) (*schemas.BifrostListModelsResponse, error) {
+	if l.CourtClient != nil {
+		return l.CourtClient.ListModels(provider)
+	}
 	if l.Local == nil {
 		return nil, fmt.Errorf("no local court available")
 	}
 	return l.Local.ListModels(provider)
+}
+
+// ApproximateContextSize routes through the wire to the court that owns
+// the registry, mirroring ListModels. The local fallback exists only for a
+// CourtClient-less LoopbackCourt.
+func (l *LoopbackCourt) ApproximateContextSize(provider, model string) int {
+	if l.CourtClient != nil {
+		return l.CourtClient.ApproximateContextSize(provider, model)
+	}
+	if l.Local == nil {
+		return 0
+	}
+	return l.Local.ApproximateContextSize(provider, model)
 }
 
 // ConnDone delegates to the underlying Conn's Done channel so the TUI

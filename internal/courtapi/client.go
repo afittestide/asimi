@@ -80,6 +80,12 @@ type Client interface {
 	// client (bifrost). Used by the TUI's :models command.
 	ListModels(provider string) (*schemas.BifrostListModelsResponse, error)
 
+	// ApproximateContextSize resolves an approximate context window for a
+	// provider:model from the court's regex registry. Returns 0 when unknown.
+	// Used for providers whose model listing carries no context length; the
+	// TUI renders a non-zero result as an estimate, never as an exact value.
+	ApproximateContextSize(provider, model string) int
+
 	// In-process only; LLM client setup. Kept for in-process callers;
 	// the wire-safe path is SetContext above.
 	//

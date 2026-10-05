@@ -578,7 +578,7 @@ func handleLoginCommand(model *TUIModel, args []string) tea.Cmd {
 		}
 	}
 
-	return model.tabs.Content().ShowUnifiedModels(providers, "")
+	return model.tabs.Content().ShowUnifiedModels(providers, "", nil)
 }
 
 // handleLogoutCommand handles the :logout command

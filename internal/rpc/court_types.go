@@ -77,6 +77,21 @@ type ListActiveEdictsResult struct {
 	Edicts []storage.ActiveEdict `msgpack:"edicts"`
 }
 
+type ListModelsParams struct {
+	Provider string `msgpack:"provider"`
+}
+type ListModelsResult struct {
+	Response *schemas.BifrostListModelsResponse `msgpack:"response"`
+}
+
+type ApproximateContextSizeParams struct {
+	Provider string `msgpack:"provider"`
+	Model    string `msgpack:"model"`
+}
+type ApproximateContextSizeResult struct {
+	Size int `msgpack:"size"`
+}
+
 type CancelZhengmingParams struct {
 	RequestID string `msgpack:"request_id"`
 }

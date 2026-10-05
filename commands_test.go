@@ -273,6 +273,23 @@ func TestQuitCommandAliasesDispatch(t *testing.T) {
 	require.NotNil(t, quitAllCmd.Handler)
 }
 
+// TestModelCommandAlias verifies that both :models and its :model alias are
+// registered and resolve to the same picker handler.
+func TestModelCommandAlias(t *testing.T) {
+	registry := NewCommandRegistry()
+
+	modelsCmd, ok := registry.GetCommand("models")
+	require.True(t, ok, ":models must be registered")
+	modelCmd, ok := registry.GetCommand("model")
+	require.True(t, ok, ":model alias must be registered")
+
+	require.Equal(t, "model", modelCmd.Name)
+	assert.Contains(t, modelCmd.Description, "refresh")
+	assert.Equal(t, "Select AI model (alias; :model refresh for a live refetch)", modelCmd.Description)
+	require.NotNil(t, modelCmd.Handler)
+	require.NotNil(t, modelsCmd.Handler)
+}
+
 func TestHandleInitCommand(t *testing.T) {
 	skipIfNotCI(t)
 	// Setup a temporary directory for the test

@@ -383,6 +383,37 @@ func TestGetKeysForProvider_Bedrock_OnlyAccessKeyInMap(t *testing.T) {
 	}
 }
 
+// TestGetKeysForProvider_KeyringWhitelistIsWildcard is a regression test for the
+// deny-all whitelist defect: the keyring-fallback paths (generic provider and
+// bedrock) must carry schemas.WhiteList{"*"}, not an empty whitelist. Bifrost
+// treats an empty whitelist as deny-all (IsRestricted() == !IsUnrestricted()),
+// and the list-models pipeline early-exits on an empty allowlist with no aliases,
+// so a validly-keyed provider would enumerate zero models and fall back to a
+// typing prompt.
+func TestGetKeysForProvider_KeyringWhitelistIsWildcard(t *testing.T) {
+	keyring.MockKeyring()
+	require.NoError(t, keyring.SaveAPIKey("anthropic", "sk-ant-test"))
+	require.NoError(t, keyring.SaveAPIKey("bedrock", "bedrock-test-key"))
+	t.Cleanup(func() {
+		keyring.DeleteAPIKey("anthropic")
+		keyring.DeleteAPIKey("bedrock")
+	})
+
+	account := &Account{} // in-process mode → keyring fallback path
+
+	generic, err := account.GetKeysForProvider(context.Background(), schemas.Anthropic)
+	require.NoError(t, err)
+	require.Len(t, generic, 1)
+	assert.Equal(t, schemas.WhiteList{"*"}, generic[0].Models,
+		"keyring-fallback key must be unrestricted; empty means deny-all")
+
+	bedrock, err := account.GetKeysForProvider(context.Background(), schemas.Bedrock)
+	require.NoError(t, err)
+	require.Len(t, bedrock, 1)
+	assert.Equal(t, schemas.WhiteList{"*"}, bedrock[0].Models,
+		"bedrock keyring path must be unrestricted; empty means deny-all")
+}
+
 // --- Legacy tests (in-process mode, no apiKeys map) ---
 
 func TestGetKeysForProvider_Bedrock_WithoutCredentials(t *testing.T) {

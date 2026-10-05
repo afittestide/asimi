@@ -3120,3 +3120,20 @@ func TestExecuteToolCall_InjectsSessionIDViaScheduler(t *testing.T) {
 	assert.Equal(t, sess.ID, captureTool.capturedSessionID,
 		"tool should receive the session's ID via context through the scheduler")
 }
+
+// TestApproximateContextSize verifies the exported registry helper mirrors
+// getModelContextSize's key format and matchContextRule precedence, and returns
+// 0 for unknown models.
+func TestApproximateContextSize(t *testing.T) {
+	assert.Equal(t, 200_000, ApproximateContextSize("anthropic", "claude-3-5-sonnet"))
+	// OpenAI gpt-4o has a per-model override ahead of the provider fallback.
+	assert.Equal(t, 128_000, ApproximateContextSize("openai", "gpt-4o"))
+	// The provider-level fallback applies to otherwise-unknown openai models.
+	assert.Equal(t, 128_000, ApproximateContextSize("openai", "some-unknown-openai-model"))
+	// The optional openrouter "provider/model" prefix matches the same family rule.
+	assert.Equal(t, 200_000, ApproximateContextSize("openrouter", "anthropic/claude-3.5-sonnet"))
+	// Routing tags are stripped before matching, as getModelContextSize does.
+	assert.Equal(t, 128_000, ApproximateContextSize("openai", "gpt-4o:nitro"))
+	// Unknown providers/models yield 0 rather than a fabricated default.
+	assert.Equal(t, 0, ApproximateContextSize("cohere", "totally-unknown-model"))
+}

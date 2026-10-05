@@ -21,7 +21,7 @@ func testModels() []Model {
 // TestSearchForward verifies forward search finds the next match
 func TestSearchForward(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search forward for "gpt" from item 0 — should find index 2 (gpt-4o)
 	idx := window.Search("gpt", 1, 0)
@@ -33,7 +33,7 @@ func TestSearchForward(t *testing.T) {
 // TestSearchForwardWrap verifies forward search wraps around
 func TestSearchForwardWrap(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search forward for "claude" from last item — should wrap to index 0
 	idx := window.Search("claude", 1, 5)
@@ -43,7 +43,7 @@ func TestSearchForwardWrap(t *testing.T) {
 // TestSearchBackward verifies backward search finds the previous match
 func TestSearchBackward(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search backward for "claude" from item 4 — should find index 1 (claude-3-5-haiku)
 	idx := window.Search("claude", -1, 4)
@@ -53,7 +53,7 @@ func TestSearchBackward(t *testing.T) {
 // TestSearchBackwardWrap verifies backward search wraps around
 func TestSearchBackwardWrap(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search backward for "gemini" from item 0 — should wrap to index 5
 	idx := window.Search("gemini", -1, 0)
@@ -63,7 +63,7 @@ func TestSearchBackwardWrap(t *testing.T) {
 // TestSearchNoMatch verifies that searching with no matches returns -1
 func TestSearchNoMatch(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	idx := window.Search("nonexistent", 1, 0)
 	assert.Equal(t, -1, idx)
@@ -73,7 +73,7 @@ func TestSearchNoMatch(t *testing.T) {
 // TestSearchCaseInsensitive verifies search is case-insensitive
 func TestSearchCaseInsensitive(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Lowercase search
 	idx := window.Search("GPT", 1, 0)
@@ -87,7 +87,7 @@ func TestSearchCaseInsensitive(t *testing.T) {
 // TestSearchClearPattern verifies that empty pattern clears search state
 func TestSearchClearPattern(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// First do a search
 	window.Search("gpt", 1, 0)
@@ -103,7 +103,7 @@ func TestSearchClearPattern(t *testing.T) {
 // TestSearchMatchesDisplayName verifies search matches on DisplayName
 func TestSearchMatchesDisplayName(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// "Flash" appears only in DisplayName of gemini-2.5-flash
 	idx := window.Search("flash", 1, 0)
@@ -113,7 +113,7 @@ func TestSearchMatchesDisplayName(t *testing.T) {
 // TestSearchMatchesID verifies search matches on ID
 func TestSearchMatchesID(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// "haiku" appears in both ID and DisplayName of claude-3-5-haiku
 	idx := window.Search("haiku", 1, 0)
@@ -123,7 +123,7 @@ func TestSearchMatchesID(t *testing.T) {
 // TestNextMatchForward verifies NextMatch cycles forward through matches
 func TestNextMatchForward(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search forward for "gpt" from item 0 — lands on index 2
 	window.Search("gpt", 1, 0)
@@ -140,7 +140,7 @@ func TestNextMatchForward(t *testing.T) {
 // TestNextMatchBackward verifies NextMatch cycles backward through matches
 func TestNextMatchBackward(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search for "gpt" — matches at 2, 3
 	window.Search("gpt", 1, 0)
@@ -157,7 +157,7 @@ func TestNextMatchBackward(t *testing.T) {
 // TestNextMatchNoSearch verifies NextMatch returns -1 when no search is active
 func TestNextMatchNoSearch(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	idx := window.NextMatch(0, 1)
 	assert.Equal(t, -1, idx)
@@ -166,7 +166,7 @@ func TestNextMatchNoSearch(t *testing.T) {
 // TestNextMatchMultipleCycles verifies cycling through all matches
 func TestNextMatchMultipleCycles(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search for "claude" — matches at 0, 1
 	window.Search("claude", 1, 5) // wraps to 0
@@ -180,7 +180,7 @@ func TestNextMatchMultipleCycles(t *testing.T) {
 // TestMatchCount verifies MatchCount returns correct count
 func TestMatchCount(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	window.Search("gpt", 1, 0)
 	assert.Equal(t, 2, window.MatchCount())
@@ -195,7 +195,7 @@ func TestMatchCount(t *testing.T) {
 // TestCurrentMatchNumber verifies CurrentMatchNumber returns 1-based position
 func TestCurrentMatchNumber(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Search for "gpt" — matches at 2, 3, cursor starts at 0 (index 2)
 	window.Search("gpt", 1, 0)
@@ -209,7 +209,7 @@ func TestCurrentMatchNumber(t *testing.T) {
 // TestHasSearch verifies HasSearch reflects search state
 func TestHasSearch(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	assert.False(t, window.HasSearch())
 
@@ -223,7 +223,7 @@ func TestHasSearch(t *testing.T) {
 // TestClearSearch verifies ClearSearch resets all search state
 func TestClearSearch(t *testing.T) {
 	window := NewModelsWindow()
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	window.Search("gpt", 1, 0)
 	window.ClearSearch()
@@ -238,7 +238,7 @@ func TestClearSearch(t *testing.T) {
 func TestSearchRenderShowsMatchCount(t *testing.T) {
 	window := NewModelsWindow()
 	window.SetSize(80, 10)
-	window.SetModels(testModels(), "")
+	window.SetModels(testModels(), "", nil)
 
 	// Without search
 	render := window.RenderList(0, 0, window.GetVisibleSlots())

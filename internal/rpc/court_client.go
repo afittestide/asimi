@@ -131,6 +131,30 @@ func (c *CourtClient) ListActiveEdicts() ([]storage.ActiveEdict, error) {
 	return r.Edicts, nil
 }
 
+func (c *CourtClient) ListModels(provider string) (*schemas.BifrostListModelsResponse, error) {
+	raw, err := c.conn.Call(context.Background(), MethodListModels, ListModelsParams{Provider: provider})
+	if err != nil {
+		return nil, err
+	}
+	var r ListModelsResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return nil, fmt.Errorf("rpc: decode ListModels result: %w", err)
+	}
+	return r.Response, nil
+}
+
+func (c *CourtClient) ApproximateContextSize(provider, model string) int {
+	raw, err := c.conn.Call(context.Background(), MethodApproximateContextSize, ApproximateContextSizeParams{Provider: provider, Model: model})
+	if err != nil {
+		return 0
+	}
+	var r ApproximateContextSizeResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return 0
+	}
+	return r.Size
+}
+
 func (c *CourtClient) CancelZhengming(requestID string) {
 	_ = c.callVoid(context.Background(), MethodCancelZhengming, CancelZhengmingParams{RequestID: requestID})
 }

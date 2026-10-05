@@ -3,10 +3,13 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/afittestide/asimi/internal/courtapi"
@@ -18,13 +21,32 @@ import (
 
 // Model represents a unified model across all providers
 type Model struct {
-	ID          string // Model identifier (e.g., "claude-3-5-sonnet-latest", "gpt-4o")
-	DisplayName string // Human-readable name
-	Provider    string // Provider key (e.g., "anthropic", "openai", "googleai")
-	Description string // Optional description
-	Status      string // "active" (currently selected), "ready" (key found), "login_required", "manual_entry"
-	OnSelect    tea.Cmd
+	ID              string // Model identifier (e.g., "claude-3-5-sonnet-latest", "gpt-4o")
+	DisplayName     string // Human-readable name
+	Provider        string // Provider key (e.g., "anthropic", "openai", "googleai")
+	Description     string // Optional description
+	Status          string // "active" (currently selected), "ready" (key found), "login_required", "manual_entry", "diagnostic"
+	ContextLength   int    // Max context window in tokens, from bifrost
+	ContextApprox   bool   // ContextLength came from the local registry, not the provider
+	Modality        string // e.g. "text->text", from bifrost Architecture
+	PricePrompt     string // Prompt price per token, from bifrost Pricing
+	PriceCompletion string // Completion price per token, from bifrost Pricing
+	OnSelect        tea.Cmd
 }
+
+// modelsCache caches the last successful catalog per provider for the
+// lifetime of the process (the TUI is a single process). It is deliberately
+// unbounded — one entry per configured provider — and has no TTL: a warm cache
+// is the whole point of :model opening instantly.
+type modelsCache struct {
+	mu          sync.Mutex
+	byProvider  map[string][]Model // successfully fetched models, per provider
+	diagnostics []string           // last diagnostics
+	fetched     bool               // has a successful population happened
+}
+
+// modelCatalog is the package-level session cache for the model picker.
+var modelCatalog = modelsCache{byProvider: map[string][]Model{}}
 
 // getOllamaBaseURL returns the Ollama API base URL
 func getOllamaBaseURL() string {
@@ -50,34 +72,62 @@ func checkOllamaAvailable() bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// fetchAllModels aggregates models from all configured providers via bifrost's
-// ListModelsRequest (per-provider). It maps schemas.Model to asimi's Model
-// struct, preserving the active/ready/manual_entry status semantics.
-func fetchAllModels(config *Config, court courtapi.Client) []Model {
-	var allModels []Model
-	currentProvider := config.LLM.Provider
-	currentModel := config.LLM.Model
-	ollamaAvailable := checkOllamaAvailable()
+// read returns the cached, flattened catalog when a successful population has
+// happened. It re-derives statuses from config so a changed active model is
+// reflected without refetching. Never touches the network.
+func (c *modelsCache) read(config *Config) ([]Model, []string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.fetched {
+		return nil, nil, false
+	}
+	return buildModelList(config, c.byProvider), append([]string(nil), c.diagnostics...), true
+}
 
-	// Build the set of configured providers to check auth for.
-	configuredProviders := getConfiguredProviderKeys(ollamaAvailable)
+// merge replaces the per-provider entries that succeeded this round, keeps the
+// prior entries for providers that failed (a transient error must not empty the
+// list), prunes providers no longer configured, and records the new diagnostics.
+// It returns the merged, flattened catalog so the caller can render it.
+func (c *modelsCache) merge(config *Config, fetched map[string][]Model, diagnostics, configuredProviders []string) ([]Model, []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if len(configuredProviders) == 0 {
-		return allModels
+	kept := make(map[string]bool, len(configuredProviders))
+	for _, p := range configuredProviders {
+		kept[p] = true
+	}
+	for p := range c.byProvider {
+		if !kept[p] {
+			delete(c.byProvider, p)
+		}
+	}
+	for provider, models := range fetched {
+		c.byProvider[provider] = models
 	}
 
-	for _, provider := range configuredProviders {
-		models, err := fetchModelsForProvider(config, court, provider)
-		if err != nil {
-			slog.Warn("failed to fetch models for provider", "provider", provider, "error", err)
-			allModels = append(allModels, Model{
-				DisplayName: "Enter model name for " + providerDisplayName(provider),
-				Provider:    provider,
-				Status:      "manual_entry",
-				Description: err.Error(),
-			})
-			continue
-		}
+	c.diagnostics = append([]string(nil), diagnostics...)
+	if len(c.byProvider) > 0 {
+		c.fetched = true
+	}
+	return buildModelList(config, c.byProvider), append([]string(nil), c.diagnostics...)
+}
+
+// populated reports whether a successful population has happened.
+func (c *modelsCache) populated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fetched
+}
+
+// buildModelList flattens per-provider models into a sorted catalog, deriving
+// the active/ready status from config, and appends the pinned manual-entry row
+// as the final item.
+func buildModelList(config *Config, byProvider map[string][]Model) []Model {
+	currentProvider := config.LLM.Provider
+	currentModel := config.LLM.Model
+
+	var allModels []Model
+	for provider, models := range byProvider {
 		for _, m := range models {
 			status := "ready"
 			if currentProvider == provider && m.ID == currentModel {
@@ -88,17 +138,98 @@ func fetchAllModels(config *Config, court courtapi.Client) []Model {
 				displayName = m.ID
 			}
 			allModels = append(allModels, Model{
-				ID:          m.ID,
-				DisplayName: displayName,
-				Provider:    provider,
-				Description: m.Description,
-				Status:      status,
+				ID:              m.ID,
+				DisplayName:     displayName,
+				Provider:        provider,
+				Description:     m.Description,
+				Status:          status,
+				ContextLength:   m.ContextLength,
+				ContextApprox:   m.ContextApprox,
+				Modality:        m.Modality,
+				PricePrompt:     m.PricePrompt,
+				PriceCompletion: m.PriceCompletion,
 			})
 		}
 	}
 
-	sortModels(allModels)
+	sortModels(allModels, currentProvider)
+
+	// Pinned manual-entry escape hatch, always last and the only manual_entry row.
+	allModels = append(allModels, Model{
+		DisplayName: "Type a model name…",
+		Status:      "manual_entry",
+		OnSelect:    func() tea.Msg { return enterModelNameRawMsg{} },
+	})
+
 	return allModels
+}
+
+// maxConcurrentModelFetches bounds the number of in-flight provider fetches so
+// a ruler with many keys does not open dozens of sockets at once.
+const maxConcurrentModelFetches = 8
+
+// fetchAllModels aggregates models from all configured providers via bifrost's
+// ListModelsRequest (per-provider). It maps schemas.Model to asimi's Model
+// struct, preserving the active/ready status semantics, and returns a list of
+// diagnostics for providers that could not be reached.
+//
+// When the session cache is warm and forceRefresh is false, it returns the
+// cached catalog immediately without any network call. On a miss (or a forced
+// refresh) it fetches every provider concurrently, then repopulates the cache.
+func fetchAllModels(config *Config, court courtapi.Client, forceRefresh bool) ([]Model, []string) {
+	if !forceRefresh {
+		if models, diagnostics, ok := modelCatalog.read(config); ok {
+			return models, diagnostics
+		}
+	}
+
+	ollamaAvailable := checkOllamaAvailable()
+	configuredProviders := getConfiguredProviderKeys(ollamaAvailable)
+
+	byProvider, diagnostics := fetchConfiguredProviders(config, court, configuredProviders)
+	return modelCatalog.merge(config, byProvider, diagnostics, configuredProviders)
+}
+
+// fetchConfiguredProviders fans out one bounded goroutine per configured
+// provider, collecting successful models per provider and sorted diagnostics.
+func fetchConfiguredProviders(config *Config, court courtapi.Client, providers []string) (map[string][]Model, []string) {
+	type fetchResult struct {
+		provider string
+		models   []Model
+		err      error
+	}
+
+	results := make(chan fetchResult, len(providers))
+	sem := make(chan struct{}, maxConcurrentModelFetches)
+	var wg sync.WaitGroup
+
+	for _, provider := range providers {
+		wg.Add(1)
+		go func(provider string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			models, err := fetchModelsForProvider(config, court, provider)
+			results <- fetchResult{provider: provider, models: models, err: err}
+		}(provider)
+	}
+
+	wg.Wait()
+	close(results)
+
+	byProvider := make(map[string][]Model, len(providers))
+	var diagnostics []string
+	for r := range results {
+		if r.err != nil {
+			slog.Warn("failed to fetch models for provider", "provider", r.provider, "error", r.err)
+			diagnostics = append(diagnostics, fmt.Sprintf("%s: %v", r.provider, r.err))
+			continue
+		}
+		byProvider[r.provider] = r.models
+	}
+
+	sort.Strings(diagnostics)
+	return byProvider, diagnostics
 }
 
 // fetchModelsForProvider fetches models from a single provider via bifrost
@@ -123,11 +254,32 @@ var fetchModelsForProvider = func(config *Config, court courtapi.Client, provide
 		if m.Description != nil {
 			description = *m.Description
 		}
-		models = append(models, Model{
+		model := Model{
 			ID:          m.ID,
 			DisplayName: displayName,
 			Description: description,
-		})
+		}
+		if m.ContextLength != nil {
+			model.ContextLength = *m.ContextLength
+		}
+		if model.ContextLength == 0 {
+			if approx := court.ApproximateContextSize(provider, m.ID); approx > 0 {
+				model.ContextLength = approx
+				model.ContextApprox = true
+			}
+		}
+		if m.Architecture != nil && m.Architecture.Modality != nil {
+			model.Modality = *m.Architecture.Modality
+		}
+		if m.Pricing != nil {
+			if m.Pricing.Prompt != nil {
+				model.PricePrompt = *m.Pricing.Prompt
+			}
+			if m.Pricing.Completion != nil {
+				model.PriceCompletion = *m.Pricing.Completion
+			}
+		}
+		models = append(models, model)
 	}
 	return models, nil
 }
@@ -179,17 +331,78 @@ func asimiProviderToBifrost(asimiProvider string) string {
 	}
 }
 
-// sortModels sorts models: active first, then ready, then manual_entry, by provider and display name.
-func sortModels(models []Model) {
-	sort.Slice(models, func(i, j int) bool {
-		statusPriority := map[string]int{"active": 0, "ready": 1, "manual_entry": 2, "error": 3}
-		if statusPriority[models[i].Status] != statusPriority[models[j].Status] {
-			return statusPriority[models[i].Status] < statusPriority[models[j].Status]
+// formatContextLength renders a token count as a compact human string (e.g. 262K).
+func formatContextLength(tokens int) string {
+	switch {
+	case tokens >= 1000000:
+		return fmt.Sprintf("%dM", tokens/1000000)
+	case tokens >= 1000:
+		return fmt.Sprintf("%dK", int(math.Round(float64(tokens)/1000)))
+	default:
+		return strconv.Itoa(tokens)
+	}
+}
+
+// modelMetadataSuffix renders the dim metadata suffix for a model row,
+// e.g. " · 262K ctx · $3/$15". Empty when no metadata exists. Modality is
+// deliberately not rendered.
+func modelMetadataSuffix(m Model) string {
+	var parts []string
+	if m.ContextLength > 0 {
+		prefix := ""
+		if m.ContextApprox {
+			prefix = "~"
 		}
-		if models[i].Provider != models[j].Provider {
-			return models[i].Provider < models[j].Provider
+		parts = append(parts, prefix+formatContextLength(m.ContextLength)+" ctx")
+	}
+	if m.PricePrompt != "" || m.PriceCompletion != "" {
+		parts = append(parts, "$"+m.PricePrompt+"/$"+m.PriceCompletion)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(parts, " · ")
+}
+
+// truncateToWidth truncates a string to the given display width. Widths <= 0
+// yield an empty string. The metadata suffix is ASCII, so rune slicing matches
+// display width here.
+func truncateToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) > width {
+		runes = runes[:width]
+	}
+	return string(runes)
+}
+
+// sortModels orders rows with the selected provider first, the remaining
+// providers alphabetically, then alphabetically by display name within each
+// group. The active model keeps its alphabetical position — it is marked with
+// ✓ but never hoisted.
+func sortModels(models []Model, selectedProvider string) {
+	sort.SliceStable(models, func(i, j int) bool {
+		pi, pj := models[i].Provider, models[j].Provider
+		si, sj := pi == selectedProvider, pj == selectedProvider
+		if si != sj {
+			return si // selected provider's group first
 		}
-		return models[i].DisplayName < models[j].DisplayName
+		if pi != pj {
+			return pi < pj // remaining providers alphabetically
+		}
+		nameI, nameJ := models[i].DisplayName, models[j].DisplayName
+		if nameI == "" {
+			nameI = models[i].ID
+		}
+		if nameJ == "" {
+			nameJ = models[j].ID
+		}
+		return nameI < nameJ // within a provider: alphabetical by name
 	})
 }
 
@@ -197,6 +410,7 @@ func sortModels(models []Model) {
 type ModelsWindow struct {
 	SelectWindow[Model]
 	currentModel string
+	diagnostics  []string // per-provider fetch failures, shown dimly under the title
 
 	// Search state
 	searchPattern   string // current search pattern (empty = no active search)
@@ -219,9 +433,10 @@ func NewModelsWindow() ModelsWindow {
 }
 
 // SetModels updates the models list (unified Model type)
-func (m *ModelsWindow) SetModels(models []Model, currentModel string) {
+func (m *ModelsWindow) SetModels(models []Model, currentModel string, diagnostics []string) {
 	m.SetItems(models)
 	m.currentModel = currentModel
+	m.diagnostics = diagnostics
 }
 
 // SetError sets error state
@@ -385,6 +600,8 @@ func getStatusIcon(status string) string {
 		return ""
 	case "error":
 		return "⚠"
+	case "diagnostic":
+		return "⚠"
 	case "manual_entry":
 		return "✏️"
 	default:
@@ -394,7 +611,7 @@ func getStatusIcon(status string) string {
 
 // IsModelSelectable returns whether a model can be selected
 func IsModelSelectable(model Model) bool {
-	return model.Status != "error"
+	return model.Status != "error" && model.Status != "diagnostic"
 }
 
 // RenderList renders the models list with the given selection
@@ -410,10 +627,18 @@ func (m *ModelsWindow) RenderList(selectedIndex, scrollOffset, visibleSlots int)
 
 	config := RenderConfig[Model]{
 		ConstructTitle: func(selectedIndex, totalItems int) string {
+			var title string
 			if m.HasSearch() {
-				return titleStyle.Render(fmt.Sprintf("Select a model [%3d/%3d]  search %q [%d/%d]:", selectedIndex+1, totalItems, m.searchPattern, m.CurrentMatchNumber(), m.MatchCount()))
+				title = titleStyle.Render(fmt.Sprintf("Select a model [%3d/%3d]  search %q [%d/%d]:", selectedIndex+1, totalItems, m.searchPattern, m.CurrentMatchNumber(), m.MatchCount()))
+			} else {
+				title = titleStyle.Render(fmt.Sprintf("Select a model [%3d/%3d]:", selectedIndex+1, totalItems))
 			}
-			return titleStyle.Render(fmt.Sprintf("Select a model [%3d/%3d]:", selectedIndex+1, totalItems))
+			if len(m.diagnostics) > 0 {
+				dim := lipgloss.NewStyle().Foreground(globalTheme.DimTextColor)
+				hint := "unavailable: " + strings.Join(m.diagnostics, ", ")
+				title += "\n" + dim.Render(hint)
+			}
+			return title
 		},
 		OnLoading: func(sb *strings.Builder) {
 			sb.WriteString("Loading models...\n")
@@ -438,7 +663,7 @@ func (m *ModelsWindow) RenderList(selectedIndex, scrollOffset, visibleSlots int)
 			lastProvider = model.Provider
 
 			prefix := "  "
-			if model.Status == "error" {
+			if model.Status == "error" || model.Status == "diagnostic" {
 				providerIcon := getProviderIcon(model.Provider)
 				statusIcon := getStatusIcon(model.Status)
 				style := lipgloss.NewStyle().Foreground(globalTheme.Error)
@@ -470,7 +695,15 @@ func (m *ModelsWindow) RenderList(selectedIndex, scrollOffset, visibleSlots int)
 			if statusIcon != "" {
 				line = fmt.Sprintf("%s%s %s %s", prefix, providerIcon, statusIcon, displayText)
 			}
-			sb.WriteString(style.Render(line) + "\n")
+			rendered := style.Render(line)
+			if suffix := modelMetadataSuffix(model); suffix != "" {
+				remaining := m.Width - lipgloss.Width(line)
+				if remaining > 0 {
+					dim := lipgloss.NewStyle().Foreground(globalTheme.DimTextColor)
+					rendered += dim.Render(truncateToWidth(suffix, remaining))
+				}
+			}
+			sb.WriteString(rendered + "\n")
 		},
 		IsSelectable: func(model Model) bool {
 			return IsModelSelectable(model)
@@ -571,7 +804,8 @@ func (s *EdictSelectWindow) RenderList(selectedIndex, scrollOffset, visibleSlots
 
 // Message types for model loading
 type modelsLoadedMsg struct {
-	models []Model
+	models      []Model
+	Diagnostics []string
 }
 
 type modelsLoadErrorMsg struct {
@@ -580,24 +814,76 @@ type modelsLoadErrorMsg struct {
 
 type showModelSelectionMsg struct{}
 
+// knownProvider reports whether the provider key is a standard bifrost
+// provider (in asimi naming) or is known to the provider metadata table.
+func knownProvider(provider string) bool {
+	for _, sp := range schemas.StandardProviders {
+		if bifrostProviderToAsimi(string(sp)) == provider {
+			return true
+		}
+	}
+	_, ok := providerMeta[provider]
+	return ok
+}
+
+// parseModelArg resolves command args into a provider and model name.
+// It accepts "<provider>/<name>" (single arg), "<provider> <name>" (two args),
+// or "<name>" (single arg without a slash, using the current provider).
+func parseModelArg(args []string, currentProvider string) (provider, name string, err error) {
+	switch len(args) {
+	case 0:
+		return "", "", fmt.Errorf("no model specified")
+	case 1:
+		if i := strings.Index(args[0], "/"); i >= 0 {
+			return args[0][:i], args[0][i+1:], nil
+		}
+		return currentProvider, args[0], nil
+	default:
+		return args[0], args[1], nil
+	}
+}
+
+// selectModelDirect resolves a direct :model selection and emits a
+// modelSelectedMsg so the existing handler performs SaveConfig and switchModel.
+func selectModelDirect(model *TUIModel, args []string) tea.Cmd {
+	provider, name, err := parseModelArg(args, model.config.LLM.Provider)
+	if err != nil {
+		return func() tea.Msg { return showToast(err.Error(), "error", 3*time.Second) }
+	}
+	if !knownProvider(provider) {
+		return func() tea.Msg {
+			return showToast(fmt.Sprintf("Unknown provider %q — use :models to pick one", provider), "error", 3*time.Second)
+		}
+	}
+	return func() tea.Msg {
+		return modelSelectedMsg{model: &Model{ID: name, DisplayName: name, Provider: provider, Status: "active"}}
+	}
+}
+
 // Command handler - now works with all providers
 func handleModelsCommand(model *TUIModel, args []string) tea.Cmd {
-	showModelsCmd := model.tabs.Content().ShowUnifiedModels([]Model{}, model.config.LLM.Model)
-	model.tabs.Content().models.SetLoading(true)
+	// Refresh form: :model refresh / :models refresh forces a live refetch.
+	forceRefresh := len(args) == 1 && args[0] == "refresh"
+	if forceRefresh {
+		args = nil
+	}
+
+	// Direct form: :model <provider>/<name>, :model <provider> <name>, or :model <name>
+	if len(args) > 0 {
+		return selectModelDirect(model, args)
+	}
+
+	// A warm cache renders immediately; only a cold cache needs the spinner.
+	warm := !forceRefresh && modelCatalog.populated()
+
+	showModelsCmd := model.tabs.Content().ShowUnifiedModels([]Model{}, model.config.LLM.Model, nil)
+	if !warm {
+		model.tabs.Content().models.SetLoading(true)
+	}
 
 	loadCmd := func() tea.Msg {
-		models := fetchAllModels(model.config, model.court)
-
-		// Set OnSelect for manual_entry entries
-		for i := range models {
-			m := &models[i]
-			if m.Status == "manual_entry" {
-				provider := m.Provider
-				m.OnSelect = func() tea.Msg { return enterModelNameMsg{provider: provider} }
-			}
-		}
-
-		return modelsLoadedMsg{models: models}
+		models, diagnostics := fetchAllModels(model.config, model.court, forceRefresh)
+		return modelsLoadedMsg{models: models, Diagnostics: diagnostics}
 	}
 
 	return tea.Batch(showModelsCmd, loadCmd)

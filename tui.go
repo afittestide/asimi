@@ -115,7 +115,10 @@ type TUIModel struct {
 	pendingAPIKeyProvider string
 	// Pending model name entry: set when user selects a manual_entry model
 	pendingModelNameProvider string
-	repoInfo                 *repo.RepoInfo
+	// Pending raw "provider/model" entry: set when the ruler picks the pinned
+	// "Type a model name…" row.
+	pendingModelNameRaw bool
+	repoInfo            *repo.RepoInfo
 
 	// Debounced render tick: prevents stacking multiple 50ms tick commands
 	renderTickPending bool
@@ -3039,6 +3042,15 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Handle raw "provider/model" entry from the pinned picker row
+		if m.pendingModelNameRaw {
+			m.pendingModelNameRaw = false
+			if msg.text == "" {
+				return m, nil
+			}
+			return m, selectModelDirect(&m, []string{msg.text})
+		}
+
 	case apiKeyPromptMsg:
 		m.pendingAPIKeyProvider = msg.provider
 		prompt := fmt.Sprintf("Enter your %s API key:", providerDisplayName(msg.provider))
@@ -3048,6 +3060,10 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingModelNameProvider = msg.provider
 		prompt := fmt.Sprintf("Enter model name for %s:", providerDisplayName(msg.provider))
 		return m, m.commandLine.EnterInputMode(prompt)
+
+	case enterModelNameRawMsg:
+		m.pendingModelNameRaw = true
+		return m, m.commandLine.EnterInputMode("Enter model as provider/model>")
 
 	case runners.ApprovalRequestMsg:
 		// Store the pending approval request
@@ -3127,7 +3143,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case modelsLoadedMsg:
-		return m, m.tabs.Content().ShowUnifiedModels(msg.models, m.config.LLM.Model)
+		return m, m.tabs.Content().ShowUnifiedModels(msg.models, m.config.LLM.Model, msg.Diagnostics)
 
 	case showModelSelectionMsg:
 		// Trigger model selection after login completes

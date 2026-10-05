@@ -802,6 +802,18 @@ func matchContextRule(rules []modelContextRule, key string) int {
 	return 0
 }
 
+// ApproximateContextSize resolves an approximate context window for a
+// provider:model key from the same registry getModelContextSize uses. It
+// returns 0 when no rule matches. Callers must present a non-zero result as
+// an estimate, never as a provider-reported value.
+func ApproximateContextSize(provider, model string) int {
+	model = strings.ToLower(model)
+	if idx := strings.Index(model, ":"); idx > 0 {
+		model = model[:idx]
+	}
+	return matchContextRule(modelContextSizes, strings.ToLower(provider)+":"+model)
+}
+
 // modelContextByKey caches context window sizes resolved from bifrost,
 // keyed "provider:model". Lazily populated on first miss from the regex
 // registry. Shared across all sessions — one network call per model.

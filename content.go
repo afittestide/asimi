@@ -744,11 +744,11 @@ func (c *ContentComponent) ShowHelp(topic string) tea.Cmd {
 }
 
 // ShowUnifiedModels switches to models view with unified model list
-func (c *ContentComponent) ShowUnifiedModels(models []Model, currentModel string) tea.Cmd {
+func (c *ContentComponent) ShowUnifiedModels(models []Model, currentModel string, diagnostics []string) tea.Cmd {
 	c.activeView = ViewModels
 	c.navMode = NavList
 	c.activeList = &c.models.SelectWindow
-	c.models.SetModels(models, currentModel)
+	c.models.SetModels(models, currentModel, diagnostics)
 	c.models.ClearSearch()
 	c.selectedItem = c.models.GetInitialSelection()
 	c.scrollOffset = 0

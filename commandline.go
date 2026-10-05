@@ -32,6 +32,7 @@ type (
 	apiKeyPromptMsg       struct{ provider string } // request API key input for a provider
 	apiKeySavedMsg        struct{ provider string } // API key saved to keyring for a provider
 	enterModelNameMsg     struct{ provider string } // request manual model name entry for a provider
+	enterModelNameRawMsg  struct{}                  // request manual "provider/model" entry (pinned picker row)
 
 	// Search messages
 	searchExecutedMsg struct {

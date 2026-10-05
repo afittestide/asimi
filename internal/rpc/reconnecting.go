@@ -3,7 +3,6 @@ package rpc
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -674,13 +673,33 @@ func (rc *ReconnectingClient) ConnDone() <-chan struct{} {
 	return conn.Done()
 }
 
-// ListModels delegates to the local court since the bifrost client
-// lives in-process, not on the daemon side.
+// ListModels reads models over the wire from the court that owns the
+// LLM client, retrying on a broken connection like other read-only
+// methods.
 func (rc *ReconnectingClient) ListModels(provider string) (*schemas.BifrostListModelsResponse, error) {
-	if rc.local == nil {
-		return nil, fmt.Errorf("no local court available")
+	client := rc.getClient()
+	if client == nil {
+		return nil, ErrClosed
 	}
-	return rc.local.ListModels(provider)
+	models, err := client.ListModels(provider)
+	if rc.reconnectIfError(err, rc.shouldRetryReadOnly) {
+		if client = rc.getClient(); client != nil {
+			return client.ListModels(provider)
+		}
+	}
+	return models, err
+}
+
+// ApproximateContextSize reads the registry over the wire, retrying on a
+// broken connection like other read-only methods.
+func (rc *ReconnectingClient) ApproximateContextSize(provider, model string) int {
+	rc.reconnectIfDead()
+	client := rc.getClient()
+	if client == nil {
+		return 0
+	}
+	size := client.ApproximateContextSize(provider, model)
+	return size
 }
 
 var _ courtapi.Client = (*ReconnectingClient)(nil)

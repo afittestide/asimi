@@ -12,6 +12,7 @@ import (
 	"github.com/afittestide/asimi/court"
 	"github.com/afittestide/asimi/internal/courtapi"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/wire"
 	"github.com/afittestide/asimi/storage"
 	"github.com/maximhq/bifrost/core/schemas"
 )
@@ -47,6 +48,7 @@ type fakeCourt struct {
 	}
 	prompts  []string // "target/message"
 	restored []string // "tabType/N"
+	listed   []string // providers passed to ListModels
 }
 
 func newFakeCourt() *fakeCourt {
@@ -255,10 +257,40 @@ func (f *fakeCourt) TakeSnapshot() court.Snapshot {
 	}
 }
 
+func (f *fakeCourt) ListModels(provider string) (*schemas.BifrostListModelsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listed = append(f.listed, provider)
+	name := provider + " display"
+	ctx := 128000
+	prompt := "0.005"
+	resp := &schemas.BifrostListModelsResponse{
+		Data: []schemas.Model{{
+			ID:            provider + "-model",
+			Name:          &name,
+			ContextLength: &ctx,
+			Pricing:       &schemas.Pricing{Prompt: &prompt},
+		}},
+		NextPageToken: "tok",
+	}
+	resp.ExtraFields.Provider = schemas.OpenAI
+	resp.ExtraFields.RequestType = schemas.ListModelsRequest
+	return resp, nil
+}
+
 func (f *fakeCourt) CancelTab(channelID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cancels = append(f.cancels, "tab:"+channelID)
+}
+
+func (f *fakeCourt) ApproximateContextSize(provider, model string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if provider == "openai" && model == "gpt-4o" {
+		return 128000
+	}
+	return 0
 }
 
 func (f *fakeCourt) PauseRitual(channelID string) bool {
@@ -590,4 +622,324 @@ func TestCourtRPCLoopback(t *testing.T) {
 		t.Errorf("resumes = %v", impl.resumes)
 	}
 	impl.mu.Unlock()
+
+	// ListModels round-trip: the response must cross the wire intact,
+	// including the pointer fields and ExtraFields that bifrost uses in
+	// practice (the edict flagged codec-carryability as the risk).
+	resp, err := client.ListModels("openai")
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].ID != "openai-model" {
+		t.Errorf("ListModels response = %+v", resp)
+	}
+	if resp.Data[0].Name == nil || *resp.Data[0].Name != "openai display" {
+		t.Errorf("ListModels Name = %v", resp.Data[0].Name)
+	}
+	if resp.Data[0].ContextLength == nil || *resp.Data[0].ContextLength != 128000 {
+		t.Errorf("ListModels ContextLength = %v", resp.Data[0].ContextLength)
+	}
+	if resp.Data[0].Pricing == nil || resp.Data[0].Pricing.Prompt == nil || *resp.Data[0].Pricing.Prompt != "0.005" {
+		t.Errorf("ListModels Pricing = %+v", resp.Data[0].Pricing)
+	}
+	if resp.NextPageToken != "tok" {
+		t.Errorf("ListModels NextPageToken = %q", resp.NextPageToken)
+	}
+	if resp.ExtraFields.Provider != schemas.OpenAI || resp.ExtraFields.RequestType != schemas.ListModelsRequest {
+		t.Errorf("ListModels ExtraFields = %+v", resp.ExtraFields)
+	}
+	impl.mu.Lock()
+	if len(impl.listed) != 1 || impl.listed[0] != "openai" {
+		t.Errorf("listed providers = %v", impl.listed)
+	}
+	impl.mu.Unlock()
+}
+
+// TestLoopbackCourtListModelsReachesWire asserts LoopbackCourt.ListModels
+// goes through the RPC surface rather than the in-process Local court.
+func TestLoopbackCourtListModelsReachesWire(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	var localCalls []string
+	local := &listModelsOnlyCourt{
+		fakeCourt: newFakeCourt(),
+		onList:    func(p string) { localCalls = append(localCalls, p) },
+	}
+	lb := NewLoopbackCourt(clientConn, local)
+
+	resp, err := lb.ListModels("anthropic")
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].ID != "anthropic-model" {
+		t.Errorf("response = %+v", resp)
+	}
+
+	impl.mu.Lock()
+	serverCalls := len(impl.listed)
+	impl.mu.Unlock()
+	if serverCalls != 1 {
+		t.Errorf("server-side ListModels calls = %d, want 1", serverCalls)
+	}
+	if len(localCalls) != 0 {
+		t.Errorf("Local.ListModels was called %v; want wire path", localCalls)
+	}
+}
+
+// listModelsOnlyCourt records calls to Local.ListModels so the test can
+// detect an accidental in-process fallback.
+type listModelsOnlyCourt struct {
+	*fakeCourt
+	onList func(string)
+}
+
+func (c *listModelsOnlyCourt) ListModels(provider string) (*schemas.BifrostListModelsResponse, error) {
+	c.onList(provider)
+	return c.fakeCourt.ListModels(provider)
+}
+
+// TestLoopbackCourtListModelsLocalFallback pins the retained fallback:
+// a LoopbackCourt with no CourtClient (nil embed) must serve through
+// Local, and with neither must error rather than panic.
+func TestLoopbackCourtListModelsLocalFallback(t *testing.T) {
+	var localCalls []string
+	local := &listModelsOnlyCourt{
+		fakeCourt: newFakeCourt(),
+		onList:    func(p string) { localCalls = append(localCalls, p) },
+	}
+	lb := &LoopbackCourt{Local: local} // no CourtClient
+
+	resp, err := lb.ListModels("ollama")
+	if err != nil {
+		t.Fatalf("ListModels (local fallback): %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].ID != "ollama-model" {
+		t.Errorf("response = %+v", resp)
+	}
+	if len(localCalls) != 1 || localCalls[0] != "ollama" {
+		t.Errorf("localCalls = %v", localCalls)
+	}
+
+	empty := &LoopbackCourt{}
+	if _, err := empty.ListModels("openai"); err == nil {
+		t.Error("ListModels with no client and no local: want error, got nil")
+	}
+}
+
+// TestCourtClientListModelsServerErrorPropagates asserts a server-side
+// failure reaches the caller intact, rather than being swallowed by the
+// wire layer.
+func TestCourtClientListModelsServerErrorPropagates(t *testing.T) {
+	impl := &erroringListModelsCourt{fakeCourt: newFakeCourt()}
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	client := NewCourtClient(clientConn)
+	if _, err := client.ListModels("openai"); err == nil {
+		t.Fatal("ListModels: want server error, got nil")
+	} else if !strings.Contains(err.Error(), "LLM client not initialized") {
+		t.Errorf("ListModels error = %v, want wrapped server error", err)
+	}
+}
+
+type erroringListModelsCourt struct {
+	*fakeCourt
+}
+
+func (c *erroringListModelsCourt) ListModels(string) (*schemas.BifrostListModelsResponse, error) {
+	return nil, errors.New("LLM client not initialized")
+}
+
+// TestMethodListModelsRegistered guards against a refactor silently
+// dropping the method from the RPC surface.
+func TestMethodListModelsRegistered(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	raw, err := clientConn.Call(ctx, MethodListModels, ListModelsParams{Provider: "openai"})
+	if err != nil {
+		t.Fatalf("MethodListModels not served: %v", err)
+	}
+	var r ListModelsResult
+	if err := wire.Decode(raw, &r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.Response == nil || len(r.Response.Data) != 1 {
+		t.Errorf("result = %+v", r)
+	}
+}
+
+// TestApproximateContextSizeRoundTrip verifies the registry helper crosses the
+// wire intact, mirroring the MethodListModels test.
+func TestApproximateContextSizeRoundTrip(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	client := NewCourtClient(clientConn)
+	if got := client.ApproximateContextSize("openai", "gpt-4o"); got != 128000 {
+		t.Errorf("ApproximateContextSize = %d, want 128000", got)
+	}
+	if got := client.ApproximateContextSize("openai", "unknown"); got != 0 {
+		t.Errorf("ApproximateContextSize(unknown) = %d, want 0", got)
+	}
+}
+
+// TestMethodApproximateContextSizeRegistered guards against a refactor silently
+// dropping the method from the RPC surface.
+func TestMethodApproximateContextSizeRegistered(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	raw, err := clientConn.Call(ctx, MethodApproximateContextSize, ApproximateContextSizeParams{Provider: "openai", Model: "gpt-4o"})
+	if err != nil {
+		t.Fatalf("MethodApproximateContextSize not served: %v", err)
+	}
+	var r ApproximateContextSizeResult
+	if err := wire.Decode(raw, &r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if r.Size != 128000 {
+		t.Errorf("result = %+v", r)
+	}
+}
+
+// TestLoopbackCourtApproximateContextSizeReachesWire asserts LoopbackCourt's
+// registry lookup goes through the RPC surface rather than the in-process
+// Local court, so the TUI never links the registry directly.
+func TestLoopbackCourtApproximateContextSizeReachesWire(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	// A local court that would return a different value: reaching it would
+	// prove the wire path was bypassed.
+	local := &approxTrackingCourt{fakeCourt: newFakeCourt(), size: 4242}
+	lb := NewLoopbackCourt(clientConn, local)
+
+	if got := lb.ApproximateContextSize("openai", "gpt-4o"); got != 128000 {
+		t.Errorf("ApproximateContextSize = %d, want 128000 (wire path)", got)
+	}
+	if len(local.calls) != 0 {
+		t.Errorf("Local.ApproximateContextSize was called %v; want wire path", local.calls)
+	}
+}
+
+// approxTrackingCourt records calls to Local.ApproximateContextSize so a test
+// can detect an accidental in-process fallback.
+type approxTrackingCourt struct {
+	*fakeCourt
+	size  int
+	calls []string
+}
+
+func (c *approxTrackingCourt) ApproximateContextSize(provider, model string) int {
+	c.calls = append(c.calls, provider+":"+model)
+	return c.size
+}
+
+// TestLoopbackCourtApproximateContextSizeLocalFallback pins the retained
+// fallback: a LoopbackCourt with no CourtClient (nil embed) must serve through
+// Local, and with neither must return 0 rather than panic.
+func TestLoopbackCourtApproximateContextSizeLocalFallback(t *testing.T) {
+	local := &approxTrackingCourt{fakeCourt: newFakeCourt(), size: 4242}
+	lb := &LoopbackCourt{Local: local} // no CourtClient
+
+	if got := lb.ApproximateContextSize("openai", "gpt-4o"); got != 4242 {
+		t.Errorf("ApproximateContextSize (local fallback) = %d, want 4242", got)
+	}
+	if len(local.calls) != 1 || local.calls[0] != "openai:gpt-4o" {
+		t.Errorf("local.calls = %v", local.calls)
+	}
+
+	empty := &LoopbackCourt{}
+	if got := empty.ApproximateContextSize("openai", "gpt-4o"); got != 0 {
+		t.Errorf("ApproximateContextSize with no client and no local = %d, want 0", got)
+	}
 }

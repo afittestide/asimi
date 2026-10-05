@@ -132,6 +132,26 @@ func RegisterCourtHandlers(c *Conn, impl courtapi.Client) {
 		return wire.Encode(ListActiveEdictsResult{Edicts: edicts})
 	})
 
+	c.Handle(MethodListModels, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p ListModelsParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		resp, err := impl.ListModels(p.Provider)
+		if err != nil {
+			return nil, err
+		}
+		return wire.Encode(ListModelsResult{Response: resp})
+	})
+
+	c.Handle(MethodApproximateContextSize, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p ApproximateContextSizeParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		return wire.Encode(ApproximateContextSizeResult{Size: impl.ApproximateContextSize(p.Provider, p.Model)})
+	})
+
 	c.Handle(MethodCancelZhengming, func(ctx context.Context, params []byte) ([]byte, error) {
 		var p CancelZhengmingParams
 		if err := wire.Decode(params, &p); err != nil {

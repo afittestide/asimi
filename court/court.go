@@ -816,6 +816,14 @@ func asimiProviderToBifrostCourt(asimiProvider string) string {
 	}
 }
 
+// ApproximateContextSize resolves an approximate context window for a
+// provider:model from the regex registry, returning 0 when unknown. Exposed
+// to the TUI (over RPC) so metadata-poor providers can show an estimated
+// context size instead of duplicating the registry in package main.
+func (s *Court) ApproximateContextSize(provider, model string) int {
+	return ApproximateContextSize(provider, model)
+}
+
 // Ministers returns the active ministers.
 func (s *Court) Ministers() []Minister {
 	if s == nil || s.ministers == nil {

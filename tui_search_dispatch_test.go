@@ -23,7 +23,7 @@ func testSearchModels() []Model {
 func showModelsInTUI(t *testing.T, models []Model, currentModel string) *TUIModel {
 	t.Helper()
 	model := newTestModel(t)
-	cmd := model.tabs.Content().ShowUnifiedModels(models, currentModel)
+	cmd := model.tabs.Content().ShowUnifiedModels(models, currentModel, nil)
 	require.NotNil(t, cmd)
 	msg := cmd()
 	newModel, cmd := model.Update(msg)

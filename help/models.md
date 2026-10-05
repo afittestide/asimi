@@ -1,22 +1,54 @@
 # Model Selection and LLM Configuration
 
 Asimi supports multiple AI providers and models. You can switch between them
-using the :models command or configure them via environment variables.
+using the :models command (alias :model) or configure them via environment
+variables.
 
 ## Selecting a Model
 
-  :models          - Open interactive model selector
-                     Shows all available models from configured providers
+  :models          - Open the live model picker (alias :model)
+                     Enumerates models from every configured provider
+  :models refresh  - Force a live refetch, bypassing the session cache
 
-The model selector displays:
-  - Available models from all providers
-  - Current active model (marked with ✓)
+  :model <provider>/<name>   - Select a model directly, e.g. :model openrouter/anthropic/claude-3.5-sonnet
+  :model <provider> <name>   - Same, space-separated
+  :model <name>              - Uses the current provider
+
+The catalog is fetched once and cached in memory for the session, so reopening
+the picker is instant and makes no network calls. Use `:models refresh` (alias
+`:model refresh`) when you need to see a newly pulled model or a provider that
+was briefly unreachable.
+
+The model picker displays:
+  - Real models enumerated live from each provider's /v1/models
+  - Useful metadata per row (context window, price)
+  - The currently selected provider's models first, followed by the other
+    providers in alphabetical order
+  - Current active model (marked with ✓, but not hoisted to the top)
   - Provider icons (🅰️  Anthropic, 🤖 OpenAI, 🔷 Google, 🦙 Ollama)
+  - A dim "unavailable:" line under the title when a provider can't be reached
+
+Context sizes are shown as `200K ctx` when the provider reported them. A
+leading `~`, e.g. `~200K ctx`, marks an approximate value filled in from
+Asimi's local registry because the provider's model listing carried no context
+length; it is an estimate, not an exact window.
+
+Some providers report rich metadata (OpenRouter supplies pricing and context),
+while plain OpenAI-compatible endpoints report only model ids. The picker does
+not warn about the missing metadata — it simply shows fewer columns.
 
 Navigation:
   ↓/↑              - Navigate through models
+  /                - Search forward (vi-style); ? searches backward
   Enter            - Select model
   ESC              - Cancel
+
+Typing a model name is only a last resort: the picker always ends with a
+"Type a model name…" row that opens an input prompt for `provider/model`.
+
+Unreachable providers appear as a diagnostic line (e.g.
+`unavailable: openrouter (401)`) rather than a typing prompt — the picker still
+shows every model from the providers that did respond.
 
 ## Supported Providers
 

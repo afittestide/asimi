@@ -245,7 +245,7 @@ func (a *Account) GetKeysForProvider(ctx context.Context, provider schemas.Model
 		if err == nil && apiKey != "" {
 			enabled := true
 			return []schemas.Key{
-				{ID: providerStr + "_apikey", Name: providerStr + " API Key", Value: schemas.EnvVar{Val: apiKey}, Models: []string{}, Weight: 1.0, Enabled: &enabled},
+				{ID: providerStr + "_apikey", Name: providerStr + " API Key", Value: schemas.EnvVar{Val: apiKey}, Models: []string{"*"}, Weight: 1.0, Enabled: &enabled},
 			}, nil
 		}
 		return []schemas.Key{}, nil
@@ -262,7 +262,7 @@ func (a *Account) GetKeysForProvider(ctx context.Context, provider schemas.Model
 	if err == nil && apiKey != "" {
 		enabled := true
 		return []schemas.Key{
-			{ID: providerStr + "_apikey", Name: providerStr + " API Key", Value: schemas.EnvVar{Val: apiKey}, Models: []string{}, Weight: 1.0, Enabled: &enabled},
+			{ID: providerStr + "_apikey", Name: providerStr + " API Key", Value: schemas.EnvVar{Val: apiKey}, Models: []string{"*"}, Weight: 1.0, Enabled: &enabled},
 		}, nil
 	}
 
