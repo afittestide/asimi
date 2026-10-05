@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -789,6 +791,193 @@ func TestExecuteForkStep_Cancelation(t *testing.T) {
 	if len(out) >= 5 {
 		t.Errorf("expected cancellation to stop processing, but all %d items succeeded", len(out))
 	}
+}
+
+// TestForkStepStates_IsolatesItemState is the invariant test for edict 900:
+// a fork item's step states must not alias the parent's backing array, and
+// each item's Session must be reset so it cannot be shared across concurrent
+// goroutines.
+func TestForkStepStates_IsolatesItemState(t *testing.T) {
+	parent := []RitualStepState{
+		{Name: "step1", Message: "parent-1", Session: &Session{ID: "shared"}},
+		{Name: "step2", Message: "parent-2", Session: &Session{ID: "shared"}},
+	}
+
+	item := forkStepStates(parent)
+
+	// The copy must not alias the parent backing array.
+	if &item[0] == &parent[0] {
+		t.Fatal("forkStepStates returned a slice aliasing the parent backing array")
+	}
+
+	// Mutating the copy must leave the parent untouched.
+	item[0].Message = "item-mutated"
+	item[0].Status = "completed"
+	if parent[0].Message != "parent-1" || parent[0].Status != "" {
+		t.Errorf("mutating fork state leaked into parent: %+v", parent[0])
+	}
+
+	// Sessions must never be shared with concurrent items.
+	for i := range item {
+		if item[i].Session != nil {
+			t.Errorf("item[%d].Session = %p, want nil (sessions must be item-private)", i, item[i].Session)
+		}
+	}
+
+	// Non-session fields are copied verbatim.
+	if item[1].Name != "step2" || item[1].Message != "parent-2" {
+		t.Errorf("forkStepStates did not preserve non-session fields: %+v", item[1])
+	}
+}
+
+// TestForkStepStates_NilSafe verifies forkStepStates handles an empty parent
+// (a ritual step with no prior states) without panicking.
+func TestForkStepStates_NilSafe(t *testing.T) {
+	if got := forkStepStates(nil); len(got) != 0 {
+		t.Errorf("forkStepStates(nil) = %v, want empty", got)
+	}
+	if got := forkStepStates([]RitualStepState{}); len(got) != 0 {
+		t.Errorf("forkStepStates(empty) = %v, want empty", got)
+	}
+}
+
+// TestSaveExecution_ForkItemNoOp verifies the invariant that a fork item never
+// persists: saveExecution is a no-op whenever forkItem is set, so sibling
+// goroutines cannot db.Save shared rows concurrently.
+func TestSaveExecution_ForkItemNoOp(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	exec := &RitualExecution{
+		ID:         "fork-exec-1",
+		RitualName: "fork-noop",
+		EdictID:    900,
+		Username:   "testuser",
+		Project:    "testproject",
+		forkItem:   true,
+		stepStates: []RitualStepState{{Name: "step1"}},
+	}
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner.saveExecution(exec)
+
+	var count int64
+	if err := db.Model(&RitualExecution{}).Where("id = ?", exec.ID).Count(&count).Error; err != nil {
+		t.Fatalf("count executions: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("fork item persisted %d execution row(s); want 0", count)
+	}
+
+	var stateCount int64
+	if err := db.Model(&RitualStepState{}).Where("execution_id = ?", exec.ID).Count(&stateCount).Error; err != nil {
+		t.Fatalf("count step states: %v", err)
+	}
+	if stateCount != 0 {
+		t.Errorf("fork item persisted %d step state row(s); want 0", stateCount)
+	}
+}
+
+// TestSaveExecution_SnapshotsLiveState verifies that persistence does not write
+// gorm's generated columns back into the live execution/step-state structs.
+// Those writes would race with concurrent readers (edict 900).
+func TestSaveExecution_SnapshotsLiveState(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	exec := &RitualExecution{
+		ID:         "snapshot-exec-1",
+		RitualName: "snapshot",
+		EdictID:    900,
+		Username:   "testuser",
+		Project:    "testproject",
+		stepStates: []RitualStepState{{ExecutionID: "snapshot-exec-1", Name: "step1"}},
+	}
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner.saveExecution(exec)
+
+	// A fresh row gets an auto-increment id from the DB. That id must live on
+	// the persisted row, not be written into the live struct by Save.
+	if exec.stepStates[0].ID != 0 {
+		t.Errorf("saveExecution wrote generated id %d into live step state", exec.stepStates[0].ID)
+	}
+
+	var stored RitualStepState
+	if err := db.Where("execution_id = ?", exec.ID).First(&stored).Error; err != nil {
+		t.Fatalf("persisted step state not found: %v", err)
+	}
+	if stored.ID == 0 {
+		t.Error("persisted step state has no generated id")
+	}
+}
+
+// TestRaceGate_FailsClosed guards the permanent gate wired by edict 900. It is
+// a static check, not a test of the race detector itself: it asserts the
+// justfile wiring is such that `just test` propagates a `just test-race`
+// failure. Without `set -e`, test-race is a non-final command and its non-zero
+// exit would be swallowed — the exact silent regression this edict prevents.
+func TestRaceGate_FailsClosed(t *testing.T) {
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "Justfile"))
+	if err != nil {
+		t.Fatalf("read Justfile: %v", err)
+	}
+	content := string(data)
+
+	// The test recipe must invoke the race recipe...
+	if !strings.Contains(content, "just test-race") {
+		t.Fatal("Justfile `test` recipe does not invoke `just test-race`")
+	}
+
+	// ...and the test recipe must run with errexit so a failing race step
+	// aborts it (`set -e` or the combined `set -euo pipefail`).
+	testRecipe := recipeBody(content, "test:")
+	if testRecipe == "" {
+		t.Fatal("could not extract `test:` recipe body from Justfile")
+	}
+	if !strings.Contains(testRecipe, "set -e") {
+		t.Fatal("`test:` recipe lacks `set -e`; a failing `just test-race` would be swallowed and `just test` would exit 0")
+	}
+
+	// The race recipe must actually enable the race detector.
+	raceRecipe := recipeBody(content, "test-race")
+	if raceRecipe == "" {
+		t.Fatal("could not extract `test-race` recipe body from Justfile")
+	}
+	if !strings.Contains(raceRecipe, "-race") {
+		t.Fatal("`test-race` recipe does not pass -race to go test")
+	}
+}
+
+// recipeBody returns the indented body of the recipe whose header line starts
+// with header (e.g. "test:" or "test-race"). It stops at the next unindented,
+// non-blank line.
+func recipeBody(justfile, header string) string {
+	lines := strings.Split(justfile, "\n")
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, header) && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	var body []string
+	for _, line := range lines[start:] {
+		if line == "" {
+			body = append(body, line)
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			break
+		}
+		body = append(body, line)
+	}
+	return strings.Join(body, "\n")
 }
 
 // mockCallCountRunner implements runners.Runner for fork tests

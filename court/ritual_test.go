@@ -2233,8 +2233,10 @@ func TestRitualMinisterStepRoutesThroughTaskPattern(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run ritual in background and capture the task
+	runDone := make(chan struct{})
 	go func() {
 		_ = runner.Run(ctx, exec)
+		close(runDone)
 	}()
 
 	// Wait for task to arrive at the minister
@@ -2257,12 +2259,13 @@ func TestRitualMinisterStepRoutesThroughTaskPattern(t *testing.T) {
 	// Send result back and verify ritual completes
 	receivedTask.Done <- Result{Output: "success", Err: nil}
 
-	// Wait for ritual to complete
-	for i := 0; i < 50; i++ {
-		if exec.State == RitualStateCompleted || exec.State == RitualStateFailed {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// Wait for ritual to complete. Waiting on the goroutine's completion
+	// synchronizes with the Run goroutine's writes to exec (channel close
+	// establishes happens-before) — polling exec.State directly would race.
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ritual did not complete after result was delivered")
 	}
 
 	assert.Equal(t, RitualStateCompleted, exec.State, "ritual should complete successfully")
@@ -3990,6 +3993,158 @@ func TestExecuteForkDAG_NoEarlyDispatch(t *testing.T) {
 	// Since l1 takes 50ms, any premature l2 dispatch would appear as
 	// callLog[0] containing "task 2" — but we already verified
 	// callLog[0] is task 1 and callLog[1] is task 2 above.
+}
+
+// concurrencyProbeMinister accepts each task and holds it "in flight" for a
+// fixed duration, tracking the high-water mark of simultaneously in-flight
+// tasks. It exists to prove that a fork with BatchSize=N actually overlaps N
+// units in time — the existing order-only tests cannot distinguish parallel
+// dispatch from sequential dispatch.
+type concurrencyProbeMinister struct {
+	MinisterBase
+	id        string
+	tasksCh   chan *Task
+	hold      time.Duration
+	mu        sync.Mutex
+	inFlight  int
+	maxFlight int
+}
+
+func (m *concurrencyProbeMinister) ID() string                  { return m.id }
+func (m *concurrencyProbeMinister) SystemPrompt() string        { return "" }
+func (m *concurrencyProbeMinister) Title() string               { return m.id }
+func (m *concurrencyProbeMinister) Tools() []Tool               { return nil }
+func (m *concurrencyProbeMinister) Tasks() chan<- *Task         { return m.tasksCh }
+func (m *concurrencyProbeMinister) Model() LLMProvider          { return nil }
+func (m *concurrencyProbeMinister) GetConfig() config.LLMConfig { return config.LLMConfig{} }
+func (m *concurrencyProbeMinister) RepoInfo() repo.RepoInfo     { return repo.RepoInfo{} }
+
+func (m *concurrencyProbeMinister) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-m.tasksCh:
+			// Each task runs in its own goroutine so multiple dispatched
+			// units can genuinely overlap.
+			go func(t *Task) {
+				m.mu.Lock()
+				m.inFlight++
+				if m.inFlight > m.maxFlight {
+					m.maxFlight = m.inFlight
+				}
+				m.mu.Unlock()
+
+				select {
+				case <-time.After(m.hold):
+				case <-t.Ctx.Done():
+				}
+
+				m.mu.Lock()
+				m.inFlight--
+				m.mu.Unlock()
+				t.Done <- Result{Output: "done\n"}
+			}(t)
+		}
+	}
+}
+
+func (m *concurrencyProbeMinister) maxInFlight() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxFlight
+}
+
+// TestExecuteForkDAG_ProvesConcurrentDispatch is the adversarial companion to
+// TestExecuteForkDAG_DispatchOrder_DiamondDeps. That test only checks dispatch
+// ORDER and passes whether or not siblings overlap. This test proves that with
+// BatchSize=N and N independent units, all N are genuinely in flight at the
+// same wall-clock instant. If the DAG engine silently serialized sibling units,
+// the observed max-in-flight would be 1 and this test would fail.
+//
+// The batch_size=1 case is the teeth-check: it must observe max-in-flight 1,
+// proving the assertion can distinguish serialized from parallel dispatch.
+func TestExecuteForkDAG_ProvesConcurrentDispatch(t *testing.T) {
+	cases := []struct {
+		name      string
+		batchSize int
+		want      int
+	}{
+		{"serial_batch1", 1, 1},
+		{"parallel_batch3", 3, 3},
+		{"parallel_batch8_starter", 8, 8},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupRitualTestDB(t)
+			registry := NewRitualRegistry()
+
+			ritual := &RitualDef{
+				Name: "fork-concurrency",
+				Steps: []RitualStep{
+					{
+						Name: "fork-step",
+						Fork: &ForkDef{Over: "lings", BatchSize: tc.batchSize},
+						Work: []RitualStep{
+							{Name: "work", Minister: "forge", Act: "implement {{ .item.description }}"},
+						},
+					},
+				},
+			}
+			registry.Register(ritual)
+
+			// A probe minister that holds each task long enough for siblings to
+			// overlap. Buffer must be >= the widest case (8).
+			probe := &concurrencyProbeMinister{
+				MinisterBase: MinisterBase{logger: slog.Default()},
+				id:           "forge",
+				tasksCh:      make(chan *Task, 16),
+				hold:         150 * time.Millisecond,
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go probe.Run(ctx)
+
+			court := &Court{ministers: map[string]Minister{"forge": probe}, logger: slog.Default()}
+			court.ritualGuard = NewRitualGuard(RitualGuardOpts{
+				Base:        &MinisterBase{logger: slog.Default()},
+				GetMinister: court.GetMinister,
+			})
+			runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+
+			// N independent units (no dependencies) — all ready at once.
+			workUnits := make([]interface{}, tc.want)
+			for i := range workUnits {
+				workUnits[i] = map[string]interface{}{
+					"ling_id":      fmt.Sprintf("l%d", i),
+					"description":  fmt.Sprintf("task %d", i),
+					"dependencies": storage.StringArray{},
+					"status":       "pending",
+				}
+			}
+
+			exec := &RitualExecution{
+				ID: "test-exec", RitualName: "fork-concurrency", EdictID: 1,
+				Username: "testuser", Project: "testproject",
+				Data:       storage.JSON{"lings": workUnits},
+				def:        ritual,
+				stepStates: []RitualStepState{{Name: "fork-step"}},
+			}
+
+			results, err := runner.executeForkDAG(context.Background(), exec, ritual.Steps[0], workUnits, tc.batchSize)
+			if err != nil {
+				t.Fatalf("executeForkDAG error: %v", err)
+			}
+			if len(results) != tc.want {
+				t.Fatalf("expected %d results, got %d", tc.want, len(results))
+			}
+
+			if got := probe.maxInFlight(); got != tc.want {
+				t.Fatalf("BatchSize=%d: expected max %d units in flight, observed %d — dispatch concurrency mismatch", tc.batchSize, tc.want, got)
+			}
+		})
+	}
 }
 
 // idleTestMinister is a minister that periodically sends notifications

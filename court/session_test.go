@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,13 +22,13 @@ import (
 type mockTool struct {
 	name   string
 	output string
-	called bool
+	called atomic.Bool
 }
 
 func (t *mockTool) Name() string        { return t.name }
 func (t *mockTool) Description() string { return "A mock tool for testing" }
 func (t *mockTool) Call(ctx context.Context, input string) (string, error) {
-	t.called = true
+	t.called.Store(true)
 	return t.output, nil
 }
 func (t *mockTool) Format(input, result string, err error) string {
@@ -349,9 +350,9 @@ func TestBuildPromptWithContext_WithContext(t *testing.T) {
 func TestCoreToolScheduler_Schedule(t *testing.T) {
 	t.Parallel()
 
-	var notified bool
+	var notified atomic.Bool
 	notify := func(msg any) {
-		notified = true
+		notified.Store(true)
 	}
 
 	scheduler := runners.NewCoreToolScheduler(notify)
@@ -362,8 +363,8 @@ func TestCoreToolScheduler_Schedule(t *testing.T) {
 
 	assert.NoError(t, result.Error)
 	assert.Equal(t, "result", result.Output)
-	assert.True(t, tool.called)
-	assert.True(t, notified)
+	assert.True(t, tool.called.Load())
+	assert.True(t, notified.Load())
 }
 
 func TestSession_StreamBufferMethods(t *testing.T) {
@@ -902,7 +903,7 @@ func TestSession_ExecuteToolCall_WithScheduler(t *testing.T) {
 
 	content := msgContentStr(resp)
 	assert.Equal(t, "scheduled result", content)
-	assert.True(t, tool.called)
+	assert.True(t, tool.called.Load())
 }
 
 func TestSession_ExecuteToolCall_WithoutScheduler(t *testing.T) {
@@ -918,7 +919,7 @@ func TestSession_ExecuteToolCall_WithoutScheduler(t *testing.T) {
 
 	content := msgContentStr(resp)
 	assert.Equal(t, "direct result", content)
-	assert.True(t, tool.called)
+	assert.True(t, tool.called.Load())
 }
 
 // mockToolError returns an error
@@ -954,10 +955,10 @@ func TestSession_ExecuteToolCall_Error(t *testing.T) {
 func TestCoreToolScheduler_Schedule_Error(t *testing.T) {
 	t.Parallel()
 
-	var errorNotified bool
+	var errorNotified atomic.Bool
 	notify := func(msg any) {
 		if _, ok := msg.(runners.ToolCallErrorMsg); ok {
-			errorNotified = true
+			errorNotified.Store(true)
 		}
 	}
 
@@ -968,7 +969,7 @@ func TestCoreToolScheduler_Schedule_Error(t *testing.T) {
 	result := <-ch
 
 	assert.Error(t, result.Error)
-	assert.True(t, errorNotified)
+	assert.True(t, errorNotified.Load())
 }
 
 func TestCoreToolScheduler_Schedule_NoNotify(t *testing.T) {
@@ -1575,7 +1576,7 @@ type mockToolLargeOutput struct {
 }
 
 func (t *mockToolLargeOutput) Call(ctx context.Context, input string) (string, error) {
-	t.called = true
+	t.called.Store(true)
 	// Return output larger than DefaultMaxOutputSize (50KB)
 	return strings.Repeat("col1|col2|col3|col4\n", t.outputSize/20), nil
 }

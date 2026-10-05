@@ -515,6 +515,21 @@ type RitualExecution struct {
 	forkItemLabel string // e.g. "1/3" — set by executeForkItem, read by Notify
 	forkWorkIndex int    // index of current work step within the fork
 	forkWorkTotal int    // total work steps in the fork
+	forkItem      bool   // true for a per-item fork context; owns its state and never persists
+}
+
+// forkStepStates returns a private copy of the parent's step states for a
+// single fork item. The copy resets Session so each item creates its own
+// minister session — sharing a *Session across concurrent items would itself
+// be a data race. The copy gives every item sole ownership of its slice, so no
+// goroutine in the fork path can read or write a sibling's state.
+func forkStepStates(states []RitualStepState) []RitualStepState {
+	out := make([]RitualStepState, len(states))
+	copy(out, states)
+	for i := range out {
+		out[i].Session = nil
+	}
+	return out
 }
 
 // TableName returns the table name for RitualExecution
@@ -1448,7 +1463,10 @@ func (r *RitualRunner) executeForkItem(ctx context.Context, exec *RitualExecutio
 		"item_index", itemIndex,
 		"total_items", totalItems)
 
-	// Create a fork-specific execution context
+	// Create a fork-specific execution context. Each item gets its own copy of
+	// Data and stepStates so no goroutine in the fork path shares mutable state
+	// with the parent or with a sibling item. Data values are still shallow-copied
+	// (matching the previous behaviour); only the map itself is per-item.
 	forkExec := &RitualExecution{
 		ID:            exec.ID,
 		RitualName:    exec.RitualName,
@@ -1457,10 +1475,11 @@ func (r *RitualRunner) executeForkItem(ctx context.Context, exec *RitualExecutio
 		Project:       exec.Project,
 		Data:          storage.JSON{},
 		def:           exec.def,
-		stepStates:    exec.stepStates,
+		stepStates:    forkStepStates(exec.stepStates),
 		notify:        exec.notify,
 		CurrentStep:   exec.CurrentStep,
 		forkItemLabel: fmt.Sprintf("%d/%d", itemIndex+1, totalItems),
+		forkItem:      true,
 	}
 
 	// Copy existing context
@@ -1486,18 +1505,8 @@ func (r *RitualRunner) executeForkItem(ctx context.Context, exec *RitualExecutio
 		forkExec.forkWorkIndex = i
 		forkExec.forkWorkTotal = len(step.Work)
 
-		// Create a temporary step state for this work item
-		workStepState := RitualStepState{
-			ExecutionID: exec.ID,
-			StepIndex:   exec.CurrentStep,
-			Name:        workStep.Name,
-			Status:      "pending",
-		}
-
 		// Execute the work step
 		output, err := r.executeStep(ctx, forkExec, workStep)
-		workStepState.Message = output
-		workStepState.Output = output
 
 		if err != nil {
 			result.Error = err
@@ -2264,15 +2273,27 @@ func (r *RitualRunner) clearPause(channelID string) {
 	delete(r.pauseChans, channelID)
 }
 
-// saveExecution persists execution state to database
+// saveExecution persists execution state to database. Fork items never persist:
+// they own only item-private state, and persisting shared rows concurrently
+// would race. The parent execution is saved once all fork items complete.
+//
+// Persistence operates on snapshots: gorm's Save writes back generated
+// columns (ids, timestamps) into the struct it is given, and those writes to
+// live state would race with concurrent readers. Copies absorb them instead.
 func (r *RitualRunner) saveExecution(exec *RitualExecution) {
+	if exec.forkItem {
+		return
+	}
 	exec.UpdatedAt = time.Now()
-	if err := r.db.Save(exec).Error; err != nil {
+
+	snapshot := *exec
+	if err := r.db.Save(&snapshot).Error; err != nil {
 		r.logger.Warn("failed to save ritual execution", "error", err)
 	}
 
 	for i := range exec.stepStates {
-		if err := r.db.Save(&exec.stepStates[i]).Error; err != nil {
+		state := exec.stepStates[i]
+		if err := r.db.Save(&state).Error; err != nil {
 			r.logger.Warn("failed to save step state", "error", err)
 		}
 	}
