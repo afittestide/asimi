@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +78,114 @@ func bifrostErrorToGoError(be *schemas.BifrostError) error {
 		}
 	}
 	return fmt.Errorf("bifrost error: %s", RedactProviderErrorMessage(be.String()))
+}
+
+// contextOverflowPhrases are provider phrasings that indicate the request
+// was rejected because the prompt exceeds the model's context window. Match
+// is case-insensitive; status 400/413 narrows non-overflow 400s out.
+var contextOverflowPhrases = []string{
+	"exceeds the available context size",
+	"context_length_exceeded",
+	"maximum context length",
+	"too many tokens",
+}
+
+// contextOverflowStatusPattern captures the HTTP status embedded in a
+// wrapped provider error ("... , status 400): ..." or "status 413: ...").
+var contextOverflowStatusPattern = regexp.MustCompile(`status (\d{3})\b`)
+
+// isContextOverflowError reports whether err is a provider rejection caused
+// by the prompt exceeding the context window. It matches when a known
+// overflow phrase is present; when the error carries an HTTP status, only
+// 400/413 qualify, so an unrelated 400 (no phrase) is never classified.
+func isContextOverflowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	hasPhrase := false
+	for _, phrase := range contextOverflowPhrases {
+		if strings.Contains(msg, phrase) {
+			hasPhrase = true
+			break
+		}
+	}
+	if !hasPhrase {
+		return false
+	}
+	// When a status made it onto the error string, it must be client-error
+	// 400/413. Errors whose status never crossed the wire (bare stream
+	// message) still classify on the phrase alone.
+	if m := contextOverflowStatusPattern.FindStringSubmatch(msg); len(m) == 2 {
+		if m[1] != "400" && m[1] != "413" {
+			return false
+		}
+	}
+	return true
+}
+
+// contextOverflowLimitPattern matches the token count in a provider message
+// of the form "exceeds the available context size (131072 tokens)". The
+// capture is the integer token count.
+var contextOverflowLimitPattern = regexp.MustCompile(`exceeds the available context size \((\d+)\s+tokens?\)`)
+
+// parseContextOverflowLimit extracts the provider-reported context window
+// from a context-overflow error message. It returns 0 when the message does
+// not carry a well-formed count, so a malformed message never fabricates a
+// window.
+func parseContextOverflowLimit(err error) int {
+	if err == nil {
+		return 0
+	}
+	m := contextOverflowLimitPattern.FindStringSubmatch(strings.ToLower(err.Error()))
+	if len(m) < 2 {
+		return 0
+	}
+	n, convErr := strconv.Atoi(m[1])
+	if convErr != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// autoRecoveryCompactPrompt is the summarisation instruction used when Asimi
+// auto-recovers from a context-overflow rejection. The interactive :compact
+// command supplies its own prompt.
+const autoRecoveryCompactPrompt = `The conversation exceeded the model's context window and must be compacted to continue.
+
+Summarize the conversation history below so it can replace the history while preserving all essential information:
+1. Capture the user's outstanding request and any pending work verbatim.
+2. Preserve key decisions, file paths, code snippets, and changes made.
+3. Maintain the chronological flow of work.
+4. Exclude redundant tool calls and intermediate steps.
+
+Format the response as a clear, well-organized summary that allows the conversation to continue seamlessly.`
+
+// contextOverflowError is a classified context-window overflow. It is
+// intentionally not rendered as a generic model error: the TUI maps it to a
+// dedicated stream message and the session stays usable.
+type contextOverflowError struct {
+	Window int
+	Cause  error
+}
+
+func (e *contextOverflowError) Error() string {
+	if e.Window > 0 {
+		return fmt.Sprintf("context window %d exceeded — use :compact or :new", e.Window)
+	}
+	return "context window exceeded — use :compact or :new"
+}
+
+func (e *contextOverflowError) Unwrap() error { return e.Cause }
+
+// contextOverflowWindow reports whether err is (or wraps) a classified
+// context-overflow error, returning its window when known.
+func contextOverflowWindow(err error) (int, bool) {
+	var coe *contextOverflowError
+	if errors.As(err, &coe) {
+		return coe.Window, true
+	}
+	return 0, false
 }
 
 // requestContext identifies the provider endpoint this session's
@@ -197,6 +306,17 @@ type StreamMaxTokensReachedMsg struct {
 	Content   string `msgpack:"content,omitempty"`
 }
 
+// StreamContextOverflowMsg signals that a provider rejected the request
+// because the prompt exceeds the context window, and that recovery could not
+// fit. Unlike StreamErrorMsg it does not render a generic "Model Error:" nor
+// mark the session failed — the session stays alive and the prompt remains
+// recoverable. Window is the (provider-reported or parsed) window size when
+// known, 0 otherwise.
+type StreamContextOverflowMsg struct {
+	ChannelID string `msgpack:"channel_id"`
+	Window    int    `msgpack:"window,omitempty"`
+}
+
 // SessionConfig holds configuration for minister sessions
 type SessionConfig struct {
 	LLM             internalconfig.LLMConfig
@@ -234,15 +354,25 @@ type Session struct {
 	// keystroke. Unlike the package-level modelContextByKey cache, a registry
 	// or "guessed" default is stored here and never shared across sessions;
 	// a model change displaces it. See getModelContextSize.
-	ctxSizeKey   string
-	ctxSize      int
-	ctxSizeSet   bool
-	atifRecorder atifRecorder // ATIF trajectory recorder (non-nil when --atif is set)
-	tools        []Tool
-	messages     []schemas.ChatMessage
-	notify       internal.NotifyFunc
-	systemPrompt string
-	channelID    string
+	//
+	// ctxSizeApprox records whether the memoized window is a provider-reported
+	// fact (false) or a registry estimate (true). Only a provider-reported
+	// value or a token count parsed from a provider error is ever exact.
+	ctxSizeKey    string
+	ctxSize       int
+	ctxSizeSet    bool
+	ctxSizeApprox bool
+
+	// contextRecoveryDone guards the single context-overflow recovery and
+	// retry per turn. It is set while recovering so the compaction request it
+	// issues cannot itself trigger another recursive recovery.
+	contextRecoveryDone bool
+	atifRecorder        atifRecorder // ATIF trajectory recorder (non-nil when --atif is set)
+	tools               []Tool
+	messages            []schemas.ChatMessage
+	notify              internal.NotifyFunc
+	systemPrompt        string
+	channelID           string
 
 	// Tool execution
 	toolCatalog map[string]Tool
@@ -737,6 +867,7 @@ var modelMaxOutputTokens = map[string]int{
 type ContextInfo struct {
 	Model              string
 	TotalTokens        int
+	TotalTokensApprox  bool // TotalTokens is a registry estimate, not provider-reported
 	UsedTokens         int
 	SystemPromptTokens int
 	SystemToolsTokens  int
@@ -751,6 +882,7 @@ func (s *Session) GetContextInfo() ContextInfo {
 	info := ContextInfo{
 		Model:              s.getModelName(),
 		TotalTokens:        s.getModelContextSize(),
+		TotalTokensApprox:  s.contextSizeIsApprox(),
 		SystemPromptTokens: s.systemPromptTokens,
 		SystemToolsTokens:  s.systemToolsTokens,
 		MemoryFilesTokens:  s.memoryFilesTokens,
@@ -814,9 +946,12 @@ func ApproximateContextSize(provider, model string) int {
 	return matchContextRule(modelContextSizes, strings.ToLower(provider)+":"+model)
 }
 
-// modelContextByKey caches context window sizes resolved from bifrost,
-// keyed "provider:model". Lazily populated on first miss from the regex
-// registry. Shared across all sessions — one network call per model.
+// modelContextByKey caches provider-reported context window sizes, keyed
+// "provider:model". Lazily populated on first miss from the provider probe
+// or from a value parsed out of a provider error. It holds exact values
+// only — a registry estimate is never shared here, so no session can
+// inherit a guess as fact. Shared across all sessions — one network call
+// per model.
 var modelContextByKey sync.Map // map[string]int
 
 // resolveContextSizeFromBifrost queries the LLM provider for the configured
@@ -856,24 +991,27 @@ func (s *Session) resolveContextSizeFromBifrost(provider, modelName string) int 
 	return defaultUnknownContextRef
 }
 
-// getModelContextSize returns the context window size for the current model.
-// The resolved size (including provider defaults) lives in modelContextSizes;
-// a provider:model key lets one general family rule serve many delivery routes.
-// The regex registry is the primary deterministic fast path; bifrost only
-// supplements known models with a shared, lazy per-provider:model cache.
-func (s *Session) getModelContextSize() int {
-	modelName := strings.ToLower(s.getModelName())
-
-	// Strip routing tag (":nitro", ":free") before matching model rules.
+// currentContextKey returns the normalized "<provider>:<model>" cache key
+// for the active session model, with any routing tag (":nitro", ":free")
+// stripped from the model half. provider and model are the normalized parts.
+func (s *Session) currentContextKey() (key, provider, modelName string) {
+	modelName = strings.ToLower(s.getModelName())
 	if idx := strings.Index(modelName, ":"); idx > 0 {
 		modelName = modelName[:idx]
 	}
-
-	var provider string
 	if s.config != nil {
 		provider = strings.ToLower(s.config.Provider)
 	}
-	key := provider + ":" + modelName
+	return provider + ":" + modelName, provider, modelName
+}
+
+// getModelContextSize returns the context window size for the current model.
+// The provider-reported window (bifrost list-models) is the source of truth
+// and is probed first; only when the provider reports nothing does the
+// registry supply an approximate fallback. Exact values are shared via
+// modelContextByKey; an estimate is memoized per-session only.
+func (s *Session) getModelContextSize() int {
+	key, provider, modelName := s.currentContextKey()
 
 	// Per-session fast path: the window was already resolved for this exact
 	// provider:model during this session's lifetime. This is what keeps the
@@ -882,28 +1020,27 @@ func (s *Session) getModelContextSize() int {
 		return s.ctxSize
 	}
 
-	// Shared lazy path: one network lookup per provider:model, stored at
-	// package level for all sessions. Only genuine bifrost-reported values
-	// are stored here — never a registry guess or a fabricated default.
+	// Shared lazy path: a provider-reported value already learned for this
+	// provider:model. Exact only — a registry guess never lands here.
 	if size, ok := modelContextByKey.Load(key); ok {
-		s.rememberContextSize(key, size.(int))
+		s.rememberContextSize(key, size.(int), false)
 		return size.(int)
 	}
 
-	// Deterministic registry first — the primary fast path, no I/O. Trying
-	// the registry before bifrost keeps a known model's first resolution free
-	// of a network round-trip that previously happened on every UI render.
-	if size := matchContextRule(modelContextSizes, key); size > 0 {
-		slog.Info("Using context size from registry", "size", size)
-		modelContextByKey.Store(key, size) // deterministic result → cache it, stop re-probing
-		s.rememberContextSize(key, size)
+	// Provider-reported window first — the authoritative source of truth.
+	// The registry can overestimate for self-hosted OpenAI-compatible
+	// proxies, so it must never win over what the endpoint advertises.
+	if size := s.resolveContextSizeFromBifrost(provider, modelName); size != defaultUnknownContextRef {
+		modelContextByKey.Store(key, size) // real provider value, safe to share
+		s.rememberContextSize(key, size, false)
 		return size
 	}
 
-	// Lazy bifrost probe, only for models the registry does not cover.
-	if size := s.resolveContextSizeFromBifrost(provider, modelName); size != defaultUnknownContextRef {
-		modelContextByKey.Store(key, size) // real bifrost value, safe to share
-		s.rememberContextSize(key, size)
+	// Provider reported nothing: fall back to the deterministic registry and
+	// mark the result approximate so callers never present it as exact.
+	if size := matchContextRule(modelContextSizes, key); size > 0 {
+		slog.Info("using approximate context size from registry", "size", size)
+		s.rememberContextSize(key, size, true)
 		return size
 	}
 
@@ -912,17 +1049,43 @@ func (s *Session) getModelContextSize() int {
 	// memoize it per-session so the render loop doesn't re-probe bifrost on
 	// every keystroke.
 	slog.Warn("context window unknown; not guessing", "provider", provider, "model", modelName)
-	s.rememberContextSize(key, defaultUnknownContextRef)
+	s.rememberContextSize(key, defaultUnknownContextRef, true)
 	return defaultUnknownContextRef
+}
+
+// contextSizeIsApprox reports whether the current session's memoized window
+// is a registry estimate rather than a provider-reported fact.
+func (s *Session) contextSizeIsApprox() bool {
+	key, _, _ := s.currentContextKey()
+	if s.ctxSizeSet && s.ctxSizeKey == key {
+		return s.ctxSizeApprox
+	}
+	return false
 }
 
 // rememberContextSize memoizes the resolved window size for the active
 // provider:model in the per-session cache. Only the current key is kept; a
-// provider/model change naturally displaces the stale entry.
-func (s *Session) rememberContextSize(key string, size int) {
+// provider/model change naturally displaces the stale entry. approx marks
+// a registry estimate (never to be shown as exact).
+func (s *Session) rememberContextSize(key string, size int, approx bool) {
 	s.ctxSizeKey = key
 	s.ctxSize = size
 	s.ctxSizeSet = true
+	s.ctxSizeApprox = approx
+}
+
+// learnContextSizeFromError seeds the per-session and shared caches with an
+// authoritative window parsed from a provider context-length error. Values
+// parsed here override any registry guess; a non-positive size is ignored so
+// a malformed message can never fabricate a window.
+func (s *Session) learnContextSizeFromError(size int) {
+	if size <= 0 {
+		return
+	}
+	key, _, _ := s.currentContextKey()
+	modelContextByKey.Store(key, size)
+	s.rememberContextSize(key, size, false)
+	slog.Info("learned context window from provider error", "size", size)
 }
 
 // updateTokenCounts recalculates and stores token counts for all context components
@@ -1019,49 +1182,218 @@ func (s *Session) GetContextUsagePercent() float64 {
 
 // --- History Compaction ---
 
-// CompactHistory summarizes the conversation history to reduce context usage
+// Bounds for the summary request built by CompactHistory. The prompt handed
+// to the model must fit the same window that triggered the overflow, leaving
+// room for the system prompt and the model's output cap. minCompactContentTokens
+// keeps at least a token of conversation in pathological tiny-window cases.
+const (
+	minCompactContentTokens = 256
+	compactSectionOverhead  = 16
+)
+
+// maxCompletionTokens returns the output cap applied to chat requests. Kept in
+// one place so the compaction budget and generateLLMResponse agree.
+func (s *Session) maxCompletionTokens() int {
+	maxTokens := 262144
+	if cap, ok := modelMaxOutputTokens[s.Model]; ok && cap < maxTokens {
+		maxTokens = cap
+	}
+	return maxTokens
+}
+
+// compactBudget returns the token budget the assembled summary prompt must
+// respect: the known window minus the system prompt and an output reserve,
+// where the reserve never swallows more than a quarter of the window.
+func (s *Session) compactBudget() int {
+	window := s.getModelContextSize()
+	reserve := s.maxCompletionTokens()
+	if quarter := window / 4; quarter > 0 && reserve > quarter {
+		reserve = quarter
+	}
+	budget := window - s.systemPromptTokens - reserve
+	if budget < minCompactContentTokens {
+		budget = minCompactContentTokens
+	}
+	return budget
+}
+
+// truncationMarker marks a truncated piece of text. Its tokens are charged
+// against the truncation budget so the result never exceeds maxTokens.
+const truncationMarker = "\n…[truncated]"
+
+// truncateToTokens truncates text to at most maxTokens estimated tokens,
+// cutting on a word boundary and marking the cut. It returns text unchanged
+// when it already fits. The returned string's countTokens is guaranteed to be
+// ≤ maxTokens: the marker's tokens are reserved up front and the kept-word
+// count is shrunk until the assembled text verifiably fits.
+func (s *Session) truncateToTokens(text string, maxTokens int) string {
+	if maxTokens <= 0 {
+		return ""
+	}
+	if s.countTokens(text) <= maxTokens {
+		return text
+	}
+
+	// Reserve the marker's tokens; if even the bare marker cannot fit, return
+	// nothing (the caller drops the piece) rather than exceed the bound.
+	markerTokens := s.countTokens(truncationMarker)
+	if markerTokens >= maxTokens {
+		return ""
+	}
+	contentBudget := maxTokens - markerTokens
+
+	words := strings.Fields(text)
+	// countTokens is len(words)*4/3, so contentBudget tokens ≈ contentBudget*3/4
+	// words. Start there and shrink until the fully assembled result verifies
+	// ≤ maxTokens, because integer truncation in countTokens can round up.
+	keep := contentBudget * 3 / 4
+	if keep < 1 {
+		keep = 1
+	}
+	if keep > len(words) {
+		keep = len(words)
+	}
+	for keep > 0 {
+		result := strings.Join(words[:keep], " ") + truncationMarker
+		if s.countTokens(result) <= maxTokens {
+			return result
+		}
+		keep--
+	}
+	return truncationMarker
+}
+
+// summarizableMessageText renders a single history message for the summary
+// prompt. Tool results are included but are the first candidates for trimming
+// because they are the usual source of bulk.
+func (s *Session) summarizableMessageText(msg schemas.ChatMessage) string {
+	switch msg.Role {
+	case schemas.ChatMessageRoleUser:
+		if msg.Content != nil && msg.Content.ContentStr != nil {
+			return "**User:**\n" + *msg.Content.ContentStr + "\n\n"
+		}
+	case schemas.ChatMessageRoleAssistant:
+		if msg.Content != nil && msg.Content.ContentStr != nil {
+			return "**Assistant:**\n" + *msg.Content.ContentStr + "\n\n"
+		}
+	case schemas.ChatMessageRoleTool:
+		if msg.Content != nil && msg.Content.ContentStr != nil {
+			return "**Tool result:**\n" + *msg.Content.ContentStr + "\n\n"
+		}
+	}
+	return ""
+}
+
+// buildCompactContent assembles the conversation content to summarize within
+// contentBudget tokens. It keeps the most recent messages and drops or
+// truncates older/large ones until the content fits. The returned string is
+// guaranteed to be ≤ contentBudget in estimated tokens.
+func (s *Session) buildCompactContent(contentBudget int) string {
+	var b strings.Builder
+
+	// appendWithin adds text only while the cumulative string fits the
+	// budget. countTokens is not additive across joins (integer *4/3), so the
+	// check runs against the real accumulated string: after truncating on a
+	// word boundary, content words are dropped from the end until it verifies
+	// (the trailing truncation marker is preserved throughout).
+	appendWithin := func(text string) {
+		if text == "" {
+			return
+		}
+		base := b.String()
+		if s.countTokens(base+text) <= contentBudget {
+			b.WriteString(text)
+			return
+		}
+		// Reserve one token for the non-additivity across the join boundary.
+		allowed := contentBudget - s.countTokens(base) - 1
+		if allowed <= 0 {
+			return
+		}
+		text = s.truncateToTokens(text, allowed)
+
+		marker := ""
+		if strings.HasSuffix(text, truncationMarker) {
+			marker = truncationMarker
+			text = strings.TrimSuffix(text, truncationMarker)
+		}
+		for {
+			if s.countTokens(base+text+marker) <= contentBudget {
+				b.WriteString(text + marker)
+				return
+			}
+			words := strings.Fields(text)
+			if len(words) == 0 {
+				return
+			}
+			text = strings.Join(words[:len(words)-1], " ")
+		}
+	}
+
+	// File changes are valuable but bulky, so they share the budget. Every
+	// section is routed through appendWithin so even a tiny budget cannot be
+	// overrun by a header.
+	appendWithin("## File Changes and Diffs\n\n")
+	fileChanges := s.extractFileChanges()
+	if len(fileChanges) > 0 {
+		for path, changes := range fileChanges {
+			appendWithin(fmt.Sprintf("### %s\n\n", path))
+			for _, change := range changes {
+				appendWithin(change + "\n\n")
+			}
+		}
+	} else {
+		appendWithin("No file changes recorded.\n\n")
+	}
+
+	appendWithin("## Conversation History\n\n")
+
+	// Keep the most recent messages: walk backwards collecting rendered
+	// pieces until nothing more fits, then emit them oldest-first.
+	remaining := contentBudget - s.countTokens(b.String())
+	pieces := make([]string, 0, len(s.messages))
+	for i := len(s.messages) - 1; i >= 1 && remaining > 0; i-- {
+		text := s.summarizableMessageText(s.messages[i])
+		if text == "" {
+			continue
+		}
+		tokens := s.countTokens(text)
+		if tokens > remaining {
+			text = s.truncateToTokens(text, remaining)
+			tokens = s.countTokens(text)
+		}
+		if text == "" {
+			continue
+		}
+		pieces = append(pieces, text)
+		remaining -= tokens
+	}
+	for i := len(pieces) - 1; i >= 0; i-- {
+		appendWithin(pieces[i])
+	}
+
+	return b.String()
+}
+
+// CompactHistory summarizes the conversation history to reduce context usage.
+// The assembled summary request is bounded against the known context window
+// (minus the system prompt and output reserve); when the conversation is too
+// large to summarize whole, older/large messages and tool results are trimmed
+// so the request itself fits the window that triggered the overflow. When the
+// conversation already fits, the content is summarized in full (:compact).
 func (s *Session) CompactHistory(ctx context.Context, compactPrompt string) (string, error) {
 	if len(s.messages) <= 2 {
 		return "", fmt.Errorf("not enough conversation history to compact")
 	}
 
-	// Build the content to summarize
-	var contentBuilder strings.Builder
-
-	contentBuilder.WriteString("## File Changes and Diffs\n\n")
-	fileChanges := s.extractFileChanges()
-	if len(fileChanges) > 0 {
-		for path, changes := range fileChanges {
-			contentBuilder.WriteString(fmt.Sprintf("### %s\n\n", path))
-			for _, change := range changes {
-				contentBuilder.WriteString(change)
-				contentBuilder.WriteString("\n\n")
-			}
-		}
-	} else {
-		contentBuilder.WriteString("No file changes recorded.\n\n")
+	// Reserve room for the compact instructions themselves before sizing the
+	// conversation content.
+	contentBudget := s.compactBudget() - s.countTokens(compactPrompt) - compactSectionOverhead
+	if contentBudget < minCompactContentTokens {
+		contentBudget = minCompactContentTokens
 	}
 
-	contentBuilder.WriteString("## Conversation History\n\n")
-	for i := 1; i < len(s.messages); i++ {
-		msg := s.messages[i]
-		switch msg.Role {
-		case schemas.ChatMessageRoleUser:
-			contentBuilder.WriteString("**User:**\n")
-			if msg.Content != nil && msg.Content.ContentStr != nil {
-				contentBuilder.WriteString(*msg.Content.ContentStr)
-				contentBuilder.WriteString("\n\n")
-			}
-		case schemas.ChatMessageRoleAssistant:
-			contentBuilder.WriteString("**Assistant:**\n")
-			if msg.Content != nil && msg.Content.ContentStr != nil {
-				contentBuilder.WriteString(*msg.Content.ContentStr)
-				contentBuilder.WriteString("\n\n")
-			}
-		}
-	}
-
-	fullPrompt := fmt.Sprintf("%s\n\n---\n\n%s", compactPrompt, contentBuilder.String())
+	fullPrompt := fmt.Sprintf("%s\n\n---\n\n%s", compactPrompt, s.buildCompactContent(contentBudget))
 
 	originalMessages := s.messages
 	systemMessage := s.messages[0]
@@ -1104,6 +1436,25 @@ func (s *Session) CompactHistory(ctx context.Context, compactPrompt string) (str
 	s.updateTokenCounts()
 
 	return summary, nil
+}
+
+// pendingUserTurn returns the content of the most recent user message, or ""
+// when the history has none. At overflow time the final message may be a
+// tool result (a large read_file/shell output blowing past the window inside
+// a tool loop), so recovery must look back past trailing assistant/tool turns
+// to recover the outstanding request being retried.
+func (s *Session) pendingUserTurn() string {
+	for i := len(s.messages) - 1; i >= 0; i-- {
+		msg := s.messages[i]
+		if msg.Role != schemas.ChatMessageRoleUser {
+			continue
+		}
+		if msg.Content != nil && msg.Content.ContentStr != nil {
+			return *msg.Content.ContentStr
+		}
+		return ""
+	}
+	return ""
 }
 
 // extractFileChanges extracts all file changes from tool call responses
@@ -1310,7 +1661,89 @@ func buildPromptWithContext(userPrompt string, contextFiles map[string]string) s
 // generateLLMResponse calls the LLM and returns the response. When stream is
 // true it takes the streaming path, emitting content and reasoning chunks via
 // s.notify as deltas arrive.
+//
+// On a provider context-overflow rejection it recovers once: it learns the
+// real window from the error, runs a bounded compaction that fits within that
+// window, and re-sends the current request. If recovery cannot fit, it
+// returns an actionable contextOverflowError instead of a raw provider error
+// so the caller can keep the session alive.
 func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*responseChoice, error) {
+	choice, err := s.doGenerateLLMResponse(ctx, stream)
+	if err == nil {
+		return choice, nil
+	}
+	if !isContextOverflowError(err) {
+		return nil, err
+	}
+
+	// The provider just told us the true window; trust it over any registry
+	// estimate before doing anything else.
+	if size := parseContextOverflowLimit(err); size > 0 {
+		s.learnContextSizeFromError(size)
+	}
+	window := s.getModelContextSize()
+
+	// A single recovery per call. The guard is also set while CompactHistory
+	// issues its own summary request, so that request cannot recurse.
+	if s.contextRecoveryDone {
+		return nil, s.classifyOverflow(window, err)
+	}
+	s.contextRecoveryDone = true
+	defer func() { s.contextRecoveryDone = false }()
+
+	// Remember the outstanding user turn before compaction: CompactHistory
+	// rebuilds history ending in an assistant ack, so the request being
+	// retried would otherwise be dropped from the payload entirely. This must
+	// look past trailing assistant/tool turns: the edict's motivating case is
+	// a large tool result overflowing the window mid-tool-loop, where the last
+	// message is a tool result, not the user turn.
+	pending := s.pendingUserTurn()
+
+	if _, cerr := s.CompactHistory(ctx, autoRecoveryCompactPrompt); cerr != nil {
+		slog.Warn("context overflow recovery could not compact", "error", cerr)
+		return nil, s.classifyOverflow(window, err)
+	}
+
+	// Re-append the outstanding request so the retried payload ends on the
+	// user's turn rather than the compaction ack. Bound it to the room left
+	// after the summary so a large prompt cannot immediately re-overflow.
+	if pending != "" {
+		room := s.compactBudget() - s.countMessagesTokens()
+		if room < 1 {
+			room = 1
+		}
+		s.messages = append(s.messages, schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: textContent(s.truncateToTokens(pending, room)),
+		})
+		s.updateTokenCounts()
+	}
+
+	// Re-send the current request now that history fits. Discard any partial
+	// streamed content from the overflowed attempt so the retry's output is
+	// what the caller sees.
+	if stream {
+		s.resetStreamBuffer()
+	}
+	retryChoice, retryErr := s.doGenerateLLMResponse(ctx, stream)
+	if retryErr != nil && isContextOverflowError(retryErr) {
+		if size := parseContextOverflowLimit(retryErr); size > 0 {
+			s.learnContextSizeFromError(size)
+		}
+		return nil, s.classifyOverflow(s.getModelContextSize(), retryErr)
+	}
+	return retryChoice, retryErr
+}
+
+// classifyOverflow wraps a raw provider overflow error as a non-halting,
+// actionable contextOverflowError carrying the known window (0 when unknown).
+func (s *Session) classifyOverflow(window int, cause error) error {
+	return &contextOverflowError{Window: window, Cause: cause}
+}
+
+// doGenerateLLMResponse performs a single provider request without overflow
+// recovery.
+func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*responseChoice, error) {
 	// Remove any unmatched tool calls from context before sending to API
 	s.sanitizeMessages()
 
@@ -1940,6 +2373,15 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 					s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText})
 				}
 				return accumulatedText, ctx.Err()
+			}
+			// A context overflow that recovery could not fit is surfaced as a
+			// distinct, non-halting message: no generic "Model Error:" and no
+			// session failure — the prompt stays recoverable.
+			if window, ok := contextOverflowWindow(err); ok {
+				if s.notify != nil {
+					s.notify(StreamContextOverflowMsg{ChannelID: s.channelID, Window: window})
+				}
+				return "", err
 			}
 			if s.notify != nil {
 				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err})

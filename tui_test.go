@@ -1827,6 +1827,81 @@ func TestStreamErrorMsg_ModelError_StillShowsModelError(t *testing.T) {
 	assert.True(t, foundModelError, "genuine model error should show 'Model Error'")
 }
 
+// e908: a context-overflow rejection that recovery could not fit must not be
+// rendered as a generic model error and must not mark the session failed. The
+// prompt stays recoverable and the window is surfaced in the hint.
+func TestStreamContextOverflowMsg_NonHaltingActionableHint(t *testing.T) {
+	if globalTheme == nil {
+		globalTheme = NewTheme()
+	}
+	model := newTestModel(t)
+	channelID := model.tabs.ActiveTab().Target
+
+	// A prompt is in flight when the overflow arrives.
+	model.startWaitingForResponse()
+	model.tabs.ActiveTab().Streaming = true
+	model.streamCompleteCallback = func(*TUIModel) tea.Cmd { return nil }
+
+	msgCountBefore := len(model.tabs.Content().Chat.Messages)
+
+	newModel, _ := model.handleCustomMessages(court.StreamContextOverflowMsg{
+		ChannelID: channelID,
+		Window:    131_072,
+	})
+	updatedModel := newModel.(TUIModel)
+
+	// Streaming is cleared: the session is left usable.
+	assert.False(t, updatedModel.waitingForResponse, "overflow must stop the waiting indicator")
+	assert.False(t, updatedModel.tabs.ActiveTab().Streaming, "overflow must clear streaming state")
+
+	// Explicitly not a failed session: no error icon.
+	assert.False(t, updatedModel.status.HasError, "context overflow must not SetError (non-halting)")
+
+	// Actionable hint naming the window and the recovery commands appears.
+	var hint string
+	for _, m := range updatedModel.tabs.Content().Chat.Messages[msgCountBefore:] {
+		if strings.Contains(m.Content, ":compact") {
+			hint = m.Content
+		}
+	}
+	require.NotEmpty(t, hint, "overflow must surface an actionable :compact hint")
+	assert.Contains(t, hint, "131072", "hint must name the provider-reported window")
+
+	// Never a generic "Model Error:".
+	for _, m := range updatedModel.tabs.Content().Chat.Messages {
+		assert.NotContains(t, m.Content, "Model Error", "overflow must not render as a generic model error")
+	}
+
+	// The terminal handler must clear the pending guardrail callback, or a
+	// stale callback could fire on the next StreamCompleteMsg.
+	assert.Nil(t, updatedModel.streamCompleteCallback, "overflow must clear the stream-complete callback")
+}
+
+// e908: an overflow with no provider-reported window still surfaces an
+// actionable, non-halting hint (no fabricated window number).
+func TestStreamContextOverflowMsg_UnknownWindow(t *testing.T) {
+	if globalTheme == nil {
+		globalTheme = NewTheme()
+	}
+	model := newTestModel(t)
+	channelID := model.tabs.ActiveTab().Target
+	model.tabs.ActiveTab().Streaming = true
+
+	newModel, _ := model.handleCustomMessages(court.StreamContextOverflowMsg{
+		ChannelID: channelID,
+	})
+	updatedModel := newModel.(TUIModel)
+
+	assert.False(t, updatedModel.status.HasError, "unknown-window overflow must stay non-halting")
+	foundHint := false
+	for _, m := range updatedModel.tabs.Content().Chat.Messages {
+		if strings.Contains(m.Content, "Context window exceeded") {
+			foundHint = true
+		}
+	}
+	assert.True(t, foundHint, "unknown-window overflow must still surface an actionable hint")
+}
+
 // --- Connection drop detection tests (edict 552) ---
 
 func TestConnectionLostMsg_SavesPendingRetry(t *testing.T) {

@@ -246,6 +246,7 @@ func handleContextCommand(model *TUIModel, args []string) tea.Cmd {
 		info := ContextInfo{
 			Model:              ci.Model,
 			TotalTokens:        ci.TotalTokens,
+			TotalTokensApprox:  ci.TotalTokensApprox,
 			UsedTokens:         ci.UsedTokens,
 			SystemPromptTokens: ci.SystemPromptTokens,
 			SystemToolsTokens:  ci.SystemToolsTokens,

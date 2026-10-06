@@ -85,6 +85,25 @@ func TestRenderContextInfoIncludesSections(t *testing.T) {
 	}
 }
 
+// e908: a registry estimate must render with a leading "~"; a
+// provider-reported window must not.
+func TestRenderContextInfo_ApproxWindowPrefix(t *testing.T) {
+	exact := ContextInfo{Model: "m", TotalTokens: 128_000, UsedTokens: 1_000, FreeTokens: 127_000}
+	out := renderContextInfo(exact)
+	if strings.Contains(out, "~128.0k") {
+		t.Fatalf("exact window must not be prefixed with '~'\n%s", out)
+	}
+	if !strings.Contains(out, "128.0k") {
+		t.Fatalf("expected exact window label 128.0k\n%s", out)
+	}
+
+	approx := ContextInfo{Model: "m", TotalTokens: 128_000, TotalTokensApprox: true, UsedTokens: 1_000, FreeTokens: 127_000}
+	out = renderContextInfo(approx)
+	if !strings.Contains(out, "~128.0k") {
+		t.Fatalf("approximate window must render with '~'\n%s", out)
+	}
+}
+
 func TestHandleContextCommand(t *testing.T) {
 	t.Run("no session", func(t *testing.T) {
 		model := &TUIModel{}

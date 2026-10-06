@@ -412,7 +412,13 @@ func (m *MinisterBase) ProcessPrompt(ctx context.Context, minister Minister, pro
 
 	_, err := session.AskWithStreaming(ctx, message, prompt.ContextFiles)
 	if err != nil && ctx.Err() == nil {
-		m.notify(StreamErrorMsg{ChannelID: channelID, Err: err})
+		// A classified context overflow was already surfaced to the TUI by the
+		// session (StreamContextOverflowMsg). Re-notifying here would render it
+		// as a generic "Model Error:" and mark the session failed — the hard
+		// halt this edict removes. The session is left usable for recovery.
+		if _, overflow := contextOverflowWindow(err); !overflow {
+			m.notify(StreamErrorMsg{ChannelID: channelID, Err: err})
+		}
 		return
 	}
 	m.notify(StreamDoneMsg{ChannelID: channelID})

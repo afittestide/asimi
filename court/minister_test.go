@@ -217,6 +217,47 @@ func TestProcessPrompt_NoPreprocessor(t *testing.T) {
 	assert.Equal(t, 1, doneCount, "should complete streaming without error")
 }
 
+// e908: a classified context overflow must not be re-notified as a generic
+// StreamErrorMsg by the minister wrapper. The session already emitted
+// StreamContextOverflowMsg; re-notifying renders "Model Error: …" and marks
+// the session failed — the hard halt this edict removes. The minister must
+// suppress the duplicate so the interactive path stays non-halting.
+func TestProcessPrompt_ContextOverflow_NotReNotifiedAsGenericError(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A provider that always overflows, and a history too small to compact.
+	prov := &overflowProvider{always: true}
+	base := NewMinisterBase(db, nil, nil, "testuser", "testproject", nil)
+	sage := NewChancellor(base)
+	sage.SetMinisterConfig(prov, &SessionConfig{LLM: config.LLMConfig{Provider: "openai", Model: "e908-minister-overflow"}}, repo.RepoInfo{})
+
+	var mu sync.Mutex
+	var overflowMsgs, genericErrs int
+	sage.SetNotify(func(msg any) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch msg.(type) {
+		case StreamContextOverflowMsg:
+			overflowMsgs++
+		case StreamErrorMsg:
+			genericErrs++
+		}
+	})
+
+	prompt := &Prompt{
+		EdictKey: storage.EdictKey{ID: 0, Username: "testuser", Project: "testproject"},
+		Message:  "hello",
+	}
+	base.ProcessPrompt(ctx, sage, prompt)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, overflowMsgs, "the session's overflow message must reach the TUI once")
+	assert.Zero(t, genericErrs, "a classified overflow must not be re-notified as a generic StreamErrorMsg")
+}
+
 // TestProcessPrompt_ChannelIDRouting verifies that when a prompt has a
 // ChannelID set (e.g. "e633" for a ritual tab), stream notifications
 // use that ChannelID instead of the minister's own ID.

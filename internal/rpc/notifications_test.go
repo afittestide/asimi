@@ -48,6 +48,7 @@ func TestNotificationPipeline(t *testing.T) {
 		court.StreamChunkMsg{ChannelID: "ruling", Text: "world"},
 		court.StreamChunkMsg{ChannelID: "chancellor", Text: "thinking"},
 		court.StreamCompleteMsg{ChannelID: "ruling"},
+		court.StreamContextOverflowMsg{ChannelID: "ruling", Window: 131072},
 		court.StreamErrorMsg{ChannelID: "forge", Err: errors.New("boom")},
 		court.EventsDrainedMsg{Events: []court.DrainedEvent{
 			{EventType: storage.EventEdictCreated, EdictKey: storage.EdictKey{ID: 9}},
@@ -162,6 +163,9 @@ func comparableEqual(a, b any) bool {
 		return ok && at == bt
 	case court.StreamMaxTokensReachedMsg:
 		bt, ok := b.(court.StreamMaxTokensReachedMsg)
+		return ok && at == bt
+	case court.StreamContextOverflowMsg:
+		bt, ok := b.(court.StreamContextOverflowMsg)
 		return ok && at == bt
 	case court.MinisterInvokingMsg:
 		bt, ok := b.(court.MinisterInvokingMsg)

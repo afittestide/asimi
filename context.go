@@ -19,6 +19,7 @@ const (
 type ContextInfo struct {
 	Model              string
 	TotalTokens        int
+	TotalTokensApprox  bool // TotalTokens is a registry estimate, not provider-reported
 	UsedTokens         int
 	SystemPromptTokens int
 	SystemToolsTokens  int
@@ -45,12 +46,19 @@ func renderContextInfo(info ContextInfo) string {
 	memoryFilesPercent := percentage(info.MemoryFilesTokens, total)
 	messagesPercent := percentage(info.MessagesTokens, total)
 
+	// An estimate must never be shown as exact: prefix the window with "~"
+	// when it came from the registry rather than the provider.
+	totalLabel := formatTokenCount(info.TotalTokens)
+	if info.TotalTokensApprox && info.TotalTokens > 0 {
+		totalLabel = "~" + totalLabel
+	}
+
 	b.WriteString("  ⎿  Context Usage\n")
 	b.WriteString(fmt.Sprintf("     %s   %s · %s/%s tokens (%.1f%%)\n",
 		renderContextBar(info),
 		info.Model,
 		formatTokenCount(info.UsedTokens),
-		formatTokenCount(info.TotalTokens),
+		totalLabel,
 		usedPercent,
 	))
 

@@ -21,22 +21,44 @@ Different models have different context limits:
   - GPT-4: 128K tokens
   - Gemini Pro: 1M tokens
 
+The window is **provider-reported when available** — Asimi asks the provider
+for the model's real context length and treats that as the source of truth.
+When the provider reports nothing, Asimi falls back to a local registry
+estimate; an estimate is rendered with a leading `~` (e.g. `~128.0k`) so it
+is never shown as exact.
+
 Asimi automatically tracks usage and warns when approaching limits.
+
+## Automatic Overflow Recovery
+
+If a request is rejected because the prompt exceeds the model's context
+window, Asimi does not halt. It:
+
+1. Learns the true window from the provider's error message.
+2. Compacts the conversation with a summary request that is bounded to fit
+   within that window (older and large messages are trimmed as needed).
+3. Re-sends your message once.
+
+If recovery still cannot fit, the session stays alive and you get an
+actionable hint: `context window N exceeded — use :compact or :new`.
 
 ## Managing Context
 
 When context gets too large:
 
-1. Start a new session:
+1. Compact the conversation:
+   :compact
+
+2. Start a new session:
    :new
 
-2. Export current conversation:
+3. Export current conversation:
    :export
 
-3. Reference only essential files:
+4. Reference only essential files:
    Use @ selectively
 
-4. Use shorter prompts:
+5. Use shorter prompts:
    Be concise in your requests
 
 ## Context Files

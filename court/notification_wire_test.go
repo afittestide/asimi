@@ -62,6 +62,31 @@ func TestStreamMaxTokensReachedMsgRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStreamContextOverflowMsgRoundTrip(t *testing.T) {
+	in := StreamContextOverflowMsg{ChannelID: "ruling", Window: 131072}
+	b, err := msgpack.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out StreamContextOverflowMsg
+	if err := msgpack.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out != in {
+		t.Fatalf("round trip: got %+v want %+v", out, in)
+	}
+}
+
+func TestStreamContextOverflowMsgRoundTripUnknownWindow(t *testing.T) {
+	in := StreamContextOverflowMsg{ChannelID: "forge"}
+	b, _ := msgpack.Marshal(in)
+	var out StreamContextOverflowMsg
+	_ = msgpack.Unmarshal(b, &out)
+	if out != in {
+		t.Fatalf("round trip: got %+v want %+v", out, in)
+	}
+}
+
 func TestStreamErrorMsgRoundTrip(t *testing.T) {
 	in := StreamErrorMsg{ChannelID: "ruling", Err: errors.New("something broke")}
 	b, err := msgpack.Marshal(in)

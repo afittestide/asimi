@@ -3,6 +3,7 @@ package court
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -1499,9 +1500,10 @@ func TestModelContextSize_RepeatedCallsNoReProbe(t *testing.T) {
 	t.Parallel()
 
 	// Regression: the TUI refreshes context info on every render (each
-	// keystroke), so getModelContextSize was probing bifrost on every call for
-	// a model the registry already answers — an endless list_models network
-	// storm that stalled typing. The resolved size must be memoized per
+	// keystroke), so an unresolved getModelContextSize used to probe bifrost
+	// on every call — an endless list_models network storm that stalled
+	// typing. The provider probe now runs first (one lookup), and its result
+	// (here: no advertised models → registry fallback) must be memoized per
 	// session so repeated calls never touch the network again.
 	prov := &networkTrackingProvider{}
 	cfg := &SessionConfig{LLM: internalconfig.LLMConfig{
@@ -1512,32 +1514,32 @@ func TestModelContextSize_RepeatedCallsNoReProbe(t *testing.T) {
 	sess, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
 
-	// First call resolves from the deterministic registry (no network).
+	// First call probes the provider once; it advertises nothing, so the
+	// registry supplies the approximate 128k fallback.
 	assert.Equal(t, 128_000, sess.getModelContextSize())
-	assert.Equal(t, 0, prov.listCalls, "registry covers gpt-4o; no bifrost probe needed")
+	assert.Equal(t, 1, prov.listCalls, "first resolution probes the provider once")
 
-	// Simulate the render loop calling over and over; must stay at zero
-	// network probes.
+	// Simulate the render loop calling over and over; must stay at one
+	// network probe.
 	for i := 0; i < 50; i++ {
 		assert.Equal(t, 128_000, sess.getModelContextSize())
 	}
-	assert.Equal(t, 0, prov.listCalls, "repeated per-session calls must not re-probe bifrost")
+	assert.Equal(t, 1, prov.listCalls, "repeated per-session calls must not re-probe bifrost")
 
 	// GetContextInfo funnels through getModelContextSize and must share the
 	// same memoized result.
 	assert.Greater(t, sess.GetContextInfo().TotalTokens, 0)
-	assert.Equal(t, 0, prov.listCalls, "GetContextInfo must not re-probe bifrost")
+	assert.Equal(t, 1, prov.listCalls, "GetContextInfo must not re-probe bifrost")
 }
 
 func TestModelContextSize_RegistryCachedNoReProbe(t *testing.T) {
 	t.Parallel()
 
-	// Regression for the registry fast-path: the deterministic registry result
-	// must be stored in the shared modelContextByKey cache, so a second
-	// getModelContextSize() invocation (from a fresh session) returns from the
-	// cache without performing a bifrost probe. Registry-covered models never
-	// touch the network, but the shared memoization guarantees no per-call or
-	// per-session re-resolution. Any unresolved size is never cached.
+	// Regression for the registry fallback path: when the provider reports no
+	// window, the registry estimate is memoized per session (so a fresh
+	// session re-probes once, not per call) but must never be stored in the
+	// shared modelContextByKey cache — a later session must not inherit a
+	// guess as fact.
 	prov := &networkTrackingProvider{}
 	cfg := &SessionConfig{LLM: internalconfig.LLMConfig{
 		Provider: "anthropic",
@@ -1547,33 +1549,30 @@ func TestModelContextSize_RegistryCachedNoReProbe(t *testing.T) {
 	sess, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
 
-	// First call resolves deterministically from the registry (no network).
+	// First call probes the provider once, gets nothing, falls back to the
+	// approximate registry value.
 	assert.Equal(t, 200_000, sess.getModelContextSize())
-	assert.Equal(t, 0, prov.listCalls, "registry covers claude-3-5-sonnet-latest; first call needs no probe")
+	assert.Equal(t, 1, prov.listCalls, "provider reports nothing; one probe then registry fallback")
 
-	// The deterministic registry result must now be committed to the shared
-	// modelContextByKey cache. This is the crux of the fix: a registry-covered
-	// model never probes bifrost regardless of caching, so the only way for a
-	// later session to skip re-running the registry branch (and re-emitting the
-	// "Using context size from registry" log) is for this shared cache to hold
-	// the resolved size. Assert the cache was populated, not just the return value.
+	// The estimate must NOT be committed to the shared modelContextByKey
+	// cache — only provider-reported or error-parsed values are exact enough
+	// to share.
 	key := "anthropic:claude-3-5-sonnet-latest"
-	cached, ok := modelContextByKey.Load(key)
-	require.True(t, ok, "registry result must be stored in the shared modelContextByKey cache")
-	assert.Equal(t, 200_000, cached, "shared cache must hold the deterministic registry size")
+	_, ok := modelContextByKey.Load(key)
+	require.False(t, ok, "registry estimate must never enter the shared cache")
 
-	// A fresh session hits the shared provider:model cache and still resolves
-	// the registry size without touching the network.
+	// A fresh session re-probes the provider (the per-session memo does not
+	// leak), then falls back to the same estimate.
 	sess2, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
 	assert.Equal(t, 200_000, sess2.getModelContextSize())
-	assert.Equal(t, 0, prov.listCalls, "registry result cached; second session must not probe bifrost")
+	assert.Equal(t, 2, prov.listCalls, "estimate is not shared; second session re-probes")
 
-	// The shared entry must persist; a clean-load allows the next session to
-	// short-circuit the registry branch entirely.
-	cached, ok = modelContextByKey.Load(key)
-	require.True(t, ok, "shared cache entry must persist across sessions")
-	assert.Equal(t, 200_000, cached)
+	// Repeated calls on the second session must stay memoized.
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, 200_000, sess2.getModelContextSize())
+	}
+	assert.Equal(t, 2, prov.listCalls, "per-session memo prevents re-probing")
 }
 
 func TestSession_GetContextInfo_WithContextFiles(t *testing.T) {
@@ -1618,6 +1617,535 @@ func TestSession_GetContextInfo_UnknownModel(t *testing.T) {
 
 	assert.Equal(t, "unknown-model-xyz", info.Model)
 	assert.Equal(t, defaultUnknownContextRef, info.TotalTokens)
+}
+
+// e908: the provider-reported window is the source of truth and must win over
+// a registry match; the registry fallback is flagged approximate.
+func TestModelContextSize_PrefersProviderOverRegistry(t *testing.T) {
+	// Not t.Parallel(): asserts on the shared modelContextByKey cache.
+	ctxLen := 131_072
+	mock := &mocks.MockProvider{ModelsResponse: []schemas.Model{
+		{ID: "e908-selfhosted-proxy", ContextLength: &ctxLen},
+	}}
+	cfg := &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e908-selfhosted-proxy",
+	}}
+
+	sess, err := NewSession(mock, cfg, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// Registry would say 128k for the openai provider fallback; the provider
+	// says 131072 and must win.
+	assert.Equal(t, 131_072, sess.getModelContextSize())
+	assert.False(t, sess.contextSizeIsApprox(), "provider-reported window is not approximate")
+	assert.False(t, sess.GetContextInfo().TotalTokensApprox)
+
+	// The authoritative value is shared.
+	cached, ok := modelContextByKey.Load("openai:e908-selfhosted-proxy")
+	require.True(t, ok, "provider-reported value must be shared")
+	assert.Equal(t, 131_072, cached)
+}
+
+// e908: when the provider reports nothing, the registry fallback is used but
+// flagged approximate.
+func TestModelContextSize_RegistryFallbackFlaggedApprox(t *testing.T) {
+	t.Parallel()
+
+	sess, err := NewSession(&mocks.MockProvider{}, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "anthropic",
+		Model:    "e908-approx-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// The anthropic registry fallback matches the provider rule (200k), but
+	// the result must be flagged approximate.
+	assert.Equal(t, 200_000, sess.getModelContextSize())
+	assert.True(t, sess.contextSizeIsApprox(), "registry fallback must be approximate")
+	assert.True(t, sess.GetContextInfo().TotalTokensApprox)
+
+	// An approximate result must never enter the shared cache.
+	_, ok := modelContextByKey.Load("anthropic:e908-approx-model")
+	require.False(t, ok, "registry estimate must never be shared")
+}
+
+// e908: parsing the provider's reported limit from an overflow message.
+func TestParseContextOverflowLimit(t *testing.T) {
+	t.Parallel()
+
+	// The exact phrasing from the Ruler's report.
+	err := errors.New("provider API error (openai @ http://10.240.0.20:8080, POST /v1/chat/completions, status 400): request (144159 tokens) exceeds the available context size (131072 tokens), try increasing it")
+	assert.Equal(t, 131_072, parseContextOverflowLimit(err))
+
+	// Case-insensitive.
+	upper := errors.New("EXCEEDS THE AVAILABLE CONTEXT SIZE (9000 TOKENS)")
+	assert.Equal(t, 9_000, parseContextOverflowLimit(upper))
+
+	// Malformed variants must yield no value (never fabricate a window).
+	malformed := []string{
+		"",
+		"context window exceeded",
+		"exceeds the available context size (many tokens)",
+		"exceeds the available context size ( tokens)",
+		"exceeds the available context size (0 tokens)",
+		"exceeds the available context size (131072)",
+	}
+	for _, m := range malformed {
+		assert.Equalf(t, 0, parseContextOverflowLimit(errors.New(m)), "malformed %q", m)
+	}
+	assert.Equal(t, 0, parseContextOverflowLimit(nil))
+}
+
+// e908: classification matches the provider phrasings and 400/413, and does
+// not fire on unrelated errors.
+func TestIsContextOverflowError(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("provider API error (openai @ x, POST /v1/chat/completions, status 400): request (144159 tokens) exceeds the available context size (131072 tokens)")
+	assert.True(t, isContextOverflowError(err))
+
+	// 413 also qualifies.
+	err413 := errors.New("status 413: context_length_exceeded")
+	assert.True(t, isContextOverflowError(err413))
+
+	// Phrase without status still classifies (bare stream message).
+	assert.True(t, isContextOverflowError(errors.New("maximum context length is 8192 tokens")))
+
+	// Unrelated 400 must not classify.
+	unrelated := errors.New("provider API error (openai @ x, POST /v1/chat/completions, status 400): invalid model name")
+	assert.False(t, isContextOverflowError(unrelated))
+
+	// A context phrase on an unrelated status must not classify.
+	assert.False(t, isContextOverflowError(errors.New("status 500: exceeds the available context size (100 tokens)")))
+
+	assert.False(t, isContextOverflowError(nil))
+}
+
+// overflowProvider 400s on the first calls with a context-overflow message
+// and then succeeds, so tests can exercise the recovery + retry path. When
+// alwaysFail is set it overflows on every call.
+type overflowProvider struct {
+	mu        sync.Mutex
+	calls     int
+	always    bool
+	successAt int // call index (1-based) from which it succeeds; default 2
+	lastReq   *schemas.BifrostChatRequest
+	requests  []*schemas.BifrostChatRequest
+}
+
+func (p *overflowProvider) record(req *schemas.BifrostChatRequest) {
+	p.lastReq = req
+	p.requests = append(p.requests, req)
+}
+
+func (p *overflowProvider) chatErr() *schemas.BifrostError {
+	status := 400
+	return &schemas.BifrostError{
+		StatusCode: &status,
+		Error: &schemas.ErrorField{
+			Message: "request (144159 tokens) exceeds the available context size (131072 tokens), try increasing it",
+		},
+	}
+}
+
+func (p *overflowProvider) shouldFail() bool {
+	p.calls++
+	if p.always {
+		return true
+	}
+	successAt := p.successAt
+	if successAt == 0 {
+		successAt = 2
+	}
+	return p.calls < successAt
+}
+
+func (p *overflowProvider) ChatCompletionRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	p.mu.Lock()
+	fail := p.shouldFail()
+	p.record(req)
+	p.mu.Unlock()
+	if fail {
+		return nil, p.chatErr()
+	}
+	content := "recovered response"
+	return &schemas.BifrostChatResponse{
+		Choices: []schemas.BifrostResponseChoice{{
+			Index:                       0,
+			ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{Message: &schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: &content}}},
+			FinishReason:                strPtr("stop"),
+		}},
+	}, nil
+}
+
+func (p *overflowProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	p.mu.Lock()
+	fail := p.shouldFail()
+	p.record(req)
+	p.mu.Unlock()
+
+	ch := make(chan *schemas.BifrostStreamChunk)
+	go func() {
+		defer close(ch)
+		if fail {
+			ch <- &schemas.BifrostStreamChunk{BifrostError: p.chatErr()}
+			return
+		}
+		content := "recovered response"
+		finish := "stop"
+		ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+				},
+				FinishReason: &finish,
+			}},
+		}}
+	}()
+	return ch, nil
+}
+
+func (p *overflowProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *overflowProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+// e908 end-to-end: a provider that 400s once with the overflow message then
+// succeeds — the session learns the window, compacts, retries, and completes.
+func TestSession_ContextOverflow_RecoversAndRetries(t *testing.T) {
+	prov := &overflowProvider{successAt: 2}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e908-recover-model",
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	// Give the session enough history to compact (CompactHistory needs > 2
+	// messages) and enough bulk that an unbounded summary would overflow.
+	sess.AddMessage(schemas.ChatMessageRoleUser, strings.Repeat("word ", 200))
+	sess.AddMessage(schemas.ChatMessageRoleAssistant, strings.Repeat("reply ", 200))
+
+	var overflowMsgs int
+	sess.SetNotify(func(msg any) {
+		if _, ok := msg.(StreamContextOverflowMsg); ok {
+			overflowMsgs++
+		}
+	}, "test-channel")
+
+	ctx := context.Background()
+	resp, err := sess.AskWithStreaming(ctx, "continue", nil)
+	require.NoError(t, err, "session must recover instead of halting")
+	assert.Contains(t, resp, "recovered response")
+
+	// The provider's window was learned from the error, exact (not approx).
+	assert.Equal(t, 131_072, sess.getModelContextSize())
+	assert.False(t, sess.contextSizeIsApprox())
+
+	// Recovery succeeded, so no overflow message was surfaced.
+	assert.Zero(t, overflowMsgs, "successful recovery must not surface an overflow message")
+
+	// D.8: the retried request must again end with the outstanding user turn,
+	// not the compaction ack. The last recorded request is the retry.
+	require.NotNil(t, prov.lastReq, "the retry request must have been sent")
+	require.NotEmpty(t, prov.lastReq.Input)
+	last := prov.lastReq.Input[len(prov.lastReq.Input)-1]
+	require.Equal(t, schemas.ChatMessageRoleUser, last.Role,
+		"retried payload must end with the user turn, not the assistant ack")
+	require.NotNil(t, last.Content)
+	require.NotNil(t, last.Content.ContentStr)
+	assert.Contains(t, *last.Content.ContentStr, "continue",
+		"retried payload must carry the outstanding user request")
+}
+
+// e908 end-to-end: a provider that always overflows ends with a classified,
+// non-halting error surfaced via StreamContextOverflowMsg (never a generic
+// StreamErrorMsg).
+func TestSession_ContextOverflow_AlwaysFailsNonHalting(t *testing.T) {
+	prov := &overflowProvider{always: true}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e908-overflow-model",
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	// A simple two-message history; compaction (needs >2 messages) will fail,
+	// so the retry cannot fit and the actionable error must surface.
+	sess.AddMessage(schemas.ChatMessageRoleUser, "hello")
+	sess.AddMessage(schemas.ChatMessageRoleAssistant, "hi")
+
+	var overflowMsg *StreamContextOverflowMsg
+	var genericErr bool
+	sess.SetNotify(func(msg any) {
+		switch m := msg.(type) {
+		case StreamContextOverflowMsg:
+			cp := m
+			overflowMsg = &cp
+		case StreamErrorMsg:
+			genericErr = true
+		}
+	}, "test-channel")
+
+	ctx := context.Background()
+	_, err = sess.AskWithStreaming(ctx, "continue", nil)
+	require.Error(t, err)
+
+	// The error is classified and actionable, never a raw provider error.
+	assert.Contains(t, err.Error(), "context window")
+	assert.Contains(t, err.Error(), ":compact")
+	window, ok := contextOverflowWindow(err)
+	require.True(t, ok, "error must be a classified context-overflow error")
+	assert.Equal(t, 131_072, window)
+
+	require.NotNil(t, overflowMsg, "overflow must surface via StreamContextOverflowMsg")
+	assert.Equal(t, 131_072, overflowMsg.Window)
+	assert.False(t, genericErr, "must not surface as a generic StreamErrorMsg")
+
+	// The learned window persists for later recovery attempts.
+	assert.Equal(t, 131_072, sess.getModelContextSize())
+	assert.False(t, sess.contextSizeIsApprox())
+}
+
+// midLoopOverflowProvider streams a tool call on the first request, then
+// rejects the (now tool-result-terminated) follow-up with a context-overflow
+// 400, then succeeds. This reproduces the edict's own motivating scenario: a
+// single large read_file/shell result blows past the window inside one turn,
+// so the last message at overflow time is a TOOL result, not a user turn.
+type midLoopOverflowProvider struct {
+	mu       sync.Mutex
+	calls    int
+	requests []*schemas.BifrostChatRequest
+}
+
+func (p *midLoopOverflowProvider) record(req *schemas.BifrostChatRequest) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	p.requests = append(p.requests, req)
+	return p.calls
+}
+
+func (p *midLoopOverflowProvider) ChatCompletionRequest(_ *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	p.record(req)
+	content := "summary of the conversation"
+	return &schemas.BifrostChatResponse{Choices: []schemas.BifrostResponseChoice{{
+		Index:                       0,
+		ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{Message: &schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: &content}}},
+		FinishReason:                strPtr("stop"),
+	}}}, nil
+}
+
+func (p *midLoopOverflowProvider) ChatCompletionStreamRequest(_ *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	n := p.record(req)
+	ch := make(chan *schemas.BifrostStreamChunk)
+	go func() {
+		defer close(ch)
+		switch {
+		case n == 1:
+			finish := "tool_calls"
+			id := "call_1"
+			ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: &schemas.ChatStreamResponseChoiceDelta{
+					ToolCalls: []schemas.ChatAssistantMessageToolCall{{Index: 0, ID: &id, Function: schemas.ChatAssistantMessageToolCallFunction{Name: strPtr("t"), Arguments: "{}"}}}}},
+				FinishReason: &finish}}}}
+		case n == 2:
+			status := 400
+			ch <- &schemas.BifrostStreamChunk{BifrostError: &schemas.BifrostError{
+				StatusCode: &status,
+				Error:      &schemas.ErrorField{Message: "request (144159 tokens) exceeds the available context size (131072 tokens), try increasing it"},
+			}}
+		default:
+			finish := "stop"
+			content := "final answer"
+			ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{Choices: []schemas.BifrostResponseChoice{{
+				Index:                    0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content}},
+				FinishReason:             &finish}}}}
+		}
+	}()
+	return ch, nil
+}
+
+func (p *midLoopOverflowProvider) ListAllModels(_ *schemas.BifrostContext, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *midLoopOverflowProvider) ListModelsRequest(_ *schemas.BifrostContext, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+// e908 end-to-end: overflow INSIDE a tool loop (last message is a tool
+// result) must also recover and retry without halting. No test covered this
+// path, even though it is the edict's stated motivating scenario.
+func TestSession_ContextOverflow_DuringToolLoopRecovers(t *testing.T) {
+	prov := &midLoopOverflowProvider{}
+	tool := &mockTool{name: "t", output: "TOOL-RESULT-BODY"}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e908-midloop",
+	}}, []Tool{tool}, nil, func(any) {}, "system", "test-channel")
+	require.NoError(t, err)
+
+	var overflowMsgs, genericErrs int
+	sess.SetNotify(func(msg any) {
+		switch msg.(type) {
+		case StreamContextOverflowMsg:
+			overflowMsgs++
+		case StreamErrorMsg:
+			genericErrs++
+		}
+	}, "test-channel")
+
+	resp, err := sess.AskWithStreaming(context.Background(), "GO", nil)
+	require.NoError(t, err, "mid-tool-loop overflow must recover, not halt")
+	assert.Contains(t, resp, "final answer")
+	assert.Zero(t, overflowMsgs, "successful recovery must not surface an overflow message")
+	assert.Zero(t, genericErrs, "recovery must not surface a generic StreamErrorMsg")
+
+	// The provider's window was learned from the mid-loop error.
+	assert.Equal(t, 131_072, sess.getModelContextSize())
+	assert.False(t, sess.contextSizeIsApprox())
+
+	// The compaction request (call 3, the non-streaming summary call) must
+	// carry the tool result forward, so the retry can actually answer the
+	// pending turn rather than losing it with the dropped history.
+	require.GreaterOrEqual(t, len(prov.requests), 3, "compaction request must have been sent")
+	var summaryReq string
+	for _, m := range prov.requests[2].Input {
+		if m.Content != nil && m.Content.ContentStr != nil {
+			summaryReq += *m.Content.ContentStr + "\n"
+		}
+	}
+	assert.Contains(t, summaryReq, "TOOL-RESULT-BODY",
+		"compaction must summarize the oversized tool result, not silently drop it")
+
+	// D.8: the retried payload must present an unanswered turn to the model,
+	// not terminate on the compaction assistant-ack. When the overflow lands
+	// mid-tool-loop the last message is a tool result, so a fix that only
+	// inspects the final message (outstandingUserTurn) re-appends nothing and
+	// the retry ends on the ack — omitting the pending request. Strict
+	// providers reject such a payload; loose ones continue the ack.
+	last := prov.requests[len(prov.requests)-1]
+	require.NotEmpty(t, last.Input, "retry payload must not be empty")
+	assert.NotEqual(t, schemas.ChatMessageRoleAssistant, last.Input[len(last.Input)-1].Role,
+		"retried payload must not end with the compaction assistant-ack")
+}
+
+// e908: CompactHistory must bound the assembled summary prompt within the
+// known window (minus reserve) by trimming, where today's unbounded version
+// would exceed.
+func TestSession_CompactHistory_BoundedByTrimming(t *testing.T) {
+	t.Parallel()
+
+	ctxLen := 2_000
+	mock := &mocks.MockProvider{ModelsResponse: []schemas.Model{
+		{ID: "small-ctx-model", ContextLength: &ctxLen},
+	}}
+	sess, err := NewSession(mock, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "cohere",
+		Model:    "small-ctx-model",
+	}}, nil, nil, func(any) {}, "system", "")
+	require.NoError(t, err)
+
+	// Bulk history: far larger than the 2000-token window.
+	for i := 0; i < 50; i++ {
+		sess.AddMessage(schemas.ChatMessageRoleUser, strings.Repeat("large ", 200))
+		sess.AddMessage(schemas.ChatMessageRoleAssistant, strings.Repeat("reply ", 200))
+	}
+
+	compactPrompt := "Summarize this conversation."
+	contentBudget := sess.compactBudget() - sess.countTokens(compactPrompt) - compactSectionOverhead
+	if contentBudget < minCompactContentTokens {
+		contentBudget = minCompactContentTokens
+	}
+	assembled := fmt.Sprintf("%s\n\n---\n\n%s", compactPrompt, sess.buildCompactContent(contentBudget))
+
+	// The assembled prompt must fit the budget (window minus system + reserve),
+	// i.e. never exceed the window that triggered the overflow.
+	window := sess.getModelContextSize()
+	reserve := sess.maxCompletionTokens()
+	if quarter := window / 4; quarter > 0 && reserve > quarter {
+		reserve = quarter
+	}
+	budget := window - sess.systemPromptTokens - reserve
+	assert.LessOrEqual(t, sess.countTokens(assembled), budget,
+		"assembled summary prompt must fit within window minus reserve")
+	assert.LessOrEqual(t, sess.countTokens(assembled), window,
+		"assembled summary prompt must fit the window")
+
+	// Sanity: the unbounded content would have blown the window.
+	var unbounded strings.Builder
+	for i := 1; i < len(sess.messages); i++ {
+		unbounded.WriteString(sess.summarizableMessageText(sess.messages[i]))
+	}
+	assert.Greater(t, sess.countTokens(unbounded.String()), window,
+		"unbounded content must exceed the window, proving trimming occurred")
+}
+
+// e908: tool results are included in the summary content (they are the usual
+// source of bulk) and are trimmed on a word boundary when they exceed the
+// remaining budget, rather than left to overflow the window.
+func TestSession_BuildCompactContent_TrimsToolResults(t *testing.T) {
+	t.Parallel()
+
+	sess, err := NewSession(nil, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e908-tool-trim",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	bulk := strings.Repeat("col1 col2 col3 ", 500)
+	sess.messages = []schemas.ChatMessage{
+		{Role: schemas.ChatMessageRoleSystem, Content: textContent("system")},
+		{Role: schemas.ChatMessageRoleTool, Content: textContent(bulk)},
+	}
+
+	// summarizableMessageText must render tool results so they participate in
+	// the summarized conversation.
+	rendered := sess.summarizableMessageText(sess.messages[1])
+	require.Contains(t, rendered, "**Tool result:**")
+
+	// A small budget must trim the tool result to fit, marking the cut.
+	budget := 100
+	content := sess.buildCompactContent(budget)
+	assert.LessOrEqual(t, sess.countTokens(content), budget,
+		"tool result must be trimmed to fit the budget")
+	assert.Contains(t, content, "truncated", "trimmed content must be marked as truncated")
+	assert.Contains(t, content, "**Tool result:**", "tool result marker must survive trimming")
+
+	// A generous budget keeps the whole tool result.
+	whole := sess.buildCompactContent(1_000_000)
+	assert.Contains(t, whole, bulk[:200], "a fitting budget must keep the tool result")
+	assert.NotContains(t, whole, "[truncated]", "a fitting budget must not truncate")
+}
+
+// e908: learnContextSizeFromError must ignore a non-positive parsed value so a
+// malformed message can never fabricate a window.
+func TestSession_LearnContextSizeFromError_IgnoresNonPositive(t *testing.T) {
+	t.Parallel()
+
+	sess, err := NewSession(nil, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e908-nonpositive",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// A registry estimate first, then a bogus (non-positive) learned value.
+	_ = sess.getModelContextSize()
+	assert.True(t, sess.contextSizeIsApprox(), "precondition: registry estimate")
+
+	sess.learnContextSizeFromError(0)
+	sess.learnContextSizeFromError(-1)
+
+	// The bogus value was ignored: nothing stored in the shared cache and the
+	// session still reports the estimate.
+	_, ok := modelContextByKey.Load("openai:e908-nonpositive")
+	assert.False(t, ok, "non-positive learned value must not enter the shared cache")
+	assert.True(t, sess.contextSizeIsApprox(), "non-positive learned value must not become exact")
 }
 
 // --- Test for asimisql large output truncation bug ---

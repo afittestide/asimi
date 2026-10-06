@@ -2331,6 +2331,27 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCompleteCallback = nil // Clear callback on interrupt
 		m.repoInfo.RefreshDiff()
 
+	case court.StreamContextOverflowMsg:
+		// Context overflow that recovery could not fit. Distinct from a
+		// generic model error: the session stays alive, the prompt is
+		// recoverable, and we show an actionable hint instead of SetError.
+		chat := m.tabs.ChatByTab(msg.ChannelID)
+		chat.AddToRawHistory("STREAM_CONTEXT_OVERFLOW", fmt.Sprintf("context window exceeded: %d", msg.Window))
+		slog.Warn("court.StreamContextOverflowMsg", "window", msg.Window, "channel", msg.ChannelID)
+
+		var hint string
+		if msg.Window > 0 {
+			hint = fmt.Sprintf("Context window %d exceeded — use :compact or :new", msg.Window)
+		} else {
+			hint = "Context window exceeded — use :compact or :new"
+		}
+		chat.AddMessage(fmt.Sprintf("\n%s⚠️  %s", systemPrefix, hint))
+		m.commandLine.AddToast(hint, "warning", time.Second*5)
+		// Leave the session usable: reset streaming state but do not SetError.
+		m.clearStreamingTab(msg.ChannelID)
+		m.streamCompleteCallback = nil // Clear callback on overflow (no completion will follow)
+		m.repoInfo.RefreshDiff()
+
 	case court.StreamErrorMsg:
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		chat.AddToRawHistory("STREAM_ERROR", fmt.Sprintf("AI streaming error: %v", msg.Err))
@@ -3559,6 +3580,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			info = ContextInfo{
 				Model:              si.Model,
 				TotalTokens:        si.TotalTokens,
+				TotalTokensApprox:  si.TotalTokensApprox,
 				UsedTokens:         si.UsedTokens,
 				SystemPromptTokens: si.SystemPromptTokens,
 				SystemToolsTokens:  si.SystemToolsTokens,
