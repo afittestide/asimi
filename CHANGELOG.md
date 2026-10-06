@@ -5,6 +5,26 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-10-06
+
+### Added
+
+- **Live model picker** — `:models` (alias `:model`) now enumerates models live from every configured provider's `/v1/models` and caches the catalog for the session (reopening is instant and makes no network calls); `:models refresh` forces a refetch. Rows carry per-model metadata (context window, price), list the current provider's models first followed by the others alphabetically, show provider icons, and render a dim `unavailable: <provider>` line when a provider cannot be reached (e903, e906, e910)
+- **Direct model selection** — `:model <provider>/<name>`, `:model <provider> <name>`, and `:model <name>` (current provider) select a model without opening the picker; the picker also ends with a "Type a model name…" row for `provider/model` input (e903, e906, e910)
+
+### Changed
+
+- **Context window reporting** — the context window is now provider-reported when available, falling back to a local registry estimate rendered with a leading `~` (e.g. `~128.0k`) so an estimate is never shown as exact (e908)
+- **Model rows drop the modality token** — model picker rows no longer show a `text->text`-style modality token (e910)
+
+### Fixed
+
+- **Automatic context overflow recovery** — a request rejected for exceeding the model's context window no longer halts the session: Asimi learns the true window from the provider's error, compacts the conversation to fit, and re-sends once; if it still cannot fit, the session stays alive with an actionable hint (`context window N exceeded — use :compact or :new`) (e908)
+- **Malformed tool-call arguments** — a tool call whose `function.arguments` is not valid JSON is normalized to `{}` in place and reported back to the model as an error, instead of poisoning history and wedging the session on every later request (e854)
+- **Unknown rituals** — `enact_ritual` now rejects an unknown ritual name with a clear error listing the available rituals, instead of emitting an event that can never run (e841)
+- **Precedent verification on reforged manifests** — `check_precedent_approved` now evaluates only current manifests, so a rejected precedent left on a superseded manifest no longer blocks an edict from ascending (sibling of the verdict-gate bug)
+- **Fork race condition** — removed a data race in fork/join ritual execution (e900)
+
 ## [0.13.7] - 2026-10-01
 
 ### Chaged
