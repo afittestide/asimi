@@ -1,6 +1,6 @@
 # Roadmap
 
-### v0.14.0
+### v0.15.0
 
 ### Full Parallelism
 - Git worktrees for concurrent rituals (issues/153)

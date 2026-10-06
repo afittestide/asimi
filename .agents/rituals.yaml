@@ -30,7 +30,6 @@
   steps:
     - name: prepare-changelog
       minister: secretary
-      effort: medium
       given:
         - "!git log $(git describe --tags --abbrev=0 2>/dev/null || echo HEAD~20)..HEAD --oneline  # recent_commits"
       act: |
@@ -48,7 +47,6 @@
 
     - name: bump-version
       minister: forge
-      effort: low
       given:
         - "!grep 'var AsimiVersion' internal/utils/asimi_version.go  # current_version_line"
       act: |
@@ -62,7 +60,6 @@
 
     - name: update-roadmap
       minister: forge
-      effort: low
       act: |
         Review docs/roadmap.md entry for {{ .version }}.
         Move all lines that weren't done in the version to the next version.
@@ -74,7 +71,6 @@
 
     - name: verify-release-readiness
       minister: judge
-      effort: low
       given:
         - the earth status
         - "!just test  # test_results"
@@ -109,7 +105,6 @@
 
     - name: chancellor-reviews
       minister: chancellor
-      effort: low
       given:
         - the earth status
         - the manifests
@@ -126,7 +121,6 @@
 
     - name: commit-and-tag
       minister: secretary
-      effort: low
       given:
         - the earth status
       act: |
@@ -138,7 +132,6 @@
 
     - name: confirm-push
       minister: secretary
-      effort: low
       act: |
         Call ask_ruler asking the Ruler to confirm pushing the release
         tag and commit to origin. Options:

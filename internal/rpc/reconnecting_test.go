@@ -431,6 +431,187 @@ func TestReconnectingClient_NilClientReturnsErrClosed(t *testing.T) {
 	if err := rc.SetIntent(1, "new intent"); !errors.Is(err, ErrClosed) {
 		t.Errorf("SetIntent with nil client should return ErrClosed, got %v", err)
 	}
+	if _, err := rc.ListModels("openai"); !errors.Is(err, ErrClosed) {
+		t.Errorf("ListModels with nil client should return ErrClosed, got %v", err)
+	}
+}
+
+// ListModels must read models over the wire, never through a local
+// fallback. This guards the edict-903 change that removed rc.local
+// delegation: with local == nil, the old code returned an error.
+func TestReconnectingClient_ListModelsReachesWire(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	rc := NewReconnectingClient(nil, nil) // no local court: wire is the only path
+	rc.mu.Lock()
+	rc.conn = clientConn
+	rc.client = NewCourtClient(clientConn)
+	rc.mu.Unlock()
+
+	resp, err := rc.ListModels("openai")
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].ID != "openai-model" {
+		t.Errorf("ListModels response = %+v", resp)
+	}
+	impl.mu.Lock()
+	if len(impl.listed) != 1 || impl.listed[0] != "openai" {
+		t.Errorf("server-side listed providers = %v", impl.listed)
+	}
+	impl.mu.Unlock()
+}
+
+// ListModels is read-only, so a dead peer must trigger a reconnect and
+// retry of the call rather than surfacing the raw disconnect error.
+func TestReconnectingClient_ListModelsRetriesOnPeerDisconnect(t *testing.T) {
+	impl := newFakeCourt()
+
+	var factoryCalls atomic.Int64
+	var mu sync.Mutex
+	var servers []*Conn
+	factory := func() (*Conn, error) {
+		factoryCalls.Add(1)
+		pa, pb := net.Pipe()
+		server := New(pa, Options{})
+		clientConn := New(pb, Options{})
+		RegisterCourtHandlers(server, impl)
+		go func() { _ = server.Serve() }()
+		go func() { _ = clientConn.Serve() }()
+		mu.Lock()
+		servers = append(servers, server)
+		mu.Unlock()
+		return clientConn, nil
+	}
+
+	rc := NewReconnectingClient(factory, nil)
+	first, err := factory()
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	rc.mu.Lock()
+	rc.conn = first
+	rc.client = NewCourtClient(first)
+	rc.mu.Unlock()
+
+	// Kill the peer so the next call observes ErrPeerDisconnected.
+	mu.Lock()
+	servers[0].Close()
+	mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	resp, err := rc.ListModels("anthropic")
+	if err != nil {
+		t.Fatalf("ListModels after peer disconnect: %v", err)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].ID != "anthropic-model" {
+		t.Errorf("ListModels response = %+v", resp)
+	}
+	if got := factoryCalls.Load(); got < 2 {
+		t.Errorf("factory calls = %d, want >= 2 (reconnect on peer disconnect)", got)
+	}
+}
+
+// ApproximateContextSize must read the registry over the wire (never a local
+// fallback) and return 0 when the client is nil.
+func TestReconnectingClient_ApproximateContextSizeReachesWire(t *testing.T) {
+	impl := newFakeCourt()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	rc := NewReconnectingClient(nil, nil) // no local court: wire is the only path
+	rc.mu.Lock()
+	rc.conn = clientConn
+	rc.client = NewCourtClient(clientConn)
+	rc.mu.Unlock()
+
+	if got := rc.ApproximateContextSize("openai", "gpt-4o"); got != 128000 {
+		t.Errorf("ApproximateContextSize = %d, want 128000", got)
+	}
+	if got := rc.ApproximateContextSize("openai", "unknown"); got != 0 {
+		t.Errorf("ApproximateContextSize(unknown) = %d, want 0", got)
+	}
+
+	// A nil client must yield 0, not panic.
+	nilClient := &ReconnectingClient{}
+	if got := nilClient.ApproximateContextSize("openai", "gpt-4o"); got != 0 {
+		t.Errorf("ApproximateContextSize with nil client = %d, want 0", got)
+	}
+}
+
+// ApproximateContextSize must proactively reconnect when the connection is dead,
+// mirroring other read-only methods whose zero-value return cannot signal a
+// dropped connection.
+func TestReconnectingClient_ApproximateContextSizeReconnectsWhenDead(t *testing.T) {
+	impl := newFakeCourt()
+
+	var factoryCalls atomic.Int64
+	var mu sync.Mutex
+	var servers []*Conn
+	factory := func() (*Conn, error) {
+		factoryCalls.Add(1)
+		pa, pb := net.Pipe()
+		server := New(pa, Options{})
+		clientConn := New(pb, Options{})
+		RegisterCourtHandlers(server, impl)
+		go func() { _ = server.Serve() }()
+		go func() { _ = clientConn.Serve() }()
+		mu.Lock()
+		servers = append(servers, server)
+		mu.Unlock()
+		return clientConn, nil
+	}
+
+	rc := NewReconnectingClient(factory, nil)
+	first, err := factory()
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	rc.mu.Lock()
+	rc.conn = first
+	rc.client = NewCourtClient(first)
+	rc.mu.Unlock()
+
+	// Kill the peer so reconnectIfDead observes the closed Done channel.
+	mu.Lock()
+	servers[0].Close()
+	mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	if got := rc.ApproximateContextSize("openai", "gpt-4o"); got != 128000 {
+		t.Errorf("ApproximateContextSize after peer disconnect = %d, want 128000", got)
+	}
+	if got := factoryCalls.Load(); got < 2 {
+		t.Errorf("factory calls = %d, want >= 2 (reconnect on dead connection)", got)
+	}
 }
 
 // --- Verify shouldRetry and shouldRetryReadOnly for wrapped errors ---
