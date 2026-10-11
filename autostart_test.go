@@ -302,6 +302,12 @@ func TestWatchConnDropObservesReconnect(t *testing.T) {
 // Without the ReconnectingClient, the type assertion fails immediately —
 // no 30s poll needed — and the restore branch would be unreachable.
 func TestInstallDaemonAutostartUsesReconnectingClient(t *testing.T) {
+	// Flaky under load (reproduced ~1/3 failures: "waitForConnRestore never
+	// observed the reconnect"). Skipped to unblock the 0.14.2 release by Ruler
+	// ruling; the guard is tracked for a deterministic rewrite in the follow-up
+	// flake-fix edict (zhengming afff05a49725abd3). One-line revert.
+	t.Skip("flaky daemon-reconnect guard; rewritten by follow-up flake-fix edict")
+
 	dir := t.TempDir()
 	if len(filepath.Join(dir, rpc.DefaultSocketName)) >= 104 {
 		t.Skip("tmp path too long for unix socket")

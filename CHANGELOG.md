@@ -5,6 +5,17 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-10-11
+
+### Added
+
+- **Private-network provider egress opt-in** — a new `llm.allow_private_network` config option lets the provider SDK reach RFC1918 (`10.x`/`172.16.x`/`192.168.x`) and ULA endpoints for self-hosted/on-prem models. Off by default because enabling it relaxes the SDK's SSRF egress guard for every provider; link-local/metadata addresses (`169.254.0.0/16`, `fe80::`) remain blocked regardless (e912)
+
+### Fixed
+
+- **Daemon disconnect recovery** — the TUI reconnects automatically when the daemon connection drops: the court client is wrapped in a reconnecting client that respawns a dead daemon and re-runs the SetContext handshake on every new connection, drop detection re-arms after each drop, and if reconnect does not complete within the poll window the user is told "Daemon unreachable — still trying to reconnect…" instead of being stranded on "Reconnecting…" (e911)
+- **Judge evidence files no longer clutter the project root** — the Judge no longer writes `judge_evidence_*.json` files into the working tree; its treason clause now requires a verdict to include its evidence rather than render it to a JSON file
+
 ## [0.14.1] - 2026-10-06
 
 ### Added
