@@ -51,6 +51,13 @@ type LLMConfig struct {
 	RequestTimeoutSeconds      int    `koanf:"request_timeout_seconds"`     // Timeout for non-streaming requests (default: 60)
 	StreamIdleTimeoutSeconds   int    `koanf:"stream_idle_timeout_seconds"` // Idle timeout during streaming responses (default: 120)
 	MaxRetries                 int    `koanf:"max_retries"`                 // Retries on transient connect/network errors (default: 3); each retry uses bifrost's 500ms→5s exponential backoff
+	// AllowPrivateNetwork permits the provider SDK to connect to RFC1918
+	// (10.x/172.16.x/192.168.x) and ULA endpoints. Off by default: enabling it
+	// relaxes the SDK's SSRF egress guard for every provider, so base_url MUST
+	// remain operator-controlled (config env/startup only) — never model- or
+	// tool-settable (see the recorded precedent). Link-local/metadata
+	// (169.254.0.0/16, fe80::) and unspecified addresses stay blocked.
+	AllowPrivateNetwork bool `koanf:"allow_private_network"`
 }
 
 // HistoryConfig holds persistent history configuration

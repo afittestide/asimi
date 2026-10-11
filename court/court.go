@@ -770,6 +770,7 @@ func (s *Court) SetContext(ctx context.Context, params types.SetContextParams) e
 		projectCfg.LLM.BaseURL,
 		params.APIKeys,
 		params.CodexAccountID,
+		projectCfg.LLM.AllowPrivateNetwork,
 	)
 	if err != nil {
 		return fmt.Errorf("init bifrost: %w", err)

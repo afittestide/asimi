@@ -1,15 +1,22 @@
 package court
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"net"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/afittestide/asimi/internal/keyring"
 	"github.com/afittestide/asimi/internal/utils"
+	"github.com/maximhq/bifrost/core/network"
+	providerutils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
 
 func TestHasAWSEnvCredentials(t *testing.T) {
@@ -125,7 +132,7 @@ func TestGetConfiguredProviders_WithAWSKeysInMap(t *testing.T) {
 		"AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 		"openai":                "sk-test",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	providers, err := account.GetConfiguredProviders()
 	if err != nil {
@@ -162,7 +169,7 @@ func TestGetConfiguredProviders_WithAWSKeysInMap_MissingSecret(t *testing.T) {
 		"AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
 		"openai":            "sk-test",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	providers, err := account.GetConfiguredProviders()
 	if err != nil {
@@ -203,7 +210,7 @@ func TestNewAccountWithKeys_ReturnsKeyFromMap(t *testing.T) {
 		"openai":    "sk-test-openai",
 		"anthropic": "sk-ant-test",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	result, err := account.GetKeysForProvider(context.Background(), schemas.OpenAI)
 	if err != nil {
@@ -222,7 +229,7 @@ func TestNewAccountWithKeys_ProviderNotInMap_FallsThroughToKeyring(t *testing.T)
 	keys := map[string]string{
 		"openai": "sk-test-openai",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	// anthropic is not in the map, so it goes to keyring fallback (which returns empty)
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Anthropic)
@@ -240,7 +247,7 @@ func TestNewAccountWithKeys_EmptyValueInMap_ReturnsNoKeys(t *testing.T) {
 	keys := map[string]string{
 		"openai": "",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	result, err := account.GetKeysForProvider(context.Background(), schemas.OpenAI)
 	if err != nil {
@@ -257,7 +264,7 @@ func TestNewAccountWithKeys_NilMap_FallsThroughToKeyring(t *testing.T) {
 	keyring.MockKeyring()
 
 	// Nil map should behave like NewAccount — full keyring fallback path
-	account := NewAccountWithKeys(30, 60, 3, "", nil, "")
+	account := NewAccountWithKeys(30, 60, 3, "", nil, "", false)
 
 	// No keyring key set, so expect empty
 	result, err := account.GetKeysForProvider(context.Background(), schemas.OpenAI)
@@ -276,7 +283,7 @@ func TestNewAccountWithKeys_AllProviders(t *testing.T) {
 		"gemini":     "sk-gemini",
 		"openrouter": "sk-or",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	providers := []schemas.ModelProvider{schemas.OpenAI, schemas.Anthropic, schemas.Gemini, schemas.OpenRouter}
 	for _, provider := range providers {
@@ -294,7 +301,7 @@ func TestNewAccountWithKeys_BedrockNotInMap_ReturnsEmpty(t *testing.T) {
 	keys := map[string]string{
 		"openai": "sk-test",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Bedrock)
 	if err != nil {
@@ -311,7 +318,7 @@ func TestGetKeysForProvider_Bedrock_WithAWSKeysInMap(t *testing.T) {
 		"AWS_ACCESS_KEY_ID":     "AKIAIOSFODNN7EXAMPLE",
 		"AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Bedrock)
 	if err != nil {
@@ -345,7 +352,7 @@ func TestGetKeysForProvider_Bedrock_WithSessionToken(t *testing.T) {
 		"AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 		"AWS_SESSION_TOKEN":     "FwoGZXIvYXdzEGMaDNu5EXAMPLESESSION",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Bedrock)
 	if err != nil {
@@ -371,7 +378,7 @@ func TestGetKeysForProvider_Bedrock_OnlyAccessKeyInMap(t *testing.T) {
 	keys := map[string]string{
 		"AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Bedrock)
 	if err != nil {
@@ -515,7 +522,7 @@ func TestGetConfiguredProviders_Vertex_InKeysMap(t *testing.T) {
 		"GOOGLE_CLOUD_REGION":            "us-central1",
 		"GOOGLE_APPLICATION_CREDENTIALS": "",
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 	providers, err := account.GetConfiguredProviders()
 	if err != nil {
 		t.Fatalf("GetConfiguredProviders() error = %v", err)
@@ -593,7 +600,7 @@ func TestGetKeysForVertex_AuthCredentialsJSONPassthrough_RegionDefaultsGlobal(t 
 		"GOOGLE_CLOUD_REGION":            "", // unset → should fall back to "global"
 		"GOOGLE_APPLICATION_CREDENTIALS": `{"type":"service_account"}`,
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Vertex)
 	if err != nil {
 		t.Fatalf("GetKeysForProvider() error = %v", err)
@@ -629,7 +636,7 @@ func TestGetKeysForVertex_InKeysMap(t *testing.T) {
 		"GOOGLE_CLOUD_REGION":            "europe-west1",
 		"GOOGLE_APPLICATION_CREDENTIALS": `{"type":"service_account"}`,
 	}
-	account := NewAccountWithKeys(30, 60, 3, "", keys, "")
+	account := NewAccountWithKeys(30, 60, 3, "", keys, "", false)
 	result, err := account.GetKeysForProvider(context.Background(), schemas.Vertex)
 	if err != nil {
 		t.Fatalf("GetKeysForProvider() error = %v", err)
@@ -676,7 +683,7 @@ func TestNormalizeBaseURL(t *testing.T) {
 // base URL with a /v1 suffix is normalized before reaching bifrost.
 func TestGetConfigForProvider_NormalizesBaseURL(t *testing.T) {
 	account := NewAccountWithKeys(30, 60, 3, "https://zro.moonmath.ai/v1",
-		map[string]string{"openai": "sk-test"}, "")
+		map[string]string{"openai": "sk-test"}, "", false)
 
 	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
 	require.NoError(t, err)
@@ -702,7 +709,7 @@ func TestInitBifrost_NormalizesBaseURL(t *testing.T) {
 	normalized := normalizeBaseURL(raw)
 	require.Equal(t, "https://zro.moonmath.ai", normalized)
 
-	account := NewAccountWithKeys(30, 60, 3, normalized, map[string]string{"openai": "sk-test"}, "")
+	account := NewAccountWithKeys(30, 60, 3, normalized, map[string]string{"openai": "sk-test"}, "", false)
 	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
 	require.NoError(t, err)
 	assert.Equal(t, "https://zro.moonmath.ai", cfg.NetworkConfig.BaseURL,
@@ -715,7 +722,7 @@ func TestInitBifrost_NormalizesBaseURL(t *testing.T) {
 // TestGetConfigForProvider_AttributionHeaders verifies that User-Agent
 // and OpenRouter HTTP-Referer headers reflect the repository rename.
 func TestGetConfigForProvider_AttributionHeaders(t *testing.T) {
-	account := NewAccount(30, 60, 0, "")
+	account := NewAccount(30, 60, 0, "", false)
 	cfg, err := account.GetConfigForProvider(schemas.OpenRouter)
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
@@ -729,7 +736,7 @@ func TestGetConfigForProvider_AttributionHeaders(t *testing.T) {
 
 // TestGetConfigForProvider tests the config provider
 func TestGetConfigForProvider(t *testing.T) {
-	account := NewAccount(30, 60, 0, "")
+	account := NewAccount(30, 60, 0, "", false)
 	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
 	if err != nil {
 		t.Fatalf("GetConfigForProvider() error = %v", err)
@@ -747,7 +754,7 @@ func TestGetConfigForProvider(t *testing.T) {
 
 // TestGetConfigForProvider_WithKeysMap tests config works with NewAccountWithKeys
 func TestGetConfigForProvider_WithKeysMap(t *testing.T) {
-	account := NewAccountWithKeys(45, 90, 2, "https://custom.api.com", map[string]string{"openai": "sk-test"}, "")
+	account := NewAccountWithKeys(45, 90, 2, "https://custom.api.com", map[string]string{"openai": "sk-test"}, "", false)
 	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
 	if err != nil {
 		t.Fatalf("GetConfigForProvider() error = %v", err)
@@ -774,7 +781,7 @@ func TestGetConfigForProvider_WithKeysMap(t *testing.T) {
 // "chatgpt-account-id" header for OpenAI provider requests.
 func TestGetConfigForProvider_CodexAccountIDHeader(t *testing.T) {
 	account := NewAccountWithKeys(30, 60, 3, "https://chatgpt.com/backend-api",
-		map[string]string{"openai": "sk-test"}, "org-codex-123")
+		map[string]string{"openai": "sk-test"}, "org-codex-123", false)
 
 	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
 	if err != nil {
@@ -799,7 +806,7 @@ func TestGetConfigForProvider_CodexAccountIDHeader(t *testing.T) {
 // TestGetConfigForProvider_NoCodexAccountID verifies that the
 // chatgpt-account-id header is absent when codexAccountID is empty.
 func TestGetConfigForProvider_NoCodexAccountID(t *testing.T) {
-	account := NewAccountWithKeys(30, 60, 3, "", map[string]string{"openai": "sk-test"}, "")
+	account := NewAccountWithKeys(30, 60, 3, "", map[string]string{"openai": "sk-test"}, "", false)
 
 	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
 	if err != nil {
@@ -823,7 +830,7 @@ func TestGetConfigForProvider_CustomProvider(t *testing.T) {
 	t.Setenv("ZAI_BASE_URL", "https://api.z.ai/v1")
 	defer os.Unsetenv("ZAI_BASE_URL")
 
-	account := NewAccount(30, 60, 0, "")
+	account := NewAccount(30, 60, 0, "", false)
 	cfg, err := account.GetConfigForProvider(schemas.ModelProvider("zai"))
 	if err != nil {
 		t.Fatalf("GetConfigForProvider() error = %v", err)
@@ -847,7 +854,7 @@ func TestGetConfigForProvider_CustomProvider(t *testing.T) {
 func TestGetConfigForProvider_CustomProviderNoBaseURL(t *testing.T) {
 	os.Unsetenv("UNKNOWNPROVIDER_BASE_URL")
 
-	account := NewAccount(30, 60, 0, "")
+	account := NewAccount(30, 60, 0, "", false)
 	cfg, err := account.GetConfigForProvider(schemas.ModelProvider("unknownprovider"))
 	if err != nil {
 		t.Fatalf("GetConfigForProvider() error = %v", err)
@@ -868,4 +875,82 @@ func TestIsStandardProvider(t *testing.T) {
 	assert.True(t, isStandardProvider(schemas.Bedrock))
 	assert.False(t, isStandardProvider(schemas.ModelProvider("zai")))
 	assert.False(t, isStandardProvider(schemas.ModelProvider("custom")))
+}
+
+// --- AllowPrivateNetwork (llm.allow_private_network) tests ---
+
+// TestGetConfigForProvider_AllowPrivateNetwork_DefaultOff verifies the
+// default posture: with the flag unset, the SDK's SSRF guard stays on, so a
+// 10.x/RFC1918 base_url would still be rejected. This is the invariant the
+// unconditional `= true` hunk broke.
+func TestGetConfigForProvider_AllowPrivateNetwork_DefaultOff(t *testing.T) {
+	account := NewAccountWithKeys(30, 60, 3, "http://10.0.0.5", map[string]string{"openai": "sk-test"}, "", false)
+
+	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
+	require.NoError(t, err)
+	assert.False(t, cfg.NetworkConfig.AllowPrivateNetwork,
+		"private-network egress must be off unless the operator opts in")
+}
+
+// TestGetConfigForProvider_AllowPrivateNetwork_OptIn verifies acceptance
+// criterion 2: with llm.allow_private_network = true the flag reaches the
+// provider config, so a 10.x endpoint is dialable.
+func TestGetConfigForProvider_AllowPrivateNetwork_OptIn(t *testing.T) {
+	account := NewAccountWithKeys(30, 60, 3, "http://10.0.0.5", map[string]string{"openai": "sk-test"}, "", true)
+
+	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
+	require.NoError(t, err)
+	assert.True(t, cfg.NetworkConfig.AllowPrivateNetwork,
+		"operator opt-in must reach the provider network config")
+	assert.Equal(t, "http://10.0.0.5", cfg.NetworkConfig.BaseURL)
+}
+
+// TestGetConfigForProvider_AllowPrivateNetwork_LoopbackUnaffected verifies
+// loopback is permitted with the flag off (the SDK allows it unconditionally);
+// the flag is only needed for the private 10.x endpoint harbor uses.
+func TestGetConfigForProvider_AllowPrivateNetwork_LoopbackUnaffected(t *testing.T) {
+	account := NewAccount(30, 60, 0, "http://127.0.0.1:8080", false)
+
+	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
+	require.NoError(t, err)
+	assert.False(t, cfg.NetworkConfig.AllowPrivateNetwork)
+	assert.Equal(t, "http://127.0.0.1:8080", cfg.NetworkConfig.BaseURL)
+}
+
+// TestGetConfigForProvider_AllowPrivateNetwork_WarnOnlyWhenEnabled verifies
+// acceptance criterion 4: the relaxed posture is logged, and only when the
+// operator opted in.
+func TestGetConfigForProvider_AllowPrivateNetwork_WarnOnlyWhenEnabled(t *testing.T) {
+	capture := func(allow bool) string {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+
+		account := NewAccount(30, 60, 0, "http://10.0.0.5", allow)
+		_, err := account.GetConfigForProvider(schemas.OpenAI)
+		require.NoError(t, err)
+		return buf.String()
+	}
+
+	assert.False(t, strings.Contains(capture(false), "private-network provider egress enabled"),
+		"WARN must not fire when private-network egress is disabled")
+	assert.True(t, strings.Contains(capture(true), "private-network provider egress enabled"),
+		"WARN must fire when private-network egress is enabled")
+}
+
+// TestConfigureDialer_LinkLocalAlwaysBlocked verifies acceptance criterion 3:
+// link-local / cloud metadata (169.254.169.254) is rejected even with the
+// private-network flag on, because the SDK's IsLinkLocal guard runs before and
+// independently of the AllowPrivateNetwork check
+// (vendor/.../providers/utils/utils.go:301-302).
+func TestConfigureDialer_LinkLocalAlwaysBlocked(t *testing.T) {
+	client := providerutils.ConfigureDialer(&fasthttp.Client{}, true)
+	_, err := client.Dial("169.254.169.254:80")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "link-local",
+		"metadata endpoint must stay blocked regardless of AllowPrivateNetwork")
+	assert.True(t, network.IsLinkLocal(net.ParseIP("169.254.169.254")),
+		"the vendor guard must classify the metadata IP as link-local")
 }

@@ -1671,3 +1671,32 @@ func TestLoadProjectConfig_TimeoutDefaults(t *testing.T) {
 	assert.Equal(t, 0, cfg.RunShellCommand.TimeoutMinutes) // 0 → runner default (10m)
 	assert.Equal(t, 120*time.Second, cfg.Sandbox.ApprovalTimeout)
 }
+
+// TestLoadProjectConfig_AllowPrivateNetwork verifies the koanf key
+// allow_private_network unmarshals into LLMConfig and that it defaults off
+// when absent. This guards acceptance criterion 2: the opt-in reaches
+// GetConfigForProvider only if the config file's value actually lands in
+// projectCfg.LLM.AllowPrivateNetwork. The project-config path is used
+// deliberately so the test does not need to mutate HOME (skipIfNotCI).
+func TestLoadProjectConfig_AllowPrivateNetwork(t *testing.T) {
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+	// Absent key → default false (the safe posture).
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.False(t, cfg.LLM.AllowPrivateNetwork,
+		"allow_private_network must default off when the key is absent")
+
+	// Present and true → parsed into the struct.
+	projectConfig := "[llm]\nallow_private_network = true\n"
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err = LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.True(t, cfg.LLM.AllowPrivateNetwork,
+		"allow_private_network = true must unmarshal into LLMConfig.AllowPrivateNetwork")
+}

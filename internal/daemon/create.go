@@ -139,6 +139,7 @@ func reconfigureModel(ctx context.Context, ct *court.Court, hp types.SetContextP
 		projectCfg.LLM.BaseURL,
 		hp.APIKeys,
 		hp.CodexAccountID,
+		projectCfg.LLM.AllowPrivateNetwork,
 	)
 	if err != nil {
 		return fmt.Errorf("init bifrost: %w", err)

@@ -46,17 +46,18 @@ func NewBifrostLogger(logger *slog.Logger) *BifrostLogger {
 // first; providers absent from the map fall through to keyring for backward
 // compatibility with in-process mode.
 type Account struct {
-	requestTimeout    int
-	streamIdleTimeout int
-	maxRetries        int
-	baseURL           string
-	apiKeys           map[string]string
-	codexAccountID    string
+	requestTimeout      int
+	streamIdleTimeout   int
+	maxRetries          int
+	baseURL             string
+	apiKeys             map[string]string
+	codexAccountID      string
+	allowPrivateNetwork bool
 }
 
 // NewAccount creates a new Account implementation backed by the OS keyring.
-func NewAccount(requestTimeout, streamIdleTimeout, maxRetries int, baseURL string) schemas.Account {
-	return &Account{requestTimeout: requestTimeout, streamIdleTimeout: streamIdleTimeout, maxRetries: maxRetries, baseURL: baseURL}
+func NewAccount(requestTimeout, streamIdleTimeout, maxRetries int, baseURL string, allowPrivateNetwork bool) schemas.Account {
+	return &Account{requestTimeout: requestTimeout, streamIdleTimeout: streamIdleTimeout, maxRetries: maxRetries, baseURL: baseURL, allowPrivateNetwork: allowPrivateNetwork}
 }
 
 // NewAccountWithKeys creates a new Account that reads API keys from the given
@@ -64,8 +65,8 @@ func NewAccount(requestTimeout, streamIdleTimeout, maxRetries int, baseURL strin
 // Environment-variable reads are removed from the primary path; the caller
 // (typically the daemon) is responsible for populating the map from env vars
 // or any other source.
-func NewAccountWithKeys(requestTimeout, streamIdleTimeout, maxRetries int, baseURL string, apiKeys map[string]string, codexAccountID string) schemas.Account {
-	return &Account{requestTimeout: requestTimeout, streamIdleTimeout: streamIdleTimeout, maxRetries: maxRetries, baseURL: baseURL, apiKeys: apiKeys, codexAccountID: codexAccountID}
+func NewAccountWithKeys(requestTimeout, streamIdleTimeout, maxRetries int, baseURL string, apiKeys map[string]string, codexAccountID string, allowPrivateNetwork bool) schemas.Account {
+	return &Account{requestTimeout: requestTimeout, streamIdleTimeout: streamIdleTimeout, maxRetries: maxRetries, baseURL: baseURL, apiKeys: apiKeys, codexAccountID: codexAccountID, allowPrivateNetwork: allowPrivateNetwork}
 }
 
 // GetConfiguredProviders returns providers that have credentials configured.
@@ -349,6 +350,7 @@ func effectiveBaseURL(provider schemas.ModelProvider, configured string) string 
 // GetConfigForProvider returns network configuration for a provider
 func (a *Account) GetConfigForProvider(provider schemas.ModelProvider) (*schemas.ProviderConfig, error) {
 	networkConfig := schemas.DefaultNetworkConfig
+	networkConfig.AllowPrivateNetwork = a.allowPrivateNetwork
 	if a.requestTimeout > 0 {
 		networkConfig.DefaultRequestTimeoutInSeconds = a.requestTimeout
 	}
@@ -363,6 +365,12 @@ func (a *Account) GetConfigForProvider(provider schemas.ModelProvider) (*schemas
 		slog.Debug("base URL resolved", "provider", provider, "base_url", networkConfig.BaseURL)
 	} else {
 		slog.Debug("base URL using provider default", "provider", provider)
+	}
+	// Surface the relaxed SSRF posture. This is operator opt-in
+	// (llm.allow_private_network); when on, base_url must remain
+	// operator-controlled, never model- or tool-settable.
+	if networkConfig.AllowPrivateNetwork {
+		slog.Warn("private-network provider egress enabled", "provider", provider, "base_url", networkConfig.BaseURL)
 	}
 	if networkConfig.BaseURL != "" {
 		// Log the effective URL bifrost will actually request so a future
