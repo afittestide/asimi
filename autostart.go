@@ -234,19 +234,50 @@ func spawnDaemonAndWait(ctx context.Context, socketPath string) error {
 // no live socket is found. Symmetrical to installDaemonSocket but
 // responsible for starting the daemon.
 //
-// This is now the default wire mode for the TUI.
+// This is the default wire mode for the TUI. The conn is wrapped in a
+// ReconnectingClient so a dropped connection is re-established — and a
+// dead daemon respawned — without the user restarting anything. The
+// factory reuses connectOrStartDaemon, which already spawns on demand
+// and evicts wedged daemons; it also re-runs the SetContext handshake,
+// which the daemon requires on every new conn.
 func installDaemonAutostart(ctx context.Context, model *TUIModel) (func(*tea.Program), error) {
 	if model == nil || model.court == nil {
 		return nil, fmt.Errorf("installDaemonAutostart: tui model or court is nil")
 	}
 
-	conn, _, err := connectOrStartDaemon(ctx)
-	if err != nil {
-		return nil, err
+	local := model.court
+	factory := func() (*rpc.Conn, error) {
+		conn, _, err := connectOrStartDaemon(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := daemonSetContext(ctx, conn); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return conn, nil
 	}
 
-	// Send the SetContext handshake required before any other RPC call.
-	// The daemon disconnects clients that fail to handshake within 30s.
+	rc := rpc.NewReconnectingClient(factory, local)
+	if err := rc.Start(); err != nil {
+		return nil, fmt.Errorf("installDaemonAutostart: start: %w", err)
+	}
+
+	model.court = rc
+
+	return func(p *tea.Program) {
+		rc.RegisterHandler(func(conn *rpc.Conn) {
+			rpc.RegisterApprovalHandler(conn, teaSender{p})
+			rpc.RegisterEditorHandler(conn, teaSender{p})
+		})
+	}, nil
+}
+
+// daemonSetContext sends the SetContext handshake required before any
+// other RPC call on a freshly connected daemon. The daemon disconnects
+// clients that fail to handshake within 30s, so every new conn — initial
+// or reconnected — must run it.
+func daemonSetContext(ctx context.Context, conn *rpc.Conn) error {
 	repoInfo := repo.GetRepoInfo()
 	username := "guest"
 	if u, err := user.Current(); err == nil {
@@ -266,15 +297,7 @@ func installDaemonAutostart(ctx context.Context, model *TUIModel) (func(*tea.Pro
 		Model:           cli.Model,
 		ReasoningEffort: cli.ReasoningEffort,
 	}); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("installDaemonAutostart: handshake failed: %w", err)
+		return fmt.Errorf("handshake failed: %w", err)
 	}
-
-	local := model.court
-	model.court = rpc.NewLoopbackCourt(conn, local)
-
-	return func(p *tea.Program) {
-		rpc.RegisterApprovalHandler(conn, teaSender{p})
-		rpc.RegisterEditorHandler(conn, teaSender{p})
-	}, nil
+	return nil
 }

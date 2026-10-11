@@ -1966,6 +1966,7 @@ func TestConnectionRestoredMsg_RetriesPendingPrompt(t *testing.T) {
 
 func TestConnectionReconnectFailedMsg_ShowsError(t *testing.T) {
 	model := newTestModel(t)
+	model.court = &mockCourtClient{}
 	channelID := model.tabs.ActiveTab().Target
 
 	// Simulate a pending retry
@@ -1974,21 +1975,25 @@ func TestConnectionReconnectFailedMsg_ShowsError(t *testing.T) {
 	}
 
 	// Fire connectionReconnectFailedMsg
-	newModel, _ := model.handleCustomMessages(connectionReconnectFailedMsg{})
+	newModel, cmd := model.handleCustomMessages(connectionReconnectFailedMsg{})
 	updatedModel := newModel.(TUIModel)
 
-	// Should have cleared pending retries
-	assert.Nil(t, updatedModel.connDropPendingRetry)
+	// Pending retries are preserved: an eventual restore must still
+	// resubmit the in-flight prompt.
+	assert.NotNil(t, updatedModel.connDropPendingRetry, "pending retries should survive a reconnect timeout")
 
-	// Should show "unable to reconnect" message
-	foundUnable := false
+	// Should show the daemon-unreachable message
+	foundUnreachable := false
 	for _, m := range updatedModel.tabs.Content().Chat.Messages {
-		if strings.Contains(m.Content, "unable to reconnect") {
-			foundUnable = true
+		if strings.Contains(m.Content, "Daemon unreachable") {
+			foundUnreachable = true
 			break
 		}
 	}
-	assert.True(t, foundUnable, "should show unable to reconnect message")
+	assert.True(t, foundUnreachable, "should show daemon unreachable message")
+
+	// The watch is re-armed rather than giving up permanently.
+	assert.NotNil(t, cmd, "reconnect-failed should re-arm the restore watch")
 }
 
 // TestStopStreamingTab_ClearsPendingRetry verifies that when the user

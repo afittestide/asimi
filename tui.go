@@ -1675,36 +1675,44 @@ func friendlyConnError(err error) string {
 }
 
 // watchConnDrop returns a tea.Cmd that blocks on the court's ConnDone
-// channel and emits a connectionLostMsg when it fires, then polls for
-// reconnect and emits connectionRestoredMsg. In loopback/in-process
-// mode the channel never fires, so the goroutine idles.
+// channel and emits connectionLostMsg when it fires. In
+// loopback/in-process mode the channel never closes, so the goroutine
+// idles. After a drop the caller re-arms it via handleConnectionLost so
+// a later drop is observed too.
 func watchConnDrop(courtClient courtapi.Client) tea.Cmd {
 	if courtClient == nil {
 		return nil
 	}
 	return func() tea.Msg {
-		done := courtClient.ConnDone()
-		<-done
-		slog.Debug("tui: connection dropped, watching for reconnect")
-		// Poll for reconnect: ConnDone returns a new channel after
-		// reconnect completes (ReconnectingClient swaps conn). When
-		// the new channel is already closed (shouldn't happen), or
-		// when we detect it's still open, we wait for it to fire.
-		// We poll at 200ms intervals — reconnect has backoff up to 5s.
+		<-courtClient.ConnDone()
+		slog.Debug("tui: connection dropped")
+		return connectionLostMsg{}
+	}
+}
+
+// waitForConnRestore returns a tea.Cmd that polls the court's ConnDone
+// channel after a drop, emitting connectionRestoredMsg once the
+// ReconnectingClient has swapped in a fresh, open conn. If no reconnect
+// happens within connRestoreTimeout it emits connectionReconnectFailedMsg
+// so the TUI can tell the user the daemon is unreachable instead of
+// stranding them in "Reconnecting…" forever.
+func waitForConnRestore(courtClient courtapi.Client) tea.Cmd {
+	if courtClient == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		// Poll at 200ms intervals — reconnect backoff reaches 5s.
 		for i := 0; i < 150; i++ { // 30s max
 			time.Sleep(200 * time.Millisecond)
-			newDone := courtClient.ConnDone()
 			select {
-			case <-newDone:
-				// Still down, keep polling
-				continue
+			case <-courtClient.ConnDone():
+				// Still down, keep polling.
 			default:
-				// Reconnected
 				slog.Debug("tui: connection restored")
 				return connectionRestoredMsg{}
 			}
 		}
-		// Timed out waiting for reconnect
+		slog.Warn("tui: reconnect timed out; daemon appears unreachable")
 		return connectionReconnectFailedMsg{}
 	}
 }
@@ -3626,15 +3634,18 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleConnectionRestored()
 
 	case connectionReconnectFailedMsg:
-		// Reconnect failed — show error and clear pending retries
+		// Reconnect did not complete within the poll window — tell the
+		// user the daemon is unreachable (rather than stranding them in
+		// "Reconnecting…"), keep the pending retries so an eventual
+		// restore still resubmits them, and re-arm the watcher rather
+		// than giving up permanently.
 		for tabTarget := range m.connDropPendingRetry {
 			chat := m.tabs.ChatByTab(tabTarget)
-			chat.AddMessage(fmt.Sprintf("%s❌ Connection lost — unable to reconnect. Please restart the daemon.", systemPrefix))
+			chat.AddMessage(fmt.Sprintf("%s❌ Daemon unreachable — still trying to reconnect…", systemPrefix))
 		}
-		m.connDropPendingRetry = nil
-		m.commandLine.AddToast("Unable to reconnect. Please restart the daemon.", "error", time.Second*10)
+		m.commandLine.AddToast("Daemon unreachable — still trying to reconnect…", "error", time.Second*10)
 		m.status.SetError()
-		return m, nil
+		return m, waitForConnRestore(m.court)
 
 	}
 
@@ -4109,20 +4120,27 @@ func (m TUIModel) handleConnectionLost() (tea.Model, tea.Cmd) {
 	m.stopWaitingForResponse()
 	m.commandLine.AddToast("Connection lost — Reconnecting…", "warning", time.Second*5)
 
-	// Start watching for reconnect
-	return m, watchConnDrop(m.court)
+	// Wait for the reconnecting client to swap in a fresh conn. The
+	// drop watcher is re-armed by handleConnectionRestored, once the new
+	// open conn exists (re-arming now would grab the dead conn's closed
+	// channel and fire again immediately).
+	return m, waitForConnRestore(m.court)
 }
 
 // handleConnectionRestored is called after the RPC connection is re-established.
 // It re-submits the prompt for each tab that was streaming when the connection
 // dropped.
 func (m TUIModel) handleConnectionRestored() (tea.Model, tea.Cmd) {
+	// The reconnecting client has swapped in a fresh conn; re-arm the
+	// drop watcher so the next connection loss is detected too.
+	var cmds []tea.Cmd
+	cmds = append(cmds, watchConnDrop(m.court))
+
 	if len(m.connDropPendingRetry) == 0 {
-		// No pending retries — nothing to do
-		return m, nil
+		// No pending retries — connectivity is back, nothing to resubmit.
+		return m, tea.Batch(cmds...)
 	}
 
-	var cmds []tea.Cmd
 	for tabTarget, retry := range m.connDropPendingRetry {
 		chat := m.tabs.ChatByTab(tabTarget)
 		chat.AddMessage(fmt.Sprintf("%s✓ Reconnected — retrying your message…", systemPrefix))
@@ -4145,10 +4163,7 @@ func (m TUIModel) handleConnectionRestored() (tea.Model, tea.Cmd) {
 		cmds = append(cmds, waitCmd)
 	}
 
-	if len(cmds) > 0 {
-		return m, tea.Batch(cmds...)
-	}
-	return m, nil
+	return m, tea.Batch(cmds...)
 }
 
 // handleAnsweringComplete closes the zhengming waiter and updates the DB.

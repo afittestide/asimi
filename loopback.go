@@ -5,11 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os/user"
 
-	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/rpc"
-	"github.com/afittestide/asimi/internal/types"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -104,8 +101,7 @@ func installDaemonSocket(ctx context.Context, model *TUIModel, socketPath string
 
 // newDaemonConn dials the daemon socket, creates an rpc.Conn, starts
 // conn.Serve in a goroutine, and sends the SetContext handshake
-// required before any other RPC call. The daemon disconnects clients
-// that fail to handshake within 30s.
+// required before any other RPC call.
 func newDaemonConn(ctx context.Context, socketPath string) (*rpc.Conn, error) {
 	c, err := rpc.Dial(socketPath)
 	if err != nil {
@@ -118,28 +114,9 @@ func newDaemonConn(ctx context.Context, socketPath string) (*rpc.Conn, error) {
 		}
 	}()
 
-	repoInfo := repo.GetRepoInfo()
-	username := "guest"
-	if u, err := user.Current(); err == nil {
-		username = u.Username
-	}
-
-	if err := rpc.NewCourtClient(conn).SetContext(ctx, types.SetContextParams{
-		Project:         repoInfo.Slug,
-		Username:        username,
-		ProjectRoot:     repoInfo.ProjectRoot,
-		WorktreePath:    repoInfo.WorktreePath,
-		Branch:          repoInfo.Branch,
-		APIKeys:         collectAPIKeys(),
-		CodexAccountID:  getCodexAccountID(),
-		IsolatedHost:    cli.IsolatedHost,
-		AtifAgentName:   atifAgentName(),
-		Provider:        cli.Provider,
-		Model:           cli.Model,
-		ReasoningEffort: cli.ReasoningEffort,
-	}); err != nil {
+	if err := daemonSetContext(ctx, conn); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("handshake failed: %w", err)
+		return nil, err
 	}
 
 	return conn, nil

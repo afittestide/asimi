@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/afittestide/asimi/internal/rpc"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // fakeDaemon stands in for the real asimi daemon subprocess in unit
@@ -51,6 +52,12 @@ func startFakeDaemon(t *testing.T, socketPath string) (stop func()) {
 				conn.Handle(rpc.MethodPing, func(ctx context.Context, params []byte) ([]byte, error) {
 					return nil, nil
 				})
+				// A client factory (installDaemonAutostart /
+				// newDaemonConn) runs the SetContext handshake on
+				// every new conn; answer it so the conn is usable.
+				conn.Handle(rpc.MethodSetContext, func(ctx context.Context, params []byte) ([]byte, error) {
+					return nil, nil
+				})
 				_ = conn.Serve()
 			}(c)
 		}
@@ -63,6 +70,7 @@ func startFakeDaemon(t *testing.T, socketPath string) (stop func()) {
 	}
 }
 
+// TestConnectOrStartDaemonFastPath tests the fast path resolution of a live daemon socket.
 func TestConnectOrStartDaemonFastPath(t *testing.T) {
 	dir := t.TempDir()
 	if len(filepath.Join(dir, rpc.DefaultSocketName)) >= 104 {
@@ -197,5 +205,158 @@ func TestReadySignalOnFD(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("readiness byte never arrived")
+	}
+}
+
+// dialPair returns a connected, served rpc.Conn pair: the first is the
+// "client" end (what the TUI would hold), the second the server end.
+// Closing the server simulates a dead daemon.
+func dialPair(t *testing.T) (client, server *rpc.Conn) {
+	t.Helper()
+	pa, pb := net.Pipe()
+	client = rpc.New(pa, rpc.Options{})
+	server = rpc.New(pb, rpc.Options{})
+	go func() { _ = client.Serve() }()
+	go func() { _ = server.Serve() }()
+	return client, server
+}
+
+// TestWatchConnDropObservesReconnect is the edict 911 regression guard:
+// with the default-mode ReconnectingClient, watchConnDrop must observe a
+// drop, and waitForConnRestore must then observe the swapped-in fresh
+// conn as restored — not time out. A LoopbackCourt-style static conn
+// would make the restore branch unreachable.
+func TestWatchConnDropObservesReconnect(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	factory := func() (*rpc.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		client, server := dialPair(t)
+		// Keep the server end alive for the test; it leaks into the
+		// t.Cleanup below via the closure.
+		t.Cleanup(func() { _ = server.Close() })
+		return client, nil
+	}
+
+	rc := rpc.NewReconnectingClient(factory, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	// The first conn must be the one we hold, so we can kill it.
+	first := rc.Conn()
+	if first == nil {
+		t.Fatal("Start did not install a conn")
+	}
+
+	// watchConnDrop blocks until the conn dies.
+	lost := make(chan tea.Msg, 1)
+	go func() { lost <- watchConnDrop(rc)() }()
+
+	// Kill the conn the way a daemon exit would.
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first conn: %v", err)
+	}
+
+	select {
+	case msg := <-lost:
+		if _, ok := msg.(connectionLostMsg); !ok {
+			t.Fatalf("watchConnDrop returned %T, want connectionLostMsg", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchConnDrop never observed the drop")
+	}
+
+	// waitForConnRestore should now see the reconnected conn and report
+	// restore rather than the 30s exhaustion failure.
+	restored := make(chan tea.Msg, 1)
+	go func() { restored <- waitForConnRestore(rc)() }()
+
+	select {
+	case msg := <-restored:
+		if _, ok := msg.(connectionRestoredMsg); !ok {
+			t.Fatalf("waitForConnRestore returned %T, want connectionRestoredMsg", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForConnRestore never observed the reconnect")
+	}
+
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got < 2 {
+		t.Fatalf("factory called %d times, want at least 2 (initial + reconnect)", got)
+	}
+}
+
+// TestInstallDaemonAutostartUsesReconnectingClient guards the edict 911
+// fix at its source: installDaemonAutostart must install a
+// *rpc.ReconnectingClient (not a plain LoopbackCourt), so that a dropped
+// conn is observed via a *swapped* ConnDone channel. It then proves the
+// swap functionally: killing the live conn reconnects to the (still
+// listening) daemon and waitForConnRestore reports restore.
+//
+// Without the ReconnectingClient, the type assertion fails immediately —
+// no 30s poll needed — and the restore branch would be unreachable.
+func TestInstallDaemonAutostartUsesReconnectingClient(t *testing.T) {
+	dir := t.TempDir()
+	if len(filepath.Join(dir, rpc.DefaultSocketName)) >= 104 {
+		t.Skip("tmp path too long for unix socket")
+	}
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("ASIMI_READY_FD", "")
+
+	resolved, err := rpc.SocketPath()
+	if err != nil {
+		t.Fatalf("SocketPath: %v", err)
+	}
+	stop := startFakeDaemon(t, resolved)
+	defer stop()
+
+	model := newTestModel(t)
+	model.court = &mockCourtClient{}
+
+	hook, err := installDaemonAutostart(context.Background(), model)
+	if err != nil {
+		t.Fatalf("installDaemonAutostart: %v", err)
+	}
+	if hook == nil {
+		t.Fatal("installDaemonAutostart returned a nil program hook")
+	}
+
+	rc, ok := model.court.(*rpc.ReconnectingClient)
+	if !ok {
+		t.Fatalf("model.court = %T, want *rpc.ReconnectingClient", model.court)
+	}
+	defer rc.Close()
+
+	first := rc.Conn()
+	if first == nil {
+		t.Fatal("installDaemonAutostart did not install a conn")
+	}
+
+	// Kill the live conn the way a daemon exit would; the reconnecting
+	// client must dial the still-listening daemon and swap in a new conn.
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first conn: %v", err)
+	}
+
+	restored := make(chan tea.Msg, 1)
+	go func() { restored <- waitForConnRestore(rc)() }()
+
+	select {
+	case msg := <-restored:
+		if _, ok := msg.(connectionRestoredMsg); !ok {
+			t.Fatalf("waitForConnRestore returned %T, want connectionRestoredMsg", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waitForConnRestore never observed the reconnect")
+	}
+
+	if rc.Conn() == first {
+		t.Fatal("ConnDone channel was not swapped: rc.Conn() is still the dead conn")
 	}
 }
