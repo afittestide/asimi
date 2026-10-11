@@ -1010,10 +1010,10 @@ func TestSession_ExecuteToolCall_Error(t *testing.T) {
 func TestCoreToolScheduler_Schedule_Error(t *testing.T) {
 	t.Parallel()
 
-	var errorNotified atomic.Bool
+	done := make(chan struct{})
 	notify := func(msg any) {
 		if _, ok := msg.(runners.ToolCallErrorMsg); ok {
-			errorNotified.Store(true)
+			close(done)
 		}
 	}
 
@@ -1024,7 +1024,11 @@ func TestCoreToolScheduler_Schedule_Error(t *testing.T) {
 	result := <-ch
 
 	assert.Error(t, result.Error)
-	assert.True(t, errorNotified.Load())
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ToolCallErrorMsg was not dispatched")
+	}
 }
 
 func TestCoreToolScheduler_Schedule_NoNotify(t *testing.T) {
