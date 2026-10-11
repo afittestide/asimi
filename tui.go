@@ -1674,6 +1674,16 @@ func friendlyConnError(err error) string {
 	}
 }
 
+// connRestoreTimeout bounds how long waitForConnRestore waits for a fresh
+// conn before reporting the daemon unreachable.
+const connRestoreTimeout = 30 * time.Second
+
+// restorable is implemented by clients that signal each successful reconnect
+// by closing a channel, e.g. *rpc.ReconnectingClient.
+type restorable interface {
+	Restored() <-chan struct{}
+}
+
 // watchConnDrop returns a tea.Cmd that blocks on the court's ConnDone
 // channel and emits connectionLostMsg when it fires. In
 // loopback/in-process mode the channel never closes, so the goroutine
@@ -1690,17 +1700,41 @@ func watchConnDrop(courtClient courtapi.Client) tea.Cmd {
 	}
 }
 
-// waitForConnRestore returns a tea.Cmd that polls the court's ConnDone
-// channel after a drop, emitting connectionRestoredMsg once the
-// ReconnectingClient has swapped in a fresh, open conn. If no reconnect
-// happens within connRestoreTimeout it emits connectionReconnectFailedMsg
-// so the TUI can tell the user the daemon is unreachable instead of
-// stranding them in "Reconnecting…" forever.
+// waitForConnRestore returns a tea.Cmd that waits for the court's
+// reconnecting client to swap in a fresh conn after a drop, emitting
+// connectionRestoredMsg once it has. Clients that signal the swap via
+// Restored() are awaited on that signal; clients without one (e.g.
+// LoopbackCourt) fall back to polling. If no reconnect happens within
+// connRestoreTimeout it emits connectionReconnectFailedMsg so the TUI
+// can tell the user the daemon is unreachable instead of stranding them
+// in "Reconnecting…" forever.
 func waitForConnRestore(courtClient courtapi.Client) tea.Cmd {
 	if courtClient == nil {
 		return nil
 	}
 	return func() tea.Msg {
+		if r, ok := courtClient.(restorable); ok {
+			restored := r.Restored()
+			select {
+			case <-courtClient.ConnDone():
+				// The old conn is still the current one; wait for the
+				// reconnecting client to close the captured channel when
+				// it swaps in a fresh conn.
+			default:
+				// A reconnect already landed before we armed.
+				slog.Debug("tui: connection restored")
+				return connectionRestoredMsg{}
+			}
+			select {
+			case <-restored:
+				slog.Debug("tui: connection restored")
+				return connectionRestoredMsg{}
+			case <-time.After(connRestoreTimeout):
+				slog.Warn("tui: reconnect timed out; daemon appears unreachable")
+				return connectionReconnectFailedMsg{}
+			}
+		}
+
 		// Poll at 200ms intervals — reconnect backoff reaches 5s.
 		for i := 0; i < 150; i++ { // 30s max
 			time.Sleep(200 * time.Millisecond)

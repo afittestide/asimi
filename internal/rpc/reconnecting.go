@@ -28,6 +28,7 @@ type ReconnectingClient struct {
 	mu       sync.RWMutex
 	conn     *Conn
 	client   *CourtClient
+	restored chan struct{}
 	reconCtx context.Context
 	cancel   context.CancelFunc
 
@@ -46,6 +47,7 @@ func NewReconnectingClient(factory connFactory, local courtapi.Client) *Reconnec
 		local:    local,
 		reconCtx: ctx,
 		cancel:   cancel,
+		restored: make(chan struct{}),
 	}
 }
 
@@ -67,6 +69,9 @@ func (rc *ReconnectingClient) Start() error {
 	rc.mu.Lock()
 	rc.conn = conn
 	rc.client = NewCourtClient(conn)
+	if rc.restored == nil {
+		rc.restored = make(chan struct{})
+	}
 	rc.mu.Unlock()
 
 	go rc.watchConnection()
@@ -162,6 +167,10 @@ func (rc *ReconnectingClient) reconnect() error {
 		rc.mu.Lock()
 		rc.conn = conn
 		rc.client = NewCourtClient(conn)
+		if rc.restored != nil {
+			close(rc.restored)
+		}
+		rc.restored = make(chan struct{})
 		handlers := rc.handlers
 		rc.mu.Unlock()
 
@@ -671,6 +680,15 @@ func (rc *ReconnectingClient) ConnDone() <-chan struct{} {
 		return make(chan struct{})
 	}
 	return conn.Done()
+}
+
+// Restored returns a channel that is closed once the client has swapped in a
+// fresh connection after a drop. Callers should re-read it after each drop to
+// wait for the next reconnect, mirroring the ConnDone contract.
+func (rc *ReconnectingClient) Restored() <-chan struct{} {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.restored
 }
 
 // ListModels reads models over the wire from the court that owns the

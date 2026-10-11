@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -221,6 +222,22 @@ func dialPair(t *testing.T) (client, server *rpc.Conn) {
 	return client, server
 }
 
+// pinnedConnDone pins ConnDone to a channel captured before the drop. It
+// stands in for the documented usage of ReconnectingClient.ConnDone ("re-call
+// after a reconnect") and removes the race where the watcher subscribes to
+// the freshly swapped-in live conn instead of the conn that is about to die.
+type pinnedConnDone struct {
+	*rpc.ReconnectingClient
+	done <-chan struct{}
+}
+
+func (p pinnedConnDone) ConnDone() <-chan struct{} { return p.done }
+
+// reconnectSafetyNet bounds how long a guard waits for the reconnect swap. It
+// is a backstop only: the success condition is the swap signal (Restored()),
+// never the deadline.
+const reconnectSafetyNet = 35 * time.Second
+
 // TestWatchConnDropObservesReconnect is the edict 911 regression guard:
 // with the default-mode ReconnectingClient, watchConnDrop must observe a
 // drop, and waitForConnRestore must then observe the swapped-in fresh
@@ -252,9 +269,16 @@ func TestWatchConnDropObservesReconnect(t *testing.T) {
 		t.Fatal("Start did not install a conn")
 	}
 
-	// watchConnDrop blocks until the conn dies.
+	// watchConnDrop blocks until the conn dies. Pin the watcher's view to
+	// the first conn *before* killing it, so the assertion is driven by
+	// the drop event rather than racing the reconnect swap.
 	lost := make(chan tea.Msg, 1)
-	go func() { lost <- watchConnDrop(rc)() }()
+	go func() { lost <- watchConnDrop(pinnedConnDone{rc, first.Done()})() }()
+
+	// Capture the restore signal for this drop before triggering it.
+	// Restored() is closed when a fresh conn is swapped in; reading it
+	// after the kill could miss a swap that landed first.
+	restoreCh := rc.Restored()
 
 	// Kill the conn the way a daemon exit would.
 	if err := first.Close(); err != nil {
@@ -266,12 +290,22 @@ func TestWatchConnDropObservesReconnect(t *testing.T) {
 		if _, ok := msg.(connectionLostMsg); !ok {
 			t.Fatalf("watchConnDrop returned %T, want connectionLostMsg", msg)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(reconnectSafetyNet):
 		t.Fatal("watchConnDrop never observed the drop")
 	}
 
-	// waitForConnRestore should now see the reconnected conn and report
-	// restore rather than the 30s exhaustion failure.
+	// The reconnect swap is the success condition, not a wall clock.
+	select {
+	case <-restoreCh:
+	case <-time.After(reconnectSafetyNet):
+		t.Fatal("reconnect never swapped in a fresh conn")
+	}
+	if rc.Conn() == first {
+		t.Fatal("ConnDone channel was not swapped: rc.Conn() is still the dead conn")
+	}
+
+	// waitForConnRestore must now report restore rather than the
+	// exhaustion failure.
 	restored := make(chan tea.Msg, 1)
 	go func() { restored <- waitForConnRestore(rc)() }()
 
@@ -280,7 +314,7 @@ func TestWatchConnDropObservesReconnect(t *testing.T) {
 		if _, ok := msg.(connectionRestoredMsg); !ok {
 			t.Fatalf("waitForConnRestore returned %T, want connectionRestoredMsg", msg)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(reconnectSafetyNet):
 		t.Fatal("waitForConnRestore never observed the reconnect")
 	}
 
@@ -289,6 +323,138 @@ func TestWatchConnDropObservesReconnect(t *testing.T) {
 	mu.Unlock()
 	if got < 2 {
 		t.Fatalf("factory called %d times, want at least 2 (initial + reconnect)", got)
+	}
+}
+
+// TestReconnectGuardFailsWithoutLiveConn is the negative check for the
+// daemon-reconnect guards: when the client never swaps in a live conn, the
+// restore signal must stay open and waitForConnRestore must report failure,
+// not success. This proves the guards are signalled on an actual swap rather
+// than passing on the mere passage of time.
+func TestReconnectGuardFailsWithoutLiveConn(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	factory := func() (*rpc.Conn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls > 1 {
+			return nil, errors.New("daemon unreachable")
+		}
+		client, server := dialPair(t)
+		t.Cleanup(func() { _ = server.Close() })
+		return client, nil
+	}
+
+	rc := rpc.NewReconnectingClient(factory, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	restoreCh := rc.Restored()
+	if err := rc.Conn().Close(); err != nil {
+		t.Fatalf("close first conn: %v", err)
+	}
+
+	restored := make(chan tea.Msg, 1)
+	go func() { restored <- waitForConnRestore(rc)() }()
+	select {
+	case msg := <-restored:
+		t.Fatalf("waitForConnRestore with no live conn returned %T, want no success", msg)
+	case <-time.After(time.Second):
+	}
+
+	select {
+	case <-restoreCh:
+		t.Fatal("Restored() fired without a successful swap")
+	default:
+	}
+}
+
+// armRestorable wraps a ReconnectingClient and signals when Restored() is
+// read, so a test can prove waitForConnRestore has armed on the restore
+// signal before the swap is allowed to land.
+type armRestorable struct {
+	*rpc.ReconnectingClient
+	armed chan struct{}
+}
+
+func (a armRestorable) Restored() <-chan struct{} {
+	a.armed <- struct{}{}
+	return a.ReconnectingClient.Restored()
+}
+
+// TestWaitForConnRestoreSignalsOnSwap drives the production success path of
+// waitForConnRestore directly: the waiter is armed after the drop while the
+// client still holds the dead conn, and must return connectionRestoredMsg
+// only when the reconnect actually closes the Restored() channel — never
+// before. This covers the <-restored branch that the other guards reach only
+// via their pre-armed shortcut.
+func TestWaitForConnRestoreSignalsOnSwap(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	var calls int
+	var mu sync.Mutex
+	factory := func() (*rpc.Conn, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n > 1 {
+			// Hold the reconnect until the waiter is armed, so the swap
+			// cannot land early via the shortcut branch.
+			<-release
+		}
+		client, server := dialPair(t)
+		t.Cleanup(func() { _ = server.Close() })
+		return client, nil
+	}
+
+	rc := rpc.NewReconnectingClient(factory, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+	defer once.Do(func() { close(release) })
+
+	first := rc.Conn()
+	if first == nil {
+		t.Fatal("Start did not install a conn")
+	}
+
+	// Drop the live conn first: reconnect blocks in the factory, so rc still
+	// holds the dead conn when the waiter arms.
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first conn: %v", err)
+	}
+
+	armed := make(chan struct{}, 1)
+	wait := make(chan tea.Msg, 1)
+	go func() { wait <- waitForConnRestore(armRestorable{rc, armed})() }()
+
+	select {
+	case <-armed:
+	case <-time.After(reconnectSafetyNet):
+		t.Fatal("waitForConnRestore never armed on Restored()")
+	}
+
+	// The swap has not been released, so no restore can be reported yet.
+	select {
+	case msg := <-wait:
+		t.Fatalf("waitForConnRestore returned %T before the swap landed", msg)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	once.Do(func() { close(release) })
+
+	select {
+	case msg := <-wait:
+		if _, ok := msg.(connectionRestoredMsg); !ok {
+			t.Fatalf("waitForConnRestore returned %T, want connectionRestoredMsg", msg)
+		}
+	case <-time.After(reconnectSafetyNet):
+		t.Fatal("waitForConnRestore never observed the swap")
 	}
 }
 
@@ -302,12 +468,6 @@ func TestWatchConnDropObservesReconnect(t *testing.T) {
 // Without the ReconnectingClient, the type assertion fails immediately —
 // no 30s poll needed — and the restore branch would be unreachable.
 func TestInstallDaemonAutostartUsesReconnectingClient(t *testing.T) {
-	// Flaky under load (reproduced ~1/3 failures: "waitForConnRestore never
-	// observed the reconnect"). Skipped to unblock the 0.14.2 release by Ruler
-	// ruling; the guard is tracked for a deterministic rewrite in the follow-up
-	// flake-fix edict (zhengming afff05a49725abd3). One-line revert.
-	t.Skip("flaky daemon-reconnect guard; rewritten by follow-up flake-fix edict")
-
 	dir := t.TempDir()
 	if len(filepath.Join(dir, rpc.DefaultSocketName)) >= 104 {
 		t.Skip("tmp path too long for unix socket")
@@ -346,8 +506,19 @@ func TestInstallDaemonAutostartUsesReconnectingClient(t *testing.T) {
 
 	// Kill the live conn the way a daemon exit would; the reconnecting
 	// client must dial the still-listening daemon and swap in a new conn.
+	// Capture the restore signal before the kill so a fast swap cannot be
+	// missed.
+	restoreCh := rc.Restored()
 	if err := first.Close(); err != nil {
 		t.Fatalf("close first conn: %v", err)
+	}
+
+	// The swap signal is the success condition; the deadline is only a
+	// backstop against a hung reconnect.
+	select {
+	case <-restoreCh:
+	case <-time.After(reconnectSafetyNet):
+		t.Fatal("reconnect never swapped in a fresh conn")
 	}
 
 	restored := make(chan tea.Msg, 1)
@@ -358,7 +529,7 @@ func TestInstallDaemonAutostartUsesReconnectingClient(t *testing.T) {
 		if _, ok := msg.(connectionRestoredMsg); !ok {
 			t.Fatalf("waitForConnRestore returned %T, want connectionRestoredMsg", msg)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(reconnectSafetyNet):
 		t.Fatal("waitForConnRestore never observed the reconnect")
 	}
 
