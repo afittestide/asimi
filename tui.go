@@ -91,8 +91,8 @@ type TUIModel struct {
 	ctrlCLastPress  time.Time // Time of last Ctrl-C press for double-press detection
 	oscFilterActive time.Time // Tracks when we last filtered an OSC/CSI response
 
-	// Host command approval state
-	pendingHostApproval *runners.ApprovalRequestMsg
+	// Host command approval state (FIFO queue of commands awaiting approval)
+	pendingHostApprovals []*runners.ApprovalRequestMsg
 	// Ritual enactment confirmation state
 	pendingRitualEnact *pendingRitualEnact
 	// Seal override confirmation state
@@ -217,6 +217,10 @@ type shellCommandResultMsg struct {
 	err      error
 }
 
+// commandTimerTickMsg re-renders the status bar while a shell command is in
+// flight so its stopwatch advances at the configured interval.
+type commandTimerTickMsg struct{}
+
 // editorResultMsg is sent after tea.ExecProcess finishes running the editor.
 type editorResultMsg struct {
 	ResultChan chan tools.EditorResult
@@ -246,6 +250,23 @@ type pendingEdictCancel struct {
 // showEdictDashboardMsg requests showing the edict dashboard view
 type showEdictDashboardMsg struct {
 	content string
+}
+
+// peekPendingHostApproval returns the head of the approval queue, or nil.
+func (m *TUIModel) peekPendingHostApproval() *runners.ApprovalRequestMsg {
+	if len(m.pendingHostApprovals) == 0 {
+		return nil
+	}
+	return m.pendingHostApprovals[0]
+}
+
+// popPendingHostApproval removes and returns the head of the approval queue.
+func (m *TUIModel) popPendingHostApproval() *runners.ApprovalRequestMsg {
+	pending := m.peekPendingHostApproval()
+	if pending != nil {
+		m.pendingHostApprovals = m.pendingHostApprovals[1:]
+	}
+	return pending
 }
 
 // enterYesNoOrAuto enters yes/no mode, unless handsoff mode is active.
@@ -2127,8 +2148,12 @@ func (m TUIModel) handleShellCommand(command string) (tea.Model, tea.Cmd) {
 	// Display the command in chat similar to a shell prompt
 	m.tabs.Content().Chat.AddShellCommandInput(shellCmd)
 
+	// Start the stopwatch shown in the status bar.
+	m.status.StartCommand()
+	timerTick := m.commandTimerCmd()
+
 	// Execute the shell command using the current shell runner (sandbox or host)
-	return m, func() tea.Msg {
+	return m, tea.Batch(timerTick, func() tea.Msg {
 		ctx := context.Background()
 
 		// User-initiated commands never need approval
@@ -2155,7 +2180,20 @@ func (m TUIModel) handleShellCommand(command string) (tea.Model, tea.Cmd) {
 			exitCode: output.ExitCode,
 			err:      nil,
 		}
+	})
+}
+
+// commandTimerCmd schedules the next stopwatch refresh while a shell command
+// is in flight. It stops re-arming once the command finishes.
+func (m *TUIModel) commandTimerCmd() tea.Cmd {
+	if !m.status.commandRunning {
+		return nil
 	}
+	interval := 3 * time.Second
+	if m.config != nil && m.config.UI.CommandTimerInterval > 0 {
+		interval = m.config.UI.CommandTimerInterval
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg { return commandTimerTickMsg{} })
 }
 
 // handleWindowSizeMsg handles window resize events
@@ -3059,17 +3097,28 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Check if this is a response to a host command approval request
-		if m.pendingHostApproval != nil {
-			// Send the response back to the waiting goroutine
-			m.pendingHostApproval.ResponseChan <- msg.answer
+		if m.peekPendingHostApproval() != nil {
+			// Answer the head of the queue
+			pending := m.popPendingHostApproval()
+			pending.ResponseChan <- msg.answer
 			if msg.answer {
 				// User approved - update the emoji to ⚙️ (executing)
-				m.tabs.Content().Chat.UpdateLastToolCallEmoji(m.pendingHostApproval.Command, "⚙️")
+				m.tabs.Content().Chat.UpdateLastToolCallEmoji(pending.Command, "⚙️")
 			} else {
 				// User denied - update the emoji to ⛔︎
-				m.tabs.Content().Chat.UpdateLastToolCallEmoji(m.pendingHostApproval.Command, "⛔︎")
+				m.tabs.Content().Chat.UpdateLastToolCallEmoji(pending.Command, "⛔︎")
 			}
-			m.pendingHostApproval = nil
+
+			// Promote the next queued command to the active prompt
+			if next := m.peekPendingHostApproval(); next != nil {
+				displayCmd := next.Command
+				maxLen := 50
+				// TODO: truncate the middle
+				if len(displayCmd) > maxLen {
+					displayCmd = displayCmd[:maxLen] + "..."
+				}
+				return m, m.enterYesNoOrAuto(fmt.Sprintf("Allow `%s` to run?", displayCmd), true)
+			}
 			return m, nil
 		}
 
@@ -3129,9 +3178,14 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.commandLine.EnterInputMode("Enter model as provider/model>")
 
 	case runners.ApprovalRequestMsg:
-		// Store the pending approval request
-		m.pendingHostApproval = &msg
+		// Queue the approval request. Only prompt when nothing was pending.
+		wasEmpty := len(m.pendingHostApprovals) == 0
+		m.pendingHostApprovals = append(m.pendingHostApprovals, &msg)
 		m.tabs.Content().Chat.UpdateLastToolCallEmoji(msg.Command, approvalPrefix)
+		if !wasEmpty {
+			m.commandLine.AddToast(fmt.Sprintf("%d more command(s) awaiting approval", len(m.pendingHostApprovals)-1), "info", 3000)
+			return m, nil
+		}
 		displayCmd := msg.Command
 		maxLen := 50
 		// TODO: truncate the middle
@@ -3656,10 +3710,14 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case shellCommandResultMsg:
 		// Shell command execution completed
+		m.status.StopCommand()
 		m.tabs.Content().Chat.AddShellCommandResult(msg)
 		m.repoInfo.RefreshDiff()
 		m.prompt().Focus()
 		return m, nil
+
+	case commandTimerTickMsg:
+		return m, m.commandTimerCmd()
 
 	case connectionLostMsg:
 		return m.handleConnectionLost()

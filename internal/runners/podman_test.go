@@ -113,6 +113,32 @@ func TestNewPodmanRunnerCustomImage(t *testing.T) {
 	assert.False(t, runner.allowFallback)
 }
 
+// TestPodmanRunnerSetRepoInfoRoutesToWorktree proves the isolation lever reaches
+// the sandbox execution layer: SetRepoInfo with a WorktreePath re-points the
+// container working root at the edict's worktree, while ProjectRoot stays the
+// main tree (the only path bind-mounted into the sandbox).
+func TestPodmanRunnerSetRepoInfoRoutesToWorktree(t *testing.T) {
+	root := t.TempDir()
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: root, Slug: "test/project"}, 1, nil)
+	require.NotNil(t, runner)
+
+	assert.Equal(t, root, runner.projectWorkingRoot(), "no worktree → main tree")
+
+	worktreeRel := filepath.Join(".agents", "worktrees", "e531")
+	runner.SetRepoInfo(repo.RepoInfo{
+		ProjectRoot:  root,
+		WorktreePath: worktreeRel,
+		IsWorktree:   true,
+	})
+
+	assert.Equal(t, filepath.Join(root, worktreeRel), runner.projectWorkingRoot(),
+		"worktree → main tree joined with the worktree path")
+
+	// Returning to the main tree (no worktree) must re-point back, not latch.
+	runner.SetRepoInfo(repo.RepoInfo{ProjectRoot: root})
+	assert.Equal(t, root, runner.projectWorkingRoot(), "leaving the worktree → main tree again")
+}
+
 func TestPodmanRunnerWithFallback(t *testing.T) {
 	if os.Getenv("container") != "" {
 		t.Skip("Skipping Podman test when running inside a container")

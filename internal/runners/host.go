@@ -8,7 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"time"
+
+	"github.com/afittestide/asimi/internal/repo"
 )
 
 const (
@@ -24,6 +27,7 @@ const (
 // HostRunner runs commands directly on the host system
 type HostRunner struct {
 	projectRoot     string
+	rootMu          sync.RWMutex // guards projectRoot (re-targeted on worktree entry)
 	msgChan         chan<- Msg
 	timeout         time.Duration // per-command deadline (0 → DefaultCommandTimeout)
 	approvalTimeout time.Duration // approval wait deadline (0 → DefaultApprovalTimeout)
@@ -53,6 +57,14 @@ func (r *HostRunner) SetTimeouts(timeouts HostTimeouts) {
 
 func (r *HostRunner) SetMessageChannel(msgChan chan<- Msg) {
 	r.msgChan = msgChan
+}
+
+// SetRepoInfo re-targets the runner at a different working root (e.g. the
+// edict's worktree) so host shell commands execute inside the worktree.
+func (r *HostRunner) SetRepoInfo(repoInfo repo.RepoInfo) {
+	r.rootMu.Lock()
+	defer r.rootMu.Unlock()
+	r.projectRoot = repoInfo.EffectiveRoot()
 }
 
 func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
@@ -93,8 +105,11 @@ func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if r.projectRoot != "" {
-		cmd.Dir = r.projectRoot
+	r.rootMu.RLock()
+	projectRoot := r.projectRoot
+	r.rootMu.RUnlock()
+	if projectRoot != "" {
+		cmd.Dir = projectRoot
 	}
 
 	runErr := cmd.Run()

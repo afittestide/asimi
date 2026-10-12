@@ -61,6 +61,14 @@ type Runner interface {
 	HealthCheck(ctx context.Context) error
 }
 
+// RepoInfoSetter is implemented by runners that can be re-targeted at a
+// different working root. The Court calls it when an edict is routed into its
+// worktree (RepoInfo.WorktreePath set) so that shell commands execute inside
+// the worktree rather than the main tree.
+type RepoInfoSetter interface {
+	SetRepoInfo(repo.RepoInfo)
+}
+
 // Type aliases - use types from internal/config as the single source of truth
 type (
 	Config = config.SandboxConfig

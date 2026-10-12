@@ -478,3 +478,97 @@ func TestConsultMinisterTool_FactoryProducesPerMinisterInstances(t *testing.T) {
 		}
 	}
 }
+
+// TestToolContext_EffectiveRoot proves tools resolve against the worktree when
+// an edict is routed into one (the isolation lever is connected at the tools
+// layer, not merely set).
+func TestToolContext_EffectiveRoot(t *testing.T) {
+	t.Run("no worktree → project root", func(t *testing.T) {
+		ctx := ToolContext{RepoInfo: &repo.RepoInfo{ProjectRoot: "/proj"}}
+		if got := ctx.EffectiveRoot(); got != "/proj" {
+			t.Errorf("EffectiveRoot = %q, want /proj", got)
+		}
+	})
+
+	t.Run("worktree → project root joined with worktree path", func(t *testing.T) {
+		ctx := ToolContext{RepoInfo: &repo.RepoInfo{
+			ProjectRoot:  "/proj",
+			WorktreePath: ".agents/worktrees/e42",
+			IsWorktree:   true,
+		}}
+		want := "/proj/.agents/worktrees/e42"
+		if got := ctx.EffectiveRoot(); got != want {
+			t.Errorf("EffectiveRoot = %q, want %q", got, want)
+		}
+		if ctx.ProjectRoot() != "/proj" {
+			t.Errorf("ProjectRoot must stay /proj, got %q", ctx.ProjectRoot())
+		}
+	})
+
+	t.Run("nil repoInfo", func(t *testing.T) {
+		if got := (ToolContext{}).EffectiveRoot(); got != "" {
+			t.Errorf("EffectiveRoot = %q, want empty", got)
+		}
+	})
+}
+
+// TestRegisterEarthTools_UsesEffectiveRoot proves the registered file tools are
+// keyed on the worktree root, so a forge's edits land in the worktree.
+func TestRegisterEarthTools_UsesEffectiveRoot(t *testing.T) {
+	shared := &repo.RepoInfo{
+		ProjectRoot:  "/proj",
+		WorktreePath: ".agents/worktrees/e42",
+		IsWorktree:   true,
+	}
+	r := NewToolRegistry()
+	RegisterBuiltinTools(r, ToolRegistrationOpts{
+		Ctx:    ToolContext{RepoInfo: shared, Username: "u", Project: "p"},
+		Runner: &noopRunner{},
+		DBPath: "",
+	})
+
+	for _, name := range []string{"read_file", "write_file", "glob", "grep", "replace_text"} {
+		var tool Tool
+		for _, tp := range r.Tools() {
+			if tp.Tool.Name() == name {
+				tool = tp.Tool
+				break
+			}
+		}
+		if tool == nil {
+			t.Fatalf("tool %s not registered", name)
+		}
+		root := toolProjectRoot(tool)
+		want := "/proj/.agents/worktrees/e42"
+		if root != want {
+			t.Errorf("tool %s resolved root = %q, want %q", name, root, want)
+		}
+	}
+}
+
+// toolProjectRoot extracts the ProjectRoot a file tool resolves against.
+func toolProjectRoot(tool Tool) string {
+	switch v := tool.(type) {
+	case *ReadFileTool:
+		return v.ProjectRoot
+	case ReadFileTool:
+		return v.ProjectRoot
+	case *WriteFileTool:
+		return v.ProjectRoot
+	case WriteFileTool:
+		return v.ProjectRoot
+	case *ReplaceTextTool:
+		return v.ProjectRoot
+	case ReplaceTextTool:
+		return v.ProjectRoot
+	case *GlobTool:
+		return v.ProjectRoot
+	case GlobTool:
+		return v.ProjectRoot
+	case *GrepTool:
+		return v.ProjectRoot
+	case GrepTool:
+		return v.ProjectRoot
+	}
+	return ""
+}

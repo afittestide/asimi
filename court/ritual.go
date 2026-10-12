@@ -384,22 +384,24 @@ func LoadRitualsFromDir(dir string) (Rituals, error) {
 
 // RitualRunner executes rituals
 type RitualRunner struct {
-	registry        *RitualRegistry
-	stepDefs        *StepDefRegistry
-	getMinister     func(id string) Minister
-	publishEvent    func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
-	onRunnerUpgrade func(runners.Runner) // propagates runner changes back to court
-	db              *gorm.DB
-	runner          runners.Runner
-	logger          *slog.Logger
-	maxRetries      int
-	repoInfo        repo.RepoInfo
-	sandboxConfig   *config.SandboxConfig                                       // injected by ConfigureModel
-	projectSlug     string                                                      // injected by ConfigureModel
-	idleTimeout     time.Duration                                               // max silence before a step is aborted (0 = default)
-	waitZhengming   func(ctx context.Context, requestID string) (string, error) // injected by Court
-	isolatedHost    bool                                                        // skip sandbox steps when true
-	atifAgentName   string                                                      // ATIF agent name for ritual step sessions
+	registry         *RitualRegistry
+	stepDefs         *StepDefRegistry
+	getMinister      func(id string) Minister
+	publishEvent     func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
+	onRunnerUpgrade  func(runners.Runner) // propagates runner changes back to court
+	db               *gorm.DB
+	runner           runners.Runner
+	logger           *slog.Logger
+	maxRetries       int
+	repoInfo         repo.RepoInfo
+	ownedRepoInfo    *repo.RepoInfo                                              // shared pointer so tools see worktree isolation
+	onRepoInfoChange func(repo.RepoInfo)                                         // fan-out hook to the Court (SetRepoInfo)
+	sandboxConfig    *config.SandboxConfig                                       // injected by ConfigureModel
+	projectSlug      string                                                      // injected by ConfigureModel
+	idleTimeout      time.Duration                                               // max silence before a step is aborted (0 = default)
+	waitZhengming    func(ctx context.Context, requestID string) (string, error) // injected by Court
+	isolatedHost     bool                                                        // skip sandbox steps when true
+	atifAgentName    string                                                      // ATIF agent name for ritual step sessions
 
 	// Pause/resume for ruler interjection. When the ruler prompts on a ritual
 	// tab, the ritual pauses: the step context is cancelled (stopping the
@@ -448,6 +450,14 @@ func (r *RitualRunner) SetConfig(sandboxCfg *config.SandboxConfig, projectSlug s
 	if courtCfg != nil && courtCfg.StepIdleTimeout > 0 {
 		r.idleTimeout = courtCfg.StepIdleTimeout
 	}
+}
+
+// SetRepoInfoHooks injects the shared *repo.RepoInfo (so tools see the same
+// isolated root) and the change hook used to fan out a repoInfo update on the
+// Court. It must be called before any ritual opts into a worktree.
+func (r *RitualRunner) SetRepoInfoHooks(owned *repo.RepoInfo, onChange func(repo.RepoInfo)) {
+	r.ownedRepoInfo = owned
+	r.onRepoInfoChange = onChange
 }
 
 // SetAtifAgentName sets the ATIF agent name so ritual step sessions get an
@@ -1632,7 +1642,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 		cfg := minister.GetConfig()
 		sessionConfig := &SessionConfig{
 			LLM:           cfg,
-			WorkingDir:    r.repoInfo.ProjectRoot,
+			WorkingDir:    r.repoInfo.EffectiveRoot(),
 			AtifAgentName: r.atifAgentName,
 		}
 		var err error

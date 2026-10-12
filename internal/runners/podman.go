@@ -31,6 +31,7 @@ type PodmanRunner struct {
 	noCleanup        bool
 	config           *Config
 	repoInfo         repo.RepoInfo
+	repoMu           sync.RWMutex // guards repoInfo (re-targeted on worktree entry)
 	msgChan          chan<- Msg
 	fallback         Runner
 	mu               sync.Mutex
@@ -69,6 +70,15 @@ func NewPodmanRunner(cfg *Config, repoInfo repo.RepoInfo, connID uint64, fallbac
 
 func (r *PodmanRunner) SetMessageChannel(msgChan chan<- Msg) {
 	r.msgChan = msgChan
+}
+
+// SetRepoInfo re-targets the runner at a different working root (e.g. the
+// edict's worktree). projectWorkingRoot() derives the exec working directory
+// from repoInfo, so this routes subsequent shell commands into the worktree.
+func (r *PodmanRunner) SetRepoInfo(repoInfo repo.RepoInfo) {
+	r.repoMu.Lock()
+	defer r.repoMu.Unlock()
+	r.repoInfo = repoInfo
 }
 
 func (r *PodmanRunner) initialize(ctx context.Context) error {
@@ -229,7 +239,10 @@ func (r *PodmanRunner) preflightSandbox(ctx context.Context) error {
 }
 
 func (r *PodmanRunner) defaultCheckImage(ctx context.Context) error {
-	return CheckSandboxImageAvailable(ctx, r.imageName, r.repoInfo.ProjectRoot)
+	r.repoMu.RLock()
+	root := r.repoInfo.ProjectRoot
+	r.repoMu.RUnlock()
+	return CheckSandboxImageAvailable(ctx, r.imageName, root)
 }
 
 func (r *PodmanRunner) checkSandboxFiles() error {
@@ -253,13 +266,16 @@ func (r *PodmanRunner) checkSandboxFiles() error {
 }
 
 func (r *PodmanRunner) projectWorkingRoot() string {
-	if r.repoInfo.ProjectRoot == "" {
+	r.repoMu.RLock()
+	repoInfo := r.repoInfo
+	r.repoMu.RUnlock()
+	if repoInfo.ProjectRoot == "" {
 		return ""
 	}
-	if r.repoInfo.WorktreePath != "" {
-		return filepath.Join(r.repoInfo.ProjectRoot, r.repoInfo.WorktreePath)
+	if repoInfo.WorktreePath != "" {
+		return filepath.Join(repoInfo.ProjectRoot, repoInfo.WorktreePath)
 	}
-	return r.repoInfo.ProjectRoot
+	return repoInfo.ProjectRoot
 }
 
 // healthcheck runs a simple exec command to verify the container is responsive.
@@ -379,7 +395,10 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	s.NetNS = specgen.Namespace{NSMode: specgen.Host}
 	s.Command = []string{"sleep", "infinity"}
 
-	absPath, err := filepath.Abs(r.repoInfo.ProjectRoot)
+	r.repoMu.RLock()
+	projectRoot := r.repoInfo.ProjectRoot
+	r.repoMu.RUnlock()
+	absPath, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return "", fmt.Errorf("failed to get absolute path: %w", err)
 	}

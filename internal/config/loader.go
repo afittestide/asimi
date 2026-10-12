@@ -76,6 +76,7 @@ func DefaultConfig() Config {
 			CtrlCWindowTime:      2000 * time.Millisecond,
 			PromptExpandedHeight: 10,
 			TickInterval:         100 * time.Millisecond, // Debounce between chat content updates when streaming
+			CommandTimerInterval: 3 * time.Second,        // Stopwatch refresh while a shell command runs
 		},
 		Session: SessionConfig{
 			Enabled:      true,

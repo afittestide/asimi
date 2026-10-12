@@ -59,7 +59,9 @@ func registerEarthTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	earthWrite := Permissions{Earth: Access{Write: true}}
 	earthExec := Permissions{Earth: Access{Execute: true}}
 
-	projectRoot := opts.Ctx.ProjectRoot()
+	// Resolve against the effective root (worktree when the edict is routed into
+	// one) so the forge's file edits land in the worktree, not the main tree.
+	projectRoot := opts.Ctx.EffectiveRoot()
 
 	r.Register(NewReadFileTool(projectRoot), earthRead)
 	r.Register(ReadManyFilesTool{ProjectRoot: projectRoot}, earthRead)

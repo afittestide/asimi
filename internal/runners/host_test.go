@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/afittestide/asimi/internal/repo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -295,4 +296,32 @@ func TestHostRunnerApprovalBeforeDeadline(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, output.Output, "hello")
 	assert.Equal(t, "0", output.ExitCode)
+}
+
+// TestHostRunnerSetRepoInfoRoutesToWorktree proves the isolation lever reaches
+// the host execution layer: after SetRepoInfo with a WorktreePath, host commands
+// run inside the worktree, not the main tree.
+func TestHostRunnerSetRepoInfoRoutesToWorktree(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, ".agents", "worktrees", "e42")
+	require.NoError(t, os.MkdirAll(wt, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(wt, "marker.txt"), []byte("in-worktree"), 0o644))
+
+	runner := NewHostRunner(0, root)
+
+	// Before: commands resolve against the main tree (marker absent).
+	out, err := runner.Run(context.Background(), Input{Command: "cat marker.txt", BypassApproval: true})
+	require.NoError(t, err)
+	assert.NotEqual(t, "0", out.ExitCode, "marker must not exist on the main tree")
+
+	// After: the runner is re-targeted at the edict's worktree.
+	runner.SetRepoInfo(repo.RepoInfo{
+		ProjectRoot:  root,
+		WorktreePath: filepath.Join(".agents", "worktrees", "e42"),
+		IsWorktree:   true,
+	})
+	out, err = runner.Run(context.Background(), Input{Command: "cat marker.txt", BypassApproval: true})
+	require.NoError(t, err)
+	assert.Equal(t, "0", out.ExitCode)
+	assert.Contains(t, out.Output, "in-worktree")
 }

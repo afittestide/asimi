@@ -596,6 +596,30 @@ tick_interval = "250ms"
 	assert.Equal(t, 250*time.Millisecond, cfg.UI.TickInterval)
 }
 
+// TestLoadProjectConfig_CommandTimerInterval verifies that [ui]
+// command_timer_interval can be overridden from the project config.
+func TestLoadProjectConfig_CommandTimerInterval(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+	projectConfig := `[ui]
+command_timer_interval = "500ms"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, 500*time.Millisecond, cfg.UI.CommandTimerInterval)
+}
+
 func TestLoadProjectConfig_UserConfigPlusProjectOverride(t *testing.T) {
 	tempHome := t.TempDir()
 	originalHome := os.Getenv("HOME")

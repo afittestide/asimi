@@ -564,3 +564,22 @@ func TestFilterEnv(t *testing.T) {
 	got := filterEnv(env, "GIT_DIR", "GIT_WORK_TREE")
 	require.Equal(t, []string{"HOME=/home/x", "PATH=/bin"}, got)
 }
+
+// TestRepoInfo_EffectiveRoot pins the single source of truth for the working
+// root: the worktree path when an edict is routed into one, else ProjectRoot.
+func TestRepoInfo_EffectiveRoot(t *testing.T) {
+	if got := (RepoInfo{ProjectRoot: "/proj"}).EffectiveRoot(); got != "/proj" {
+		t.Errorf("EffectiveRoot = %q, want /proj", got)
+	}
+	ri := RepoInfo{ProjectRoot: "/proj", WorktreePath: ".agents/worktrees/e42", IsWorktree: true}
+	want := filepath.Join("/proj", ".agents", "worktrees", "e42")
+	if got := ri.EffectiveRoot(); got != want {
+		t.Errorf("EffectiveRoot = %q, want %q", got, want)
+	}
+	if ri.ProjectRoot != "/proj" {
+		t.Errorf("ProjectRoot must be unchanged, got %q", ri.ProjectRoot)
+	}
+	if got := (RepoInfo{}).EffectiveRoot(); got != "" {
+		t.Errorf("EffectiveRoot = %q, want empty", got)
+	}
+}

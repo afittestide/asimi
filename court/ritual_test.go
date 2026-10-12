@@ -1049,8 +1049,8 @@ func TestLoadBuiltinRituals(t *testing.T) {
 	for _, r := range rituals {
 		if r.Name == "swift-strike" {
 			// Background given at ritual level
-			if len(r.Background) == 0 || r.Background[0] != "the edict details" {
-				t.Errorf("swift-strike: expected background given 'the edict details', got %v", r.Background)
+			if len(r.Background) < 2 || r.Background[0] != "an edict's worktree" || r.Background[1] != "the edict details" {
+				t.Errorf("swift-strike: expected background given ['an edict's worktree' 'the edict details'], got %v", r.Background)
 			}
 			// Forge step should have no step-level given (hoisted)
 			if len(r.Steps[0].Given) != 0 {
@@ -2044,6 +2044,63 @@ func TestRitualStepSessionGetsAtifRecorder(t *testing.T) {
 	if sess.WorkingDir != canonicalRoot {
 		t.Errorf("Expected step session WorkingDir to be the runner's project root %q, got %q",
 			canonicalRoot, sess.WorkingDir)
+	}
+}
+
+// TestRitualStepSessionWorkingDirUsesWorktreeRoot proves the third isolation
+// consumer: when an edict is routed into a worktree, the step session's
+// WorkingDir is the effective root (ProjectRoot joined with WorktreePath), so
+// the agent's tool/subprocess context is the worktree rather than the main tree.
+func TestRitualStepSessionWorkingDirUsesWorktreeRoot(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name:        "worktree-step",
+		Description: "Test step session WorkingDir follows the worktree root",
+		Steps: []RitualStep{
+			{Name: "ask", Minister: "forge", Task: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "done",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go forgeM.Run(ctx)
+
+	court := &Court{ministers: map[string]Minister{"forge": forgeM}, logger: slog.Default()}
+
+	const root = "/canonical/project/root"
+	worktreeRel := filepath.Join(".agents", "worktrees", "e531")
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, nil, repo.RepoInfo{
+		ProjectRoot:  root,
+		WorktreePath: worktreeRel,
+		IsWorktree:   true,
+	})
+
+	exec, err := runner.Start(ctx, "worktree-step", testEK(11), nil, func(any) {})
+	if err != nil {
+		t.Fatalf("Failed to start ritual: %v", err)
+	}
+	if err := runner.Run(ctx, exec); err != nil {
+		t.Fatalf("Ritual run failed: %v", err)
+	}
+
+	sess := exec.stepStates[0].Session
+	if sess == nil {
+		t.Fatal("Expected step session to be created")
+	}
+	want := filepath.Join(root, worktreeRel)
+	if sess.WorkingDir != want {
+		t.Errorf("Expected step session WorkingDir to be the worktree root %q, got %q", want, sess.WorkingDir)
 	}
 }
 

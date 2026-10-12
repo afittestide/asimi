@@ -7207,6 +7207,79 @@ func TestZhengmingPendingMsg_FallbackToActiveTab(t *testing.T) {
 	assert.Contains(t, prompt.answering.Title, "war", "title should mention the asking minister")
 }
 
+// TestZhengmingPendingMsg_RoutesToChannelTab verifies that when a
+// ZhengmingPendingMsg carries a ChannelID (ritual work: "e<N>"), the handler
+// routes to the channel's tab rather than the minister's tab. This exercises
+// the tui.go wiring of msg.ChannelID -> SwitchToZhengmingTarget, which the
+// helper-only test (content_test.go) and the empty-ChannelID minister tests
+// above cannot catch.
+func TestZhengmingPendingMsg_RoutesToChannelTab(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.Add("Judge", "judge", "judge")
+
+	// Start on the secretary tab so neither the channel nor the minister tab
+	// is active beforehand.
+	model.tabs.SwitchToTabType("secretary")
+	require.Equal(t, "secretary", string(model.tabs.ActiveTab().Type))
+
+	msg := court.ZhengmingPendingMsg{
+		RequestID:  "zhengming-channel-1",
+		ChannelID:  "e42",
+		MinisterID: "judge",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Proceed?", Summary: "Proceed?", Options: []string{"Yes", "No"}},
+		},
+	}
+
+	newModel, _ := model.handleCustomMessages(msg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	// The ritual channel tab must win over the minister tab.
+	require.Equal(t, "e42", updated.tabs.ActiveTab().Target,
+		"active tab should be the channel's ritual tab, not the minister's tab")
+
+	// The ritual tab's prompt should be in answering mode.
+	prompt := updated.prompt()
+	require.NotNil(t, prompt.answering, "ritual tab's prompt should be in answering mode")
+	assert.Equal(t, "zhengming-channel-1", prompt.answering.RequestID)
+
+	// The channel mapping should be registered so a typed reply is delivered
+	// as the zhengming answer (e892 behavior).
+	assert.Equal(t, "zhengming-channel-1", updated.pendingZhengmingFor("e42"),
+		"ritual channel should be registered as the pending-zhengming channel")
+}
+
+// TestZhengmingPendingMsg_ChannelFallsBackToMinister verifies that a
+// ChannelID with no corresponding tab degrades to minister routing rather than
+// leaving the prompt on the active tab.
+func TestZhengmingPendingMsg_ChannelFallsBackToMinister(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Judge", "judge", "judge")
+	model.tabs.SwitchToTabType("secretary")
+
+	msg := court.ZhengmingPendingMsg{
+		RequestID:  "zhengming-fallback-chan",
+		ChannelID:  "e404", // no such tab
+		MinisterID: "judge",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Proceed?", Summary: "Proceed?", Options: []string{"Yes", "No"}},
+		},
+	}
+
+	newModel, _ := model.handleCustomMessages(msg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	require.Equal(t, "judge", updated.tabs.ActiveTab().Target,
+		"missing channel tab should fall back to the minister's tab")
+}
+
 // --- Handsoff mode tests ---
 
 // TestHandsoff_EditorRequest_AutoApproves verifies that in handsoff mode an
@@ -7528,4 +7601,115 @@ func TestToolCallErrorMsg_DebouncedRenderScheduling(t *testing.T) {
 		_, ok := cmdMsg.(chatRenderTickMsg)
 		assert.True(t, ok, "ToolCallError handler should return a chatRenderTickMsg")
 	}
+}
+
+// --- Tests for host command approval queue (FIFO) ---
+
+// TestHostApproval_QueueTwoRequests verifies that a second approval-requiring
+// command is queued rather than overwriting the first, and that each answer
+// promotes the next queued command in arrival order.
+func TestHostApproval_QueueTwoRequests(t *testing.T) {
+	model := newTestModel(t)
+
+	ch1 := make(chan bool, 1)
+	ch2 := make(chan bool, 1)
+
+	// First request: prompts immediately.
+	m1, cmd1 := model.handleCustomMessages(runners.ApprovalRequestMsg{Command: "echo first", ResponseChan: ch1})
+	model1 := m1.(TUIModel)
+	require.NotNil(t, cmd1, "first request should enter YESNO mode")
+	assert.True(t, model1.commandLine.IsInYesNoMode(), "first request should enter YESNO")
+	assert.Contains(t, model1.commandLine.yesNoQuestion, "echo first")
+	require.Len(t, model1.pendingHostApprovals, 1)
+
+	// Second request while the first is pending: queued, not re-prompted.
+	m2, cmd2 := model1.handleCustomMessages(runners.ApprovalRequestMsg{Command: "echo second", ResponseChan: ch2})
+	model2 := m2.(TUIModel)
+	assert.Nil(t, cmd2, "second request must not re-enter YESNO while a prompt is active")
+	require.Len(t, model2.pendingHostApprovals, 2)
+	assert.Contains(t, model2.commandLine.yesNoQuestion, "echo first",
+		"active prompt should remain on the first command")
+	assertNotAnswered(t, ch2, "second request should not be answered yet")
+
+	// The queued-while-prompting path must surface the pending count so the
+	// user knows a second command is waiting behind the active prompt.
+	toasts := model2.commandLine.ActiveToasts()
+	require.NotEmpty(t, toasts, "queuing behind an active prompt should surface a toast")
+	assert.Contains(t, toasts[len(toasts)-1].Message, "1 more command",
+		"toast should report the number of commands awaiting approval")
+
+	// Answer the first with YES: its channel receives true, second is promoted.
+	m3, cmd3 := model2.handleCustomMessages(yesNoResponseMsg{answer: true})
+	model3 := m3.(TUIModel)
+	assertChannelAnswer(t, ch1, true, "first ResponseChan should receive true")
+	require.NotNil(t, cmd3, "promoting the second request should re-enter YESNO")
+	require.Len(t, model3.pendingHostApprovals, 1)
+	assert.Contains(t, model3.commandLine.yesNoQuestion, "echo second",
+		"second command should be promoted to the active prompt")
+
+	// Answer the second with NO: deny still pops and leaves the queue empty.
+	m4, _ := model3.handleCustomMessages(yesNoResponseMsg{answer: false})
+	model4 := m4.(TUIModel)
+	assertChannelAnswer(t, ch2, false, "second ResponseChan should receive false")
+	assert.Empty(t, model4.pendingHostApprovals, "queue should be drained")
+}
+
+func assertChannelAnswer(t *testing.T, ch chan bool, want bool, msg string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		assert.Equal(t, want, got, msg)
+	default:
+		t.Fatalf("%s (channel not answered)", msg)
+	}
+}
+
+func assertNotAnswered(t *testing.T, ch chan bool, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("%s (unexpectedly answered)", msg)
+	default:
+	}
+}
+
+// TestHostApproval_HandsoffDrainsQueue verifies that in handsoff mode the
+// auto-answer path drains a multi-request queue without re-entrancy issues:
+// each auto-answer pops the head and promotes the next until empty.
+func TestHostApproval_HandsoffDrainsQueue(t *testing.T) {
+	model := newTestModel(t)
+	model.handsoff = true
+
+	ch1 := make(chan bool, 1)
+	ch2 := make(chan bool, 1)
+
+	// Two requests arrive back to back, before either auto-answer is processed.
+	m1, cmd1 := model.handleCustomMessages(runners.ApprovalRequestMsg{Command: "echo first", ResponseChan: ch1})
+	model1 := m1.(TUIModel)
+	require.Len(t, model1.pendingHostApprovals, 1)
+	require.NotNil(t, cmd1, "handsoff should return an auto-answer command")
+	resp1, ok := cmd1().(yesNoResponseMsg)
+	require.True(t, ok)
+	assert.True(t, resp1.answer)
+
+	m2, cmd2 := model1.handleCustomMessages(runners.ApprovalRequestMsg{Command: "echo second", ResponseChan: ch2})
+	model2 := m2.(TUIModel)
+	assert.Nil(t, cmd2, "second request should only enqueue while the first is pending")
+	require.Len(t, model2.pendingHostApprovals, 2)
+
+	// The first auto-answer pops the first and promotes the second.
+	m3, cmd3 := model2.handleCustomMessages(resp1)
+	model3 := m3.(TUIModel)
+	assertChannelAnswer(t, ch1, true, "first ResponseChan should receive true")
+	require.Len(t, model3.pendingHostApprovals, 1)
+	require.NotNil(t, cmd3, "promoted request should produce an auto-answer command")
+	resp2, ok := cmd3().(yesNoResponseMsg)
+	require.True(t, ok)
+
+	// The second auto-answer drains the queue.
+	m4, cmd4 := model3.handleCustomMessages(resp2)
+	model4 := m4.(TUIModel)
+	assertChannelAnswer(t, ch2, true, "second ResponseChan should receive true")
+	assert.Empty(t, model4.pendingHostApprovals, "queue should be drained")
+	assert.Nil(t, cmd4, "no command once the queue is empty")
 }

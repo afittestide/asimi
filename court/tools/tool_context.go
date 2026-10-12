@@ -62,6 +62,16 @@ func (tc ToolContext) ProjectRoot() string {
 	return ""
 }
 
+// EffectiveRoot returns the working root the edict's work actually happens in:
+// the worktree path when the edict is routed into one, otherwise the project
+// root. Tools that read or write 地 must resolve against this.
+func (tc ToolContext) EffectiveRoot() string {
+	if tc.RepoInfo != nil {
+		return tc.RepoInfo.EffectiveRoot()
+	}
+	return ""
+}
+
 // LingIgniter triggers execution of an edict's ready lings after a batch of
 // insert_ling calls completes, and records ling_created events for
 // observability. Implemented by the Court.

@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/storage"
@@ -2790,4 +2792,257 @@ func TestGetCourtStatus_StaleRulerSealShowsActive(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, rows, 1, "edict with stale ruler seal should reappear as active")
 	assert.Equal(t, "active", rows[0]["status"])
+}
+
+// ---------------------------------------------------------------------------
+// "an edict's worktree" — prepareWorktree + seal-time merge/remove (e531)
+// ---------------------------------------------------------------------------
+
+// worktreeTestRunner records every command and returns canned output, so the
+// worktree shell-outs can be asserted without touching a real repository.
+type worktreeTestRunner struct {
+	commands []string
+	outputs  map[string]runners.Output
+}
+
+func (m *worktreeTestRunner) Run(_ context.Context, input runners.Input) (runners.Output, error) {
+	m.commands = append(m.commands, input.Command)
+	for sub, out := range m.outputs {
+		if strings.Contains(input.Command, sub) {
+			return out, nil
+		}
+	}
+	return runners.Output{ExitCode: "0"}, nil
+}
+
+func (m *worktreeTestRunner) Restart(context.Context) error        { return nil }
+func (m *worktreeTestRunner) Close(context.Context) error          { return nil }
+func (m *worktreeTestRunner) AllowFallback(bool)                   {}
+func (m *worktreeTestRunner) RunnerType() string                   { return "worktree-test" }
+func (m *worktreeTestRunner) GetOS() string                        { return runtime.GOOS }
+func (m *worktreeTestRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (m *worktreeTestRunner) HealthCheck(context.Context) error    { return nil }
+
+func (m *worktreeTestRunner) joined() string { return strings.Join(m.commands, "\n") }
+
+// TestPrepareWorktree_SetsWorktreePathRelative is the v1 regression guard: the
+// worktree is expressed via WorktreePath and ProjectRoot is left untouched,
+// because the sandbox bind-mounts only ProjectRoot.
+func TestPrepareWorktree_SetsWorktreePathRelative(t *testing.T) {
+	root := t.TempDir()
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{ProjectRoot: root})
+	shared := repo.RepoInfo{ProjectRoot: root}
+	runner.SetRepoInfoHooks(&shared, nil)
+
+	exec := &RitualExecution{EdictID: 42, Username: "u", Project: "p"}
+	result, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
+	require.NoError(t, err)
+
+	m, ok := result.(map[string]string)
+	require.True(t, ok)
+	wantRel := filepath.Join(".agents", "worktrees", "e42")
+	assert.Equal(t, wantRel, runner.repoInfo.WorktreePath, "worktree is routed via WorktreePath")
+	assert.True(t, runner.repoInfo.IsWorktree)
+	assert.Equal(t, root, runner.repoInfo.ProjectRoot, "ProjectRoot must NOT be mutated")
+	assert.Equal(t, root, shared.ProjectRoot, "shared ProjectRoot must NOT be mutated")
+	assert.Equal(t, wantRel, shared.WorktreePath, "shared repoInfo must see isolation for tools")
+	assert.True(t, shared.IsWorktree, "shared repoInfo must be marked as a worktree")
+	assert.Equal(t, filepath.Join(root, wantRel), m["path"])
+	assert.Equal(t, "asimi/e42", m["branch"])
+}
+
+// TestPrepareWorktree_RepointsSharedRepoInfo verifies the onChange hook fires so
+// the Court fan-out (SetRepoInfo) sees the isolated root.
+func TestPrepareWorktree_RepointsSharedRepoInfo(t *testing.T) {
+	root := t.TempDir()
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{ProjectRoot: root})
+	var got repo.RepoInfo
+	changed := false
+	runner.SetRepoInfoHooks(nil, func(ri repo.RepoInfo) {
+		got = ri
+		changed = true
+	})
+
+	exec := &RitualExecution{EdictID: 7, Username: "u", Project: "p"}
+	_, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
+	require.NoError(t, err)
+
+	require.True(t, changed, "onRepoInfoChange must be invoked")
+	assert.Equal(t, filepath.Join(".agents", "worktrees", "e7"), got.WorktreePath)
+	assert.True(t, got.IsWorktree)
+}
+
+// TestPrepareWorktree_EmptyProjectRoot fails loudly rather than creating a
+// worktree at a relative path.
+func TestPrepareWorktree_EmptyProjectRoot(t *testing.T) {
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	exec := &RitualExecution{EdictID: 1, Username: "u", Project: "p"}
+	_, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty project root")
+}
+
+// TestPrepareWorktree_IdempotentReuse verifies a second call reuses the existing
+// worktree without issuing create commands.
+func TestPrepareWorktree_IdempotentReuse(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e9")
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	mock := &worktreeTestRunner{}
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, nil, mock, slog.Default(), repo.RepoInfo{ProjectRoot: root})
+
+	exec := &RitualExecution{EdictID: 9, Username: "u", Project: "p"}
+	_, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
+	require.NoError(t, err)
+	assert.Empty(t, mock.commands, "existing worktree is reused without commands")
+}
+
+// TestMergeEdictWorktree_OnRulerSealEvent asserts that a ruler seal fires the
+// rebase → squash-commit → remove sequence for the edict's worktree.
+func TestMergeEdictWorktree_OnRulerSealEvent(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e531")
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+	}}
+	s := &Court{
+		logger: slog.Default(),
+		runner: mock,
+		config: &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	joined := mock.joined()
+	assert.Contains(t, joined, "rebase main", "worktree branch is rebased onto default")
+	assert.Contains(t, joined, "merge --squash asimi/e531", "edict is squash-merged as one commit")
+	assert.Contains(t, joined, "e531", "commit message carries the edict suffix")
+	assert.Contains(t, joined, "worktree remove", "worktree is removed after a clean merge")
+	assert.NotContains(t, joined, "--force", "removal must not use the forbidden flag")
+}
+
+// TestMergeEdictWorktree_NonRulerSealIgnored verifies judge/chancellor seals do
+// not touch the worktree.
+func TestMergeEdictWorktree_NonRulerSealIgnored(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mock := &worktreeTestRunner{}
+	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "judge"},
+	})
+
+	assert.Empty(t, mock.commands, "non-ruler seals must not merge/remove the worktree")
+}
+
+// TestMergeEdictWorktree_NoWorktreeNoOp verifies an edict that never opted in is
+// a no-op (and does not, e.g., remove an unrelated directory).
+func TestMergeEdictWorktree_NoWorktreeNoOp(t *testing.T) {
+	root := t.TempDir()
+	mock := &worktreeTestRunner{}
+	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 999, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	assert.Empty(t, mock.commands, "no worktree means nothing to merge")
+}
+
+// TestMergeEdictWorktree_ConflictLeavesWorktreeIntact verifies that a rebase
+// conflict stops the merge and does not remove the worktree — the forge (工部)
+// resolves it before the ruler reviews.
+func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
+	}}
+	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	joined := mock.joined()
+	assert.NotContains(t, joined, "merge --squash", "no squash-merge after a failed rebase")
+	assert.NotContains(t, joined, "worktree remove", "worktree must survive a conflict")
+}
+
+// TestSwiftStrike_HasWorktreeBackground asserts the opt-in and that system-level
+// rituals stay on the main tree.
+func TestSwiftStrike_HasWorktreeBackground(t *testing.T) {
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+
+	byName := map[string]*RitualDef{}
+	for _, r := range rituals {
+		byName[r.Name] = r
+	}
+
+	swift, ok := byName["swift-strike"]
+	require.True(t, ok, "swift-strike must load")
+	require.GreaterOrEqual(t, len(swift.Background), 2)
+	assert.Equal(t, "an edict's worktree", swift.Background[0])
+	assert.Equal(t, "the edict details", swift.Background[1])
+
+	for _, name := range []string{"castle-siege", "dawn-audience", "fix-lint", "project-init"} {
+		r, ok := byName[name]
+		if !ok {
+			continue
+		}
+		assert.NotContains(t, r.Background, "an edict's worktree",
+			"%s must stay on the main tree", name)
+	}
+}
+
+// TestEdictCommitSummary_UsesRecordedSummary covers the production path of the
+// squash-merge commit message: it is derived from the edict's recorded summary
+// and always ends in the AGENTS.md-mandated "e<ID>" suffix.
+func TestEdictCommitSummary_UsesRecordedSummary(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}))
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 531, Username: "testuser", Project: "testproject",
+		Intent: "worktree isolation", Summary: "feat: per-edict worktrees",
+	}).Error)
+
+	s := &Court{
+		db:     db,
+		logger: slog.Default(),
+		config: &config.CourtConfig{Username: "testuser", Project: "testproject"},
+	}
+	assert.Equal(t, "feat: per-edict worktrees e531", s.edictCommitSummary(531))
+
+	// An unknown edict falls back to a conventional message rather than an
+	// empty subject; the edict suffix is always present.
+	assert.Equal(t, "chore: merge edict worktree e999", s.edictCommitSummary(999))
+
+	// A nil db degrades to the same safe default.
+	assert.Equal(t, "chore: merge edict worktree e531", (&Court{}).edictCommitSummary(531))
 }

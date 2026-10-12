@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 	"github.com/maximhq/bifrost/core/schemas"
 	"gorm.io/gorm"
@@ -202,6 +204,13 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		DeliverZhengming: s.DeliverZhengmingAnswer,
 	})
 	s.ritualGuard.ritualRunner.isolatedHost = s.isolatedHost
+
+	// Handle the Ruler's seal: squash-merge and remove the edict's worktree
+	// (if any) so an edict's isolated work ascends to the default branch as a
+	// single commit and the worktree does not outlive the edict. The handler
+	// runs off the ritual goroutine; it must not call SetRepoInfo (which locks
+	// and fans out).
+	s.ritualGuard.Subscribe(storage.EventSealGranted, s.handleSealGranted)
 
 	// Handle zhengming_answered events: merged handler for ritual delivery, edict creation, and legacy path
 	s.ritualGuard.Subscribe(storage.EventZhengmingAnswered, func(e Event) {
@@ -524,9 +533,14 @@ func (s *Court) SetRepoInfo(repoInfo repo.RepoInfo) {
 	if s.toolCtxRepoInfo != nil {
 		*s.toolCtxRepoInfo = repoInfo
 	}
-	// Update project-root-dependent tools when the root becomes available
-	if repoInfo.ProjectRoot != "" {
-		s.updateProjectRootTools(repoInfo.ProjectRoot)
+	// Re-target the shell runner so commands execute in the effective root
+	// (the edict's worktree when one is set) rather than always the main tree.
+	if setter, ok := s.runner.(runners.RepoInfoSetter); ok {
+		setter.SetRepoInfo(repoInfo)
+	}
+	// Update project-root-dependent tools when the effective root is available
+	if root := repoInfo.EffectiveRoot(); root != "" {
+		s.updateProjectRootTools(root)
 	}
 }
 
@@ -646,6 +660,7 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 			projectSlug = s.config.Project
 		}
 		s.ritualGuard.RitualRunner().SetConfig(sandboxCfg, projectSlug, repoInfo, s.config)
+		s.ritualGuard.RitualRunner().SetRepoInfoHooks(s.toolCtxRepoInfo, s.SetRepoInfo)
 		if config != nil {
 			s.ritualGuard.RitualRunner().SetAtifAgentName(config.AtifAgentName)
 		}
@@ -1327,6 +1342,62 @@ func (s *Court) GetEdict(edictID uint) (*storage.Edict, error) {
 		return nil, fmt.Errorf("failed to get edict: %w", err)
 	}
 	return &edict, nil
+}
+
+// handleSealGranted reacts to a granted seal. Only the ruler's seal triggers the
+// worktree merge-and-remove; other seals are ignored.
+func (s *Court) handleSealGranted(e Event) {
+	minister, _ := e.Payload["minister_id"].(string)
+	if minister != "ruler" {
+		return
+	}
+	s.mergeEdictWorktree(context.Background(), e.EdictKey.ID)
+}
+
+// mergeEdictWorktree squash-merges the edict's worktree into the default branch
+// and removes it. It is a no-op when the edict has no worktree (i.e. its rituals
+// never opted in). On a merge failure the worktree is left intact so the forge
+// (工部) can resolve conflicts before the ruler reviews.
+func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) {
+	if s == nil {
+		return
+	}
+	root := ""
+	if s.ritualGuard != nil {
+		root = s.ritualGuard.repoInfo.ProjectRoot
+	}
+	if root == "" {
+		return
+	}
+	rel := worktree.RelPath(edictID) // exact: e531 is not e5310
+	abs := filepath.Join(root, rel)
+	if _, err := os.Stat(abs); err != nil {
+		return // no worktree → nothing to do
+	}
+	branch := worktree.Branch(edictID)
+	summary := s.edictCommitSummary(edictID)
+	if err := worktree.SquashMergeToDefault(ctx, s.runner, root, abs, branch, summary); err != nil {
+		s.logger.Error("worktree merge failed; left intact for inspection/rollback",
+			"edict", edictID, "err", err)
+		return // forge resolves conflicts; do NOT remove on failure
+	}
+	if err := worktree.Remove(ctx, s.runner, root, abs, branch); err != nil {
+		s.logger.Error("worktree removal failed after successful merge", "edict", edictID, "err", err)
+	}
+}
+
+// edictCommitSummary builds the squash-merge commit message for an edict from
+// its recorded summary, ending in the AGENTS.md-mandated "e<N>" suffix.
+func (s *Court) edictCommitSummary(edictID uint) string {
+	summary := "chore: merge edict worktree"
+	if s.db != nil && s.config != nil {
+		var edict storage.Edict
+		if err := s.db.First(&edict, "id = ? AND username = ? AND project = ?",
+			edictID, s.config.Username, s.config.Project).Error; err == nil && edict.Summary != "" {
+			summary = edict.Summary
+		}
+	}
+	return fmt.Sprintf("%s e%d", summary, edictID)
 }
 
 // GrantRulerSeal stamps the Ruler's seal on an edict and publishes EventSealGranted.

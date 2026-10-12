@@ -34,6 +34,21 @@ type RepoInfo struct {
 	diffInitialized bool
 }
 
+// EffectiveRoot returns the directory the edict's work actually happens in:
+// ProjectRoot joined with WorktreePath when the edict is routed into a
+// worktree, otherwise ProjectRoot. Every consumer of a working root (session
+// WorkingDir, file tools, shell runners) must read this rather than ProjectRoot
+// so that worktree isolation is actually reached.
+func (ri RepoInfo) EffectiveRoot() string {
+	if ri.ProjectRoot == "" {
+		return ""
+	}
+	if ri.WorktreePath != "" {
+		return filepath.Join(ri.ProjectRoot, ri.WorktreePath)
+	}
+	return ri.ProjectRoot
+}
+
 // GetRepoInfo returns information about the current git repository and worktree
 func GetRepoInfo() RepoInfo {
 

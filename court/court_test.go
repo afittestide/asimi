@@ -2840,3 +2840,75 @@ func TestSetContext_PreservesHasVCSDetection(t *testing.T) {
 	assert.False(t, runnerInfo.Gitless(),
 		"ritual runner must not treat a git repository as gitless ground")
 }
+
+// repoInfoRecordingRunner records the RepoInfo it is re-targeted with, so a
+// test can prove the worktree lever reaches the shell execution layer.
+type repoInfoRecordingRunner struct {
+	runners.Runner
+	last repo.RepoInfo
+	set  bool
+}
+
+func (r *repoInfoRecordingRunner) SetRepoInfo(ri repo.RepoInfo) { r.last = ri; r.set = true }
+func (r *repoInfoRecordingRunner) Run(context.Context, runners.Input) (runners.Output, error) {
+	return runners.Output{}, nil
+}
+func (r *repoInfoRecordingRunner) Close(context.Context) error   { return nil }
+func (r *repoInfoRecordingRunner) Restart(context.Context) error { return nil }
+func (r *repoInfoRecordingRunner) AllowFallback(bool)            {}
+func (r *repoInfoRecordingRunner) RunnerType() string            { return "recording" }
+func (r *repoInfoRecordingRunner) GetOS() string                 { return runtime.GOOS }
+
+// TestSetRepoInfo_RoutesWorktreeToRunnerAndTools proves that entering a
+// worktree (RepoInfo.WorktreePath set) reaches the execution layers: the runner
+// is re-targeted and the file tools resolve against the worktree root.
+func TestSetRepoInfo_RoutesWorktreeToRunnerAndTools(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	runner := &repoInfoRecordingRunner{}
+	s := NewCourt(db, cfg, runner, nil)
+	require.NotNil(t, s)
+
+	s.ConfigureModel(nil, &SessionConfig{}, repo.RepoInfo{ProjectRoot: "/proj"})
+
+	// Enter the edict's worktree.
+	s.SetRepoInfo(repo.RepoInfo{
+		ProjectRoot:  "/proj",
+		WorktreePath: filepath.Join(".agents", "worktrees", "e531"),
+		IsWorktree:   true,
+	})
+
+	require.True(t, runner.set, "runner must be re-targeted on worktree entry")
+	assert.Equal(t, filepath.Join("/proj", ".agents", "worktrees", "e531"), runner.last.EffectiveRoot())
+	assert.Equal(t, "/proj", runner.last.ProjectRoot, "ProjectRoot must stay the main tree")
+
+	// The registered file tools must resolve against the worktree.
+	want := filepath.Join("/proj", ".agents", "worktrees", "e531")
+	found := false
+	for _, tp := range s.toolRegistry.Tools() {
+		switch rf := tp.Tool.(type) {
+		case *tools.ReadFileTool:
+			found = true
+			assert.Equal(t, want, rf.ProjectRoot, "read_file must resolve against the worktree")
+		case tools.ReadFileTool:
+			found = true
+			assert.Equal(t, want, rf.ProjectRoot, "read_file must resolve against the worktree")
+		}
+	}
+	require.True(t, found, "read_file tool must be registered")
+}
+
+// TestSetRepoInfo_NoWorktreeEndsAtProjectRoot guards the base case: without a
+// worktree, the runner and tools stay on the main tree.
+func TestSetRepoInfo_NoWorktreeEndsAtProjectRoot(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	runner := &repoInfoRecordingRunner{}
+	s := NewCourt(db, cfg, runner, nil)
+
+	s.SetRepoInfo(repo.RepoInfo{ProjectRoot: "/proj"})
+
+	require.True(t, runner.set)
+	assert.Equal(t, "/proj", runner.last.EffectiveRoot())
+	assert.Equal(t, "/proj", runner.last.ProjectRoot)
+}

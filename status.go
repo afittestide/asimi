@@ -27,6 +27,10 @@ type StatusComponent struct {
 	waitingSince       time.Time
 	ContainerID        string
 
+	// In-flight shell command stopwatch
+	commandRunning   bool
+	commandStartTime time.Time
+
 	// Stream rate tracking
 	streamCharsTotal int
 	streamStartTime  time.Time
@@ -67,6 +71,33 @@ func (s *StatusComponent) StartWaiting() {
 // StopWaiting clears the waiting indicator
 func (s *StatusComponent) StopWaiting() {
 	s.waitingForResponse = false
+}
+
+// StartCommand marks a shell command as in flight and starts its stopwatch
+func (s *StatusComponent) StartCommand() {
+	s.commandRunning = true
+	s.commandStartTime = time.Now()
+}
+
+// StopCommand clears the shell command stopwatch
+func (s *StatusComponent) StopCommand() {
+	s.commandRunning = false
+	s.commandStartTime = time.Time{}
+}
+
+// formatElapsed renders a duration as MM:SS, or H:MM:SS past an hour
+func formatElapsed(d time.Duration) string {
+	total := int(d.Seconds())
+	if total < 0 {
+		total = 0
+	}
+	h := total / 3600
+	m := (total % 3600) / 60
+	sec := total % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, sec)
+	}
+	return fmt.Sprintf("%02d:%02d", m, sec)
 }
 
 // AddStreamChars updates the stream rate with new characters received
@@ -289,6 +320,9 @@ func (s StatusComponent) renderLeftSection() string {
 	}
 
 	if branch == "" {
+		if timer := s.renderCommandStopwatch(); timer != "" {
+			parts = append(parts, timer)
+		}
 		parts = append(parts, "🪾no-git")
 		return strings.Join(parts, " ")
 	}
@@ -322,10 +356,24 @@ func (s StatusComponent) renderLeftSection() string {
 		}
 	}
 
+	// Add shell command stopwatch
+	if timer := s.renderCommandStopwatch(); timer != "" {
+		parts = append(parts, timer)
+	}
+
 	// Add shell runner indicator
 	parts = append(parts, s.renderShellRunnerIndicator())
 
 	return strings.Join(parts, " ")
+}
+
+// renderCommandStopwatch renders the in-flight shell command timer, or "" when
+// no command is running.
+func (s StatusComponent) renderCommandStopwatch() string {
+	if !s.commandRunning || s.commandStartTime.IsZero() {
+		return ""
+	}
+	return "⏱ " + formatElapsed(time.Since(s.commandStartTime))
 }
 
 // renderShellRunnerIndicator renders the shell runner status indicator

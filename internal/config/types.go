@@ -77,6 +77,7 @@ type UIConfig struct {
 	CtrlCWindowTime      time.Duration `koanf:"ctrl_c_window_time"`     // Window for second CTRL-C press to quit
 	PromptExpandedHeight int           `koanf:"prompt_expanded_height"` // Height prompt grows to when multiline (default: 10)
 	TickInterval         time.Duration `koanf:"tick_interval"`          // Chat render-tick debounce interval (default: 100ms)
+	CommandTimerInterval time.Duration `koanf:"command_timer_interval"` // Refresh interval for the in-flight command stopwatch (default: 3s)
 }
 
 // SessionConfig holds session persistence configuration

@@ -17,6 +17,7 @@ import (
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/utils"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 )
 
@@ -134,6 +135,8 @@ func (r *RitualRunner) runGiven(ctx context.Context, exec *RitualExecution, fn s
 			return map[string]string{"status": "no edict (system event)"}, nil
 		}
 		return r.getEdict(givenKey)
+	case "prepare_worktree":
+		return r.prepareWorktree(ctx, exec)
 	case "get_court_status":
 		return r.getCourtStatus(givenKey)
 	case "get_manifests":
@@ -168,6 +171,41 @@ func (r *RitualRunner) runGiven(ctx context.Context, exec *RitualExecution, fn s
 		return r.checkAsimiVersion(ctx)
 	default:
 		return nil, fmt.Errorf("unknown given function: %s", fn)
+	}
+}
+
+// prepareWorktree gives the ritual an isolated per-edict git worktree at
+// .agents/worktrees/e{ID} on branch asimi/e{ID}. It is idempotent: every
+// ritual of the edict reuses the same worktree. Isolation is achieved by
+// routing the ritual's runner into the worktree via RepoInfo.WorktreePath —
+// ProjectRoot is never mutated, because the sandbox bind-mounts only
+// ProjectRoot.
+func (r *RitualRunner) prepareWorktree(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	root := r.repoInfo.ProjectRoot
+	if root == "" {
+		return nil, fmt.Errorf("prepare_worktree: empty project root")
+	}
+	abs, rel, branch, _, err := worktree.Ensure(ctx, r.runner, root, exec.EdictID)
+	if err != nil {
+		return nil, err
+	}
+	r.enterWorktree(rel)
+	r.logger.Info("worktree prepared", "path", abs, "edict", exec.EdictID, "branch", branch)
+	return map[string]string{"path": abs, "branch": branch}, nil
+}
+
+// enterWorktree routes the runner into the worktree at rel (relative to
+// ProjectRoot) and mirrors that into the shared *repo.RepoInfo so the tools
+// layer sees the same isolated root.
+func (r *RitualRunner) enterWorktree(rel string) {
+	r.repoInfo.WorktreePath = rel
+	r.repoInfo.IsWorktree = true
+	if r.ownedRepoInfo != nil {
+		r.ownedRepoInfo.WorktreePath = rel
+		r.ownedRepoInfo.IsWorktree = true
+	}
+	if r.onRepoInfoChange != nil {
+		r.onRepoInfoChange(r.repoInfo)
 	}
 }
 
