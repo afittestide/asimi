@@ -52,6 +52,7 @@ type RitualGuard struct {
 	// Dependency injection (replaces *Court back-reference)
 	getMinister  func(id string) Minister
 	streamingCtx func(string) context.Context
+	cancelRitual func(channelID string)
 	version      string // Application version for health checks
 
 	// Zhengming functions injected by Court
@@ -71,7 +72,8 @@ type RitualGuardOpts struct {
 	GetMinister      func(id string) Minister
 	OnRunnerUpgrade  func(runners.Runner) // propagates runner changes back to court
 	StreamingCtx     func(string) context.Context
-	Version          string // Application version for health checks
+	CancelRitual     func(channelID string) // cancels a ritual's streaming context
+	Version          string                 // Application version for health checks
 	WaitForZhengming func(ctx context.Context, requestID string) (string, error)
 	RequestZhengming func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error)
 	DeliverZhengming func(answer ZhengmingAnswer) bool
@@ -94,6 +96,7 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 		flatlineAge:      5 * time.Minute,
 		getMinister:      opts.GetMinister,
 		streamingCtx:     opts.StreamingCtx,
+		cancelRitual:     opts.CancelRitual,
 		version:          opts.Version,
 		waitForZhengming: opts.WaitForZhengming,
 		requestZhengming: opts.RequestZhengming,
@@ -217,6 +220,8 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				return
 			}
 			rg.logger.Warn("ritual failed", "ritual", ritualName, "error", err)
+			// Run is the single owner of terminal Tian events; emit only the
+			// notification here to avoid a duplicate ritual_failed event.
 			rg.notify(RitualStepMsg{
 				ChannelID:   ritualChannelID(key.ID),
 				RitualName:  ritualName,
@@ -224,11 +229,6 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				EdictID:     key.ID,
 				Status:      "ritual_failed",
 				Message:     getRulersError(err),
-			})
-			rg.ritualRunner.emitEvent(key, storage.EventRitualFailed, storage.JSON{
-				"ritual":       ritualName,
-				"execution_id": exec.ID,
-				"error":        getRulersError(err),
 			})
 		}
 	}()
@@ -797,6 +797,13 @@ func (rg *RitualGuard) abortRitual(ctx context.Context, exec *RitualExecution, r
 			"execution_id": exec.ID,
 			"reason":       reason,
 		})
+	}
+
+	// Cancel the ritual's streaming context so the goroutine unwinds at its
+	// next step boundary and releases ritualMu. Without this the DB state and
+	// event lie: the ritual keeps running after being declared aborted.
+	if rg.cancelRitual != nil {
+		rg.cancelRitual(ritualChannelID(exec.EdictID))
 	}
 
 	rg.logger.Info("ritual aborted due to edict state change",

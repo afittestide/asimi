@@ -199,6 +199,7 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		StreamingCtx: func(channelID string) context.Context {
 			return s.CancellableStreamCtx(channelID)
 		},
+		CancelRitual:     s.CancelTab,
 		WaitForZhengming: s.WaitForZhengming,
 		RequestZhengming: s.RequestZhengming,
 		DeliverZhengming: s.DeliverZhengmingAnswer,

@@ -703,7 +703,13 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 	if exec.def == nil {
 		exec.def = r.registry.Get(exec.RitualName)
 		if exec.def == nil {
-			return fmt.Errorf("ritual definition not found: %s", exec.RitualName)
+			err := fmt.Errorf("ritual definition not found: %s", exec.RitualName)
+			r.emitEvent(exec.EdictKey(), storage.EventRitualFailed, storage.JSON{
+				"ritual":       exec.RitualName,
+				"execution_id": exec.ID,
+				"error":        err.Error(),
+			})
+			return err
 		}
 	}
 

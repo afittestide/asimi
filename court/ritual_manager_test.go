@@ -335,11 +335,12 @@ func TestStartRitualFailureNotifies(t *testing.T) {
 		t.Errorf("expected ChannelID 'e99' for ritual_failed message, got %q", failedMsg.ChannelID)
 	}
 
-	// Verify EventRitualFailed was persisted to DB
+	// Verify EventRitualFailed was persisted to DB exactly once — Run owns
+	// terminal events; startRitual must not add a duplicate.
 	var events []storage.TianEvent
 	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
-	if len(events) < 1 {
-		t.Fatalf("expected at least 1 EventRitualFailed in DB, got %d", len(events))
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 EventRitualFailed in DB, got %d", len(events))
 	}
 }
 
@@ -1088,5 +1089,217 @@ func TestStartRitualContextCancelNoFailedNotification(t *testing.T) {
 	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
 	if len(events) != 0 {
 		t.Errorf("expected 0 EventRitualFailed in DB on context cancel, got %d", len(events))
+	}
+}
+
+// TestAbortRitual_CancelsContext verifies that aborting a running ritual
+// cancels its streaming context through the injected cancel hook, so the
+// goroutine unwinds at its next step boundary instead of running on.
+func TestAbortRitual_CancelsContext(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name:       "abort-cancel-test",
+		Background: []string{"!sleep 30"},
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	var cancelledChannel string
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, &blockingRunner{}, slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return ctx },
+		cancelRitual: func(channelID string) {
+			mu.Lock()
+			cancelledChannel = channelID
+			mu.Unlock()
+			cancel()
+		},
+	}
+
+	key := storage.EdictKey{ID: 88, Username: "testuser", Project: "testproject"}
+	rg.startRitual("abort-cancel-test", key, nil)
+
+	// Wait for the ritual goroutine to acquire the lock and block in the runner.
+	time.Sleep(100 * time.Millisecond)
+
+	var exec RitualExecution
+	if err := db.First(&exec, "edict_id = ?", 88).Error; err != nil {
+		t.Fatalf("failed to load running ritual: %v", err)
+	}
+
+	if err := rg.abortRitual(context.Background(), &exec, "test abort"); err != nil {
+		t.Fatalf("abortRitual error: %v", err)
+	}
+
+	mu.Lock()
+	got := cancelledChannel
+	mu.Unlock()
+	if got != "e88" {
+		t.Errorf("expected cancelRitual called with 'e88', got %q", got)
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expected ritual context to be cancelled by abortRitual")
+	}
+
+	// The goroutine should release ritualMu once it unwinds.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if rg.ritualMu.TryLock() {
+			rg.ritualMu.Unlock()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ritualMu not released after abort cancelled the context")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAbortStaleRituals_CancelsHoldingRitual verifies that aborting a ritual
+// detected as stale also cancels its context, so a hung goroutine stops
+// holding ritualMu.
+func TestAbortStaleRituals_CancelsHoldingRitual(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	staleExec := &RitualExecution{
+		ID:          "stale-cancel-1",
+		RitualName:  "swift-strike",
+		EdictID:     200,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	if err := db.Save(staleExec).Error; err != nil {
+		t.Fatalf("failed to create stale ritual: %v", err)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", staleTime, staleExec.ID).Error; err != nil {
+		t.Fatalf("failed to set stale updated_at: %v", err)
+	}
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	var mu sync.Mutex
+	var cancelledChannel string
+	rg := &RitualGuard{
+		MinisterBase: base,
+		flatlineAge:  5 * time.Minute,
+		cancelRitual: func(channelID string) {
+			mu.Lock()
+			cancelledChannel = channelID
+			mu.Unlock()
+		},
+	}
+
+	rg.abortStaleRitualsIfLocked()
+
+	mu.Lock()
+	got := cancelledChannel
+	mu.Unlock()
+	if got != "e200" {
+		t.Errorf("expected cancelRitual called with 'e200' for stale ritual, got %q", got)
+	}
+
+	var exec RitualExecution
+	if err := db.First(&exec, "id = ?", staleExec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if exec.State != RitualStateAborted {
+		t.Errorf("expected ritual state %s, got %s", RitualStateAborted, exec.State)
+	}
+}
+
+// TestRun_FailedStep_EmitsExactlyOneRitualFailed verifies the Run step-failure
+// path is the sole emitter of ritual_failed — no duplicate from the caller.
+func TestRun_FailedStep_EmitsExactlyOneRitualFailed(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name:       "run-fail-once",
+		Background: []string{"!false"},
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	mockRunner := &mockCallCountRunner{
+		results: []runners.Output{
+			{Output: "boom\n", ExitCode: "1"},
+		},
+	}
+	runner := NewRitualRunner(
+		registry,
+		func(id string) Minister { return nil },
+		nil, // publishEvent nil → emitEvent persists directly to the DB
+		db, mockRunner, slog.Default(), repo.RepoInfo{},
+	)
+
+	ctx := context.Background()
+	exec, err := runner.Start(ctx, "run-fail-once", storage.EdictKey{ID: 77, Username: "testuser", Project: "testproject"}, nil, nil)
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	if err := runner.Run(ctx, exec); err == nil {
+		t.Fatal("expected Run to fail on a failing background given")
+	}
+
+	var events []storage.TianEvent
+	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 EventRitualFailed, got %d", len(events))
+	}
+}
+
+// TestRun_DefNotFound_EmitsRitualFailed verifies the unknown-ritual early
+// return emits exactly one ritual_failed event.
+func TestRun_DefNotFound_EmitsRitualFailed(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(
+		registry,
+		func(id string) Minister { return nil },
+		nil, db, nil, slog.Default(), repo.RepoInfo{},
+	)
+
+	exec := &RitualExecution{
+		ID:         "def-not-found-1",
+		RitualName: "no-such-ritual",
+		EdictID:    55,
+		Username:   "testuser",
+		Project:    "testproject",
+		State:      RitualStatePending,
+	}
+
+	if err := runner.Run(context.Background(), exec); err == nil {
+		t.Fatal("expected Run to fail for an unknown ritual definition")
+	}
+
+	var events []storage.TianEvent
+	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 EventRitualFailed for unknown ritual, got %d", len(events))
 	}
 }
