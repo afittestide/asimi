@@ -888,8 +888,8 @@ func TestStartRitualQueuedWhenLocked(t *testing.T) {
 
 	key := storage.EdictKey{ID: 77, Username: "testuser", Project: "testproject"}
 
-	// Hold the lock so the next startRitual must queue
-	rg.ritualMu.Lock()
+	// Hold the edict's lock so the next startRitual must queue
+	rg.edictRitualLock(77).Lock()
 
 	// Start ritual in a goroutine — it should emit "queued" then block on Lock()
 	done := make(chan error, 1)
@@ -940,7 +940,7 @@ func TestStartRitualQueuedWhenLocked(t *testing.T) {
 	}
 
 	// Release the lock so the queued ritual can proceed
-	rg.ritualMu.Unlock()
+	rg.edictRitualLock(77).Unlock()
 
 	// Wait for startRitual goroutine to finish
 	select {
@@ -1161,15 +1161,15 @@ func TestAbortRitual_CancelsContext(t *testing.T) {
 		t.Fatal("expected ritual context to be cancelled by abortRitual")
 	}
 
-	// The goroutine should release ritualMu once it unwinds.
+	// The goroutine should release its edict lock once it unwinds.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if rg.ritualMu.TryLock() {
-			rg.ritualMu.Unlock()
+		if l := rg.edictRitualLock(88); l.TryLock() {
+			l.Unlock()
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("ritualMu not released after abort cancelled the context")
+			t.Fatal("edict ritual lock not released after abort cancelled the context")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1177,7 +1177,7 @@ func TestAbortRitual_CancelsContext(t *testing.T) {
 
 // TestAbortStaleRituals_CancelsHoldingRitual verifies that aborting a ritual
 // detected as stale also cancels its context, so a hung goroutine stops
-// holding ritualMu.
+// holding its edict's lock.
 func TestAbortStaleRituals_CancelsHoldingRitual(t *testing.T) {
 	db := setupEventTestDB(t)
 
@@ -1302,4 +1302,133 @@ func TestRun_DefNotFound_EmitsRitualFailed(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("expected exactly 1 EventRitualFailed for unknown ritual, got %d", len(events))
 	}
+}
+
+// barrierRunner blocks each Run until a release channel is closed. It lets a
+// test prove two rituals are in flight at the same time.
+type barrierRunner struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (m *barrierRunner) Run(ctx context.Context, input runners.Input) (runners.Output, error) {
+	select {
+	case m.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-m.release:
+		return runners.Output{Output: "ok\n", ExitCode: "0"}, nil
+	case <-ctx.Done():
+		return runners.Output{}, ctx.Err()
+	}
+}
+func (m *barrierRunner) Restart(context.Context) error        { return nil }
+func (m *barrierRunner) Close(context.Context) error          { return nil }
+func (m *barrierRunner) AllowFallback(bool)                   {}
+func (m *barrierRunner) RunnerType() string                   { return "barrier" }
+func (m *barrierRunner) GetOS() string                        { return runtime.GOOS }
+func (m *barrierRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (m *barrierRunner) HealthCheck(context.Context) error    { return nil }
+
+// TestRitualsRunConcurrentlyAcrossEdicts verifies that rituals of two different
+// edicts overlap rather than serializing: both reach the blocking runner before
+// either is released.
+func TestRitualsRunConcurrentlyAcrossEdicts(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "concurrent-test",
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+		Background: []string{"!echo work"},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	runner := &barrierRunner{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, runner, slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return context.Background() },
+	}
+	rg.SetNotify(func(any) {})
+
+	// Start two rituals for two different edicts.
+	rg.startRitual("concurrent-test", storage.EdictKey{ID: 101, Username: "testuser", Project: "testproject"}, nil)
+	rg.startRitual("concurrent-test", storage.EdictKey{ID: 102, Username: "testuser", Project: "testproject"}, nil)
+
+	// Both must reach the runner before either completes. If rituals were
+	// globally serialized, only one would enter.
+	entered := 0
+	timeout := time.After(3 * time.Second)
+	for entered < 2 {
+		select {
+		case <-runner.entered:
+			entered++
+		case <-timeout:
+			t.Fatalf("rituals did not run concurrently; only %d entered", entered)
+		}
+	}
+
+	close(runner.release)
+}
+
+// TestRitualsSerializeWithinSameEdict verifies that two rituals of the SAME
+// edict remain ordered: the second cannot enter the runner until the first has
+// released its per-edict lock.
+func TestRitualsSerializeWithinSameEdict(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "serial-test",
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+		Background: []string{"!echo work"},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	runner := &barrierRunner{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, runner, slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return context.Background() },
+	}
+	rg.SetNotify(func(any) {})
+
+	key := storage.EdictKey{ID: 200, Username: "testuser", Project: "testproject"}
+	rg.startRitual("serial-test", key, nil)
+
+	select {
+	case <-runner.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ritual did not enter the runner")
+	}
+
+	// Second ritual of the same edict must wait for the edict lock.
+	rg.startRitual("serial-test", key, nil)
+	select {
+	case <-runner.entered:
+		t.Fatal("second ritual of the same edict entered concurrently — same-edict rituals must serialize")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(runner.release)
 }

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/afittestide/asimi/court"
 	"github.com/afittestide/asimi/internal/config"
@@ -41,7 +42,7 @@ func createCourt(
 		))
 		runner = hostRunner
 	} else {
-		runner = runners.NewPodmanRunner(&projectCfg.Sandbox, repoInfo, connID, nil)
+		runner = runners.NewPodmanRunner(&projectCfg.Sandbox, repoInfo, strconv.FormatUint(connID, 10), nil)
 	}
 
 	courtCfg := config.DefaultCourtConfig()
@@ -56,6 +57,9 @@ func createCourt(
 	if projectCfg.Court.OutputLimit > 0 {
 		courtCfg.OutputLimit = projectCfg.Court.OutputLimit
 	}
+	// The loader resolves this to the 15m default when unset, so an explicit 0
+	// (disabling the sweep) is preserved.
+	courtCfg.RunnerFlatlineTimeout = projectCfg.Court.RunnerFlatlineTimeout
 	courtCfg.IsolatedHost = isolatedHost
 
 	ct := court.NewCourt(shared.DB, courtCfg, runner, shared.Logger)

@@ -143,18 +143,32 @@ type Court struct {
 	// ling ignition so overlapping insert_ling triggers never double-run a ling.
 	lingIgniteMu sync.Mutex
 	lingIgniting map[uint]*sync.Mutex
+
+	// edictRunnersMu guards edictRunners/edictRunnerLastUsed, the per-edict
+	// shell runners (and their containers). Each edict gets its own runner so
+	// two edicts run concurrently without colliding on shared runner state.
+	edictRunnersMu        sync.Mutex
+	edictRunners          map[uint]runners.Runner
+	edictRunnerLastUsed   map[uint]time.Time
+	newEdictRunner        func(edictID uint, base repo.RepoInfo) (runners.Runner, error)
+	runnerFlatlineTimeout time.Duration
 }
 
 // NewCourt creates a new Court coordinator.
 func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logger *slog.Logger) *Court {
 	s := &Court{
-		db:           db,
-		logger:       logger,
-		config:       cfg,
-		runner:       runner,
-		ministers:    make(map[string]Minister),
-		zhengming:    newZhengmingDispatch(),
-		isolatedHost: cfg != nil && cfg.IsolatedHost,
+		db:                  db,
+		logger:              logger,
+		config:              cfg,
+		runner:              runner,
+		ministers:           make(map[string]Minister),
+		zhengming:           newZhengmingDispatch(),
+		isolatedHost:        cfg != nil && cfg.IsolatedHost,
+		edictRunners:        make(map[uint]runners.Runner),
+		edictRunnerLastUsed: make(map[uint]time.Time),
+	}
+	if cfg != nil {
+		s.runnerFlatlineTimeout = cfg.RunnerFlatlineTimeout
 	}
 	s.ensureDefaults()
 
@@ -203,8 +217,12 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		WaitForZhengming: s.WaitForZhengming,
 		RequestZhengming: s.RequestZhengming,
 		DeliverZhengming: s.DeliverZhengmingAnswer,
+		FlatlineRunners:  s.flatlineIdleRunners,
 	})
 	s.ritualGuard.ritualRunner.isolatedHost = s.isolatedHost
+	// Rituals resolve their own per-edict runner and stamp last-used on
+	// completion so an idle container is never flatlined mid-ritual.
+	s.ritualGuard.ritualRunner.SetRunnerResolver(s.RunnerForEdict, s.TouchEdictRunner)
 
 	// Handle the Ruler's seal: squash-merge and remove the edict's worktree
 	// (if any) so an edict's isolated work ascends to the default branch as a
@@ -591,12 +609,22 @@ func (s *Court) Stop() error {
 		s.cancel()
 	}
 	// Close the runner — stops and removes any sandbox containers
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if s.runner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		if err := s.runner.Close(ctx); err != nil {
 			s.logger.Warn("runner close failed", "error", err)
 		}
+	}
+	// Close every per-edict runner so no edict container is leaked on shutdown.
+	s.edictRunnersMu.Lock()
+	edictIDs := make([]uint, 0, len(s.edictRunners))
+	for id := range s.edictRunners {
+		edictIDs = append(edictIDs, id)
+	}
+	s.edictRunnersMu.Unlock()
+	for _, id := range edictIDs {
+		s.CloseEdictRunner(ctx, id)
 	}
 	s.logger.Info("court stopped")
 	return nil
@@ -661,9 +689,28 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 			projectSlug = s.config.Project
 		}
 		s.ritualGuard.RitualRunner().SetConfig(sandboxCfg, projectSlug, repoInfo, s.config)
-		s.ritualGuard.RitualRunner().SetRepoInfoHooks(s.toolCtxRepoInfo, s.SetRepoInfo)
 		if config != nil {
 			s.ritualGuard.RitualRunner().SetAtifAgentName(config.AtifAgentName)
+		}
+	}
+
+	// Wire the per-edict runner factory. Each edict gets its own runner so
+	// concurrent edicts never share the container or the mutable repoInfo that
+	// routes commands into the edict's worktree.
+	if config != nil && repoInfo.ProjectRoot != "" {
+		sandboxCfg := config.Sandbox
+		s.newEdictRunner = func(edictID uint, base repo.RepoInfo) (runners.Runner, error) {
+			if base.ProjectRoot == "" {
+				base = repoInfo
+			}
+			if s.isolatedHost {
+				host := runners.NewHostRunner(0, base.ProjectRoot)
+				host.SetTimeouts(s.hostTimeouts())
+				return host, nil
+			}
+			r := runners.NewPodmanRunner(&sandboxCfg, base, fmt.Sprintf("e%d", edictID), nil)
+			r.SetMessageChannel(s.msgChan)
+			return r, nil
 		}
 	}
 	// Update repoInfo on the RitualGuard (not covered by the Ministers
@@ -1069,14 +1116,129 @@ func (s *Court) SetRunner(r runners.Runner) {
 		return
 	}
 	s.runner = r
-	// Set globally so runners package can be used directly
-	runners.SetRunner(r)
 	// Propagate to all ministers that implement RunnerSetter
 	for _, m := range s.ministers {
 		if setter, ok := m.(interface{ SetRunner(runners.Runner) }); ok {
 			setter.SetRunner(r)
 		}
 	}
+}
+
+// RunnerForEdict returns the shell runner dedicated to edictID, creating and
+// caching it on first use. Every edict gets its own runner (and therefore its
+// own podman container), so concurrent edicts never share mutable runner state.
+// System rituals (edict 1) and calls with edictID 0 fall back to the Court's
+// main runner, which is also the connection runner.
+func (s *Court) RunnerForEdict(edictID uint) (runners.Runner, error) {
+	if s == nil {
+		return nil, fmt.Errorf("court not initialized")
+	}
+	if edictID <= 1 || s.newEdictRunner == nil {
+		return s.runner, nil
+	}
+
+	s.edictRunnersMu.Lock()
+	defer s.edictRunnersMu.Unlock()
+	if r, ok := s.edictRunners[edictID]; ok {
+		s.edictRunnerLastUsed[edictID] = time.Now()
+		return r, nil
+	}
+
+	base := repo.RepoInfo{}
+	if s.ritualGuard != nil {
+		base = s.ritualGuard.repoInfo
+	}
+	r, err := s.newEdictRunner(edictID, base)
+	if err != nil {
+		return nil, err
+	}
+	s.edictRunners[edictID] = r
+	s.edictRunnerLastUsed[edictID] = time.Now()
+	s.logger.Info("created per-edict runner", "edict", edictID, "runner_type", r.RunnerType())
+	return r, nil
+}
+
+// TouchEdictRunner stamps edictID's last-used time so a long-running ritual is
+// not considered idle when it completes.
+func (s *Court) TouchEdictRunner(edictID uint) {
+	if s == nil || edictID <= 1 {
+		return
+	}
+	s.edictRunnersMu.Lock()
+	defer s.edictRunnersMu.Unlock()
+	if _, ok := s.edictRunners[edictID]; ok {
+		s.edictRunnerLastUsed[edictID] = time.Now()
+	}
+}
+
+// CloseEdictRunner closes edictID's runner and forgets it. The next ritual for
+// the edict lazily recreates a runner, which re-attaches to the same on-disk
+// worktree. Safe to call when no runner exists.
+func (s *Court) CloseEdictRunner(ctx context.Context, edictID uint) {
+	if s == nil {
+		return
+	}
+	s.edictRunnersMu.Lock()
+	r, ok := s.edictRunners[edictID]
+	if ok {
+		delete(s.edictRunners, edictID)
+		delete(s.edictRunnerLastUsed, edictID)
+	}
+	s.edictRunnersMu.Unlock()
+	if !ok || r == nil {
+		return
+	}
+	if err := r.Close(ctx); err != nil {
+		s.logger.Warn("failed to close per-edict runner", "edict", edictID, "error", err)
+		return
+	}
+	s.logger.Info("closed per-edict runner", "edict", edictID)
+}
+
+// flatlineIdleRunners stops and removes containers for edicts whose runners
+// have been idle past runnerFlatlineTimeout. An edict with a running or queued
+// ritual is never flatlined. A timeout of 0 disables the sweep.
+func (s *Court) flatlineIdleRunners(ctx context.Context) {
+	if s == nil || s.runnerFlatlineTimeout <= 0 {
+		return
+	}
+	s.edictRunnersMu.Lock()
+	var candidates []uint
+	for id, last := range s.edictRunnerLastUsed {
+		if time.Since(last) < s.runnerFlatlineTimeout {
+			continue
+		}
+		candidates = append(candidates, id)
+	}
+	s.edictRunnersMu.Unlock()
+
+	var idle []uint
+	for _, id := range candidates {
+		// ritualRunningFor consults the DB; call it outside edictRunnersMu.
+		if s.ritualRunningFor(id) {
+			continue
+		}
+		idle = append(idle, id)
+	}
+	for _, id := range idle {
+		// Re-check just before closing: a ritual may have started in the gap
+		// between the sweep's collection and this close.
+		if s.ritualRunningFor(id) {
+			continue
+		}
+		s.logger.Info("edict container flatlined; stopping and removing", "edict", id)
+		s.CloseEdictRunner(ctx, id)
+	}
+}
+
+// ritualRunningFor reports whether edictID has a ritual currently running or
+// queued. The per-edict ritual lock is held for the duration of a ritual, so
+// failing to acquire it means the edict is busy.
+func (s *Court) ritualRunningFor(edictID uint) bool {
+	if s == nil || s.ritualGuard == nil {
+		return false
+	}
+	return s.ritualGuard.ritualRunningFor(edictID)
 }
 
 // SetRunnerMessageChannel sets the message channel on the runner for approval requests.
@@ -1384,7 +1546,11 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) {
 	}
 	if err := worktree.Remove(ctx, s.runner, root, abs, branch); err != nil {
 		s.logger.Error("worktree removal failed after successful merge", "edict", edictID, "err", err)
+		return // keep the edict runner so the worktree can be inspected
 	}
+	// The worktree is gone; tear down the edict's container too. The next
+	// ritual for the edict lazily recreates a runner.
+	s.CloseEdictRunner(ctx, edictID)
 }
 
 // edictCommitSummary builds the squash-merge commit message for an edict from

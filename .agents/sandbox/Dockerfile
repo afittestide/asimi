@@ -1,4 +1,10 @@
-FROM golang:1.26.6-bookworm
+FROM golang:1.26.9-bookworm
+
+# The golang base image sets GOTOOLCHAIN=local, which makes the toolchain
+# refuse to fetch a newer Go when go.mod requires one (e.g. after a dependency
+# bump). Override it so the sandbox can self-heal to the go.mod toolchain
+# instead of failing with "go.mod requires go >= X (running go Y)".
+ENV GOTOOLCHAIN=auto
 
 # Install common development tools and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

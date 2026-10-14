@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	cucumberexpressions "github.com/cucumber/cucumber-expressions/go/v19"
@@ -62,6 +63,7 @@ func NewStepDefRegistry() *StepDefRegistry {
 		outputKey  string
 	}{
 		{"the edict details", "get_edict", "edict"},
+		{"an edict's worktree", "prepare_worktree", "worktree"},
 		{"the court status", "get_court_status", "court_status"},
 		{"the manifests", "get_manifests", "manifests"},
 		{"the verdicts", "get_verdicts", "verdicts"},
@@ -125,8 +127,53 @@ func (r *StepDefRegistry) Match(text string) (*StepDef, error) {
 	return nil, nil
 }
 
+// execRunner returns the runner an execution uses. It falls back to the
+// Court-wide runner for directly-constructed or system executions.
+func (r *RitualRunner) execRunner(exec *RitualExecution) runners.Runner {
+	if exec != nil && exec.runner != nil {
+		return exec.runner
+	}
+	return r.runner
+}
+
+// execRepoInfo returns the repoInfo an execution is routed with. It falls back
+// to the runner's own repoInfo for directly-constructed executions.
+func (r *RitualRunner) execRepoInfo(exec *RitualExecution) repo.RepoInfo {
+	if exec != nil && exec.repoInfo.ProjectRoot != "" {
+		return exec.repoInfo
+	}
+	return r.repoInfo
+}
+
+// ensureExecContext seeds an execution's runner/repoInfo from the runner's
+// Court-wide defaults when they were not resolved by Start. It keeps direct
+// runGiven/runThen invocations (tests, recovery) working without reading
+// shared fields during a run.
+func (r *RitualRunner) ensureExecContext(exec *RitualExecution) {
+	if exec == nil {
+		return
+	}
+	if exec.runner == nil {
+		exec.runner = r.runner
+	}
+	if exec.repoInfo.ProjectRoot == "" {
+		exec.repoInfo = r.repoInfo
+	}
+}
+
+// seededExec returns a non-nil execution routed with the runner's defaults,
+// creating a throwaway one for direct helper invocations that pass nil.
+func (r *RitualRunner) seededExec(exec *RitualExecution) *RitualExecution {
+	if exec == nil {
+		exec = &RitualExecution{}
+	}
+	r.ensureExecContext(exec)
+	return exec
+}
+
 // runGiven runs a builtin given function and returns the result
 func (r *RitualRunner) runGiven(ctx context.Context, exec *RitualExecution, fn string) (interface{}, error) {
+	r.ensureExecContext(exec)
 	givenKey := exec.EdictKey()
 	switch fn {
 	case "get_edict":
@@ -146,27 +193,27 @@ func (r *RitualRunner) runGiven(ctx context.Context, exec *RitualExecution, fn s
 	case "get_precedents":
 		return r.arrangeGetPrecedents(givenKey)
 	case "get_earth_status":
-		return r.getEarthStatus(ctx)
+		return r.getEarthStatus(ctx, exec)
 	case "get_borderlands":
-		return r.getBorderlands(ctx)
+		return r.getBorderlands(ctx, exec)
 	case "create_borderland_manifests":
 		return r.createBorderlandManifests(ctx, exec)
 	case "check_clean_working_directory":
-		return r.checkCleanWorkingDirectory(ctx)
+		return r.checkCleanWorkingDirectory(ctx, exec)
 	case "get_infrastructure_templates":
-		return r.getInfrastructureTemplates(ctx)
+		return r.getInfrastructureTemplates(ctx, exec)
 	case "build_sandbox":
-		return r.buildSandbox(ctx)
+		return r.buildSandbox(ctx, exec)
 	case "verify_sandbox_ready":
-		return r.verifySandboxReady(ctx)
+		return r.verifySandboxReady(ctx, exec)
 	case "get_project_metadata":
-		return r.getProjectMetadata(ctx)
+		return r.getProjectMetadata(ctx, exec)
 	case "get_unsealed_edicts":
 		return r.getUnsealedEdicts(ctx, exec)
 	case "get_lings":
 		return r.getLings(givenKey)
 	case "get_heaven_snapshot":
-		return r.getHeavenSnapshot(ctx)
+		return r.getHeavenSnapshot(ctx, exec)
 	case "check_asimi_version":
 		return r.checkAsimiVersion(ctx)
 	default:
@@ -177,36 +224,29 @@ func (r *RitualRunner) runGiven(ctx context.Context, exec *RitualExecution, fn s
 // prepareWorktree gives the ritual an isolated per-edict git worktree at
 // .agents/worktrees/e{ID} on branch asimi/e{ID}. It is idempotent: every
 // ritual of the edict reuses the same worktree. Isolation is achieved by
-// routing the ritual's runner into the worktree via RepoInfo.WorktreePath —
+// routing the execution's runner into the worktree via RepoInfo.WorktreePath —
 // ProjectRoot is never mutated, because the sandbox bind-mounts only
-// ProjectRoot.
+// ProjectRoot. The worktree path is stored on the execution's own runner and
+// repoInfo, so concurrent edicts never race on shared runner state.
 func (r *RitualRunner) prepareWorktree(ctx context.Context, exec *RitualExecution) (interface{}, error) {
-	root := r.repoInfo.ProjectRoot
+	root := exec.repoInfo.ProjectRoot
 	if root == "" {
 		return nil, fmt.Errorf("prepare_worktree: empty project root")
 	}
-	abs, rel, branch, _, err := worktree.Ensure(ctx, r.runner, root, exec.EdictID)
+	if exec.runner == nil {
+		return nil, fmt.Errorf("prepare_worktree: no runner configured")
+	}
+	abs, rel, branch, _, err := worktree.Ensure(ctx, exec.runner, root, exec.EdictID)
 	if err != nil {
 		return nil, err
 	}
-	r.enterWorktree(rel)
+	exec.repoInfo.WorktreePath = rel
+	exec.repoInfo.IsWorktree = true
+	if setter, ok := exec.runner.(runners.RepoInfoSetter); ok {
+		setter.SetRepoInfo(exec.repoInfo)
+	}
 	r.logger.Info("worktree prepared", "path", abs, "edict", exec.EdictID, "branch", branch)
 	return map[string]string{"path": abs, "branch": branch}, nil
-}
-
-// enterWorktree routes the runner into the worktree at rel (relative to
-// ProjectRoot) and mirrors that into the shared *repo.RepoInfo so the tools
-// layer sees the same isolated root.
-func (r *RitualRunner) enterWorktree(rel string) {
-	r.repoInfo.WorktreePath = rel
-	r.repoInfo.IsWorktree = true
-	if r.ownedRepoInfo != nil {
-		r.ownedRepoInfo.WorktreePath = rel
-		r.ownedRepoInfo.IsWorktree = true
-	}
-	if r.onRepoInfoChange != nil {
-		r.onRepoInfoChange(r.repoInfo)
-	}
 }
 
 func (r *RitualRunner) getUnsealedEdicts(ctx context.Context, exec *RitualExecution) (interface{}, error) {
@@ -292,8 +332,9 @@ func checkLingDAG(lingList []storage.Ling) error {
 	return nil
 }
 
-func (r *RitualRunner) getHeavenSnapshot(ctx context.Context) (interface{}, error) {
-	repoInfo := r.repoInfo
+func (r *RitualRunner) getHeavenSnapshot(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
+	repoInfo := exec.repoInfo
 
 	if repoInfo.Gitless() {
 		return map[string]string{
@@ -311,7 +352,7 @@ func (r *RitualRunner) getHeavenSnapshot(ctx context.Context) (interface{}, erro
 		Command:        fmt.Sprintf("git log -1 --format='%%H' origin/%s", branch),
 		Description:    "get latest commit on upstream branch",
 		BypassApproval: true,
-	}, r.repoInfo.ProjectRoot)
+	}, repoInfo.ProjectRoot)
 	latestCommit := ""
 	if err == nil {
 		latestCommit = strings.TrimSpace(output.Output)
@@ -326,7 +367,7 @@ func (r *RitualRunner) getHeavenSnapshot(ctx context.Context) (interface{}, erro
 		Command:        fmt.Sprintf("git log -1 --format='%%cr' origin/%s", branch),
 		Description:    "get age of upstream commit",
 		BypassApproval: true,
-	}, r.repoInfo.ProjectRoot)
+	}, repoInfo.ProjectRoot)
 	if err == nil {
 		ageStr = strings.TrimSpace(output2.Output)
 	}
@@ -535,14 +576,15 @@ const gitlessEarthMarker = "(no git repository — the borderlands are all)"
 
 // getEarthStatus captures the three parts of the Earth realm:
 // the capital (git log), the middle kingdom (git diff --staged), and the borderlands (git diff).
-func (r *RitualRunner) getEarthStatus(ctx context.Context) (map[string]string, error) {
+func (r *RitualRunner) getEarthStatus(ctx context.Context, exec *RitualExecution) (map[string]string, error) {
+	exec = r.seededExec(exec)
 	result := map[string]string{
 		"earth_capital":        "",
 		"earth_middle_kingdom": "",
 		"earth_borderlands":    "",
 	}
 
-	if r.repoInfo.Gitless() {
+	if exec.repoInfo.Gitless() {
 		result["earth_capital"] = gitlessEarthMarker
 		result["earth_middle_kingdom"] = gitlessEarthMarker
 		result["earth_borderlands"] = gitlessEarthMarker
@@ -551,7 +593,10 @@ func (r *RitualRunner) getEarthStatus(ctx context.Context) (map[string]string, e
 
 	// Git operations always run on host (not in sandbox)
 	gitRun := func(cmd, desc string) string {
-		output, err := r.runner.Run(ctx, runners.Input{
+		if exec.runner == nil {
+			return ""
+		}
+		output, err := exec.runner.Run(ctx, runners.Input{
 			Command:     cmd,
 			Description: desc,
 		})
@@ -569,8 +614,9 @@ func (r *RitualRunner) getEarthStatus(ctx context.Context) (map[string]string, e
 }
 
 // getBorderlands captures unstaged changes and untracked files.
-func (r *RitualRunner) getBorderlands(ctx context.Context) (interface{}, error) {
-	if r.repoInfo.Gitless() {
+func (r *RitualRunner) getBorderlands(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
+	if exec.repoInfo.Gitless() {
 		return map[string]string{
 			"borderlands:changes":   gitlessEarthMarker,
 			"borderlands:untracked": gitlessEarthMarker,
@@ -585,7 +631,7 @@ func (r *RitualRunner) getBorderlands(ctx context.Context) (interface{}, error) 
 		Command:        "git diff",
 		Description:    "get borderlands (git diff)",
 		BypassApproval: true,
-	}, r.repoInfo.ProjectRoot)
+	}, exec.repoInfo.ProjectRoot)
 	if err == nil {
 		result["borderlands:changes"] = diff.Output
 	}
@@ -593,7 +639,7 @@ func (r *RitualRunner) getBorderlands(ctx context.Context) (interface{}, error) 
 		Command:        "git ls-files --others --exclude-standard",
 		Description:    "get borderlands (untracked files)",
 		BypassApproval: true,
-	}, r.repoInfo.ProjectRoot)
+	}, exec.repoInfo.ProjectRoot)
 	if err == nil {
 		result["borderlands:untracked"] = untracked.Output
 	}
@@ -606,17 +652,21 @@ func (r *RitualRunner) getBorderlands(ctx context.Context) (interface{}, error) 
 // On gitless ground there is no diff, so it falls back to a file inventory of
 // the project root (skipping VCS, tooling, and build artifacts).
 func (r *RitualRunner) createBorderlandManifests(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
 	key := exec.EdictKey()
 
 	var files []string
-	if r.repoInfo.Gitless() {
+	if exec.repoInfo.Gitless() {
 		var err error
-		files, err = inventoryProjectFiles(r.repoInfo.ProjectRoot)
+		files, err = inventoryProjectFiles(exec.repoInfo.ProjectRoot)
 		if err != nil {
 			return nil, fmt.Errorf("file inventory: %w", err)
 		}
 	} else {
-		output, err := r.runner.Run(ctx, runners.Input{
+		if exec.runner == nil {
+			return nil, fmt.Errorf("no runner configured for borderland manifests")
+		}
+		output, err := exec.runner.Run(ctx, runners.Input{
 			Command:        "git diff --name-only",
 			Description:    "list borderland changed files",
 			BypassApproval: true,
@@ -719,8 +769,9 @@ func inventoryProjectFiles(root string) ([]string, error) {
 // checkCleanWorkingDirectory verifies the working directory is clean (no unstaged changes).
 // On gitless ground cleanliness is not defined — report the gitless state
 // explicitly instead of vacuously claiming a clean tree.
-func (r *RitualRunner) checkCleanWorkingDirectory(ctx context.Context) (interface{}, error) {
-	repoInfo := r.repoInfo
+func (r *RitualRunner) checkCleanWorkingDirectory(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
+	repoInfo := exec.repoInfo
 	if repoInfo.Gitless() {
 		return map[string]string{
 			"status": "no git repository — the borderlands are all",
@@ -733,11 +784,12 @@ func (r *RitualRunner) checkCleanWorkingDirectory(ctx context.Context) (interfac
 }
 
 // getInfrastructureTemplates creates infrastructure files from embedded templates and returns their paths
-func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context) (interface{}, error) {
+func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
 	// Ensure directory structure exists — use os.MkdirAll with ProjectRoot so
 	// paths resolve consistently regardless of process CWD.
-	r.logger.Debug("making dirs", "project root", r.repoInfo.ProjectRoot)
-	sandboxDir := filepath.Join(r.repoInfo.ProjectRoot, ".agents", "sandbox")
+	r.logger.Debug("making dirs", "project root", exec.repoInfo.ProjectRoot)
+	sandboxDir := filepath.Join(exec.repoInfo.ProjectRoot, ".agents", "sandbox")
 	if err := os.MkdirAll(sandboxDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create .agents/sandbox directory: %w", err)
 	}
@@ -753,7 +805,7 @@ func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context) (interfac
 	// because the user may have set it before any git remote was configured.
 	slug := r.projectSlug
 	if slug == "" {
-		slug = r.repoInfo.Slug
+		slug = exec.repoInfo.Slug
 	}
 	if slug == "" {
 		slug = "local"
@@ -769,11 +821,11 @@ func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context) (interfac
 	// All paths are prefixed with ProjectRoot via filepath.Join so os.Stat and
 	// os.WriteFile resolve against the project root, not the process CWD.
 	files := map[string]string{
-		filepath.Join(r.repoInfo.ProjectRoot, "Justfile"):                         justfile,
-		filepath.Join(r.repoInfo.ProjectRoot, ".agents/asimi.conf"):               asimiConf,
-		filepath.Join(r.repoInfo.ProjectRoot, ".agents/sandbox/Dockerfile"):       dotagentsDockerfile,
-		filepath.Join(r.repoInfo.ProjectRoot, ".agents/sandbox/bashrc"):           dotagentsBashrc,
-		filepath.Join(r.repoInfo.ProjectRoot, ".agents/sandbox/asimi_runtime.sh"): dotagentsAsimiRuntime,
+		filepath.Join(exec.repoInfo.ProjectRoot, "Justfile"):                         justfile,
+		filepath.Join(exec.repoInfo.ProjectRoot, ".agents/asimi.conf"):               asimiConf,
+		filepath.Join(exec.repoInfo.ProjectRoot, ".agents/sandbox/Dockerfile"):       dotagentsDockerfile,
+		filepath.Join(exec.repoInfo.ProjectRoot, ".agents/sandbox/bashrc"):           dotagentsBashrc,
+		filepath.Join(exec.repoInfo.ProjectRoot, ".agents/sandbox/asimi_runtime.sh"): dotagentsAsimiRuntime,
 	}
 
 	// Only seed files that don't already exist — preserve any prior customization
@@ -796,7 +848,7 @@ func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context) (interfac
 
 	return map[string]interface{}{
 		"template_files": createdFiles,
-		"directories":    []string{filepath.Join(r.repoInfo.ProjectRoot, ".agents"), filepath.Join(r.repoInfo.ProjectRoot, ".agents", "sandbox")},
+		"directories":    []string{filepath.Join(exec.repoInfo.ProjectRoot, ".agents"), filepath.Join(exec.repoInfo.ProjectRoot, ".agents", "sandbox")},
 	}, nil
 }
 
@@ -804,9 +856,17 @@ func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context) (interfac
 // Infrastructure files are baselined by getInfrastructureTemplates, which the
 // establish-infrastructure step resolves (via its background) before each
 // attempt — including on retry — so this function does not need to reset them.
-func (r *RitualRunner) buildSandbox(ctx context.Context) (interface{}, error) {
+func (r *RitualRunner) buildSandbox(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
 	if r.isolatedHost {
 		return map[string]string{"status": "skipped", "output": "isolated-host mode: sandbox not needed"}, nil
+	}
+	// Building the sandbox is a Court-wide infrastructure operation that
+	// targets the Court's main runner. Inside an edict's worktree we must not
+	// tear down the Court runner: the edict has its own runner, and the image
+	// is shared.
+	if exec != nil && exec.repoInfo.IsWorktree {
+		return map[string]string{"status": "skipped", "output": "inside an edict worktree: sandbox image is managed by the Court runner"}, nil
 	}
 	output, err := runners.HostRun(ctx, runners.Input{
 		Command:        "just build-sandbox",
@@ -822,7 +882,8 @@ func (r *RitualRunner) buildSandbox(ctx context.Context) (interface{}, error) {
 	}
 
 	// Stop and remove the old container so verifySandboxReady creates a fresh
-	// one from the rebuilt image.
+	// one from the rebuilt image. Confined to the Court's main runner so a
+	// per-edict runner is never clobbered.
 	if r.runner != nil {
 		if closeErr := r.runner.Close(ctx); closeErr != nil {
 			r.logger.Warn("failed to close old sandbox container after rebuild", "error", closeErr)
@@ -834,11 +895,20 @@ func (r *RitualRunner) buildSandbox(ctx context.Context) (interface{}, error) {
 
 // verifySandboxUp runs a quick smoke test and verify it's on linux
 // It distinguishes between configuration failures (blocking) and transient failures (non-blocking).
-func (r *RitualRunner) verifySandboxUp(ctx context.Context) (interface{}, error) {
+func (r *RitualRunner) verifySandboxUp(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
 	if r.isolatedHost {
 		return map[string]string{"status": "ready", "output": "isolated-host mode: sandbox check skipped"}, nil
 	}
-	output, err := r.runner.Run(ctx, runners.Input{
+	runner := r.runner
+	if exec != nil && exec.runner != nil {
+		runner = exec.runner
+	}
+	if runner == nil {
+		return map[string]string{"status": "failed", "output": "no runner configured"},
+			fmt.Errorf("no runner configured for sandbox smoke test")
+	}
+	output, err := runner.Run(ctx, runners.Input{
 		Command:        "echo $container",
 		Description:    "print podman if in a sandbox",
 		BypassApproval: true,
@@ -861,11 +931,12 @@ func (r *RitualRunner) verifySandboxUp(ctx context.Context) (interface{}, error)
 	}, nil
 }
 
-func (r *RitualRunner) verifySandboxReady(ctx context.Context) (interface{}, error) {
+func (r *RitualRunner) verifySandboxReady(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
 	if r.isolatedHost {
 		return map[string]string{"status": "ready", "output": "isolated-host mode: sandbox check skipped"}, nil
 	}
-	// Step 1: Reload the runner to pick up the newly built sandbox image
+	// Step 1: Reload the runner to pick up the newly built sandbox image.
 	// Use the injected sandbox config instead of reloading from disk.
 	if r.sandboxConfig == nil {
 		return map[string]string{
@@ -873,28 +944,49 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context) (interface{}, err
 			"output": "sandbox configuration not available",
 		}, fmt.Errorf("sandbox configuration not available (SetConfig not called)")
 	}
-	repoInfo := r.repoInfo
-	r.runner = runners.InitShellRunner(r.sandboxConfig, repoInfo)
-	if r.runner == nil {
+	// The Court-wide upgrade is confined to the non-worktree path. Inside a
+	// worktree the execution already has its own per-edict runner; rebuilding
+	// the Court runner would clobber it and race concurrent edicts.
+	runner := r.runner
+	if exec != nil && exec.runner != nil {
+		runner = exec.runner
+	}
+	inWorktree := exec != nil && exec.repoInfo.IsWorktree
+	if !inWorktree {
+		// Recreate the Court's main runner with the same container-naming
+		// identifier the initial InitShellRunner used (the process ID), so the
+		// rebuilt container keeps the connection runner's name.
+		runner = runners.InitShellRunner(r.sandboxConfig, r.repoInfo, strconv.FormatUint(uint64(os.Getpid()), 10))
+		r.runner = runner
+		if exec != nil {
+			exec.runner = runner
+		}
+		if runner == nil {
+			return map[string]string{
+				"status": "failed",
+				"output": "container runner not available",
+			}, fmt.Errorf("container runner not available")
+		}
+		if runner.RunnerType() != "podman" {
+			return map[string]string{
+				"status": "failed",
+				"output": "failed to bring the container up",
+			}, fmt.Errorf("container runner type is %s, expected podman", runner.RunnerType())
+		}
+		// Propagate runner upgrade to Court and all ministers
+		if r.onRunnerUpgrade != nil {
+			r.onRunnerUpgrade(runner)
+		}
+	}
+	if runner == nil {
 		return map[string]string{
 			"status": "failed",
 			"output": "container runner not available",
 		}, fmt.Errorf("container runner not available")
 	}
-	if r.runner.RunnerType() != "podman" {
-		return map[string]string{
-			"status": "failed",
-			"output": "failed to bring the container up",
-		}, fmt.Errorf("container runner type is %s, expected podman", r.runner.RunnerType())
-	}
-
-	// Propagate runner upgrade to Court and all ministers
-	if r.onRunnerUpgrade != nil {
-		r.onRunnerUpgrade(r.runner)
-	}
 
 	// Step 2: Smoke-test the newly built sandbox container
-	output, err := r.runner.Run(ctx, runners.Input{
+	output, err := runner.Run(ctx, runners.Input{
 		Command:        "uname",
 		Description:    "smoke test the sandbox",
 		BypassApproval: true,
@@ -917,7 +1009,7 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context) (interface{}, err
 	}
 
 	// Step 3: Install dependencies inside the sandbox (BLOCKING - configuration failure)
-	installOutput, installErr := r.runner.Run(ctx, runners.Input{
+	installOutput, installErr := runner.Run(ctx, runners.Input{
 		Command:        "just install",
 		Description:    "install dependencies in sandbox",
 		BypassApproval: true,
@@ -940,7 +1032,7 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context) (interface{}, err
 	}
 
 	// Step 4: Build inside the sandbox to verify it works (BLOCKING)
-	output, err = r.runner.Run(ctx, runners.Input{
+	output, err = runner.Run(ctx, runners.Input{
 		Command:        "just build",
 		Description:    "verify sandbox by building inside container",
 		BypassApproval: true,
@@ -957,7 +1049,7 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context) (interface{}, err
 	}
 
 	// Step 5: Run tests as non-blocking smoke test (TRANSIENT - may fail due to incomplete test data)
-	testOutput, testErr := r.runner.Run(ctx, runners.Input{
+	testOutput, testErr := runner.Run(ctx, runners.Input{
 		Command:        "just test",
 		Description:    "smoke test: verify tests run in sandbox",
 		BypassApproval: true,
@@ -977,8 +1069,9 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context) (interface{}, err
 }
 
 // getProjectMetadata captures repository information for use in ritual templates
-func (r *RitualRunner) getProjectMetadata(ctx context.Context) (interface{}, error) {
-	repoInfo := r.repoInfo
+func (r *RitualRunner) getProjectMetadata(ctx context.Context, exec *RitualExecution) (interface{}, error) {
+	exec = r.seededExec(exec)
+	repoInfo := exec.repoInfo
 
 	// Use ProjectRoot for remote URL lookup
 	root := repoInfo.ProjectRoot
@@ -1042,21 +1135,22 @@ func parseHostOrgProject(remote string) (host, org, project string) {
 
 // runThen runs a builtin then function (extensible via step registry)
 func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn string) error {
+	r.ensureExecContext(exec)
 	// Non-edict operations run regardless of EdictID
 	switch fn {
 	case "build_sandbox":
-		_, err := r.buildSandbox(ctx)
+		_, err := r.buildSandbox(ctx, exec)
 		return err
 	case "verify_sandbox_up":
-		_, err := r.verifySandboxUp(ctx)
+		_, err := r.verifySandboxUp(ctx, exec)
 		return err
 	case "verify_sandbox_ready":
-		_, err := r.verifySandboxReady(ctx)
+		_, err := r.verifySandboxReady(ctx, exec)
 		return err
 	case "stage_infrastructure":
 		// Stage infrastructure files on the host (git runs on host, not in sandbox).
 		// On gitless ground there is nothing to stage — skip gracefully.
-		if r.repoInfo.Gitless() {
+		if exec.repoInfo.Gitless() {
 			r.logger.Info("no git repository — the edict is sealed in the court ledger only; no commit was made")
 			return nil
 		}
@@ -1065,7 +1159,7 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		// should still succeed.
 		paths := []string{"Justfile", ".agents/"}
 		for _, p := range []string{"AGENTS.md", "CLAUDE.md"} {
-			if _, err := os.Stat(filepath.Join(r.repoInfo.ProjectRoot, p)); err == nil {
+			if _, err := os.Stat(filepath.Join(exec.repoInfo.ProjectRoot, p)); err == nil {
 				paths = append(paths, p)
 			}
 		}
@@ -1073,7 +1167,7 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			Command:        "git add " + strings.Join(paths, " "),
 			Description:    "stage infrastructure files",
 			BypassApproval: true,
-		}, r.repoInfo.ProjectRoot)
+		}, exec.repoInfo.ProjectRoot)
 		if err != nil {
 			return fmt.Errorf("failed to stage infrastructure: %w", err)
 		}
@@ -1130,16 +1224,16 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		return ErrZhengmingPending
 	case "the changes are staged":
 		// Stage all changes in the working directory (Borderlands → Middle Kingdom)
-		if r.repoInfo.Gitless() {
+		if exec.repoInfo.Gitless() {
 			// No heaven to ascend to — the borderlands are all there is.
 			// Nothing to stage; ascension stops after the chancellor's seal.
 			r.logger.Info("no git repository — the edict is sealed in the court ledger only; no commit was made")
 			return nil
 		}
-		if r.runner == nil {
+		if exec.runner == nil {
 			return fmt.Errorf("no runner configured for staging changes")
 		}
-		output, err := r.runner.Run(ctx, runners.Input{
+		output, err := exec.runner.Run(ctx, runners.Input{
 			Command:        "git add -A",
 			Description:    "stage all changes (Borderlands → Middle Kingdom)",
 			BypassApproval: true,
@@ -1153,7 +1247,7 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		return nil
 	case "await_ruler_seal":
 		// Stage only files from manifests (not git add -A)
-		if r.repoInfo.Gitless() {
+		if exec.repoInfo.Gitless() {
 			// No git repository — nothing to stage, no commit will be made.
 			// The edict is sealed in the court ledger only.
 			r.logger.Info("no git repository — the edict is sealed in the court ledger only; no commit was made")
@@ -1176,9 +1270,12 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 				}
 			}
 
+			if exec.runner == nil {
+				return fmt.Errorf("no runner configured for staging manifests")
+			}
 			// Stage specific files
 			cmd := "git add " + strings.Join(files, " ")
-			output, err := r.runner.Run(ctx, runners.Input{
+			output, err := exec.runner.Run(ctx, runners.Input{
 				Command:        cmd,
 				Description:    "stage manifest files",
 				BypassApproval: true,
@@ -1535,7 +1632,8 @@ func isMissingToolFailure(output runners.Output) bool {
 func (r *RitualRunner) runGivenStep(ctx context.Context, exec *RitualExecution, entry StepDefEntry) (interface{}, error) {
 	switch entry.Kind {
 	case StepDefBash:
-		if r.runner == nil {
+		runner := r.execRunner(exec)
+		if runner == nil {
 			return nil, fmt.Errorf("no runner configured for bash given step")
 		}
 		cmd := r.expandTemplate(entry.Command, exec)
@@ -1544,7 +1642,7 @@ func (r *RitualRunner) runGivenStep(ctx context.Context, exec *RitualExecution, 
 			Status:   "cmd_running",
 			Message:  cmd,
 		})
-		output, err := r.runner.Run(ctx, runners.Input{
+		output, err := runner.Run(ctx, runners.Input{
 			Command:        cmd,
 			Description:    fmt.Sprintf("given: %s", entry.Command),
 			BypassApproval: true,
@@ -1585,7 +1683,8 @@ func (r *RitualRunner) runGivenStep(ctx context.Context, exec *RitualExecution, 
 func (r *RitualRunner) runThenStep(ctx context.Context, exec *RitualExecution, entry StepDefEntry) error {
 	switch entry.Kind {
 	case StepDefBash:
-		if r.runner == nil {
+		runner := r.execRunner(exec)
+		if runner == nil {
 			return fmt.Errorf("no runner configured for bash then step")
 		}
 		cmd := r.expandTemplate(entry.Command, exec)
@@ -1594,7 +1693,7 @@ func (r *RitualRunner) runThenStep(ctx context.Context, exec *RitualExecution, e
 			Status:   "cmd_running",
 			Message:  cmd,
 		})
-		output, err := r.runner.Run(ctx, runners.Input{
+		output, err := runner.Run(ctx, runners.Input{
 			Command:        cmd,
 			Description:    fmt.Sprintf("then: %s", entry.Command),
 			BypassApproval: true,

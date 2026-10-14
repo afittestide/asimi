@@ -964,12 +964,21 @@ Configured in `internal/config/types.go` under `CourtConfig`, set via `.agents/a
 [court]
 poll_interval = "5s"        # Ritual Guard polling interval (default: 5s)
 step_idle_timeout = "5m"    # Max silence before aborting a step (default: 5m)
+runner_flatline_timeout = "15m"  # Stop/remove idle per-edict containers (default: 15m; 0 disables)
 ```
 
 `step_idle_timeout` is an **idle** timer, not a wall-clock deadline: it resets
 on every notification from the minister (stream chunks, tool calls, etc.).
 A minister that is actively producing output — even if slowly — will never
 hit this limit. Only truly stuck steps (no output at all) are aborted.
+
+`runner_flatline_timeout` extends the same idle metaphor to per-edict
+containers: each edict gets its own runner and podman container
+(`asimi-shell-{slug}-e{ID}`), and after this long with no activity that
+container is stopped and removed (a later ritual for the edict recreates it
+against the same on-disk worktree). An edict with a running or queued ritual is
+never flatlined, and the edict's container is torn down immediately when its
+worktree is removed on the ruler's seal. `0` disables the sweep.
 ```
 
 ### Project Rituals

@@ -44,14 +44,17 @@ type PodmanRunner struct {
 // healthcheckTimeout is the maximum time to wait for a healthcheck command.
 const healthcheckTimeout = 5 * time.Second
 
-// NewPodmanRunner creates a new PodmanRunner
-func NewPodmanRunner(cfg *Config, repoInfo repo.RepoInfo, connID uint64, fallback Runner) *PodmanRunner {
+// NewPodmanRunner creates a new PodmanRunner. identifier is used verbatim as
+// the container name suffix: connections pass the connection ID (numeric), and
+// per-edict runners pass "e{ID}" so each edict gets its own container
+// (asimi-shell-{slug}-{identifier}).
+func NewPodmanRunner(cfg *Config, repoInfo repo.RepoInfo, identifier string, fallback Runner) *PodmanRunner {
 	imageName := cfg.ImageName
 	if imageName == "" {
 		imageName = fmt.Sprintf("localhost/asimi/sandbox/%s:latest", repoInfo.Slug)
 	}
 
-	containerName := fmt.Sprintf("asimi-shell-%s-%d", repo.SanitizeSegment(repoInfo.Slug), connID)
+	containerName := fmt.Sprintf("asimi-shell-%s-%s", repo.SanitizeSegment(repoInfo.Slug), identifier)
 	slog.Debug("NewPodmanRunner", "containerName", containerName, "imageName", imageName, "slug", repoInfo.Slug)
 
 	r := &PodmanRunner{

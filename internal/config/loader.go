@@ -233,6 +233,13 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 		config.Session.Enabled = true // Default to enabled
 	}
 
+	// Runner flatline timeout defaults to 15m when unset. An explicit 0 in the
+	// config file disables the sweep, so the default must be applied only when
+	// the key is absent (DefaultConfig's Court is the zero value).
+	if !k.Exists("court.runner_flatline_timeout") {
+		config.Court.RunnerFlatlineTimeout = DefaultRunnerFlatlineTimeout
+	}
+
 	// Backward-compat: old config files may have a [shogunate] section
 	// instead of [court]. If [court] wasn't explicitly set, copy values
 	// from [shogunate] so existing user configs keep working.
@@ -248,6 +255,11 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	// Step idle timeout: aborts a ritual step after N seconds of silence.
 	if !k.Exists("court.step_idle_timeout") && k.Exists("shogunate.step_idle_timeout") {
 		config.Court.StepIdleTimeout = k.Duration("shogunate.step_idle_timeout")
+	}
+	// Runner flatline timeout: stops and removes idle per-edict containers
+	// after N of inactivity (0 disables the sweep).
+	if !k.Exists("court.runner_flatline_timeout") && k.Exists("shogunate.runner_flatline_timeout") {
+		config.Court.RunnerFlatlineTimeout = k.Duration("shogunate.runner_flatline_timeout")
 	}
 
 	// Resolve API keys from environment variables when requested

@@ -592,7 +592,7 @@ func verifyInitWithRetry(model *TUIModel, containerRunner runners.Runner, retryC
 		// This is necessary because the previous container was closed and the image was rebuilt
 		slog.Debug("Reinitializing shell runner after build-sandbox")
 		// TODO: should the repoInfo be part of status?
-		containerRunner = runners.InitShellRunner(&model.config.Sandbox, *model.status.repoInfo)
+		containerRunner = runners.InitShellRunner(&model.config.Sandbox, *model.status.repoInfo, strconv.FormatUint(uint64(os.Getpid()), 10))
 		slog.Debug("Shell runner reinitialized", "containerRunner", containerRunner)
 
 		// Run smoke test in container

@@ -1,12 +1,11 @@
-FROM <a debian 13 "trixie" base> 
+FROM <a debian 13 "trixie" base, slim if available> 
 
-# Install common development tools
+# Install common development tools and libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ripgrep \
-    just
-    && rm -rf /var/lib/apt/lists/*
+    just && rm -rf /var/lib/apt/lists/*
 
 COPY Justfile .
 # Runs as root inside the container — bootstrap must NOT use sudo

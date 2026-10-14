@@ -129,8 +129,8 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 	}
 
 	// Set recoveryComplete before the per-ritual loop so event-driven rituals
-	// are not blocked. ritualMu already serializes ritual execution, so a
-	// recovering ritual cannot conflict with itself.
+	// are not blocked. The per-edict ritual locks serialize ritual execution, so
+	// a recovering ritual cannot conflict with itself.
 	rg.recoveryMu.Lock()
 	rg.recoveryComplete = true
 	rg.recoveryMu.Unlock()
