@@ -28,7 +28,7 @@ func TestInitShellRunnerMustNotFallbackToHost(t *testing.T) {
 		Slug:        "test-project",
 	}
 
-	runner := runners.InitShellRunner(cfg, repoInfo)
+	runner := runners.InitShellRunner(cfg, repoInfo, "1")
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -54,7 +54,7 @@ func TestInitShellRunnerDefaultImage(t *testing.T) {
 		Slug:        "myorg/myproject",
 	}
 
-	runner := runners.InitShellRunner(cfg, repoInfo)
+	runner := runners.InitShellRunner(cfg, repoInfo, "1")
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -81,7 +81,7 @@ func TestPodmanRunnerHostFallbackMustNotLeak(t *testing.T) {
 	}
 
 	hostRunner := runners.NewHostRunner(1, t.TempDir())
-	runner := runners.NewPodmanRunner(cfg, repoInfo, 1, hostRunner)
+	runner := runners.NewPodmanRunner(cfg, repoInfo, "1", hostRunner)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -114,7 +114,7 @@ func TestShellCommandMustFailWithoutSandbox(t *testing.T) {
 		Slug:        "test-project",
 	}
 
-	runner := runners.NewPodmanRunner(cfg, repoInfo, 99, nil)
+	runner := runners.NewPodmanRunner(cfg, repoInfo, "99", nil)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

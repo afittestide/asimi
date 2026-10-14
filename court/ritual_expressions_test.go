@@ -57,6 +57,36 @@ func TestStepDefRegistry(t *testing.T) {
 	}
 }
 
+// TestStepDefRegistry_WorktreeGivenRegistered guards against the swift-strike
+// background regression where "an edict's worktree" was declared in the YAML
+// but had no step definition to dispatch to its handler.
+func TestStepDefRegistry_WorktreeGivenRegistered(t *testing.T) {
+	def, err := NewStepDefRegistry().Match("an edict's worktree")
+	require.NoError(t, err)
+	require.NotNil(t, def, "background given %q must resolve to a step definition", "an edict's worktree")
+	assert.Equal(t, "prepare_worktree", def.HandlerKey)
+}
+
+// TestBuiltinRituals_BackgroundGivensResolve ensures every non-bash background
+// given in the embedded rituals is registered, so no future background given
+// can ship unregistered and fail at execution time.
+func TestBuiltinRituals_BackgroundGivensResolve(t *testing.T) {
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+
+	registry := NewStepDefRegistry()
+	for _, r := range rituals {
+		for _, bg := range r.Background {
+			if strings.HasPrefix(bg, "!") {
+				continue // inline bash command, not registry-matched
+			}
+			def, err := registry.Match(bg)
+			require.NoError(t, err, "ritual %s: matching background given %q", r.Name, bg)
+			assert.NotNil(t, def, "ritual %s: background given %q is not registered", r.Name, bg)
+		}
+	}
+}
+
 func TestResolveStepDef(t *testing.T) {
 	db := setupRitualTestDB(t)
 	registry := NewRitualRegistry()
@@ -1350,7 +1380,7 @@ func TestGetInfrastructureTemplates_ResolvesAgainstProjectRoot(t *testing.T) {
 		Slug:        "test/project",
 	})
 
-	result, err := runner.getInfrastructureTemplates(context.Background())
+	result, err := runner.getInfrastructureTemplates(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap, ok := result.(map[string]interface{})
@@ -1410,7 +1440,7 @@ func TestGetInfrastructureTemplates_PreservesExistingFiles(t *testing.T) {
 		Slug:        "test/project",
 	})
 
-	result, err := runner.getInfrastructureTemplates(context.Background())
+	result, err := runner.getInfrastructureTemplates(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]interface{})
@@ -1436,7 +1466,7 @@ func TestGetInfrastructureTemplates_SlugSubstitution(t *testing.T) {
 		Slug:        "myorg/myrepo",
 	})
 
-	_, err := runner.getInfrastructureTemplates(context.Background())
+	_, err := runner.getInfrastructureTemplates(context.Background(), nil)
 	require.NoError(t, err)
 
 	// Check Justfile has the slug substituted
@@ -1464,7 +1494,7 @@ func TestGetInfrastructureTemplates_SlugSubstitutionLowercasesImage(t *testing.T
 		Slug:        "myorg/myproject",
 	})
 
-	_, err := runner.getInfrastructureTemplates(context.Background())
+	_, err := runner.getInfrastructureTemplates(context.Background(), nil)
 	require.NoError(t, err)
 
 	// The slug is canonical lowercase at its source, so the runner uses it
@@ -1485,7 +1515,7 @@ func TestGetInfrastructureTemplates_TemplateFilesListSorted(t *testing.T) {
 		ProjectRoot: projectRoot,
 	})
 
-	result, err := runner.getInfrastructureTemplates(context.Background())
+	result, err := runner.getInfrastructureTemplates(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]interface{})
@@ -1766,7 +1796,7 @@ func TestBuildSandbox_ClosesOldRunner(t *testing.T) {
 		ProjectRoot: projectRoot,
 	})
 
-	result, err := runner.buildSandbox(context.Background())
+	result, err := runner.buildSandbox(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]string)
@@ -1792,7 +1822,7 @@ func TestBuildSandbox_ClosesOldRunnerEvenOnCloseError(t *testing.T) {
 		ProjectRoot: projectRoot,
 	})
 
-	result, err := runner.buildSandbox(context.Background())
+	result, err := runner.buildSandbox(context.Background(), nil)
 	require.NoError(t, err, "buildSandbox should not fail when Close returns an error")
 
 	resultMap := result.(map[string]string)
@@ -1813,7 +1843,7 @@ func TestBuildSandbox_NilRunner(t *testing.T) {
 	})
 
 	// Should not panic when r.runner is nil
-	result, err := runner.buildSandbox(context.Background())
+	result, err := runner.buildSandbox(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]string)
@@ -1827,11 +1857,59 @@ func TestBuildSandbox_IsolatedHost(t *testing.T) {
 	runner := NewRitualRunner(registry, nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
 	runner.isolatedHost = true
 
-	result, err := runner.buildSandbox(context.Background())
+	result, err := runner.buildSandbox(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]string)
 	assert.Equal(t, "skipped", resultMap["status"])
+}
+
+// TestBuildSandbox_SkipsInsideWorktree verifies that inside an edict worktree the
+// Court-wide sandbox rebuild is skipped: the image is shared, and closing the
+// Court runner would clobber the per-edict runner and race concurrent edicts.
+func TestBuildSandbox_SkipsInsideWorktree(t *testing.T) {
+	registry := NewRitualRegistry()
+	mockRunner := &closeTrackingRunner{}
+	runner := NewRitualRunner(registry, nil, nil, nil, mockRunner, slog.Default(), repo.RepoInfo{ProjectRoot: t.TempDir()})
+
+	exec := &RitualExecution{
+		EdictID:  42,
+		repoInfo: repo.RepoInfo{ProjectRoot: runner.repoInfo.ProjectRoot, WorktreePath: ".agents/worktrees/e42", IsWorktree: true},
+	}
+
+	result, err := runner.buildSandbox(context.Background(), exec)
+	require.NoError(t, err)
+
+	resultMap := result.(map[string]string)
+	assert.Equal(t, "skipped", resultMap["status"])
+	assert.False(t, mockRunner.closeCalled, "the Court runner must not be closed inside a worktree")
+}
+
+// TestVerifySandboxReady_UsesEdictRunnerInWorktree verifies that inside a worktree
+// verifySandboxReady uses the execution's own runner and does NOT rebuild or
+// clobber the Court runner (which would race concurrent edicts).
+func TestVerifySandboxReady_UsesEdictRunnerInWorktree(t *testing.T) {
+	registry := NewRitualRegistry()
+	courtRunner := &worktreeTestRunner{}
+	edictRunner := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"uname": {Output: "Linux\n", ExitCode: "0"},
+	}}
+	runner := NewRitualRunner(registry, nil, nil, nil, courtRunner, slog.Default(), repo.RepoInfo{ProjectRoot: t.TempDir()})
+	runner.sandboxConfig = &config.SandboxConfig{}
+
+	exec := &RitualExecution{
+		EdictID:  42,
+		runner:   edictRunner,
+		repoInfo: repo.RepoInfo{ProjectRoot: runner.repoInfo.ProjectRoot, WorktreePath: ".agents/worktrees/e42", IsWorktree: true},
+	}
+
+	result, err := runner.verifySandboxReady(context.Background(), exec)
+	require.NoError(t, err)
+
+	resultMap := result.(map[string]string)
+	assert.Equal(t, "ready", resultMap["status"])
+	assert.NotEmpty(t, edictRunner.commands, "the edict's own runner must run the smoke tests")
+	assert.Empty(t, courtRunner.commands, "the Court runner must not be rebuilt/clobbered inside a worktree")
 }
 
 // TestVerifySandboxUp_IsolatedHost verifies that verifySandboxUp
@@ -1841,7 +1919,7 @@ func TestVerifySandboxUp_IsolatedHost(t *testing.T) {
 	runner := NewRitualRunner(registry, nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
 	runner.isolatedHost = true
 
-	result, err := runner.verifySandboxUp(context.Background())
+	result, err := runner.verifySandboxUp(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]string)
@@ -1855,7 +1933,7 @@ func TestVerifySandboxReady_IsolatedHost(t *testing.T) {
 	runner := NewRitualRunner(registry, nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
 	runner.isolatedHost = true
 
-	result, err := runner.verifySandboxReady(context.Background())
+	result, err := runner.verifySandboxReady(context.Background(), nil)
 	require.NoError(t, err)
 
 	resultMap := result.(map[string]string)
@@ -2825,54 +2903,72 @@ func (m *worktreeTestRunner) HealthCheck(context.Context) error    { return nil 
 
 func (m *worktreeTestRunner) joined() string { return strings.Join(m.commands, "\n") }
 
-// TestPrepareWorktree_SetsWorktreePathRelative is the v1 regression guard: the
-// worktree is expressed via WorktreePath and ProjectRoot is left untouched,
-// because the sandbox bind-mounts only ProjectRoot.
+// TestPrepareWorktree_SetsWorktreePathRelative is the regression guard: the
+// worktree is expressed via WorktreePath on the execution's own repoInfo and
+// ProjectRoot is left untouched, because the sandbox bind-mounts only
+// ProjectRoot.
 func TestPrepareWorktree_SetsWorktreePathRelative(t *testing.T) {
 	root := t.TempDir()
 	registry := NewRitualRegistry()
 	runner := NewRitualRunner(registry, nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{ProjectRoot: root})
-	shared := repo.RepoInfo{ProjectRoot: root}
-	runner.SetRepoInfoHooks(&shared, nil)
 
-	exec := &RitualExecution{EdictID: 42, Username: "u", Project: "p"}
+	exec := &RitualExecution{EdictID: 42, Username: "u", Project: "p", runner: runner.runner, repoInfo: repo.RepoInfo{ProjectRoot: root}}
 	result, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
 	require.NoError(t, err)
 
 	m, ok := result.(map[string]string)
 	require.True(t, ok)
 	wantRel := filepath.Join(".agents", "worktrees", "e42")
-	assert.Equal(t, wantRel, runner.repoInfo.WorktreePath, "worktree is routed via WorktreePath")
-	assert.True(t, runner.repoInfo.IsWorktree)
-	assert.Equal(t, root, runner.repoInfo.ProjectRoot, "ProjectRoot must NOT be mutated")
-	assert.Equal(t, root, shared.ProjectRoot, "shared ProjectRoot must NOT be mutated")
-	assert.Equal(t, wantRel, shared.WorktreePath, "shared repoInfo must see isolation for tools")
-	assert.True(t, shared.IsWorktree, "shared repoInfo must be marked as a worktree")
+	assert.Equal(t, wantRel, exec.repoInfo.WorktreePath, "worktree is routed via WorktreePath on the execution")
+	assert.True(t, exec.repoInfo.IsWorktree)
+	assert.Equal(t, root, exec.repoInfo.ProjectRoot, "ProjectRoot must NOT be mutated")
 	assert.Equal(t, filepath.Join(root, wantRel), m["path"])
 	assert.Equal(t, "asimi/e42", m["branch"])
 }
 
-// TestPrepareWorktree_RepointsSharedRepoInfo verifies the onChange hook fires so
-// the Court fan-out (SetRepoInfo) sees the isolated root.
-func TestPrepareWorktree_RepointsSharedRepoInfo(t *testing.T) {
+// TestPrepareWorktree_UsesEdictRunnerAndRepoInfo is the regression guard against
+// e531's global mutation: after a worktree run, the runner's shared repoInfo
+// (and toolCtxRepoInfo) are UNCHANGED, while the execution's runner is
+// re-targeted with the worktree.
+func TestPrepareWorktree_UsesEdictRunnerAndRepoInfo(t *testing.T) {
 	root := t.TempDir()
 	registry := NewRitualRegistry()
-	runner := NewRitualRunner(registry, nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{ProjectRoot: root})
-	var got repo.RepoInfo
-	changed := false
-	runner.SetRepoInfoHooks(nil, func(ri repo.RepoInfo) {
-		got = ri
-		changed = true
-	})
+	mock := &recordingRepoInfoRunner{}
+	runner := NewRitualRunner(registry, nil, nil, nil, mock, slog.Default(), repo.RepoInfo{ProjectRoot: root})
 
-	exec := &RitualExecution{EdictID: 7, Username: "u", Project: "p"}
+	shared := repo.RepoInfo{ProjectRoot: root}
+	exec := &RitualExecution{EdictID: 42, Username: "u", Project: "p", runner: mock, repoInfo: shared}
 	_, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
 	require.NoError(t, err)
 
-	require.True(t, changed, "onRepoInfoChange must be invoked")
-	assert.Equal(t, filepath.Join(".agents", "worktrees", "e7"), got.WorktreePath)
-	assert.True(t, got.IsWorktree)
+	wantRel := filepath.Join(".agents", "worktrees", "e42")
+	assert.Equal(t, wantRel, exec.repoInfo.WorktreePath, "execution repoInfo carries the worktree")
+	assert.True(t, exec.repoInfo.IsWorktree)
+	assert.Equal(t, root, exec.repoInfo.ProjectRoot, "ProjectRoot must NOT be mutated")
+
+	// The shared repoInfo passed in must be untouched (it is a value copy).
+	assert.Equal(t, "", shared.WorktreePath, "shared repoInfo must be UNCHANGED after a worktree run")
+	assert.False(t, shared.IsWorktree, "shared repoInfo must not be marked as a worktree")
+
+	// The runner's own Court-wide repoInfo must also be UNCHANGED — this is the
+	// regression guard against e531's global mutation.
+	assert.Equal(t, "", runner.repoInfo.WorktreePath, "runner repoInfo must be UNCHANGED after a worktree run")
+	assert.False(t, runner.repoInfo.IsWorktree, "runner repoInfo must not be marked as a worktree")
+
+	// The execution's runner was re-targeted with the worktree.
+	require.True(t, mock.set, "execution runner must be re-targeted on worktree entry")
+	assert.Equal(t, filepath.Join(root, wantRel), mock.last.EffectiveRoot())
+	assert.Equal(t, root, mock.last.ProjectRoot, "runner ProjectRoot must stay the main tree")
 }
+
+// recordingRepoInfoRunner records SetRepoInfo calls and accepts commands.
+type recordingRepoInfoRunner struct {
+	worktreeTestRunner
+	last repo.RepoInfo
+	set  bool
+}
+
+func (r *recordingRepoInfoRunner) SetRepoInfo(ri repo.RepoInfo) { r.last = ri; r.set = true }
 
 // TestPrepareWorktree_EmptyProjectRoot fails loudly rather than creating a
 // worktree at a relative path.
@@ -2896,7 +2992,7 @@ func TestPrepareWorktree_IdempotentReuse(t *testing.T) {
 	registry := NewRitualRegistry()
 	runner := NewRitualRunner(registry, nil, nil, nil, mock, slog.Default(), repo.RepoInfo{ProjectRoot: root})
 
-	exec := &RitualExecution{EdictID: 9, Username: "u", Project: "p"}
+	exec := &RitualExecution{EdictID: 9, Username: "u", Project: "p", runner: mock, repoInfo: repo.RepoInfo{ProjectRoot: root}}
 	_, err := runner.runGiven(context.Background(), exec, "prepare_worktree")
 	require.NoError(t, err)
 	assert.Empty(t, mock.commands, "existing worktree is reused without commands")

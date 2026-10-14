@@ -384,24 +384,29 @@ func LoadRitualsFromDir(dir string) (Rituals, error) {
 
 // RitualRunner executes rituals
 type RitualRunner struct {
-	registry         *RitualRegistry
-	stepDefs         *StepDefRegistry
-	getMinister      func(id string) Minister
-	publishEvent     func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
-	onRunnerUpgrade  func(runners.Runner) // propagates runner changes back to court
-	db               *gorm.DB
-	runner           runners.Runner
-	logger           *slog.Logger
-	maxRetries       int
-	repoInfo         repo.RepoInfo
-	ownedRepoInfo    *repo.RepoInfo                                              // shared pointer so tools see worktree isolation
-	onRepoInfoChange func(repo.RepoInfo)                                         // fan-out hook to the Court (SetRepoInfo)
-	sandboxConfig    *config.SandboxConfig                                       // injected by ConfigureModel
-	projectSlug      string                                                      // injected by ConfigureModel
-	idleTimeout      time.Duration                                               // max silence before a step is aborted (0 = default)
-	waitZhengming    func(ctx context.Context, requestID string) (string, error) // injected by Court
-	isolatedHost     bool                                                        // skip sandbox steps when true
-	atifAgentName    string                                                      // ATIF agent name for ritual step sessions
+	registry        *RitualRegistry
+	stepDefs        *StepDefRegistry
+	getMinister     func(id string) Minister
+	publishEvent    func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
+	onRunnerUpgrade func(runners.Runner) // propagates runner changes back to court
+	db              *gorm.DB
+	runner          runners.Runner
+	logger          *slog.Logger
+	maxRetries      int
+	repoInfo        repo.RepoInfo
+	sandboxConfig   *config.SandboxConfig                                       // injected by ConfigureModel
+	projectSlug     string                                                      // injected by ConfigureModel
+	idleTimeout     time.Duration                                               // max silence before a step is aborted (0 = default)
+	waitZhengming   func(ctx context.Context, requestID string) (string, error) // injected by Court
+	isolatedHost    bool                                                        // skip sandbox steps when true
+	atifAgentName   string                                                      // ATIF agent name for ritual step sessions
+	// getRunner resolves the per-edict runner for an execution. Injected by
+	// the Court; nil falls back to the Court-wide runner (r.runner).
+	getRunner func(edictID uint) (runners.Runner, error)
+	// onRitualDone is called when a ritual reaches a terminal state, so the
+	// Court can stamp the edict runner's last-used time (never flatline a
+	// just-finished ritual).
+	onRitualDone func(edictID uint)
 
 	// Pause/resume for ruler interjection. When the ruler prompts on a ritual
 	// tab, the ritual pauses: the step context is cancelled (stopping the
@@ -452,12 +457,12 @@ func (r *RitualRunner) SetConfig(sandboxCfg *config.SandboxConfig, projectSlug s
 	}
 }
 
-// SetRepoInfoHooks injects the shared *repo.RepoInfo (so tools see the same
-// isolated root) and the change hook used to fan out a repoInfo update on the
-// Court. It must be called before any ritual opts into a worktree.
-func (r *RitualRunner) SetRepoInfoHooks(owned *repo.RepoInfo, onChange func(repo.RepoInfo)) {
-	r.ownedRepoInfo = owned
-	r.onRepoInfoChange = onChange
+// SetRunnerResolver injects the per-edict runner resolver and the
+// terminal-state hook used to stamp an edict runner's last-used time. It must
+// be called before any ritual runs.
+func (r *RitualRunner) SetRunnerResolver(getRunner func(edictID uint) (runners.Runner, error), onDone func(edictID uint)) {
+	r.getRunner = getRunner
+	r.onRitualDone = onDone
 }
 
 // SetAtifAgentName sets the ATIF agent name so ritual step sessions get an
@@ -516,6 +521,12 @@ type RitualExecution struct {
 	def        *RitualDef
 	stepStates []RitualStepState
 	notify     internal.NotifyFunc
+
+	// runner and repoInfo are this execution's own shell runner and the
+	// repoInfo it has been re-targeted with (worktree isolation). They are
+	// per-execution so concurrent edicts never share runner state.
+	runner   runners.Runner `gorm:"-"`
+	repoInfo repo.RepoInfo  `gorm:"-"`
 
 	// Recovery tracking (not persisted)
 	PreviousExecutionID string `gorm:"-"` // ID of the aborted execution being recovered
@@ -644,6 +655,19 @@ func (r *RitualRunner) Start(ctx context.Context, ritualName string, key storage
 		Data:        storage.JSON{"inputs": inputs},
 		def:         def,
 		notify:      notify,
+		repoInfo:    r.repoInfo,
+	}
+
+	// Resolve this execution's runner. Per-edict runners give each edict its
+	// own container; the Court-wide runner serves system rituals and the
+	// fallback when no resolver is wired (tests, direct construction).
+	exec.runner = r.runner
+	if r.getRunner != nil {
+		if runner, err := r.getRunner(key.ID); err == nil && runner != nil {
+			exec.runner = runner
+		} else if err != nil {
+			r.logger.Warn("failed to resolve per-edict runner; using court runner", "edict_id", key.ID, "error", err)
+		}
 	}
 
 	// Check for and recover from previous aborted/paused execution
@@ -715,6 +739,13 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 
 	exec.State = RitualStateRunning
 	r.saveExecution(exec)
+
+	// Terminal-state stamp: a long-running ritual that finishes at T must not
+	// be considered idle until T+timeout, so refresh the edict runner's
+	// last-used time when the ritual unwinds.
+	if r.onRitualDone != nil && exec.EdictID > 1 {
+		defer r.onRitualDone(exec.EdictID)
+	}
 
 	// Emit ritual_started Tian event
 	execKey := exec.EdictKey()
@@ -1496,6 +1527,8 @@ func (r *RitualRunner) executeForkItem(ctx context.Context, exec *RitualExecutio
 		CurrentStep:   exec.CurrentStep,
 		forkItemLabel: fmt.Sprintf("%d/%d", itemIndex+1, totalItems),
 		forkItem:      true,
+		runner:        exec.runner,
+		repoInfo:      exec.repoInfo,
 	}
 
 	// Copy existing context
@@ -1648,7 +1681,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 		cfg := minister.GetConfig()
 		sessionConfig := &SessionConfig{
 			LLM:           cfg,
-			WorkingDir:    r.repoInfo.EffectiveRoot(),
+			WorkingDir:    exec.repoInfo.EffectiveRoot(),
 			AtifAgentName: r.atifAgentName,
 		}
 		var err error

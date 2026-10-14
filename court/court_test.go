@@ -3,6 +3,7 @@ package court
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -2911,4 +2912,244 @@ func TestSetRepoInfo_NoWorktreeEndsAtProjectRoot(t *testing.T) {
 	require.True(t, runner.set)
 	assert.Equal(t, "/proj", runner.last.EffectiveRoot())
 	assert.Equal(t, "/proj", runner.last.ProjectRoot)
+}
+
+// ---------------------------------------------------------------------------
+// Per-edict runners (edict 934)
+// ---------------------------------------------------------------------------
+
+// trackingRunner records Close calls and exposes a distinct label so a test can
+// assert that distinct edicts get distinct runners.
+type trackingRunner struct {
+	label       string
+	closeCalled bool
+}
+
+func (r *trackingRunner) Run(context.Context, runners.Input) (runners.Output, error) {
+	return runners.Output{}, nil
+}
+func (r *trackingRunner) Restart(context.Context) error        { return nil }
+func (r *trackingRunner) Close(context.Context) error          { r.closeCalled = true; return nil }
+func (r *trackingRunner) AllowFallback(bool)                   {}
+func (r *trackingRunner) RunnerType() string                   { return "tracking" }
+func (r *trackingRunner) GetOS() string                        { return runtime.GOOS }
+func (r *trackingRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (r *trackingRunner) HealthCheck(context.Context) error    { return nil }
+
+// newEdictRunnerTestCourt builds a Court whose per-edict factory hands out
+// tracking runners with unique labels.
+func newEdictRunnerTestCourt(t *testing.T) (*Court, *[]*trackingRunner) {
+	t.Helper()
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	// Avoid the connection runner so RunnerForEdict creates real edict runners.
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	var created []*trackingRunner
+	s.newEdictRunner = func(edictID uint, _ repo.RepoInfo) (runners.Runner, error) {
+		r := &trackingRunner{label: fmt.Sprintf("e%d", edictID)}
+		created = append(created, r)
+		return r, nil
+	}
+	// Wire the guard's resolver so rituals use it too.
+	if s.ritualGuard != nil && s.ritualGuard.RitualRunner() != nil {
+		s.ritualGuard.RitualRunner().SetRunnerResolver(s.RunnerForEdict, s.TouchEdictRunner)
+	}
+	return s, &created
+}
+
+func TestRunnerForEdict_DistinctRunnersPerEdict(t *testing.T) {
+	s, created := newEdictRunnerTestCourt(t)
+
+	r1, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	require.NotNil(t, r1)
+
+	r1again, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	assert.Same(t, r1, r1again, "the same edict must reuse its cached runner")
+
+	r2, err := s.RunnerForEdict(43)
+	require.NoError(t, err)
+	require.NotNil(t, r2)
+
+	assert.NotSame(t, r1, r2, "distinct edicts must get distinct runners")
+	assert.Equal(t, "e42", r1.(*trackingRunner).label)
+	assert.Equal(t, "e43", r2.(*trackingRunner).label)
+	assert.Len(t, *created, 2, "one runner created per edict")
+}
+
+func TestRunnerForEdict_SystemEdictUsesCourtRunner(t *testing.T) {
+	db := setupCourtTestDB(t)
+	courtRunner := &trackingRunner{label: "court"}
+	s := NewCourt(db, config.DefaultCourtConfig(), courtRunner, slog.Default())
+	s.newEdictRunner = func(uint, repo.RepoInfo) (runners.Runner, error) {
+		t.Fatal("system edict must not create a per-edict runner")
+		return nil, nil
+	}
+
+	for _, id := range []uint{0, 1} {
+		r, err := s.RunnerForEdict(id)
+		require.NoError(t, err)
+		assert.Same(t, courtRunner, r, "edict %d must fall back to the Court runner", id)
+	}
+}
+
+func TestCloseEdictRunner_ClosesAndForgets(t *testing.T) {
+	s, _ := newEdictRunnerTestCourt(t)
+
+	r, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	tr := r.(*trackingRunner)
+
+	s.CloseEdictRunner(context.Background(), 42)
+	assert.True(t, tr.closeCalled, "Close must be called on the edict runner")
+
+	s.edictRunnersMu.Lock()
+	_, stillCached := s.edictRunners[42]
+	_, stillUsed := s.edictRunnerLastUsed[42]
+	s.edictRunnersMu.Unlock()
+	assert.False(t, stillCached, "closed runner must be removed from the map")
+	assert.False(t, stillUsed, "closed runner's last-used entry must be removed")
+
+	// Closing again is a no-op.
+	s.CloseEdictRunner(context.Background(), 42)
+
+	// A new acquisition recreates the runner.
+	r2, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	assert.NotSame(t, r, r2, "a flatlined edict's runner is recreated on next use")
+}
+
+func TestFlatlineIdleRunners_ClosesIdle(t *testing.T) {
+	s, _ := newEdictRunnerTestCourt(t)
+	s.runnerFlatlineTimeout = time.Minute
+
+	r, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	tr := r.(*trackingRunner)
+
+	// Backdate the last-used stamp past the timeout.
+	s.edictRunnersMu.Lock()
+	s.edictRunnerLastUsed[42] = time.Now().Add(-2 * time.Minute)
+	s.edictRunnersMu.Unlock()
+
+	s.flatlineIdleRunners(context.Background())
+	assert.True(t, tr.closeCalled, "an idle edict container must be stopped and removed")
+}
+
+func TestFlatlineIdleRunners_SkipsActiveRitual(t *testing.T) {
+	s, _ := newEdictRunnerTestCourt(t)
+	s.runnerFlatlineTimeout = time.Minute
+
+	r, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	tr := r.(*trackingRunner)
+
+	s.edictRunnersMu.Lock()
+	s.edictRunnerLastUsed[42] = time.Now().Add(-2 * time.Minute)
+	s.edictRunnersMu.Unlock()
+
+	// Hold the edict's ritual lock to simulate a running ritual.
+	lock := s.ritualGuard.edictRitualLock(42)
+	lock.Lock()
+	defer lock.Unlock()
+
+	s.flatlineIdleRunners(context.Background())
+	assert.False(t, tr.closeCalled, "a running ritual's container must never be flatlined")
+}
+
+func TestFlatlineIdleRunners_DisabledWhenZero(t *testing.T) {
+	s, _ := newEdictRunnerTestCourt(t)
+	s.runnerFlatlineTimeout = 0
+
+	r, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	tr := r.(*trackingRunner)
+
+	s.edictRunnersMu.Lock()
+	s.edictRunnerLastUsed[42] = time.Now().Add(-24 * time.Hour)
+	s.edictRunnersMu.Unlock()
+
+	s.flatlineIdleRunners(context.Background())
+	assert.False(t, tr.closeCalled, "a zero timeout disables the flatline sweep")
+}
+
+// TestTouchEdictRunner_StampsLastUsed verifies the terminal-state stamp refreshes
+// an existing edict runner's last-used time (so a just-finished ritual is not
+// immediately flatlined) and is a no-op for system edicts / unknown edicts.
+func TestTouchEdictRunner_StampsLastUsed(t *testing.T) {
+	s, _ := newEdictRunnerTestCourt(t)
+
+	_, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+
+	// Backdate, then touch, and confirm it moved forward.
+	s.edictRunnersMu.Lock()
+	s.edictRunnerLastUsed[42] = time.Now().Add(-time.Hour)
+	s.edictRunnersMu.Unlock()
+
+	s.TouchEdictRunner(42)
+
+	s.edictRunnersMu.Lock()
+	stamped := s.edictRunnerLastUsed[42]
+	s.edictRunnersMu.Unlock()
+	assert.WithinDuration(t, time.Now(), stamped, time.Minute,
+		"TouchEdictRunner must refresh the edict's last-used time")
+
+	// System edicts and unknown edicts must not create/stamp entries.
+	s.TouchEdictRunner(1)
+	s.TouchEdictRunner(999)
+	s.edictRunnersMu.Lock()
+	_, unknown := s.edictRunnerLastUsed[999]
+	s.edictRunnersMu.Unlock()
+	assert.False(t, unknown, "touching an edict without a runner must be a no-op")
+}
+
+// TestFlatlineIdleRunners_SkipsRunningRitualFromDB verifies the flatline sweep
+// consults the DB, not just the in-memory lock: a ritual row left in the running
+// state (e.g. recovered after a restart) protects its edict's container.
+func TestFlatlineIdleRunners_SkipsRunningRitualFromDB(t *testing.T) {
+	s, _ := newEdictRunnerTestCourt(t)
+	s.runnerFlatlineTimeout = time.Minute
+
+	r, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	tr := r.(*trackingRunner)
+
+	require.NotNil(t, s.ritualGuard)
+	require.NoError(t, s.ritualGuard.db.Create(&RitualExecution{
+		ID:         "db-running-42",
+		RitualName: "db-running",
+		EdictID:    42,
+		Username:   s.ritualGuard.Username(),
+		Project:    s.ritualGuard.Project(),
+		State:      RitualStateRunning,
+	}).Error)
+
+	s.edictRunnersMu.Lock()
+	s.edictRunnerLastUsed[42] = time.Now().Add(-2 * time.Minute)
+	s.edictRunnersMu.Unlock()
+
+	s.flatlineIdleRunners(context.Background())
+	assert.False(t, tr.closeCalled,
+		"an edict with a ritual running in the DB must never be flatlined")
+}
+
+// TestStop_ClosesEdictRunners verifies Court.Stop tears down every per-edict
+// runner (and thus its container) so none is leaked on shutdown.
+func TestStop_ClosesEdictRunners(t *testing.T) {
+	s, created := newEdictRunnerTestCourt(t)
+
+	_, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	_, err = s.RunnerForEdict(43)
+	require.NoError(t, err)
+	require.Len(t, *created, 2)
+
+	require.NoError(t, s.Stop())
+
+	for _, r := range *created {
+		assert.True(t, r.closeCalled, "every edict runner must be closed on Stop")
+	}
 }

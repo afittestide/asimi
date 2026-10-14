@@ -1724,3 +1724,46 @@ func TestLoadProjectConfig_AllowPrivateNetwork(t *testing.T) {
 	assert.True(t, cfg.LLM.AllowPrivateNetwork,
 		"allow_private_network = true must unmarshal into LLMConfig.AllowPrivateNetwork")
 }
+
+// TestLoadProjectConfig_RunnerFlatlineTimeoutDefault verifies that
+// runner_flatline_timeout defaults to 15m when unset and preserves an explicit
+// value (including 0, which disables the sweep).
+func TestLoadProjectConfig_RunnerFlatlineTimeoutDefault(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	t.Run("defaults to 15m when unset", func(t *testing.T) {
+		projectDir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(projectDir, ".agents"), 0o755))
+
+		cfg, err := LoadProjectConfig(projectDir, false)
+		require.NoError(t, err)
+		assert.Equal(t, 15*time.Minute, cfg.Court.RunnerFlatlineTimeout)
+	})
+
+	t.Run("honors an explicit value", func(t *testing.T) {
+		projectDir := t.TempDir()
+		agentsDir := filepath.Join(projectDir, ".agents")
+		require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"),
+			[]byte("[court]\nrunner_flatline_timeout = \"2m\"\n"), 0o644))
+
+		cfg, err := LoadProjectConfig(projectDir, false)
+		require.NoError(t, err)
+		assert.Equal(t, 2*time.Minute, cfg.Court.RunnerFlatlineTimeout)
+	})
+
+	t.Run("an explicit zero disables the sweep", func(t *testing.T) {
+		projectDir := t.TempDir()
+		agentsDir := filepath.Join(projectDir, ".agents")
+		require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"),
+			[]byte("[court]\nrunner_flatline_timeout = \"0s\"\n"), 0o644))
+
+		cfg, err := LoadProjectConfig(projectDir, false)
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), cfg.Court.RunnerFlatlineTimeout)
+	})
+}

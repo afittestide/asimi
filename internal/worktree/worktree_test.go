@@ -121,10 +121,16 @@ func TestCopyIgnored(t *testing.T) {
 		t.Fatalf("CopyIgnored: %v", err)
 	}
 	joined := strings.Join(mock.commands, "\n")
-	for _, needle := range []string{"--others", "--ignored", "--exclude-standard", "tar --null", "tar -xf - -C"} {
+	for _, needle := range []string{"--others", "--ignored", "--exclude-standard", "tar --null", ".agents/worktrees/*", "tar -xf - -C"} {
 		if !strings.Contains(joined, needle) {
 			t.Errorf("CopyIgnored command missing %q: %s", needle, joined)
 		}
+	}
+	// GNU tar treats --exclude as positional: placed after -T it is
+	// silently ignored, re-opening the recursive copy bug.
+	exclude, list := strings.Index(joined, "--exclude="), strings.Index(joined, "-T -")
+	if exclude == -1 || list == -1 || exclude > list {
+		t.Errorf("--exclude must precede -T: %s", joined)
 	}
 }
 
@@ -235,7 +241,7 @@ func TestEnsure_RealGit(t *testing.T) {
 	runGit(t, root, "init", "-b", "main")
 	runGit(t, root, "config", "user.email", "test@example.com")
 	runGit(t, root, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.agents/worktrees/\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
@@ -247,6 +253,15 @@ func TestEnsure_RealGit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "local.env"), []byte("SECRET=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Plant an ignored nested worktree copy that must not travel into the
+	// new worktree.
+	nested := filepath.Join(root, ".agents", "worktrees", "e999")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "nested.txt"), []byte("nested\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -264,6 +279,10 @@ func TestEnsure_RealGit(t *testing.T) {
 	// copy-ignored carried the local-only env file.
 	if _, err := os.Stat(filepath.Join(abs, "local.env")); err != nil {
 		t.Errorf("ignored file not copied: %v", err)
+	}
+	// ...but worktrees are never copied into worktrees.
+	if _, err := os.Stat(filepath.Join(abs, ".agents", "worktrees")); !os.IsNotExist(err) {
+		t.Errorf("CopyIgnored must not copy .agents/worktrees, stat err = %v", err)
 	}
 
 	// Commit work in the worktree and squash-merge it into main.

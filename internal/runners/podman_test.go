@@ -69,7 +69,7 @@ func TestNewPodmanRunner(t *testing.T) {
 		NoCleanup:         false,
 	}
 
-	runner := NewPodmanRunner(config, repoInfo, 1, hostRunner)
+	runner := NewPodmanRunner(config, repoInfo, "1", hostRunner)
 	require.NotNil(t, runner)
 	assert.Equal(t, "localhost/asimi/sandbox/test/project:latest", runner.imageName)
 	assert.Equal(t, "asimi-shell-test-project-1", runner.containerName)
@@ -89,7 +89,7 @@ func TestNewPodmanRunnerLowercasesSlug(t *testing.T) {
 		AllowHostFallback: true,
 	}
 
-	runner := NewPodmanRunner(config, repoInfo, 7, hostRunner)
+	runner := NewPodmanRunner(config, repoInfo, "7", hostRunner)
 	require.NotNil(t, runner)
 	assert.Equal(t, "localhost/asimi/sandbox/myorg/myproject:latest", runner.imageName)
 	assert.Equal(t, "asimi-shell-myorg-myproject-7", runner.containerName)
@@ -106,11 +106,29 @@ func TestNewPodmanRunnerCustomImage(t *testing.T) {
 		AllowHostFallback: false,
 	}
 
-	runner := NewPodmanRunner(config, repoInfo, 2, nil)
+	runner := NewPodmanRunner(config, repoInfo, "2", nil)
 	require.NotNil(t, runner)
 	assert.Equal(t, "custom-image:v1", runner.imageName)
 	assert.Equal(t, "asimi-shell-test-project-2", runner.containerName)
 	assert.False(t, runner.allowFallback)
+}
+
+// TestNewPodmanRunner_EdictContainerName proves per-edict identifiers yield
+// per-edict container names, so distinct edicts never share a container.
+func TestNewPodmanRunner_EdictContainerName(t *testing.T) {
+	repoInfo := repo.RepoInfo{
+		ProjectRoot: t.TempDir(),
+		Slug:        "test/project",
+	}
+
+	runner := NewPodmanRunner(&Config{}, repoInfo, "e42", nil)
+	require.NotNil(t, runner)
+	assert.Equal(t, "asimi-shell-test-project-e42", runner.containerName,
+		"per-edict identifier must be used verbatim as the container name suffix")
+
+	other := NewPodmanRunner(&Config{}, repoInfo, "e43", nil)
+	assert.NotEqual(t, runner.containerName, other.containerName,
+		"distinct edicts must not share a container name")
 }
 
 // TestPodmanRunnerSetRepoInfoRoutesToWorktree proves the isolation lever reaches
@@ -119,7 +137,7 @@ func TestNewPodmanRunnerCustomImage(t *testing.T) {
 // main tree (the only path bind-mounted into the sandbox).
 func TestPodmanRunnerSetRepoInfoRoutesToWorktree(t *testing.T) {
 	root := t.TempDir()
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: root, Slug: "test/project"}, 1, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: root, Slug: "test/project"}, "1", nil)
 	require.NotNil(t, runner)
 
 	assert.Equal(t, root, runner.projectWorkingRoot(), "no worktree → main tree")
@@ -155,7 +173,7 @@ func TestPodmanRunnerWithFallback(t *testing.T) {
 		AllowHostFallback: true,
 	}
 
-	runner := NewPodmanRunner(config, repoInfo, 3, hostRunner)
+	runner := NewPodmanRunner(config, repoInfo, "3", hostRunner)
 	require.NotNil(t, runner)
 
 	// This should fall back to host runner since the image doesn't exist
@@ -190,7 +208,7 @@ func TestPodmanRunnerIntegration(t *testing.T) {
 		AllowHostFallback: false,
 	}
 
-	runner := NewPodmanRunner(config, repoInfo, 4, nil)
+	runner := NewPodmanRunner(config, repoInfo, "4", nil)
 	require.NotNil(t, runner)
 	defer runner.Close(context.Background())
 
@@ -237,7 +255,7 @@ func TestPodmanRunnerContainerLaunchMessage(t *testing.T) {
 		AllowHostFallback: false,
 	}
 
-	runner := NewPodmanRunner(config, repoInfo, 5, nil)
+	runner := NewPodmanRunner(config, repoInfo, "5", nil)
 	msgChan := make(chan Msg, 10)
 	runner.SetMessageChannel(msgChan)
 	require.NotNil(t, runner)
@@ -276,7 +294,7 @@ func TestPodmanRunnerHealthcheckPass(t *testing.T) {
 		AllowHostFallback: false,
 	}
 
-	runner1 := NewPodmanRunner(config, repoInfo, 100, nil)
+	runner1 := NewPodmanRunner(config, repoInfo, "100", nil)
 	msgChan1 := make(chan Msg, 10)
 	runner1.SetMessageChannel(msgChan1)
 	require.NotNil(t, runner1)
@@ -287,7 +305,7 @@ func TestPodmanRunnerHealthcheckPass(t *testing.T) {
 	assert.Contains(t, output.Output, "alive")
 
 	// Second runner reuses the same running container
-	runner2 := NewPodmanRunner(config, repoInfo, 100, nil)
+	runner2 := NewPodmanRunner(config, repoInfo, "100", nil)
 	msgChan2 := make(chan Msg, 10)
 	runner2.SetMessageChannel(msgChan2)
 	require.NotNil(t, runner2)
@@ -323,7 +341,7 @@ func TestPodmanRunnerHealthcheckRecovery(t *testing.T) {
 		AllowHostFallback: false,
 	}
 
-	runner1 := NewPodmanRunner(config, repoInfo, 200, nil)
+	runner1 := NewPodmanRunner(config, repoInfo, "200", nil)
 	require.NotNil(t, runner1)
 
 	output, err := runner1.Run(context.Background(), Input{Command: "echo before-wedge"})
@@ -338,7 +356,7 @@ func TestPodmanRunnerHealthcheckRecovery(t *testing.T) {
 
 	_ = runner1.Close(context.Background())
 
-	runner2 := NewPodmanRunner(config, repoInfo, 200, nil)
+	runner2 := NewPodmanRunner(config, repoInfo, "200", nil)
 	msgChan := make(chan Msg, 10)
 	runner2.SetMessageChannel(msgChan)
 	require.NotNil(t, runner2)
@@ -395,7 +413,7 @@ func TestEstablishConnectionContextNotCanceled(t *testing.T) {
 		t.Skip("Skipping Podman test when running inside a container")
 	}
 
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/ctx"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/ctx"}, "0", nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
@@ -425,7 +443,7 @@ func TestInitializeReestablishesDeadConnection(t *testing.T) {
 	defer mock.close()
 	host := mock.start(t)
 
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/dead-conn"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/dead-conn"}, "0", nil)
 
 	deadCtx, deadCancel := context.WithCancel(context.Background())
 	deadCancel()
@@ -695,7 +713,7 @@ func TestFastPathDetectsStoppedContainer(t *testing.T) {
 
 	projectRoot := t.TempDir()
 	makeSandboxFiles(t, projectRoot)
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/fastpath-stopped"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/fastpath-stopped"}, "0", nil)
 	runner.conn = connCtx
 	runner.containerStarted = true
 	runner.checkImage = func(context.Context) error { return nil }
@@ -723,7 +741,7 @@ func TestFastPathInspectFailureTriggersRecreation(t *testing.T) {
 
 	projectRoot := t.TempDir()
 	makeSandboxFiles(t, projectRoot)
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/fastpath-removed"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/fastpath-removed"}, "0", nil)
 	runner.conn = connCtx
 	runner.containerStarted = true
 	runner.checkImage = func(context.Context) error { return nil }
@@ -751,7 +769,7 @@ func TestFastPathRunningContainerNoRecreation(t *testing.T) {
 
 	projectRoot := t.TempDir()
 	makeSandboxFiles(t, projectRoot)
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/fastpath-running"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/fastpath-running"}, "0", nil)
 	runner.conn = connCtx
 	runner.containerStarted = true
 	runner.checkImage = func(context.Context) error { return nil }
@@ -781,7 +799,7 @@ func TestCreateContainerStaleCleanup(t *testing.T) {
 
 	projectRoot := t.TempDir()
 	makeSandboxFiles(t, projectRoot)
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/stale-cleanup"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/stale-cleanup"}, "0", nil)
 	runner.conn = connCtx
 	runner.checkImage = func(context.Context) error { return nil }
 
@@ -814,7 +832,7 @@ func TestCreateContainerStaleCleanupRemoveFails(t *testing.T) {
 
 	projectRoot := t.TempDir()
 	makeSandboxFiles(t, projectRoot)
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/stale-cleanup-fail"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/stale-cleanup-fail"}, "0", nil)
 	runner.conn = connCtx
 	runner.checkImage = func(context.Context) error { return nil }
 
@@ -852,7 +870,7 @@ func TestContainerLaunchedMsgAllPaths(t *testing.T) {
 
 		projectRoot := t.TempDir()
 		makeSandboxFiles(t, projectRoot)
-		runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/launch-a"}, 0, nil)
+		runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/launch-a"}, "0", nil)
 		runner.conn = connCtx
 		runner.checkImage = func(context.Context) error { return nil }
 		msgChan := make(chan Msg, 10)
@@ -880,7 +898,7 @@ func TestContainerLaunchedMsgAllPaths(t *testing.T) {
 
 		projectRoot := t.TempDir()
 		makeSandboxFiles(t, projectRoot)
-		runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/launch-b"}, 0, nil)
+		runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/launch-b"}, "0", nil)
 		runner.conn = connCtx
 		runner.checkImage = func(context.Context) error { return nil }
 		msgChan := make(chan Msg, 10)
@@ -908,7 +926,7 @@ func TestContainerLaunchedMsgAllPaths(t *testing.T) {
 
 		projectRoot := t.TempDir()
 		makeSandboxFiles(t, projectRoot)
-		runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/launch-c"}, 0, nil)
+		runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/launch-c"}, "0", nil)
 		runner.conn = connCtx
 		runner.checkImage = func(context.Context) error { return nil }
 		msgChan := make(chan Msg, 10)
@@ -932,7 +950,7 @@ func TestContainerLaunchedMsgAllPaths(t *testing.T) {
 // TestSendContainerLaunchedNoChannel verifies that sendContainerLaunched is
 // a no-op when msgChan is nil (no panic).
 func TestSendContainerLaunchedNoChannel(t *testing.T) {
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/nochan"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/nochan"}, "0", nil)
 	runner.sendContainerLaunched("test-id")
 }
 
@@ -955,7 +973,7 @@ func TestInitializeConcurrentSafety(t *testing.T) {
 
 	projectRoot := t.TempDir()
 	makeSandboxFiles(t, projectRoot)
-	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/concurrent-safety"}, 0, nil)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/concurrent-safety"}, "0", nil)
 	runner.conn = connCtx
 	runner.checkImage = func(context.Context) error { return nil }
 

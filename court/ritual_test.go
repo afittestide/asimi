@@ -5381,3 +5381,37 @@ func TestRitualEffort_ExplicitOverridesUserDefault(t *testing.T) {
 	assert.Equal(t, "low", sess.ReasoningEffort,
 		"explicit ritual step effort should take precedence over the user default")
 }
+
+// TestRitualRun_StampsEdictRunnerOnCompletion verifies the terminal-state hook:
+// when a ritual for a real edict (ID > 1) finishes, the Court is told so it can
+// refresh the edict runner's last-used time and never flatline a just-finished
+// ritual. System edicts (ID <= 1) must not stamp.
+func TestRitualRun_StampsEdictRunnerOnCompletion(t *testing.T) {
+	db := setupRitualTestDB(t)
+	court := newRitualTestCourtWithDB(t, db, "hello\n", nil)
+
+	ritual := &RitualDef{
+		Name: "done-stamp",
+		Steps: []RitualStep{
+			{Name: "echo", Minister: "forge", Task: "Echo hello"},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+
+	var stamped []uint
+	runner.SetRunnerResolver(nil, func(edictID uint) { stamped = append(stamped, edictID) })
+
+	exec, err := runner.Start(context.Background(), "done-stamp", testEK(42), nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(context.Background(), exec))
+	assert.Equal(t, []uint{42}, stamped, "a completed edict ritual must stamp the runner's last-used time")
+
+	// A system ritual (edict 1) must not stamp.
+	sysExec, err := runner.Start(context.Background(), "done-stamp", testEK(1), nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(context.Background(), sysExec))
+	assert.Equal(t, []uint{42}, stamped, "system edicts must not stamp a per-edict runner")
+}

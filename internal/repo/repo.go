@@ -196,18 +196,21 @@ func GetRepoInfoForRoot(root string) RepoInfo {
 					branch = ref.Hash().String()[:7]
 				}
 			}
-		} else if isWorktree {
-			// go-git doesn't fully support worktrees, try reading HEAD directly
-			branch = readBranchFromWorktreeAt(root)
+		} else {
+			// go-git can't resolve HEAD inside a linked worktree; read it from
+			// the enclosing worktree's .git file, ascending from root so a
+			// nested directory (e.g. internal/repo under .agents/worktrees/e<N>)
+			// still resolves.
+			branch = readBranchFromEnclosingWorktree(root)
 		}
 		// Get git status - only read once at startup
 		// Skip in tests to avoid slow git operations
 		if os.Getenv("ASIMI_SKIP_GIT_STATUS") == "" {
 			status = readShortStatus(repo)
 		}
-	} else if isWorktree {
-		// go-git failed, try reading branch directly from worktree
-		branch = readBranchFromWorktreeAt(root)
+	} else {
+		// go-git failed, try reading the branch from the enclosing worktree.
+		branch = readBranchFromEnclosingWorktree(root)
 	}
 
 	// Detect if branch is a main branch
@@ -457,6 +460,27 @@ func readBranchFromWorktreeAt(dir string) string {
 	return ""
 }
 
+// readBranchFromEnclosingWorktree walks from root up through its ancestors and
+// returns the branch read from the first ancestor whose .git is a file (i.e. a
+// linked worktree root). This handles callers whose root is a subdirectory of a
+// worktree — under `go test` the cwd is the package directory, so a worktree's
+// .git file lives several levels above root. readBranchFromWorktreeAt returns ""
+// for a normal repo root (.git is a directory), so this yields "" when root is
+// nested in a plain repository, preserving existing behavior.
+func readBranchFromEnclosingWorktree(root string) string {
+	dir := root
+	for {
+		if branch := readBranchFromWorktreeAt(dir); branch != "" {
+			return branch
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
 // branchFromDetachedHead recovers the original branch name when HEAD is detached
 // during git operations that preserve it (rebase, bisect). Returns "" if the
 // branch can't be recovered.
@@ -487,6 +511,13 @@ func isMainBranch(branch string) bool {
 	return branch == "main" || branch == "master"
 }
 
+// readShortStatus summarizes the working tree state as a compact indicator
+// string. It shells out to `git status --porcelain` rather than using
+// go-git's Worktree.Status: go-git walks every path in the worktree,
+// including ignored trees (vendored deps, worktree copies), so its cost
+// scales with repository junk. The subprocess reads the index and untracked
+// cache and stays fast — a full walk once pushed the daemon handshake past
+// its deadline on a repo carrying nested worktree copies.
 func readShortStatus(repo *gogit.Repository) string {
 	if repo == nil {
 		return ""
@@ -496,13 +527,17 @@ func readShortStatus(repo *gogit.Repository) string {
 	if err != nil {
 		return ""
 	}
-
-	status, err := worktree.Status()
-	if err != nil {
+	root := worktree.Filesystem.Root()
+	if root == "" {
 		return ""
 	}
 
-	return summarizeStatus(status)
+	out, err := runGitCommand(root, "status", "--porcelain")
+	if err != nil {
+		slog.Debug("git status failed", "dir", root, "err", err)
+		return ""
+	}
+	return summarizePorcelain(out)
 }
 
 // projectSlug returns the project slug (e.g., "owner/repo") from the git remote origin URL.
@@ -573,54 +608,52 @@ func filterEnv(env []string, keys ...string) []string {
 	return filtered
 }
 
-func summarizeStatus(status gogit.Status) string {
-	if len(status) == 0 {
-		return ""
-	}
-
-	var modified, added, deleted, untracked, renamed int
-	for _, entry := range status {
-		switch entry.Staging {
-		case gogit.Modified, gogit.UpdatedButUnmerged:
-			modified++
-		case gogit.Added, gogit.Copied:
-			added++
-		case gogit.Deleted:
-			deleted++
-		case gogit.Renamed:
-			renamed++
-		case gogit.Untracked:
-			untracked++
+// summarizePorcelain reduces `git status --porcelain` output to the compact
+// indicator string shown next to the project (e.g. "[!+?]").
+func summarizePorcelain(out []byte) string {
+	var modified, added, deleted, renamed, untracked bool
+	for _, line := range strings.Split(string(out), "\n") {
+		if len(line) < 2 {
+			continue
 		}
-		switch entry.Worktree {
-		case gogit.Modified, gogit.UpdatedButUnmerged:
-			modified++
-		case gogit.Added, gogit.Copied:
-			added++
-		case gogit.Deleted:
-			deleted++
-		case gogit.Renamed:
-			renamed++
-		case gogit.Untracked:
-			untracked++
+		// Unmerged entries (conflicts) correspond to go-git's
+		// UpdatedButUnmerged, which the old summary reported as modified.
+		switch line[:2] {
+		case "DD", "AU", "UD", "UA", "DU", "AA", "UU":
+			modified = true
+			continue
+		}
+		for _, code := range []byte{line[0], line[1]} {
+			switch code {
+			case 'M':
+				modified = true
+			case 'A', 'C':
+				added = true
+			case 'D':
+				deleted = true
+			case 'R':
+				renamed = true
+			case '?':
+				untracked = true
+			}
 		}
 	}
 
 	var builder strings.Builder
 	builder.WriteString("[")
-	if modified > 0 {
+	if modified {
 		builder.WriteString("!")
 	}
-	if added > 0 {
+	if added {
 		builder.WriteString("+")
 	}
-	if deleted > 0 {
+	if deleted {
 		builder.WriteString("-")
 	}
-	if renamed > 0 {
+	if renamed {
 		builder.WriteString("→")
 	}
-	if untracked > 0 {
+	if untracked {
 		builder.WriteString("?")
 	}
 	builder.WriteString("]")

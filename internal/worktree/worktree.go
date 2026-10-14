@@ -80,8 +80,13 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string) error 
 	if r == nil {
 		return fmt.Errorf("worktree: no runner configured")
 	}
-	cmd := fmt.Sprintf("cd %s && git ls-files -z --others --ignored --exclude-standard | tar --null -T - -cf - | tar -xf - -C %s",
-		shellescape.Quote(root), shellescape.Quote(abs))
+	// .agents/worktrees is itself gitignored, so without the tar --exclude a
+	// new worktree would copy every other worktree — and any nested copies
+	// they carry — into itself, growing the tree on every edict. --exclude
+	// must precede -T: GNU tar treats it as positional and silently drops it
+	// when it follows a file list.
+	cmd := fmt.Sprintf("cd %s && git ls-files -z --others --ignored --exclude-standard | tar --null --exclude=%s -T - -cf - | tar -xf - -C %s",
+		shellescape.Quote(root), shellescape.Quote(".agents/worktrees/*"), shellescape.Quote(abs))
 	if _, err := run(ctx, r, cmd, "copy gitignored files into worktree"); err != nil {
 		return err
 	}

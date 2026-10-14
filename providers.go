@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/afittestide/asimi/court"
@@ -206,7 +207,7 @@ func ProvideShellRunner(params ShellRunnerParams) runners.Runner {
 		runner = hostRunner
 		params.Logger.Info("using host runner (isolated-host mode)")
 	} else {
-		runner = runners.InitShellRunner(&params.Config.Sandbox, params.RepoInfo)
+		runner = runners.InitShellRunner(&params.Config.Sandbox, params.RepoInfo, strconv.FormatUint(uint64(os.Getpid()), 10))
 	}
 
 	params.Logger.Info("shell runner initialized", "type", runner.RunnerType())
@@ -215,12 +216,7 @@ func ProvideShellRunner(params ShellRunnerParams) runners.Runner {
 	params.Lifecycle.Append(fx.Hook{
 		OnStop: func(ctx context.Context) error {
 			params.Logger.Info("shutting down shell runner")
-			err := runner.Close(ctx)
-			r := runners.GetRunner()
-			if r != nil && runner != r {
-				err = errors.Join(err, r.Close(ctx))
-			}
-			return err
+			return runner.Close(ctx)
 		},
 	})
 
@@ -418,6 +414,9 @@ func ProvideCourt(params CourtParams) *court.Court {
 	if params.Config.Court.OutputLimit > 0 {
 		cfg.OutputLimit = params.Config.Court.OutputLimit
 	}
+	// Copy explicitly: RunnerFlatlineTimeout is resolved to the default by the
+	// loader when unset, so an explicit 0 disables the sweep.
+	cfg.RunnerFlatlineTimeout = params.Config.Court.RunnerFlatlineTimeout
 	params.Logger.Info("initializing Court", "user", cfg.Username, "project", cfg.Project)
 
 	s := court.NewCourt(params.GormDB, cfg, params.Runner, params.Logger)

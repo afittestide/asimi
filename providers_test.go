@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -191,4 +192,43 @@ func TestProvideConfig_ReasoningEffortInvalidCLI(t *testing.T) {
 	require.Error(t, err, "invalid --reasoning-effort should be rejected at the CLI merge point")
 	assert.Nil(t, cfg)
 	assert.Contains(t, err.Error(), "reasoning_effort")
+}
+
+// TestNoGlobalRunnerSingleton verifies the package-global runner is fully
+// retired: no production code references runners.GetRunner or runners.SetRunner
+// (both of which no longer exist, so any reference would also fail to compile).
+func TestNoGlobalRunnerSingleton(t *testing.T) {
+	root, err := os.Getwd()
+	require.NoError(t, err)
+
+	banned := []string{"runners.GetRunner", "runners.SetRunner"}
+	var offenders []string
+
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == "vendor" || name == ".git" || name == ".agents" || name == "tmp" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, b := range banned {
+			if strings.Contains(string(data), b) {
+				offenders = append(offenders, path+": "+b)
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Empty(t, offenders, "package-global runner singleton must be fully retired")
 }

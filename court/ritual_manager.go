@@ -44,16 +44,23 @@ type RitualGuard struct {
 	ritualRunner   *RitualRunner
 	eventRegistry  *EventRegistry
 	eventCh        chan Event
-	ritualMu       sync.Mutex   // serializes ritual execution without blocking the event loop
-	queuedCount    atomic.Int32 // number of rituals waiting for the lock
-	maxRetries     int
-	batchSize      int
-	flatlineAge    time.Duration
+	// ritualMu guards ritualLocks/queuedCount, the per-edict mutexes that
+	// serialize rituals of the same edict without blocking different edicts.
+	ritualMu    sync.Mutex
+	ritualLocks map[uint]*sync.Mutex
+	queuedCount atomic.Int32 // number of rituals waiting for any per-edict lock
+	maxRetries  int
+	batchSize   int
+	flatlineAge time.Duration
 	// Dependency injection (replaces *Court back-reference)
 	getMinister  func(id string) Minister
 	streamingCtx func(string) context.Context
 	cancelRitual func(channelID string)
 	version      string // Application version for health checks
+
+	// flatlineRunners, injected by the Court, stops and removes idle per-edict
+	// containers next to the stale-ritual scan.
+	flatlineRunners func(context.Context)
 
 	// Zhengming functions injected by Court
 	waitForZhengming func(ctx context.Context, requestID string) (string, error)
@@ -77,6 +84,9 @@ type RitualGuardOpts struct {
 	WaitForZhengming func(ctx context.Context, requestID string) (string, error)
 	RequestZhengming func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error)
 	DeliverZhengming func(answer ZhengmingAnswer) bool
+	// FlatlineRunners stops and removes idle per-edict containers. Injected by
+	// the Court; piggybacks the existing stale-ritual ticker.
+	FlatlineRunners func(context.Context)
 }
 
 // NewRitualGuard creates a new Ritual Guard that owns all ritual/event infrastructure.
@@ -91,6 +101,7 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 		ritualRegistry:   registry,
 		eventRegistry:    eventRegistry,
 		eventCh:          eventCh,
+		ritualLocks:      make(map[uint]*sync.Mutex),
 		maxRetries:       3,
 		batchSize:        100,
 		flatlineAge:      5 * time.Minute,
@@ -101,6 +112,7 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 		waitForZhengming: opts.WaitForZhengming,
 		requestZhengming: opts.RequestZhengming,
 		deliverZhengming: opts.DeliverZhengming,
+		flatlineRunners:  opts.FlatlineRunners,
 	}
 
 	// Create ritual runner with injected functions
@@ -182,14 +194,56 @@ func isRitualChannelID(channelID string) bool {
 	return err == nil
 }
 
+// edictRitualLock returns the mutex that serializes rituals of edictID.
+// Different edicts get different locks, so their rituals run concurrently while
+// rituals of the same edict stay ordered. System rituals (edict 1) keep their
+// own key, like every other edict.
+func (rg *RitualGuard) edictRitualLock(edictID uint) *sync.Mutex {
+	rg.ritualMu.Lock()
+	defer rg.ritualMu.Unlock()
+	if rg.ritualLocks == nil {
+		rg.ritualLocks = make(map[uint]*sync.Mutex)
+	}
+	l, ok := rg.ritualLocks[edictID]
+	if !ok {
+		l = &sync.Mutex{}
+		rg.ritualLocks[edictID] = l
+	}
+	return l
+}
+
+// ritualRunningFor reports whether edictID has a ritual running or queued. It
+// checks both the in-memory lock (currently held) and the DB (a ritual row in
+// the running state), so a just-starting ritual loaded from recovery is also
+// seen. Used by the flatline sweep to never kill a busy edict's container.
+func (rg *RitualGuard) ritualRunningFor(edictID uint) bool {
+	if l := rg.edictRitualLock(edictID); !l.TryLock() {
+		return true
+	} else {
+		l.Unlock()
+	}
+	if rg.db == nil {
+		return false
+	}
+	var count int64
+	if err := rg.db.Model(&RitualExecution{}).
+		Where("edict_id = ? AND state = ? AND username = ? AND project = ?",
+			edictID, RitualStateRunning, rg.Username(), rg.Project()).
+		Count(&count).Error; err != nil {
+		return false
+	}
+	return count > 0
+}
+
 // startRitual starts and runs a ritual using the edict's own streaming context.
 // It runs in a goroutine so ritual execution (including blocking waits for
-// zhengming during recovery) cannot stall the event loop. Rituals remain
-// serialized via ritualMu so only one runs at a time.
+// zhengming during recovery) cannot stall the event loop. Rituals of the same
+// edict are serialized via that edict's lock; different edicts run concurrently.
 func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inputs map[string]string) {
 	go func() {
-		// Try to acquire lock; if held, check for stale rituals and abort them
-		if !rg.ritualMu.TryLock() {
+		lock := rg.edictRitualLock(key.ID)
+		// Try to acquire the lock; if held, check for stale rituals and abort them
+		if !lock.TryLock() {
 			queueLen := int(rg.queuedCount.Add(1))
 			rg.notify(RitualStepMsg{
 				ChannelID:  ritualChannelID(key.ID),
@@ -200,10 +254,10 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				QueueLen:   queueLen,
 			})
 			rg.abortStaleRitualsIfLocked()
-			rg.ritualMu.Lock()
+			lock.Lock()
 			rg.queuedCount.Add(-1)
 		}
-		defer rg.ritualMu.Unlock()
+		defer lock.Unlock()
 		channelID := ritualChannelID(key.ID)
 		ctx := rg.streamingCtx(channelID)
 		exec, err := rg.ritualRunner.Start(ctx, ritualName, key, inputs, rg.notify)
@@ -236,7 +290,10 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 
 // abortStaleRitualsIfLocked checks for running rituals older than flatlineAge
 // and aborts them directly in the database. This handles the case where a
-// previous ritual goroutine died while holding the lock.
+// previous ritual goroutine died or hung while holding its edict's lock: the
+// DB row is stale (no progress in flatlineAge) and is reaped, and its
+// streaming context is cancelled so any live goroutine unwinds and releases
+// the per-edict lock.
 func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 	if rg.db == nil {
 		return
@@ -800,8 +857,9 @@ func (rg *RitualGuard) abortRitual(ctx context.Context, exec *RitualExecution, r
 	}
 
 	// Cancel the ritual's streaming context so the goroutine unwinds at its
-	// next step boundary and releases ritualMu. Without this the DB state and
-	// event lie: the ritual keeps running after being declared aborted.
+	// next step boundary and releases its edict lock. Without this the DB
+	// state and event lie: the ritual keeps running after being declared
+	// aborted.
 	if rg.cancelRitual != nil {
 		rg.cancelRitual(ritualChannelID(exec.EdictID))
 	}
@@ -822,7 +880,9 @@ func (rg *RitualGuard) Run(ctx context.Context) {
 	// Start aborted ritual recovery in background so event loop can process zhengming answers
 	go rg.promptForAbortedRituals(ctx)
 
-	// Create ticker for stale ritual scan every 2 minutes
+	// Create ticker for stale ritual scan every 2 minutes. The same tick also
+	// sweeps idle per-edict containers (flatline), so no new goroutine is
+	// introduced.
 	staleScanTicker := time.NewTicker(2 * time.Minute)
 	defer staleScanTicker.Stop()
 
@@ -835,6 +895,9 @@ func (rg *RitualGuard) Run(ctx context.Context) {
 			rg.DispatchEvent(event)
 		case <-staleScanTicker.C:
 			rg.scanForStaleRituals(ctx)
+			if rg.flatlineRunners != nil {
+				rg.flatlineRunners(ctx)
+			}
 		}
 	}
 }

@@ -132,6 +132,9 @@ type CourtConfig struct {
 	Project         string        `koanf:"project"`           // project slug for edict scoping
 	IsolatedHost    bool          `koanf:"isolated_host"`     // skip sandbox, run commands on host without approval
 	OutputLimit     int           `koanf:"output_limit"`      // max chars of heavy output fields in summary mode (default 500)
+	// RunnerFlatlineTimeout is how long a per-edict container may sit idle
+	// before it is stopped and removed (default 15m). 0 disables the sweep.
+	RunnerFlatlineTimeout time.Duration `koanf:"runner_flatline_timeout"`
 	// LingIgnitionEnabled gates automatic execution of lings. It defaults to
 	// false (zero value) because concurrent lings share one working tree and
 	// are unsafe until per-ling worktree isolation lands (e531).
@@ -142,6 +145,10 @@ type CourtConfig struct {
 // fields when court.output_limit is unset in summary mode.
 const DefaultOutputLimit = 500
 
+// DefaultRunnerFlatlineTimeout is how long a per-edict container may sit idle
+// before the Court stops and removes it.
+const DefaultRunnerFlatlineTimeout = 15 * time.Minute
+
 // DefaultCourtConfig returns the default configuration.
 func DefaultCourtConfig() *CourtConfig {
 	username := "guest"
@@ -149,9 +156,10 @@ func DefaultCourtConfig() *CourtConfig {
 		username = u.Username
 	}
 	return &CourtConfig{
-		StepIdleTimeout: 5 * time.Minute,
-		Username:        username,
-		OutputLimit:     DefaultOutputLimit,
+		StepIdleTimeout:       5 * time.Minute,
+		Username:              username,
+		OutputLimit:           DefaultOutputLimit,
+		RunnerFlatlineTimeout: DefaultRunnerFlatlineTimeout,
 	}
 }
 

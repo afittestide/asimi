@@ -32,52 +32,27 @@ func TestIsMainBranch(t *testing.T) {
 	}
 }
 
-func TestSummarizeStatus(t *testing.T) {
+func TestSummarizePorcelain(t *testing.T) {
 	cases := []struct {
 		name     string
-		status   gogit.Status
+		status   string
 		expected string
 	}{
+		{name: "empty status", status: "", expected: ""},
 		{
-			name:     "empty status",
-			status:   gogit.Status{},
-			expected: "",
-		},
-		{
-			name: "mixed indicators",
-			status: gogit.Status{
-				"modified.go": &gogit.FileStatus{
-					Staging:  gogit.Modified,
-					Worktree: gogit.Unmodified,
-				},
-				"staged_added.go": &gogit.FileStatus{
-					Staging:  gogit.Added,
-					Worktree: gogit.Unmodified,
-				},
-				"deleted.txt": &gogit.FileStatus{
-					Staging:  gogit.Deleted,
-					Worktree: gogit.Unmodified,
-				},
-				"renamed.txt": &gogit.FileStatus{
-					Staging:  gogit.Renamed,
-					Worktree: gogit.Unmodified,
-				},
-				"untracked.md": &gogit.FileStatus{
-					Staging:  gogit.Untracked,
-					Worktree: gogit.Untracked,
-				},
-				"worktree_modified.go": &gogit.FileStatus{
-					Staging:  gogit.Unmodified,
-					Worktree: gogit.Modified,
-				},
-			},
+			name:     "mixed indicators",
+			status:   " M modified.go\nA  staged_added.go\nD  deleted.txt\nR  renamed.txt\n?? untracked.md\n",
 			expected: "[!+-→?]",
 		},
+		{name: "modified in worktree", status: " M file.go\n", expected: "[!]"},
+		{name: "copied in index counts as added", status: "C  copy.go\n", expected: "[+]"},
+		{name: "untracked only", status: "?? note.md\n", expected: "[?]"},
+		{name: "conflict counts as modified", status: "UU conflict.go\n", expected: "[!]"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.expected, summarizeStatus(tc.status))
+			require.Equal(t, tc.expected, summarizePorcelain([]byte(tc.status)))
 		})
 	}
 }
@@ -228,6 +203,35 @@ func TestGetRepoInfoForRoot_Gitless(t *testing.T) {
 	require.Equal(t, "hello-world-trial", info.Slug,
 		"gitless slug derives from the sanitized directory basename")
 	require.True(t, info.Gitless())
+}
+
+// TestGetRepoInfoForRoot_NestedInWorktree covers the case where root is a
+// subdirectory of a linked worktree (e.g. under `go test` the cwd is the
+// package directory). go-git cannot resolve HEAD there, so the branch must be
+// recovered from the enclosing worktree's .git file by walking ancestors.
+func TestGetRepoInfoForRoot_NestedInWorktree(t *testing.T) {
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	// Simulate a linked worktree: .git is a FILE pointing at a gitdir whose
+	// HEAD records the branch.
+	worktree := t.TempDir()
+	gitdir := filepath.Join(t.TempDir(), "wt-gitdir")
+	require.NoError(t, os.MkdirAll(gitdir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(gitdir, "HEAD"),
+		[]byte("ref: refs/heads/e938-fix\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, ".git"),
+		[]byte("gitdir: "+gitdir+"\n"), 0o644))
+
+	nested := filepath.Join(worktree, "internal", "repo")
+	require.NoError(t, os.MkdirAll(nested, 0o755))
+
+	info := GetRepoInfoForRoot(nested)
+	require.Equal(t, "e938-fix", info.Branch,
+		"branch must be recovered from the enclosing worktree .git file")
+	require.Equal(t, nested, info.ProjectRoot,
+		"ProjectRoot stays the given dir")
+	require.False(t, info.IsWorktree,
+		"a subdirectory is not itself the worktree root")
 }
 
 func TestBranchSlugOrDefault(t *testing.T) {

@@ -44,7 +44,7 @@ func newGitlessRitualRunner(t *testing.T) (*RitualRunner, string) {
 func TestGetEarthStatus_Gitless(t *testing.T) {
 	runner, _ := newGitlessRitualRunner(t)
 
-	result, err := runner.getEarthStatus(context.Background())
+	result, err := runner.getEarthStatus(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("getEarthStatus failed: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestGetEarthStatus_Gitless(t *testing.T) {
 func TestGetBorderlands_Gitless(t *testing.T) {
 	runner, _ := newGitlessRitualRunner(t)
 
-	result, err := runner.getBorderlands(context.Background())
+	result, err := runner.getBorderlands(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("getBorderlands failed: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestGetBorderlands_Gitless(t *testing.T) {
 func TestCheckCleanWorkingDirectory_Gitless(t *testing.T) {
 	runner, _ := newGitlessRitualRunner(t)
 
-	result, err := runner.checkCleanWorkingDirectory(context.Background())
+	result, err := runner.checkCleanWorkingDirectory(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("checkCleanWorkingDirectory should not fail on gitless ground: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestStageInfrastructure_GitlessSkipsGitCommands(t *testing.T) {
 func TestGetHeavenSnapshot_Gitless(t *testing.T) {
 	runner, _ := newGitlessRitualRunner(t)
 
-	result, err := runner.getHeavenSnapshot(context.Background())
+	result, err := runner.getHeavenSnapshot(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("getHeavenSnapshot failed on gitless ground: %v", err)
 	}

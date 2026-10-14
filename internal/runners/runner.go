@@ -6,32 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 )
-
-var (
-	globalRunner Runner
-	runnerMu     sync.RWMutex
-)
-
-// SetRunner sets the global runner (thread-safe)
-func SetRunner(r Runner) {
-	runnerMu.Lock()
-	globalRunner = r
-	runnerMu.Unlock()
-}
-
-// GetRunner returns the global runner (thread-safe)
-func GetRunner() Runner {
-	runnerMu.RLock()
-	r := globalRunner
-	runnerMu.RUnlock()
-	return r
-}
 
 // DefaultMaxOutputSize is the fallback when no config is provided.
 const DefaultMaxOutputSize = 51200 // 50KB
@@ -183,7 +162,7 @@ func ResolveHostTimeouts(commandTimeoutMinutes int, approvalTimeout time.Duratio
 	}
 }
 
-func InitShellRunner(config *Config, repoInfo repo.RepoInfo) Runner {
+func InitShellRunner(config *Config, repoInfo repo.RepoInfo, identifier string) Runner {
 	// Resolve image name using same default as NewPodmanRunner
 	imageName := config.ImageName
 	if imageName == "" {
@@ -202,18 +181,14 @@ func InitShellRunner(config *Config, repoInfo repo.RepoInfo) Runner {
 			})
 			fallback = host
 		}
-		runner := NewPodmanRunner(config, repoInfo, uint64(os.Getpid()), fallback)
-		SetRunner(runner)
-		return runner
+		return NewPodmanRunner(config, repoInfo, identifier, fallback)
 	}
 
 	// Podman is not available or image is missing. Return a PodmanRunner
 	// with no fallback so that Run() returns SandboxMissingError rather
 	// than silently executing on the host.
 	slog.Warn("podman not available or image missing; commands will fail until sandbox is set up", "image", imageName)
-	runner := NewPodmanRunner(config, repoInfo, uint64(os.Getpid()), nil)
-	SetRunner(runner)
-	return runner
+	return NewPodmanRunner(config, repoInfo, identifier, nil)
 }
 func HostRun(ctx context.Context, in Input, projectRoot string) (Output, error) {
 	runner := NewHostRunner(0, projectRoot)
