@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"al.essio.dev/pkg/shellescape"
@@ -98,6 +99,10 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string) error 
 // message. On a rebase conflict it returns an error and leaves the worktree
 // intact so the forge (工部) can resolve the conflict before the ruler reviews.
 //
+// A branch that is already contained in the default branch is a no-op: the
+// canonical branch is not a feature by itself, so merging it would either fail
+// ("Already up to date") or land a duplicate commit.
+//
 // The caller owns the commit message shape (AGENTS.md: feat:/bug:/chore: … e<N>).
 func SquashMergeToDefault(ctx context.Context, r runners.Runner, root, abs, branch, summary string) error {
 	if r == nil {
@@ -108,6 +113,19 @@ func SquashMergeToDefault(ctx context.Context, r runners.Runner, root, abs, bran
 	}
 
 	defaultBranch := DefaultBranch(ctx, r, root)
+
+	// Guard against rebasing/squash-merging a branch that carries no work of
+	// its own (i.e. it is the default branch, or already contained in it).
+	// Otherwise `git rebase <default>` succeeds trivially and the following
+	// squash-merge fails with "Already up to date", which the Court would
+	// (correctly) report as a merge failure for a canonical-commit edict.
+	countCmd := fmt.Sprintf("git -C %s rev-list --count %s..%s",
+		shellescape.Quote(root), shellescape.Quote(defaultBranch), shellescape.Quote(branch))
+	if out, err := run(ctx, r, countCmd, "count edict branch commits"); err == nil {
+		if n, convErr := strconv.Atoi(strings.TrimSpace(out.Output)); convErr == nil && n == 0 {
+			return nil // nothing to merge
+		}
+	}
 
 	rebaseCmd := fmt.Sprintf("git -C %s rebase %s", shellescape.Quote(abs), shellescape.Quote(defaultBranch))
 	if _, err := run(ctx, r, rebaseCmd, "rebase edict worktree onto default branch"); err != nil {

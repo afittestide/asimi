@@ -1542,10 +1542,28 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) {
 	if err := worktree.SquashMergeToDefault(ctx, s.runner, root, abs, branch, summary); err != nil {
 		s.logger.Error("worktree merge failed; left intact for inspection/rollback",
 			"edict", edictID, "err", err)
+		// The ruler's seal is already recorded, so the TUI would otherwise
+		// report an unqualified success. Publish a dedicated event so the
+		// failure is visible: edict sealed but work NOT merged.
+		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
+			"minister_id": "ruler",
+			"reason":      err.Error(),
+			"worktree":    rel,
+			"branch":      branch,
+		})
 		return // forge resolves conflicts; do NOT remove on failure
 	}
 	if err := worktree.Remove(ctx, s.runner, root, abs, branch); err != nil {
-		s.logger.Error("worktree removal failed after successful merge", "edict", edictID, "err", err)
+		s.logger.Error("worktree removal failed after successful merge",
+			"edict", edictID, "err", err,
+			"remediation", fmt.Sprintf("run `git worktree remove %s` after cleaning", abs))
+		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
+			"minister_id": "ruler",
+			"reason":      fmt.Sprintf("work merged but worktree removal failed: %v", err),
+			"worktree":    rel,
+			"branch":      branch,
+			"merged":      true,
+		})
 		return // keep the edict runner so the worktree can be inspected
 	}
 	// The worktree is gone; tear down the edict's container too. The next
@@ -1556,15 +1574,40 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) {
 // edictCommitSummary builds the squash-merge commit message for an edict from
 // its recorded summary, ending in the AGENTS.md-mandated "e<N>" suffix.
 func (s *Court) edictCommitSummary(edictID uint) string {
+	var username, project string
+	if s.config != nil {
+		username, project = s.config.Username, s.config.Project
+	}
+	return edictCommitSummary(s.db, username, project, edictID)
+}
+
+// edictCommitSummary builds the "<summary> e<N>" commit message for an edict
+// from its recorded summary, falling back to its intent. It degrades to a
+// conventional message when the edict is unknown or the database is
+// unavailable, so callers always get a non-empty subject with the
+// AGENTS.md-mandated suffix.
+func edictCommitSummary(db *gorm.DB, username, project string, edictID uint) string {
 	summary := "chore: merge edict worktree"
-	if s.db != nil && s.config != nil {
+	if db != nil {
 		var edict storage.Edict
-		if err := s.db.First(&edict, "id = ? AND username = ? AND project = ?",
-			edictID, s.config.Username, s.config.Project).Error; err == nil && edict.Summary != "" {
-			summary = edict.Summary
+		if err := db.First(&edict, "id = ? AND username = ? AND project = ?",
+			edictID, username, project).Error; err == nil {
+			if edict.Summary != "" {
+				summary = edict.Summary
+			} else if edict.Intent != "" {
+				summary = firstLine(edict.Intent)
+			}
 		}
 	}
 	return fmt.Sprintf("%s e%d", summary, edictID)
+}
+
+// firstLine returns s up to its first newline, for a one-line commit subject.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 // GrantRulerSeal stamps the Ruler's seal on an edict and publishes EventSealGranted.

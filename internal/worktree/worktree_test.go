@@ -191,39 +191,84 @@ func TestSquashMerge_ConflictLeavesWorktreeIntact(t *testing.T) {
 	}
 }
 
-func TestRemove_CommandSequence(t *testing.T) {
+// TestSquashMergeToDefault_CleanBranchNoOp guards the canonical-branch case: a
+// branch already contained in the default branch carries no work of its own, so
+// nothing is rebased, merged, or committed and no error is returned. Without
+// the guard the squash-merge would fail with "Already up to date" and the Court
+// would wrongly report a merge failure for an already-landed edict.
+func TestSquashMergeToDefault_CleanBranchNoOp(t *testing.T) {
 	root := t.TempDir()
-	abs := filepath.Join(root, ".agents", "worktrees", "e11")
-	mock := &recordingRunner{}
-
-	if err := Remove(context.Background(), mock, root, abs, "asimi/e11"); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	joined := strings.Join(mock.commands, "\n")
-	if !strings.Contains(joined, "worktree remove") {
-		t.Errorf("expected worktree remove, got:\n%s", joined)
-	}
-	if strings.Contains(joined, "--force") {
-		t.Errorf("removal must not use the forbidden --force flag, got:\n%s", joined)
-	}
-	if !strings.Contains(joined, "update-ref -d refs/heads/asimi/e11") {
-		t.Errorf("expected branch delete via update-ref, got:\n%s", joined)
-	}
-}
-
-func TestDefaultBranch_FallsBackToMain(t *testing.T) {
-	mock := &recordingRunner{}
-	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "main" {
-		t.Errorf("DefaultBranch = %q, want main", got)
-	}
-}
-
-func TestDefaultBranch_StripsRemotePrefix(t *testing.T) {
+	abs := filepath.Join(root, ".agents", "worktrees", "e8")
 	mock := &recordingRunner{outputs: map[string]runners.Output{
-		"symbolic-ref": {Output: "origin/trunk\n", ExitCode: "0"},
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"rev-list":     {Output: "0\n", ExitCode: "0"},
 	}}
-	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "trunk" {
-		t.Errorf("DefaultBranch = %q, want trunk", got)
+
+	if err := SquashMergeToDefault(context.Background(), mock, root, abs, "asimi/e8", "feat: x e8"); err != nil {
+		t.Fatalf("SquashMergeToDefault: %v", err)
+	}
+	if mock.contains("rebase") {
+		t.Errorf("a clean branch must not be rebased, got %v", mock.commands)
+	}
+	if mock.contains("merge --squash") {
+		t.Errorf("a clean branch must not be squash-merged, got %v", mock.commands)
+	}
+	if mock.contains("commit -m") {
+		t.Errorf("a clean branch must not produce a commit, got %v", mock.commands)
+	}
+}
+
+// TestSquashMerge_RealGitDirtyRebaseLeavesWorktreeIntact exercises the bug's
+// trigger against a real repository: when the worktree has uncommitted work, the
+// rebase aborts and SquashMergeToDefault returns an error without landing
+// anything on main. The worktree stays intact for the forge to resolve.
+func TestSquashMerge_RealGitDirtyRebaseLeavesWorktreeIntact(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".agents/worktrees/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+
+	// Hand-build the worktree so the test does not depend on `just install`.
+	abs := filepath.Join(root, ".agents", "worktrees", "e77")
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	branch := "asimi/e77"
+	runGit(t, root, "worktree", "add", "-B", branch, abs)
+
+	// Give the branch a commit so the rebase has work to replay...
+	if err := os.WriteFile(filepath.Join(abs, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, abs, "add", "feature.txt")
+	runGit(t, abs, "commit", "-m", "feat: feature e77")
+	// ...then leave uncommitted staged work: the rebase must refuse it.
+	if err := os.WriteFile(filepath.Join(abs, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, abs, "add", "dirty.txt")
+
+	runner := &realLightRunner{root: root}
+	if err := SquashMergeToDefault(context.Background(), runner, root, abs, branch, "feat: dirty e77"); err == nil {
+		t.Fatal("expected a dirty-rebase error")
+	}
+	if _, err := os.Stat(abs); err != nil {
+		t.Errorf("worktree must stay intact on a dirty rebase: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "feature.txt")); !os.IsNotExist(err) {
+		t.Errorf("edict work must not land on main after a failed merge, stat err = %v", err)
 	}
 }
 
@@ -303,6 +348,42 @@ func TestEnsure_RealGit(t *testing.T) {
 	}
 	if _, err := os.Stat(abs); !os.IsNotExist(err) {
 		t.Errorf("worktree directory still present after Remove")
+	}
+}
+
+func TestRemove_CommandSequence(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e11")
+	mock := &recordingRunner{}
+
+	if err := Remove(context.Background(), mock, root, abs, "asimi/e11"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	joined := strings.Join(mock.commands, "\n")
+	if !strings.Contains(joined, "worktree remove") {
+		t.Errorf("expected worktree remove, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "--force") {
+		t.Errorf("removal must not use the forbidden --force flag, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "update-ref -d refs/heads/asimi/e11") {
+		t.Errorf("expected branch delete via update-ref, got:\n%s", joined)
+	}
+}
+
+func TestDefaultBranch_FallsBackToMain(t *testing.T) {
+	mock := &recordingRunner{}
+	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "main" {
+		t.Errorf("DefaultBranch = %q, want main", got)
+	}
+}
+
+func TestDefaultBranch_StripsRemotePrefix(t *testing.T) {
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/trunk\n", ExitCode: "0"},
+	}}
+	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "trunk" {
+		t.Errorf("DefaultBranch = %q, want trunk", got)
 	}
 }
 

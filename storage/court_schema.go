@@ -270,6 +270,11 @@ const (
 	EventEdictCancelled      CourtEvent = "edict_cancelled"
 	EventSealGranted         CourtEvent = "seal_granted"
 	EventEdictSealed         CourtEvent = "edict_sealed"
+	// EventWorktreeMergeFailed records that a ruler seal could not land the
+	// edict's worktree on the default branch (or remove it afterwards). The
+	// seal is already recorded, so this event is the only signal that the
+	// edict is sealed but its work is NOT merged.
+	EventWorktreeMergeFailed CourtEvent = "worktree_merge_failed"
 )
 
 // TianEvent represents an event in the Tian ledger
