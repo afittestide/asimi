@@ -230,6 +230,35 @@ func TestGetRepoInfoForRoot_Gitless(t *testing.T) {
 	require.True(t, info.Gitless())
 }
 
+// TestGetRepoInfoForRoot_NestedInWorktree covers the case where root is a
+// subdirectory of a linked worktree (e.g. under `go test` the cwd is the
+// package directory). go-git cannot resolve HEAD there, so the branch must be
+// recovered from the enclosing worktree's .git file by walking ancestors.
+func TestGetRepoInfoForRoot_NestedInWorktree(t *testing.T) {
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	// Simulate a linked worktree: .git is a FILE pointing at a gitdir whose
+	// HEAD records the branch.
+	worktree := t.TempDir()
+	gitdir := filepath.Join(t.TempDir(), "wt-gitdir")
+	require.NoError(t, os.MkdirAll(gitdir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(gitdir, "HEAD"),
+		[]byte("ref: refs/heads/e928-fix\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(worktree, ".git"),
+		[]byte("gitdir: "+gitdir+"\n"), 0o644))
+
+	nested := filepath.Join(worktree, "internal", "repo")
+	require.NoError(t, os.MkdirAll(nested, 0o755))
+
+	info := GetRepoInfoForRoot(nested)
+	require.Equal(t, "e928-fix", info.Branch,
+		"branch must be recovered from the enclosing worktree .git file")
+	require.Equal(t, nested, info.ProjectRoot,
+		"ProjectRoot stays the given dir")
+	require.False(t, info.IsWorktree,
+		"a subdirectory is not itself the worktree root")
+}
+
 func TestBranchSlugOrDefault(t *testing.T) {
 	require.Equal(t, "", (&RepoInfo{}).BranchSlugOrDefault(), "gitless: no branch")
 	require.Equal(t, "main", (&RepoInfo{HasVCS: true, Branch: ""}).BranchSlugOrDefault(),

@@ -196,18 +196,21 @@ func GetRepoInfoForRoot(root string) RepoInfo {
 					branch = ref.Hash().String()[:7]
 				}
 			}
-		} else if isWorktree {
-			// go-git doesn't fully support worktrees, try reading HEAD directly
-			branch = readBranchFromWorktreeAt(root)
+		} else {
+			// go-git can't resolve HEAD inside a linked worktree; read it from
+			// the enclosing worktree's .git file, ascending from root so a
+			// nested directory (e.g. internal/repo under .agents/worktrees/e<N>)
+			// still resolves.
+			branch = readBranchFromEnclosingWorktree(root)
 		}
 		// Get git status - only read once at startup
 		// Skip in tests to avoid slow git operations
 		if os.Getenv("ASIMI_SKIP_GIT_STATUS") == "" {
 			status = readShortStatus(repo)
 		}
-	} else if isWorktree {
-		// go-git failed, try reading branch directly from worktree
-		branch = readBranchFromWorktreeAt(root)
+	} else {
+		// go-git failed, try reading the branch from the enclosing worktree.
+		branch = readBranchFromEnclosingWorktree(root)
 	}
 
 	// Detect if branch is a main branch
@@ -455,6 +458,27 @@ func readBranchFromWorktreeAt(dir string) string {
 	}
 
 	return ""
+}
+
+// readBranchFromEnclosingWorktree walks from root up through its ancestors and
+// returns the branch read from the first ancestor whose .git is a file (i.e. a
+// linked worktree root). This handles callers whose root is a subdirectory of a
+// worktree — under `go test` the cwd is the package directory, so a worktree's
+// .git file lives several levels above root. readBranchFromWorktreeAt returns ""
+// for a normal repo root (.git is a directory), so this yields "" when root is
+// nested in a plain repository, preserving existing behavior.
+func readBranchFromEnclosingWorktree(root string) string {
+	dir := root
+	for {
+		if branch := readBranchFromWorktreeAt(dir); branch != "" {
+			return branch
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
 }
 
 // branchFromDetachedHead recovers the original branch name when HEAD is detached
