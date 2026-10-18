@@ -11,6 +11,7 @@ build-sandbox:
     podman machine init --disk-size 30 >/dev/null 2>&1 || true
     podman machine start >/dev/null 2>&1 || true
     podman rmi localhost/asimi/sandbox/{{PROJECT_NAME}}:latest 2>/dev/null || true
+    podman builder prune -f >/dev/null 2>&1 || true
     podman build -t localhost/asimi/sandbox/{{PROJECT_NAME}}:latest -f .agents/sandbox/Dockerfile .
 
 # Clean up the sandbox container

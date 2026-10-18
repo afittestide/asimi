@@ -1,0 +1,28 @@
+# Keep the podman build context minimal.
+#
+# The sandbox Dockerfile only COPYs `Justfile` and `.agents/sandbox/bashrc`;
+# the source tree is bind-mounted at container runtime. Without this file the
+# entire repo — every edict worktree under .agents/worktrees/, vendor/, .git/
+# and the build logs — is shipped into the podman VM, exhausts its disk and
+# fails with:
+#   mkdir /var/tmp/libpod_builder...: no space left on device
+
+.git
+.gitignore
+.ignore
+.gocache
+vendor
+.agents/worktrees
+.agents/skills
+jobs
+*.log
+*.out
+asimi
+asimi_linux
+coverage.*
+test_tmp
+profiles
+dist
+notes
+tmp
+.envrc

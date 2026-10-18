@@ -183,8 +183,9 @@ vuln:
 init-podman:
     podman machine init --disk-size 30 --memory 4096 >/dev/null 2>&1 || true
     podman machine start >/dev/null 2>&1 || true
-# Build the sandbox container
+# Build the sandbox container.
 build-sandbox: init-podman
+    podman builder prune -f >/dev/null 2>&1 || true
     podman build -t localhost/asimi/sandbox/{{PROJECT_NAME}}:latest -f .agents/sandbox/Dockerfile .
 
 # Clean up the sandbox container
