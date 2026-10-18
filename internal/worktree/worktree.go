@@ -161,6 +161,11 @@ func Remove(ctx context.Context, r runners.Runner, root, abs, branch string) err
 // DefaultBranch resolves the repository's default branch, preferring the
 // remote HEAD (origin/HEAD) and falling back to root's current branch, then
 // to "main". Resolution never fails: an unreadable answer degrades to "main".
+//
+// The remote HEAD name is only used when it is a locally valid upstream: a
+// local branch b, else the remote-tracking ref origin/b, else the fallbacks.
+// Returning the bare b when only origin/b exists makes git rebase/merge fail
+// with "invalid upstream 'b'" (see edict 955).
 func DefaultBranch(ctx context.Context, r runners.Runner, root string) string {
 	if r == nil || root == "" {
 		return "main"
@@ -168,7 +173,13 @@ func DefaultBranch(ctx context.Context, r runners.Runner, root string) string {
 	symRef := fmt.Sprintf("git -C %s symbolic-ref --short refs/remotes/origin/HEAD", shellescape.Quote(root))
 	if out, err := run(ctx, r, symRef, "resolve default branch"); err == nil {
 		if b := strings.TrimSpace(out.Output); b != "" {
-			return strings.TrimPrefix(b, "origin/")
+			b = strings.TrimPrefix(b, "origin/")
+			if refExists(ctx, r, root, "refs/heads/"+b) {
+				return b
+			}
+			if refExists(ctx, r, root, "refs/remotes/origin/"+b) {
+				return "origin/" + b
+			}
 		}
 	}
 	head := fmt.Sprintf("git -C %s rev-parse --abbrev-ref HEAD", shellescape.Quote(root))
@@ -178,6 +189,16 @@ func DefaultBranch(ctx context.Context, r runners.Runner, root string) string {
 		}
 	}
 	return "main"
+}
+
+// refExists reports whether ref resolves in root.
+func refExists(ctx context.Context, r runners.Runner, root, ref string) bool {
+	cmd := fmt.Sprintf("git -C %s rev-parse --verify --quiet %s", shellescape.Quote(root), shellescape.Quote(ref))
+	out, err := run(ctx, r, cmd, "check ref "+ref)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out.Output) != ""
 }
 
 // run executes a command with approval bypassed and treats a non-zero exit
