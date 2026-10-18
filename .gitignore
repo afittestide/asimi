@@ -15,6 +15,7 @@ notes/
 tmp/
 dist/
 .envrc
-
 # Harbor job artifacts (may contain secrets)
 jobs/
+# auto-synced to github
+intent/issues
