@@ -6,6 +6,14 @@ FROM golang:1.26.9-bookworm
 # instead of failing with "go.mod requires go >= X (running go Y)".
 ENV GOTOOLCHAIN=auto
 
+# Bound Go build parallelism and runtime memory so concurrent edict rituals
+# cannot OOM-kill the compiler in the ~2 GiB sandbox VM. Without these, cold
+# parallel compilation of modernc.org/sqlite/libc produces `signal: killed`
+# => `[build failed]`, which the swift-strike judge gate reads as a test failure.
+ENV GOFLAGS=-p=1 \
+    GOMAXPROCS=2 \
+    GOMEMLIMIT=1500MiB
+
 # Install common development tools and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
