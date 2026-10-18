@@ -390,13 +390,18 @@ func (tm *TabManager) SetLoadSessionFn(fn func(sessionID string) tea.Cmd) {
 	}
 }
 
-// Close closes the active tab if safe to do so
+// Close closes the active tab if safe to do so. The closing tab's context is
+// cancelled before the tab is removed so in-flight work bound to that tab (a
+// paused ritual goroutine, say) does not outlive it.
 func (tm *TabManager) Close() error {
 	if len(tm.tabs) <= 1 {
 		return errors.New("cannot close the last tab")
 	}
 	if tm.tabs[tm.activeTab].Streaming {
 		return errors.New("cannot close tab while streaming")
+	}
+	if cancel := tm.tabs[tm.activeTab].Cancel; cancel != nil {
+		cancel()
 	}
 
 	closingIdx := tm.activeTab

@@ -3728,6 +3728,7 @@ type mockCourtClient struct {
 	resumeRitualFn      func(string) bool
 	pausedChannels      []string
 	resumedChannels     []string
+	cancelledChannels   []string
 
 	setIntentFn             func(uint, string) error
 	submitPromptTarget      string
@@ -3836,7 +3837,7 @@ func (m *mockCourtClient) ResumeRitual(channelID string) bool {
 }
 
 func (m *mockCourtClient) CancelTab(channelID string) {
-	// no-op for tests
+	m.cancelledChannels = append(m.cancelledChannels, channelID)
 }
 
 func (m *mockCourtClient) SessionState(target string) court.SessionState {

@@ -192,4 +192,63 @@ func registerContinueStepDefs(ctx *godog.ScenarioContext, t *testing.T) {
 		assert.Empty(t, s.mock.publishedEvents, "should not publish any ritual event")
 		return nil
 	})
+
+	// --- Tab-close aborts the ritual (e921) ---
+
+	ctx.Step(`^a court is active with a recorded CancelTab$`, func() error {
+		// newContinueTestState already installs a mockCourtClient that records
+		// CancelTab calls; nothing more to wire.
+		return nil
+	})
+
+	ctx.Step(`^the ritual is actively streaming$`, func() error {
+		tab := s.model.tabs.ActiveTab()
+		if tab == nil {
+			return fmt.Errorf("no active tab")
+		}
+		tab.Streaming = true
+		return nil
+	})
+
+	ctx.Step(`^the Ruler types ":q"$`, func() error {
+		cmd := handleQuitCommand(s.model, []string{})
+		if cmd != nil {
+			// Closing a tab is synchronous; a non-nil command would mean the
+			// model quit instead of closing a tab.
+			return fmt.Errorf(":q returned a command instead of closing the tab")
+		}
+		return nil
+	})
+
+	ctx.Step(`^the ritual tab is closed$`, func() error {
+		if tab := s.model.tabs.TabByTarget("e647"); tab != nil {
+			return fmt.Errorf("ritual tab e647 should have been closed")
+		}
+		return nil
+	})
+
+	ctx.Step(`^the ritual tab is still open$`, func() error {
+		if tab := s.model.tabs.TabByTarget("e647"); tab == nil {
+			return fmt.Errorf("ritual tab e647 should still be open")
+		}
+		return nil
+	})
+
+	ctx.Step(`^the ritual is aborted through the court$`, func() error {
+		assert.Equal(t, []string{"e647"}, s.mock.cancelledChannels,
+			"the ritual must be aborted via CancelTab")
+		return nil
+	})
+
+	ctx.Step(`^the ritual was not aborted$`, func() error {
+		assert.Empty(t, s.mock.cancelledChannels,
+			"the ritual must not be aborted")
+		return nil
+	})
+
+	ctx.Step(`^the ritual was not resumed$`, func() error {
+		assert.Empty(t, s.mock.resumedChannels,
+			"a running ritual must not be resumed")
+		return nil
+	})
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -509,4 +510,139 @@ func TestSubmitPrompt_RitualTabPendingZhengming_DeliveredAsAnswer(t *testing.T) 
 
 	// The pending mapping is cleared after the answer.
 	assert.Empty(t, updated.pendingZhengmingFor("e892"))
+}
+
+// TestTabManager_CloseCancelsTabContext verifies that closing a tab cancels its
+// per-tab context, so work bound to that tab cannot outlive it.
+func TestTabManager_CloseCancelsTabContext(t *testing.T) {
+	tm := newTestTabManager()
+	tm.DismissWelcome()
+
+	tm.Add("Ritual:e42", "ritual", "e42")
+	tab := tm.TabByTarget("e42")
+	require.NotNil(t, tab)
+	tabCtx := tab.Ctx
+	require.NoError(t, tabCtx.Err(), "context should be live before close")
+
+	require.NoError(t, tm.Close())
+
+	assert.ErrorIs(t, tabCtx.Err(), context.Canceled,
+		"closing the tab must cancel its context")
+}
+
+// TestTabManager_CloseStreamingTabKeepsContext verifies that a streaming tab is
+// refused by Close and its context is left uncancelled.
+func TestTabManager_CloseStreamingTabKeepsContext(t *testing.T) {
+	tm := newTestTabManager()
+	tm.DismissWelcome()
+
+	tm.Add("Ritual:e42", "ritual", "e42")
+	tab := tm.TabByTarget("e42")
+	require.NotNil(t, tab)
+	tab.Streaming = true
+
+	err := tm.Close()
+	require.Error(t, err, "streaming tab must not close")
+	assert.NoError(t, tab.Ctx.Err(), "a refused close must not cancel the context")
+}
+
+// TestAbortRitualOnClose_AbortsPausedRitualTab covers the e921 bug: CTRL-C
+// pauses a ritual (goroutine stays alive), then closing the tab must abort it
+// through the court — resume the paused channel, then cancel it — so the
+// single-flight latch is released and the next ritual starts immediately.
+func TestAbortRitualOnClose_AbortsPausedRitualTab(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	tab := model.tabs.TabByTarget("e647")
+	require.NotNil(t, tab)
+	tab.ChatMode = true
+	tabCtx := tab.Ctx
+	model.tabs.SwitchToTarget("e647")
+
+	abortRitualOnClose(model)
+
+	assert.Equal(t, []string{"e647"}, mock.resumedChannels,
+		"a paused ritual must be resumed to unblock its goroutine")
+	assert.Equal(t, []string{"e647"}, mock.cancelledChannels,
+		"the ritual must be aborted through the court")
+	assert.False(t, tab.ChatMode, "ChatMode should be cleared once aborted")
+	assert.NoError(t, tabCtx.Err(), "the tab context is cancelled by Close, not here")
+}
+
+// TestAbortRitualOnClose_RunningRitualTab aborts a running (not paused) ritual
+// tab too, without a spurious resume.
+func TestAbortRitualOnClose_RunningRitualTab(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	model.tabs.SwitchToTarget("e647")
+
+	abortRitualOnClose(model)
+
+	assert.Empty(t, mock.resumedChannels, "a running ritual must not be resumed")
+	assert.Equal(t, []string{"e647"}, mock.cancelledChannels,
+		"a running ritual must be aborted through the court")
+}
+
+// TestAbortRitualOnClose_StreamingTabUntouched verifies the "cannot close while
+// streaming" guard is preserved: a streaming tab's ritual is left alone because
+// Close will refuse to close it anyway.
+func TestAbortRitualOnClose_StreamingTabUntouched(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	model.tabs.ActiveTab().Streaming = true
+	model.tabs.SwitchToTarget("e647")
+
+	abortRitualOnClose(model)
+
+	assert.Empty(t, mock.cancelledChannels, "a streaming tab's ritual must not be touched")
+}
+
+// TestAbortRitualOnClose_NonRitualTabNoop verifies that closing a plain minister
+// tab never talks to the court.
+func TestAbortRitualOnClose_NonRitualTabNoop(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.SwitchTo(0)
+
+	abortRitualOnClose(model)
+
+	assert.Empty(t, mock.resumedChannels)
+	assert.Empty(t, mock.cancelledChannels)
+}
+
+// TestHandleQuitCommand_PausedRitualTabAbortsThenCloses is the end-to-end shape
+// of the acceptance criterion: :q on a paused ritual tab aborts the ritual and
+// removes the tab.
+func TestHandleQuitCommand_PausedRitualTabAbortsThenCloses(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+	initialTabs := model.tabs.TabCount()
+
+	model.tabs.Add("Ritual:e647", "ritual", "e647")
+	model.tabs.ActiveTab().ChatMode = true
+	model.tabs.SwitchToTarget("e647")
+
+	cmd := handleQuitCommand(model, []string{})
+	require.Nil(t, cmd, "closing a tab returns no tea.Cmd")
+
+	assert.Equal(t, []string{"e647"}, mock.cancelledChannels,
+		":q must abort the paused ritual through the court")
+	assert.Equal(t, initialTabs, model.tabs.TabCount(), "the tab must be closed")
+	assert.Nil(t, model.tabs.TabByTarget("e647"), "the ritual tab must be gone")
 }

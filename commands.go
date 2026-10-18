@@ -217,6 +217,7 @@ func handleNewSessionCommand(model *TUIModel, args []string) tea.Cmd {
 func handleQuitCommand(model *TUIModel, args []string) tea.Cmd {
 	// If multiple tabs exist, close the current tab (like Vim's :quit)
 	if model.tabs.TabCount() > 1 {
+		abortRitualOnClose(model)
 		err := model.tabs.Close()
 		if err != nil {
 			model.commandLine.AddToast(err.Error(), "error", time.Second*3)
@@ -943,6 +944,7 @@ func addMinisterTab(model *TUIModel, defsByID map[string]ministers.MinisterDef, 
 }
 
 func handleTabCloseCommand(model *TUIModel, args []string) tea.Cmd {
+	abortRitualOnClose(model)
 	err := model.tabs.Close()
 	if err != nil {
 		model.commandLine.AddToast(err.Error(), "error", time.Second*3)
@@ -950,6 +952,33 @@ func handleTabCloseCommand(model *TUIModel, args []string) tea.Cmd {
 	}
 	model.commandLine.AddToast("Tab closed", "success", time.Second*2)
 	return nil
+}
+
+// abortRitualOnClose tears down any ritual bound to the active tab before the
+// tab is removed. A paused ritual keeps its goroutine alive (CTRL-C only
+// pauses), so merely deleting the tab orphans it and leaves the court's
+// single-flight latch held — every subsequent ritual would queue forever.
+// Mirroring :abort, we resume the paused channel to unblock the goroutine, then
+// cancel its context to abort the ritual. Streaming tabs are left alone: Close
+// refuses those anyway.
+func abortRitualOnClose(model *TUIModel) {
+	tab := model.tabs.ActiveTab()
+	if tab == nil || tab.Type != "ritual" || !isRitualChannel(tab.Target) {
+		return
+	}
+	if tab.Streaming {
+		// Close will refuse; leave the running ritual untouched.
+		return
+	}
+	if model.court == nil {
+		return
+	}
+	if tab.ChatMode {
+		model.court.ResumeRitual(tab.Target)
+		model.tabs.SetTabChatMode(tab.Target, false)
+	}
+	// CancelTab aborts the ritual goroutine; Close cancels the tab context.
+	model.court.CancelTab(tab.Target)
 }
 
 // handleContinueCommand resumes a paused ritual or enacts a fresh swift-strike

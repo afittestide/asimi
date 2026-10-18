@@ -51,10 +51,20 @@ run:
 # `set -e` is load-bearing: `just test-race` is not the final command, so
 # without it a failing race step would be silently swallowed and the recipe
 # would still exit 0.
+#
+# The build throttle mirrors the sandbox image defaults (edict 948): cold
+# parallel compilation of the full ./... tree (modernc.org/sqlite/lib,
+# aws-sdk-go-v2/service/s3) OOM-kills the compiler in the ~2GiB sandbox, which
+# surfaces as `compile: signal: killed` → `[build failed]` and makes the
+# swift-strike judge gate misread a resource failure as a test failure. These
+# only serialize compilation; no test is skipped or weakened.
 test:
     #!/usr/bin/env bash
     set -euo pipefail
     export GOTOOLCHAIN=auto
+    export GOFLAGS="-p=1"
+    export GOMAXPROCS=2
+    export GOMEMLIMIT=1500MiB
     if [ -n "${CI:-}" ]; then
         go test -tags containers_image_openpgp -timeout 5m -v ./...
     else
@@ -74,7 +84,10 @@ test-race *packages="./court/":
     #!/usr/bin/env bash
     set -o pipefail
     export GOTOOLCHAIN=auto
-    go test -race -tags containers_image_openpgp -timeout 10m {{packages}}
+    export GOFLAGS="-p=1"
+    export GOMAXPROCS=2
+    export GOMEMLIMIT=1500MiB
+    go test -race -parallel 1 -tags containers_image_openpgp -timeout 10m {{packages}}
 
 # Run performance benchmarks and guardrail tests
 test-performance:
