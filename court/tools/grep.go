@@ -43,11 +43,12 @@ func (t GrepTool) Call(ctx context.Context, input string) (string, error) {
 	if params.Path == "" {
 		params.Path = "."
 	}
-	if t.ProjectRoot != "" && !filepath.IsAbs(params.Path) {
-		params.Path = filepath.Join(t.ProjectRoot, params.Path)
+	root := resolvedRoot(ctx, t.ProjectRoot)
+	if root != "" && !filepath.IsAbs(params.Path) {
+		params.Path = filepath.Join(root, params.Path)
 	}
 
-	if err := ValidatePathWithinProject(params.Path, t.ProjectRoot); err != nil {
+	if err := ValidatePathWithinProject(params.Path, root); err != nil {
 		return "", err
 	}
 

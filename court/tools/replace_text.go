@@ -38,12 +38,13 @@ func (t ReplaceTextTool) Call(ctx context.Context, input string) (string, error)
 		return "", fmt.Errorf("invalid input: %w. The input should be a JSON object with 'path', 'old_text', and 'new_text' fields", err)
 	}
 
+	root := resolvedRoot(ctx, t.ProjectRoot)
 	// Validate that the path is within the project root
-	if err := ValidatePathWithinProject(params.Path, t.ProjectRoot); err != nil {
+	if err := ValidatePathWithinProject(params.Path, root); err != nil {
 		return "", err
 	}
 
-	resolvedPath := ResolvePath(params.Path, t.ProjectRoot)
+	resolvedPath := ResolvePath(params.Path, root)
 
 	content, err := os.ReadFile(resolvedPath)
 	if err != nil {

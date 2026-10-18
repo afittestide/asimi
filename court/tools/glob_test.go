@@ -154,3 +154,32 @@ func TestGlobTool_ExplicitProjectRootDiffersFromGetwd(t *testing.T) {
 		}
 	})
 }
+
+// TestGlobTool_WorktreeContext verifies that a context-carried RepoInfo
+// (edict 943) routes globbing into the edict's worktree.
+func TestGlobTool_WorktreeContext(t *testing.T) {
+	mainRoot := t.TempDir()
+	wtRel := filepath.Join(".agents", "worktrees", "e42")
+	if err := os.MkdirAll(filepath.Join(mainRoot, wtRel), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(mainRoot, "main_only.go"), []byte("package main"), 0644)
+	os.WriteFile(filepath.Join(mainRoot, wtRel, "wt_only.go"), []byte("package main"), 0644)
+
+	tool := GlobTool{ProjectRoot: mainRoot}
+	ctx := worktreeCtx(mainRoot, wtRel)
+
+	result, err := tool.Call(ctx, `{"pattern": "**/*.go"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !containsLine(result, filepath.Join(mainRoot, wtRel, "wt_only.go")) {
+		t.Errorf("expected worktree file in results, got %q", result)
+	}
+	if containsLine(result, filepath.Join(mainRoot, "main_only.go")) {
+		t.Error("main tree file leaked into worktree-context glob")
+	}
+	if tool.ProjectRoot != mainRoot {
+		t.Errorf("registered ProjectRoot mutated: %q", tool.ProjectRoot)
+	}
+}

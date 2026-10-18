@@ -58,12 +58,13 @@ func (t WriteFileTool) Call(ctx context.Context, input string) (string, error) {
 	// Clean up path - remove surrounding quotes if any (handles LLM adding extra quotes)
 	params.Path = strings.Trim(params.Path, `"'`)
 
+	root := resolvedRoot(ctx, t.ProjectRoot)
 	// Validate that the path is within the project root
-	if err := ValidatePathWithinProject(params.Path, t.ProjectRoot); err != nil {
+	if err := ValidatePathWithinProject(params.Path, root); err != nil {
 		return "", err
 	}
 
-	resolvedPath := ResolvePath(params.Path, t.ProjectRoot)
+	resolvedPath := ResolvePath(params.Path, root)
 
 	// Create parent directory if it doesn't exist
 	dir := filepath.Dir(resolvedPath)

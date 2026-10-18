@@ -112,3 +112,32 @@ func TestReadManyFilesTool_NoProjectRoot(t *testing.T) {
 		t.Error("expected hello.txt content when ProjectRoot is set")
 	}
 }
+
+// TestReadManyFilesTool_WorktreeContext verifies that a context-carried RepoInfo
+// (edict 943) routes globbed reads into the edict's worktree.
+func TestReadManyFilesTool_WorktreeContext(t *testing.T) {
+	mainRoot := t.TempDir()
+	wtRel := filepath.Join(".agents", "worktrees", "e42")
+	if err := os.MkdirAll(filepath.Join(mainRoot, wtRel), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(mainRoot, "hello.txt"), []byte("main world"), 0644)
+	os.WriteFile(filepath.Join(mainRoot, wtRel, "hello.txt"), []byte("worktree world"), 0644)
+
+	tool := ReadManyFilesTool{ProjectRoot: mainRoot}
+	ctx := worktreeCtx(mainRoot, wtRel)
+
+	result, err := tool.Call(ctx, `{"paths": ["*.txt"]}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "worktree world") {
+		t.Errorf("expected worktree content, got %q", result)
+	}
+	if strings.Contains(result, "main world") {
+		t.Error("main tree file leaked into worktree-context read")
+	}
+	if tool.ProjectRoot != mainRoot {
+		t.Errorf("registered ProjectRoot mutated: %q", tool.ProjectRoot)
+	}
+}

@@ -40,6 +40,17 @@ func ResolvePath(path, projectRoot string) string {
 	return abs
 }
 
+// resolvedRoot returns the context-propagated effective root when present, else
+// the tool's registered projectRoot, preserving behavior outside rituals.
+func resolvedRoot(ctx context.Context, registered string) string {
+	if ri, ok := RepoInfoFromContext(ctx); ok {
+		if r := ri.EffectiveRoot(); r != "" {
+			return r
+		}
+	}
+	return registered
+}
+
 // ValidatePathWithinProject checks if a file path is within the project root directory.
 // It prevents path traversal attacks and ensures files are only modified within the project tree.
 // Returns an error if projectRoot is empty — SetContext is the sole authority for project root.

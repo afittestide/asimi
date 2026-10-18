@@ -1,11 +1,53 @@
 package tools
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/afittestide/asimi/internal/repo"
 )
+
+// TestResolvedRoot covers worktree-aware root resolution (edict 943): a context
+// RepoInfoKey carrying an edict worktree wins, the registered field is the
+// fallback, and the registered field is never mutated.
+func TestResolvedRoot(t *testing.T) {
+	t.Run("no context repo info falls back to registered root", func(t *testing.T) {
+		if got := resolvedRoot(context.Background(), "/main"); got != "/main" {
+			t.Errorf("resolvedRoot = %q, want /main", got)
+		}
+	})
+
+	t.Run("context repo info with worktree wins", func(t *testing.T) {
+		ctx := context.WithValue(context.Background(), RepoInfoKey{}, repo.RepoInfo{
+			ProjectRoot:  "/main",
+			WorktreePath: ".agents/worktrees/e42",
+			IsWorktree:   true,
+		})
+		if got := resolvedRoot(ctx, "/main"); got != "/main/.agents/worktrees/e42" {
+			t.Errorf("resolvedRoot = %q, want /main/.agents/worktrees/e42", got)
+		}
+	})
+
+	t.Run("empty effective root falls back to registered root", func(t *testing.T) {
+		ctx := context.WithValue(context.Background(), RepoInfoKey{}, repo.RepoInfo{})
+		if got := resolvedRoot(ctx, "/main"); got != "/main" {
+			t.Errorf("resolvedRoot = %q, want /main", got)
+		}
+	})
+}
+
+// worktreeCtx builds a context carrying an edict's worktree-aware RepoInfo, as
+// Session.executeToolCall does at dispatch. edict 943.
+func worktreeCtx(mainRoot, worktree string) context.Context {
+	return context.WithValue(context.Background(), RepoInfoKey{}, repo.RepoInfo{
+		ProjectRoot:  mainRoot,
+		WorktreePath: worktree,
+		IsWorktree:   true,
+	})
+}
 
 func TestResolvePath(t *testing.T) {
 	t.Run("absolute path is cleaned", func(t *testing.T) {

@@ -201,3 +201,34 @@ func TestReplaceTextTool_Interface(t *testing.T) {
 		}
 	})
 }
+
+// TestReplaceTextTool_WorktreeContext verifies that a context-carried RepoInfo
+// (edict 943) routes replacements into the edict's worktree.
+func TestReplaceTextTool_WorktreeContext(t *testing.T) {
+	mainRoot := t.TempDir()
+	wtRel := filepath.Join(".agents", "worktrees", "e42")
+	if err := os.MkdirAll(filepath.Join(mainRoot, wtRel), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(mainRoot, "file.txt"), []byte("main tree"), 0644)
+	os.WriteFile(filepath.Join(mainRoot, wtRel, "file.txt"), []byte("worktree"), 0644)
+
+	tool := ReplaceTextTool{ProjectRoot: mainRoot}
+	ctx := worktreeCtx(mainRoot, wtRel)
+
+	if _, err := tool.Call(ctx, `{"path": "file.txt", "old_text": "worktree", "new_text": "edited"}`); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, _ := os.ReadFile(filepath.Join(mainRoot, wtRel, "file.txt"))
+	if string(got) != "edited" {
+		t.Errorf("worktree file = %q, want edited", string(got))
+	}
+	main, _ := os.ReadFile(filepath.Join(mainRoot, "file.txt"))
+	if string(main) != "main tree" {
+		t.Errorf("main file = %q, want untouched", string(main))
+	}
+	if tool.ProjectRoot != mainRoot {
+		t.Errorf("registered ProjectRoot mutated: %q", tool.ProjectRoot)
+	}
+}

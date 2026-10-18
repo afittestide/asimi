@@ -1683,6 +1683,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 			LLM:           cfg,
 			WorkingDir:    exec.repoInfo.EffectiveRoot(),
 			AtifAgentName: r.atifAgentName,
+			RepoInfo:      exec.repoInfo,
 		}
 		var err error
 		actSession, err = CreateSession(minister, minister.Model(), sessionConfig, notify, exec.ChannelID(), exec.EdictKey())

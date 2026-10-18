@@ -22,6 +22,7 @@ import (
 	"github.com/afittestide/asimi/internal"
 	"github.com/afittestide/asimi/internal/atif"
 	internalconfig "github.com/afittestide/asimi/internal/config"
+	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/vmihailenco/msgpack/v5"
@@ -325,6 +326,7 @@ type SessionConfig struct {
 	RunShellCommand internalconfig.RunShellCommandConfig
 	WorkingDir      string
 	AtifAgentName   string // non-empty enables ATIF trajectory recording
+	RepoInfo        repo.RepoInfo
 }
 
 // Session represents a chat session for a minister
@@ -338,6 +340,11 @@ type Session struct {
 	WorkingDir  string    `json:"working_dir"`
 	ProjectSlug string    `json:"project_slug,omitempty"`
 	TabType     string    `json:"tab_type,omitempty"`
+
+	// RepoInfo is the edict's repo info (worktree-aware) carried into each tool
+	// call's context so 地 file tools resolve against the edict's effective root.
+	// Runtime state, not part of the persisted public contract.
+	RepoInfo repo.RepoInfo `json:"-"`
 
 	// ReasoningEffort, when non-empty, sets the reasoning.effort parameter on
 	// outgoing chat requests ("low" | "medium" | "high"). Set by ritual steps
@@ -466,6 +473,7 @@ func NewSession(
 		session.config = &cfg.LLM
 		session.Provider = cfg.LLM.Provider
 		session.Model = cfg.LLM.Model
+		session.RepoInfo = cfg.RepoInfo
 		// The resolved reasoning effort (CLI flag > env var > config > default)
 		// becomes the session's default. Ritual-level `effort:` overrides (set on
 		// the session per step) take precedence for the steps that declare one.
@@ -2101,6 +2109,9 @@ func hasToolCallResponse(toolMessages []schemas.ChatMessage, toolCallID string) 
 func (s *Session) executeToolCall(ctx context.Context, tool Tool, toolCallID, toolName, argsJSON string) schemas.ChatMessage {
 	ctx = context.WithValue(ctx, tools.SessionIDKey{}, s.ID)
 	ctx = context.WithValue(ctx, tools.ChannelIDKey{}, s.channelID)
+	if s.RepoInfo.ProjectRoot != "" {
+		ctx = context.WithValue(ctx, tools.RepoInfoKey{}, s.RepoInfo)
+	}
 	var out string
 	var callErr error
 

@@ -14,6 +14,7 @@ import (
 	"github.com/afittestide/asimi/court/tools"
 	internalconfig "github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/mocks"
+	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
@@ -3112,6 +3113,56 @@ func (t *sessionIDCaptureTool) Format(input, result string, err error) string {
 }
 func (t *sessionIDCaptureTool) ParameterSchema() map[string]any {
 	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
+// repoInfoCaptureTool captures the per-call RepoInfo from the context.
+type repoInfoCaptureTool struct {
+	captured repo.RepoInfo
+	found    bool
+}
+
+func (t *repoInfoCaptureTool) Name() string        { return "capture_repo_info" }
+func (t *repoInfoCaptureTool) Description() string { return "Captures repo info from context" }
+func (t *repoInfoCaptureTool) Call(ctx context.Context, input string) (string, error) {
+	t.captured, t.found = tools.RepoInfoFromContext(ctx)
+	return "ok", nil
+}
+func (t *repoInfoCaptureTool) Format(input, result string, err error) string {
+	return result
+}
+func (t *repoInfoCaptureTool) ParameterSchema() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
+// TestExecuteToolCall_InjectsRepoInfoIntoContext verifies that executeToolCall
+// carries the session's (worktree-aware) RepoInfo into the tool call context,
+// and that the zero RepoInfo injects nothing. (edict 943)
+func TestExecuteToolCall_InjectsRepoInfoIntoContext(t *testing.T) {
+	mockLLM := mocks.NewLLMProvider()
+
+	t.Run("session repo info is propagated", func(t *testing.T) {
+		captureTool := &repoInfoCaptureTool{}
+		want := repo.RepoInfo{
+			ProjectRoot:  "/main",
+			WorktreePath: ".agents/worktrees/e42",
+			IsWorktree:   true,
+		}
+		sess, err := NewSession(mockLLM, &SessionConfig{RepoInfo: want}, []Tool{captureTool}, nil, func(any) {}, "", "test-channel")
+		require.NoError(t, err)
+
+		sess.executeToolCall(context.Background(), captureTool, "call-1", "capture_repo_info", `{}`)
+		assert.True(t, captureTool.found)
+		assert.Equal(t, want, captureTool.captured)
+	})
+
+	t.Run("zero repo info injects nothing", func(t *testing.T) {
+		captureTool := &repoInfoCaptureTool{}
+		sess, err := NewSession(mockLLM, &SessionConfig{}, []Tool{captureTool}, nil, func(any) {}, "", "test-channel")
+		require.NoError(t, err)
+
+		sess.executeToolCall(context.Background(), captureTool, "call-1", "capture_repo_info", `{}`)
+		assert.False(t, captureTool.found)
+	})
 }
 
 // TestExecuteToolCall_InjectsSessionIDIntoContext verifies that

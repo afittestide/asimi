@@ -525,3 +525,39 @@ func TestReadFileTool_ExplicitProjectRootDiffersFromGetwd(t *testing.T) {
 		}
 	})
 }
+
+// TestReadFileTool_WorktreeContext verifies that a context-carried RepoInfo
+// (edict 943) routes reads into the edict's worktree, not the main tree.
+func TestReadFileTool_WorktreeContext(t *testing.T) {
+	mainRoot := t.TempDir()
+	wtRel := filepath.Join(".agents", "worktrees", "e42")
+	if err := os.MkdirAll(filepath.Join(mainRoot, wtRel), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Same relative path in both trees, different content.
+	os.WriteFile(filepath.Join(mainRoot, "file.txt"), []byte("main tree"), 0644)
+	os.WriteFile(filepath.Join(mainRoot, wtRel, "file.txt"), []byte("worktree"), 0644)
+
+	tool := NewReadFileTool(mainRoot)
+	ctx := worktreeCtx(mainRoot, wtRel)
+
+	result, err := tool.Call(ctx, `{"path": "file.txt"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "worktree" {
+		t.Errorf("read %q, want worktree content", result)
+	}
+	if tool.ProjectRoot != mainRoot {
+		t.Errorf("registered ProjectRoot mutated: %q", tool.ProjectRoot)
+	}
+
+	// Without the context value the tool resolves against ProjectRoot as before.
+	result, err = tool.Call(context.Background(), `{"path": "file.txt"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "main tree" {
+		t.Errorf("read %q, want main tree content", result)
+	}
+}

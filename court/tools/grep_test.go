@@ -137,3 +137,32 @@ func TestGrepTool_ExplicitProjectRootDiffersFromGetwd(t *testing.T) {
 		}
 	})
 }
+
+// TestGrepTool_WorktreeContext verifies that a context-carried RepoInfo
+// (edict 943) routes searching into the edict's worktree.
+func TestGrepTool_WorktreeContext(t *testing.T) {
+	mainRoot := t.TempDir()
+	wtRel := filepath.Join(".agents", "worktrees", "e42")
+	if err := os.MkdirAll(filepath.Join(mainRoot, wtRel), 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(mainRoot, "main.txt"), []byte("needle in main"), 0644)
+	os.WriteFile(filepath.Join(mainRoot, wtRel, "wt.txt"), []byte("needle in worktree"), 0644)
+
+	tool := GrepTool{ProjectRoot: mainRoot}
+	ctx := worktreeCtx(mainRoot, wtRel)
+
+	result, err := tool.Call(ctx, `{"pattern": "needle", "path": "."}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "wt.txt") {
+		t.Errorf("expected worktree match, got %q", result)
+	}
+	if strings.Contains(result, "main.txt") {
+		t.Error("main tree file leaked into worktree-context grep")
+	}
+	if tool.ProjectRoot != mainRoot {
+		t.Errorf("registered ProjectRoot mutated: %q", tool.ProjectRoot)
+	}
+}

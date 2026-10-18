@@ -38,6 +38,19 @@ func ChannelIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// RepoInfoKey carries the executing edict's repo info (worktree-aware) so path
+// tools resolve against the edict's effective root rather than the Court-wide
+// project root. Carried per call; never the shared Court RepoInfo pointer.
+type RepoInfoKey struct{}
+
+// RepoInfoFromContext returns the per-call repo info, or the zero value when unset.
+func RepoInfoFromContext(ctx context.Context) (repo.RepoInfo, bool) {
+	if v, ok := ctx.Value(RepoInfoKey{}).(repo.RepoInfo); ok {
+		return v, true
+	}
+	return repo.RepoInfo{}, false
+}
+
 // ToolContext carries shared identity and daemon-level resources to all tools.
 // RepoInfo is a pointer so all contexts see live state (ProjectRoot, Branch, etc.)
 // MinisterID is the one field that varies per minister tool set.

@@ -432,3 +432,30 @@ func TestWriteFileTool_ExplicitProjectRootDiffersFromGetwd(t *testing.T) {
 		}
 	})
 }
+
+// TestWriteFileTool_WorktreeContext verifies that a context-carried RepoInfo
+// (edict 943) routes writes into the edict's worktree, leaving main untouched.
+func TestWriteFileTool_WorktreeContext(t *testing.T) {
+	mainRoot := t.TempDir()
+	wtRel := filepath.Join(".agents", "worktrees", "e42")
+	if err := os.MkdirAll(filepath.Join(mainRoot, wtRel), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := WriteFileTool{ProjectRoot: mainRoot}
+	ctx := worktreeCtx(mainRoot, wtRel)
+
+	if _, err := tool.Call(ctx, `{"path": "out.txt", "content": "hello"}`); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(mainRoot, wtRel, "out.txt")); err != nil {
+		t.Errorf("expected file in worktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mainRoot, "out.txt")); err == nil {
+		t.Error("main tree was polluted by a worktree-context write")
+	}
+	if tool.ProjectRoot != mainRoot {
+		t.Errorf("registered ProjectRoot mutated: %q", tool.ProjectRoot)
+	}
+}

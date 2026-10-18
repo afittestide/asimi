@@ -69,11 +69,12 @@ func (t ReadFileTool) Call(ctx context.Context, input string) (string, error) {
 	// Clean up the path to remove any surrounding quotes
 	params.Path = strings.Trim(params.Path, `"'`)
 
-	if err := ValidatePathWithinProject(params.Path, t.ProjectRoot); err != nil {
+	root := resolvedRoot(ctx, t.ProjectRoot)
+	if err := ValidatePathWithinProject(params.Path, root); err != nil {
 		return "", err
 	}
 
-	resolvedPath := ResolvePath(params.Path, t.ProjectRoot)
+	resolvedPath := ResolvePath(params.Path, root)
 
 	// Read file content
 	content, err := os.ReadFile(resolvedPath)

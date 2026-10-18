@@ -40,9 +40,10 @@ func (t GlobTool) Call(ctx context.Context, input string) (string, error) {
 		params.Pattern = "*"
 	}
 
+	root := resolvedRoot(ctx, t.ProjectRoot)
 	// If ProjectRoot is set and pattern is not absolute, join with ProjectRoot
-	if t.ProjectRoot != "" && !filepath.IsAbs(params.Pattern) {
-		params.Pattern = filepath.Join(t.ProjectRoot, params.Pattern)
+	if root != "" && !filepath.IsAbs(params.Pattern) {
+		params.Pattern = filepath.Join(root, params.Pattern)
 	}
 
 	var matches []string
@@ -51,7 +52,7 @@ func (t GlobTool) Call(ctx context.Context, input string) (string, error) {
 	// Handle patterns starting with "**/"
 	if strings.HasPrefix(params.Pattern, "**/") {
 		subpattern := strings.TrimPrefix(params.Pattern, "**/")
-		baseDir := t.ProjectRoot
+		baseDir := root
 		if baseDir == "" {
 			baseDir = "."
 		}
@@ -67,7 +68,7 @@ func (t GlobTool) Call(ctx context.Context, input string) (string, error) {
 	var results []string
 	maxResults := 200
 	for _, path := range matches {
-		if err := ValidatePathWithinProject(path, t.ProjectRoot); err != nil {
+		if err := ValidatePathWithinProject(path, root); err != nil {
 			continue
 		}
 		results = append(results, path)

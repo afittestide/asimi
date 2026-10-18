@@ -37,13 +37,14 @@ func (t ReadManyFilesTool) Call(ctx context.Context, input string) (string, erro
 		return "", fmt.Errorf("invalid input: %w. The input should be a JSON object with a 'paths' field", err)
 	}
 
+	root := resolvedRoot(ctx, t.ProjectRoot)
 	var contentBuilder strings.Builder
 	var allMatches []string
 
 	for _, pattern := range params.Paths {
 		// If ProjectRoot is set and pattern is not absolute, join with ProjectRoot
-		if t.ProjectRoot != "" && !filepath.IsAbs(pattern) {
-			pattern = filepath.Join(t.ProjectRoot, pattern)
+		if root != "" && !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(root, pattern)
 		}
 		matches, err := filepathx.Glob(pattern)
 		if err != nil {
@@ -64,7 +65,7 @@ func (t ReadManyFilesTool) Call(ctx context.Context, input string) (string, erro
 	}
 
 	for _, path := range uniqueMatches {
-		if err := ValidatePathWithinProject(path, t.ProjectRoot); err != nil {
+		if err := ValidatePathWithinProject(path, root); err != nil {
 			// Skip files outside the project directory
 			continue
 		}
