@@ -508,6 +508,13 @@ func branchFromDetachedHead(projectRoot string) string {
 // isMainBranch checks if the given branch name is considered a main branch.
 // Currently checks for "main" and "master".
 func isMainBranch(branch string) bool {
+	return IsMainBranch(branch)
+}
+
+// IsMainBranch reports whether branch is a repository default branch
+// ("main" or "master"). Exported so callers outside this package (e.g. the
+// `:switch` command) can classify a branch without duplicating the rule.
+func IsMainBranch(branch string) bool {
 	return branch == "main" || branch == "master"
 }
 

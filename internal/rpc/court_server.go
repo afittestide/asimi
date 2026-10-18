@@ -352,6 +352,18 @@ func RegisterCourtHandlers(c *Conn, impl courtapi.Client) {
 		}
 		return wire.Encode(GetSessionExportResult{Export: exp})
 	})
+
+	c.Handle(MethodEnsureEdictWorktree, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p EnsureEdictWorktreeParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		rel, err := impl.EnsureEdictWorktree(ctx, p.EdictID)
+		if err != nil {
+			return nil, err
+		}
+		return wire.Encode(EnsureEdictWorktreeResult{WorktreeRel: rel})
+	})
 }
 
 // ServeCourtNotifications drives the server-side notification pump:

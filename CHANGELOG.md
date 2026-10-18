@@ -5,6 +5,12 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`:switch <target>`** — move the whole Court between branches and edict worktrees in place, without exiting Asimi and starting a new instance: `:switch e123` enters (creating it when missing) edict 123's worktree on `asimi/e123`, `:switch main` returns to the main working tree, and `:switch <branch>` resolves a named branch to its linked worktree via `git worktree list`. The switch re-targets every minister, the RitualRunner, and the shell runner through the existing `SetContext` path, then resets all tabs to the default minister tabs; it refuses while any tab is streaming (e952)
+
 ## [0.14.5] - 2026-10-11
 
 ### Added

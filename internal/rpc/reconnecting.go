@@ -668,6 +668,23 @@ func (rc *ReconnectingClient) SetContext(ctx context.Context, params types.SetCo
 	return err
 }
 
+// EnsureEdictWorktree creates edictID's worktree on the court's side of the
+// wire and returns its project-root-relative path, retrying on a broken
+// connection like other methods.
+func (rc *ReconnectingClient) EnsureEdictWorktree(ctx context.Context, edictID uint) (string, error) {
+	client := rc.getClient()
+	if client == nil {
+		return "", ErrClosed
+	}
+	rel, err := client.EnsureEdictWorktree(ctx, edictID)
+	if rc.reconnectIfError(err, rc.shouldRetry) {
+		if client = rc.getClient(); client != nil {
+			return client.EnsureEdictWorktree(ctx, edictID)
+		}
+	}
+	return rel, err
+}
+
 // ConnDone returns a channel that is closed when the current underlying
 // connection drops. Callers should re-call ConnDone after a reconnect
 // to get the new connection's channel. Returns a never-closed channel

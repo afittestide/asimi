@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/afittestide/asimi/internal/config"
+	"github.com/afittestide/asimi/internal/ministers"
 	"github.com/afittestide/asimi/internal/repo"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
@@ -704,4 +709,155 @@ func TestSaveProjectNameAndInit(t *testing.T) {
 
 	// cmd is nil from createInitEdict
 	assert.Nil(t, cmd)
+}
+
+// testModelForSwitch builds a model whose repoInfo points at a temp project
+// root with a fake court recording SetContext/EnsureEdictWorktree calls.
+func testModelForSwitch(t *testing.T) (*TUIModel, *mockCourtClient, string) {
+	t.Helper()
+	root := t.TempDir()
+	mock := &mockCourtClient{}
+
+	prev := resolveSwitchTarget
+	resolveSwitchTarget = func(_ context.Context, gotRoot, target string) (worktree.ResolvedTarget, error) {
+		switch {
+		case target == "main" || target == "master":
+			return worktree.ResolvedTarget{Branch: "main"}, nil
+		case strings.HasPrefix(target, "e"):
+			var id uint
+			_, err := fmt.Sscanf(target, "e%d", &id)
+			if err != nil {
+				return worktree.ResolvedTarget{}, err
+			}
+			return worktree.ResolvedTarget{
+				Branch:      worktree.Branch(id),
+				WorktreeRel: worktree.RelPath(id),
+				IsWorktree:  true,
+				EdictID:     id,
+			}, nil
+		default:
+			return worktree.ResolvedTarget{Branch: target}, nil
+		}
+	}
+	t.Cleanup(func() { resolveSwitchTarget = prev })
+
+	model := newTestModel(t)
+	model.court = mock
+	model.status.SetRepoInfo(&repo.RepoInfo{
+		ProjectRoot: root,
+		Branch:      "main",
+		HasVCS:      true,
+		IsMain:      true,
+	})
+	model.repoInfo = model.status.repoInfo
+	model.tabs.DismissWelcome()
+	return model, mock, root
+}
+
+func TestHandleSwitchCommand_RequiresOneArg(t *testing.T) {
+	model, _, _ := testModelForSwitch(t)
+
+	require.Nil(t, handleSwitchCommand(model, nil))
+	toasts := model.commandLine.ActiveToasts()
+	require.Len(t, toasts, 1)
+	assert.Contains(t, toasts[0].Message, "Usage: :switch")
+	assert.Equal(t, "error", toasts[0].Type)
+}
+
+func TestHandleSwitchCommand_RefusesWhileStreaming(t *testing.T) {
+	model, mock, _ := testModelForSwitch(t)
+	model.tabs.Add("chat2", TabType("chat"), "target2")
+	model.tabs.ActiveTab().Streaming = true
+
+	require.Nil(t, handleSwitchCommand(model, []string{"main"}))
+
+	toasts := model.commandLine.ActiveToasts()
+	require.Len(t, toasts, 1)
+	assert.Equal(t, "Cannot switch while a tab is streaming", toasts[0].Message)
+	assert.Equal(t, "error", toasts[0].Type)
+	assert.Empty(t, mock.setContextCalls, "no SetContext may happen while streaming")
+	assert.Equal(t, "main", model.repoInfo.Branch, "repoInfo must be untouched on refusal")
+}
+
+func TestHandleSwitchCommand_Main(t *testing.T) {
+	model, mock, root := testModelForSwitch(t)
+	// Pretend the court is currently in a worktree.
+	model.repoInfo.WorktreePath = filepath.Join(".agents", "worktrees", "e1")
+	model.repoInfo.IsWorktree = true
+	model.repoInfo.IsMain = false
+
+	cmd := handleSwitchCommand(model, []string{"main"})
+	require.NotNil(t, cmd, ":switch must return a tea.Cmd that re-targets the court")
+
+	assert.Equal(t, "main", model.repoInfo.Branch)
+	assert.Equal(t, "", model.repoInfo.WorktreePath)
+	assert.False(t, model.repoInfo.IsWorktree)
+	assert.True(t, model.repoInfo.IsMain)
+	assert.Empty(t, mock.ensuredWorktreeIDs, "main must not create a worktree")
+
+	msg := cmd()
+	assert.IsType(t, repoSwitchedMsg{}, msg)
+	require.Len(t, mock.setContextCalls, 1, "SetContext must be called once")
+	assert.Equal(t, root, mock.setContextCalls[0].ProjectRoot)
+	assert.Equal(t, "main", mock.setContextCalls[0].Branch)
+	assert.Equal(t, "", mock.setContextCalls[0].WorktreePath)
+}
+
+func TestHandleSwitchCommand_EdictEnsuresMissingWorktree(t *testing.T) {
+	model, mock, root := testModelForSwitch(t)
+
+	cmd := handleSwitchCommand(model, []string{"e999"})
+	require.NotNil(t, cmd)
+
+	require.Equal(t, []uint{999}, mock.ensuredWorktreeIDs, "missing worktree must be created")
+	assert.Equal(t, "asimi/e999", model.repoInfo.Branch)
+	assert.Equal(t, filepath.Join(".agents", "worktrees", "e999"), model.repoInfo.WorktreePath)
+	assert.True(t, model.repoInfo.IsWorktree)
+	assert.False(t, model.repoInfo.IsMain)
+
+	msg := cmd()
+	assert.IsType(t, repoSwitchedMsg{}, msg)
+	require.Len(t, mock.setContextCalls, 1)
+	assert.Equal(t, root, mock.setContextCalls[0].ProjectRoot)
+	assert.Equal(t, "asimi/e999", mock.setContextCalls[0].Branch)
+	assert.Equal(t, filepath.Join(".agents", "worktrees", "e999"), mock.setContextCalls[0].WorktreePath)
+}
+
+func TestHandleSwitchCommand_EdictReusesExistingWorktree(t *testing.T) {
+	model, mock, root := testModelForSwitch(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e999"), 0o755))
+
+	cmd := handleSwitchCommand(model, []string{"e999"})
+	require.NotNil(t, cmd)
+	assert.Empty(t, mock.ensuredWorktreeIDs, "existing worktree must be reused without Ensure")
+	assert.Equal(t, "asimi/e999", model.repoInfo.Branch)
+}
+
+func TestHandleSwitchCommand_UnknownBranchFallsBackToBranchString(t *testing.T) {
+	model, mock, root := testModelForSwitch(t)
+
+	cmd := handleSwitchCommand(model, []string{"feature/x"})
+	require.NotNil(t, cmd)
+
+	assert.Equal(t, "feature/x", model.repoInfo.Branch)
+	assert.Equal(t, "", model.repoInfo.WorktreePath)
+	assert.False(t, model.repoInfo.IsWorktree)
+	assert.False(t, model.repoInfo.IsMain)
+
+	msg := cmd()
+	assert.IsType(t, repoSwitchedMsg{}, msg)
+	require.Len(t, mock.setContextCalls, 1)
+	assert.Equal(t, root, mock.setContextCalls[0].ProjectRoot)
+	assert.Equal(t, "feature/x", mock.setContextCalls[0].Branch)
+}
+
+func TestHandleSwitchCommand_ResetsTabs(t *testing.T) {
+	model, _, _ := testModelForSwitch(t)
+	model.tabs.Add("chat2", TabType("chat"), "target2")
+	require.Equal(t, len(ministers.DefaultTabIDs)+1, model.tabs.TabCount())
+
+	require.NotNil(t, handleSwitchCommand(model, []string{"main"}))
+
+	assert.Equal(t, len(ministers.DefaultTabIDs), model.tabs.TabCount(), "tabs must reset to defaults")
+	assert.Nil(t, model.tabs.TabByTarget("target2"), "extra tabs must be discarded")
 }

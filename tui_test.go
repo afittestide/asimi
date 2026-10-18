@@ -30,7 +30,9 @@ import (
 	"github.com/afittestide/asimi/internal/ministers"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/types"
 	"github.com/afittestide/asimi/internal/utils"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 
 	_ "modernc.org/sqlite"
@@ -3730,6 +3732,11 @@ type mockCourtClient struct {
 	resumedChannels     []string
 	cancelledChannels   []string
 
+	setContextFn       func(types.SetContextParams) error
+	setContextCalls    []types.SetContextParams
+	ensureWorktreeFn   func(uint) (string, error)
+	ensuredWorktreeIDs []uint
+
 	setIntentFn             func(uint, string) error
 	submitPromptTarget      string
 	submitPromptMsg         string
@@ -3765,6 +3772,22 @@ func (m *mockCourtClient) PublishEvent(key storage.EdictKey, eventType storage.C
 
 func (m *mockCourtClient) CreateEdictSilent(issueRef, intent, sessionID string) (*storage.Edict, error) {
 	return &storage.Edict{ID: 1, Intent: intent, IssueRef: issueRef}, nil
+}
+
+func (m *mockCourtClient) SetContext(_ context.Context, params types.SetContextParams) error {
+	m.setContextCalls = append(m.setContextCalls, params)
+	if m.setContextFn != nil {
+		return m.setContextFn(params)
+	}
+	return nil
+}
+
+func (m *mockCourtClient) EnsureEdictWorktree(_ context.Context, edictID uint) (string, error) {
+	m.ensuredWorktreeIDs = append(m.ensuredWorktreeIDs, edictID)
+	if m.ensureWorktreeFn != nil {
+		return m.ensureWorktreeFn(edictID)
+	}
+	return worktree.RelPath(edictID), nil
 }
 
 func (m *mockCourtClient) HandleZhengmingResponse(_ context.Context, requestID, answer string) error {
@@ -3842,6 +3865,20 @@ func (m *mockCourtClient) CancelTab(channelID string) {
 
 func (m *mockCourtClient) SessionState(target string) court.SessionState {
 	return court.SessionState{}
+}
+
+// repoSwitchedMsgRefresh verifies the TUI swallows the switch completion
+// message and refreshes the diff stats for the new root.
+func TestRepoSwitchedMsg_RefreshesDiff(t *testing.T) {
+	model := newTestModel(t)
+	model.repoInfo = &repo.RepoInfo{ProjectRoot: t.TempDir()}
+
+	newModel, cmd := model.Update(repoSwitchedMsg{})
+
+	require.Nil(t, cmd)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	require.NotNil(t, updated.repoInfo)
 }
 
 func (m *mockCourtClient) SubmitPrompt(targetID string, p *court.Prompt) error {

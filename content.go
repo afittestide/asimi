@@ -58,6 +58,8 @@ type TabManager struct {
 	showWelcome      bool        // True until the user presses any key; shows welcome screen
 	getUpdateAvail   func() bool // Returns whether an update is available
 	getConfigCreated func() bool // Returns whether config was created on first run
+	defs             []ministers.MinisterDef
+	loadSessionFn    func(sessionID string) tea.Cmd
 }
 
 // initTabGreetings seeds each tab's ChatComponent with its minister welcome
@@ -95,6 +97,7 @@ func NewTabManager(w, h int, mdEnabled bool, getStatus func() string, defs []min
 		markdownEnabled: mdEnabled,
 		getStatus:       getStatus,
 		showWelcome:     true,
+		defs:            defs,
 	}
 	// Seed each tab with its minister welcome greeting
 	return tm
@@ -385,9 +388,45 @@ func (tm *TabManager) Add(label string, tabType TabType, target string) {
 // SetLoadSessionFn wires a session-loading function into every tab's
 // ContentComponent so :resume uses the shared session store.
 func (tm *TabManager) SetLoadSessionFn(fn func(sessionID string) tea.Cmd) {
+	tm.loadSessionFn = fn
 	for i := range tm.tabs {
 		tm.tabs[i].Content.loadSessionFn = fn
 	}
+}
+
+// ResetToDefaults discards every tab (cancelling each tab's context) and
+// rebuilds the default minister tabs (Forge, Secretary, Judge, Chancellor),
+// re-seeding each greeting from the stored minister defs. It is the tab half of
+// `:switch`: the Court's base branch changed, so every per-tab session derived
+// from the old branch is stale. It returns false when a tab is streaming —
+// cancelling mid-stream would strand the in-flight response.
+func (tm *TabManager) ResetToDefaults() bool {
+	if tm.AnyStreaming() {
+		return false
+	}
+	for i := range tm.tabs {
+		if tm.tabs[i].Cancel != nil {
+			tm.tabs[i].Cancel()
+		}
+	}
+
+	defsByID := ministers.LookupMap(tm.defs)
+	tabs := make([]Tab, 0, len(ministers.DefaultTabIDs))
+	for _, id := range ministers.DefaultTabIDs {
+		d := defsByID[id]
+		c := newContentComponent(tm.width, tm.height, tm.markdownEnabled, tm.getStatus)
+		c.loadSessionFn = tm.loadSessionFn
+		tabs = append(tabs, NewTab(d.Label(), TabType(id), id, c))
+	}
+	tm.tabs = tabs
+	tm.activeTab = 0
+	tm.pendingG = false
+	tm.showWelcome = false
+	initTabGreetings(tm, tm.defs)
+	if tm.onTabSwitch != nil {
+		tm.onTabSwitch()
+	}
+	return true
 }
 
 // Close closes the active tab if safe to do so. The closing tab's context is

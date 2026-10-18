@@ -313,6 +313,18 @@ func (c *CourtClient) SetContext(ctx context.Context, params types.SetContextPar
 	return c.callVoid(ctx, MethodSetContext, params)
 }
 
+func (c *CourtClient) EnsureEdictWorktree(ctx context.Context, edictID uint) (string, error) {
+	raw, err := c.conn.Call(ctx, MethodEnsureEdictWorktree, EnsureEdictWorktreeParams{EdictID: edictID})
+	if err != nil {
+		return "", err
+	}
+	var r EnsureEdictWorktreeResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return "", fmt.Errorf("rpc: decode EnsureEdictWorktree result: %w", err)
+	}
+	return r.WorktreeRel, nil
+}
+
 func (c *CourtClient) GetSessionExport(tabTarget string) (*court.SessionExport, error) {
 	raw, err := c.conn.Call(context.Background(), MethodGetSessionExport, GetSessionExportParams{TabTarget: tabTarget})
 	if err != nil {
