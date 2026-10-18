@@ -12,6 +12,14 @@ COMMAND-LINE mode, then type the command and press Enter.
   :qa / :quitall    - Quit the application (all tabs)
   :update           - Check for and install updates
 
+## Navigation
+
+  :switch <target>  - Move the Court to a branch or edict worktree in place
+                      e123   → edict 123's worktree (branch asimi/e123); created if missing
+                      main   → the main working tree
+                      branch → a named branch, resolved to its worktree when one exists
+                      Refused while a tab is streaming; resets tabs to their defaults
+
 ## Information
 
   :help [topic]     - Show help (optionally for a specific topic)

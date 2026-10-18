@@ -39,4 +39,5 @@ const (
 	MethodResumeRitual           = "ResumeRitual"
 	MethodGetSessionExport       = "GetSessionExport"
 	MethodSetContext             = "SetContext"
+	MethodEnsureEdictWorktree    = "EnsureEdictWorktree"
 )

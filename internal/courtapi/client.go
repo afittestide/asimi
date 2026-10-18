@@ -76,6 +76,12 @@ type Client interface {
 	// each call reconfigures the LLM client.
 	SetContext(ctx context.Context, params types.SetContextParams) error
 
+	// EnsureEdictWorktree idempotently creates edictID's worktree (branch
+	// asimi/e<N>, `just install`, ignored-file copy) and returns its
+	// project-root-relative path. Wire-safe: the daemon performs the host
+	// repo mutation on its side of the socket. Used by `:switch e<N>`.
+	EnsureEdictWorktree(ctx context.Context, edictID uint) (string, error)
+
 	// ListModels lists models for a specific provider via the court's LLM
 	// client (bifrost). Used by the TUI's :models command.
 	ListModels(provider string) (*schemas.BifrostListModelsResponse, error)

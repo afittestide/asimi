@@ -210,3 +210,10 @@ type GetSessionExportParams struct {
 type GetSessionExportResult struct {
 	Export *court.SessionExport `msgpack:"export"`
 }
+
+type EnsureEdictWorktreeParams struct {
+	EdictID uint `msgpack:"edict_id"`
+}
+type EnsureEdictWorktreeResult struct {
+	WorktreeRel string `msgpack:"worktree_rel"`
+}

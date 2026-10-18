@@ -340,3 +340,89 @@ func runGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
 }
+
+func TestResolve_MainAndMaster(t *testing.T) {
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+	}}
+	for _, target := range []string{"main", "master"} {
+		got, err := Resolve(context.Background(), mock, t.TempDir(), target)
+		if err != nil {
+			t.Fatalf("Resolve(%q): %v", target, err)
+		}
+		if got.Branch != "main" || got.WorktreeRel != "" || got.IsWorktree || got.EdictID != 0 {
+			t.Errorf("Resolve(%q) = %+v, want main in-tree", target, got)
+		}
+	}
+}
+
+func TestResolve_EdictTarget(t *testing.T) {
+	got, err := Resolve(context.Background(), &recordingRunner{}, t.TempDir(), "e123")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.Branch != "asimi/e123" {
+		t.Errorf("Branch = %q, want asimi/e123", got.Branch)
+	}
+	if got.WorktreeRel != filepath.Join(".agents", "worktrees", "e123") {
+		t.Errorf("WorktreeRel = %q", got.WorktreeRel)
+	}
+	if !got.IsWorktree || got.EdictID != 123 {
+		t.Errorf("Resolve(e123) = %+v, want worktree for edict 123", got)
+	}
+}
+
+func TestResolve_PlainBranchWithNoWorktree(t *testing.T) {
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"worktree list": {Output: "worktree /tmp/repo\nbranch refs/heads/main\n", ExitCode: "0"},
+	}}
+	got, err := Resolve(context.Background(), mock, "/tmp/repo", "feature/x")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.Branch != "feature/x" || got.WorktreeRel != "" || got.IsWorktree {
+		t.Errorf("Resolve(feature/x) = %+v, want branch as-is", got)
+	}
+}
+
+func TestResolve_PlainBranchMatchingLinkedWorktree(t *testing.T) {
+	root := t.TempDir()
+	porcelain := "worktree " + root + "\nHEAD abc\nbranch refs/heads/main\n\n" +
+		"worktree " + filepath.Join(root, ".agents", "worktrees", "e55") + "\nHEAD def\nbranch refs/heads/feature/y\n"
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"worktree list": {Output: porcelain, ExitCode: "0"},
+	}}
+	got, err := Resolve(context.Background(), mock, root, "feature/y")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.Branch != "feature/y" {
+		t.Errorf("Branch = %q, want feature/y", got.Branch)
+	}
+	if !got.IsWorktree || got.WorktreeRel != filepath.Join(".agents", "worktrees", "e55") {
+		t.Errorf("Resolve(feature/y) = %+v, want linked worktree path", got)
+	}
+}
+
+// A path outside the project root must never be accepted, even when git
+// reports a branch match: the sandbox only bind-mounts ProjectRoot.
+func TestResolve_RejectsWorktreeOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	porcelain := "worktree /somewhere/else\nHEAD abc\nbranch refs/heads/feature/z\n"
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"worktree list": {Output: porcelain, ExitCode: "0"},
+	}}
+	got, err := Resolve(context.Background(), mock, root, "feature/z")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.IsWorktree || got.WorktreeRel != "" {
+		t.Errorf("Resolve(feature/z) = %+v, want no worktree path outside root", got)
+	}
+}
+
+func TestResolve_EmptyTarget(t *testing.T) {
+	if _, err := Resolve(context.Background(), &recordingRunner{}, t.TempDir(), "  "); err == nil {
+		t.Error("expected error for empty target")
+	}
+}

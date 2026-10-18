@@ -17,6 +17,7 @@ import (
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/utils"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -86,6 +87,7 @@ func NewCommandRegistry() CommandRegistry {
 	registry.RegisterCommand("edicts", "Manage edicts: read, enact, seal, resume, or cancel (usage: :edict [id] [enact|seal|resume|cancel])", handleEdictCommand)
 	registry.RegisterCommand("continue", "Resume a paused ritual on the current tab", handleContinueCommand)
 	registry.RegisterCommand("abort", "Abort a paused ritual on the current tab", handleAbortCommand)
+	registry.RegisterCommand("switch", "Switch to a branch or edict worktree (usage: :switch <main|e123|branch>)", handleSwitchCommand)
 
 	return registry
 }
@@ -1027,6 +1029,85 @@ func handleAbortCommand(model *TUIModel, args []string) tea.Cmd {
 	chat.AddMessage(fmt.Sprintf("%s✋ Ritual aborted by ruler", systemPrefix))
 	return nil
 }
+
+// resolveSwitchTarget maps a `:switch` target to its branch and worktree.
+// It is a variable so tests can drive the handler without invoking git.
+var resolveSwitchTarget = func(ctx context.Context, root, target string) (worktree.ResolvedTarget, error) {
+	return worktree.Resolve(ctx, runners.NewHostRunner(0, root), root, target)
+}
+
+// handleSwitchCommand moves the whole Court to a branch or edict worktree in
+// place, without exiting Asimi. The branch is global — every minister shares
+// the Court's repo context — so after re-targeting it the tab set is reset to
+// the default minister tabs, discarding sessions bound to the old branch.
+func handleSwitchCommand(model *TUIModel, args []string) tea.Cmd {
+	if len(args) != 1 {
+		model.commandLine.AddToast("Usage: :switch <main|e123|branch>", "error", 3*time.Second)
+		return nil
+	}
+	// Refuse mid-stream: switching would tear the ground out from under an
+	// in-flight response.
+	if model.tabs.AnyStreaming() {
+		model.commandLine.AddToast("Cannot switch while a tab is streaming", "error", 3*time.Second)
+		return nil
+	}
+	if model.repoInfo == nil {
+		model.commandLine.AddToast("No repository information available", "error", 3*time.Second)
+		return nil
+	}
+
+	target := args[0]
+	projectRoot := model.repoInfo.ProjectRoot
+	resolved, err := resolveSwitchTarget(context.Background(), projectRoot, target)
+	if err != nil {
+		model.commandLine.AddToast(fmt.Sprintf("Cannot switch to %s: %v", target, err), "error", 3*time.Second)
+		return nil
+	}
+
+	// Create the edict worktree when it is missing (git worktree add -B,
+	// `just install`, ignored-file copy).
+	if resolved.EdictID > 0 && model.court != nil {
+		if _, err := os.Stat(filepath.Join(projectRoot, resolved.WorktreeRel)); err != nil {
+			if _, err := model.court.EnsureEdictWorktree(context.Background(), resolved.EdictID); err != nil {
+				model.commandLine.AddToast(fmt.Sprintf("Failed to create worktree for edict %d: %v", resolved.EdictID, err), "error", 3*time.Second)
+				return nil
+			}
+		}
+	}
+
+	// Mutate a copy so the status bar and setContextParams see the new target.
+	newInfo := *model.repoInfo
+	newInfo.Branch = resolved.Branch
+	newInfo.WorktreePath = resolved.WorktreeRel
+	newInfo.IsWorktree = resolved.IsWorktree
+	newInfo.IsMain = repo.IsMainBranch(resolved.Branch)
+	model.repoInfo = &newInfo
+	model.status.SetRepoInfo(model.repoInfo)
+
+	// Clear all tabs: sessions built on the old branch no longer apply.
+	if !model.tabs.ResetToDefaults() {
+		model.commandLine.AddToast("Cannot switch while a tab is streaming", "error", 3*time.Second)
+		return nil
+	}
+
+	model.commandLine.AddToast(fmt.Sprintf("Switched to %s", resolved.Branch), "success", 2*time.Second)
+
+	// Re-target the Court (daemon path over the wire, single-process inline)
+	// and refresh the diff stats for the new root.
+	params := model.setContextParams()
+	court := model.court
+	return func() tea.Msg {
+		if court != nil {
+			if err := court.SetContext(context.Background(), params); err != nil {
+				return toastMsg{message: fmt.Sprintf("Switch failed: %v", err), msgType: "error", timeout: 3 * time.Second}
+			}
+		}
+		return repoSwitchedMsg{}
+	}
+}
+
+// repoSwitchedMsg triggers a diff refresh after a successful `:switch`.
+type repoSwitchedMsg struct{}
 
 // handleEdictCommand manages edicts: read, enact, seal, resume, or cancel.
 func handleEdictCommand(model *TUIModel, args []string) tea.Cmd {

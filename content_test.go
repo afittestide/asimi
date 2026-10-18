@@ -464,6 +464,62 @@ func TestSwitchToZhengmingTarget(t *testing.T) {
 	}
 }
 
+// TestResetToDefaults_RebuildsDefaultTabsAndCancelsContexts verifies the tab
+// half of `:switch`: every tab is discarded (its context cancelled) and the
+// default minister tabs are rebuilt with their greetings.
+func TestResetToDefaults_RebuildsDefaultTabsAndCancelsContexts(t *testing.T) {
+	defs, err := ministers.LoadMinisters()
+	require.NoError(t, err)
+
+	tm := NewTabManager(80, 24, true, func() string { return "" }, defs)
+	tm.showWelcome = false
+
+	// Open an extra tab and capture its cancel plumbing.
+	tm.Add("chat2", TabType("chat"), "target2")
+	extra := tm.TabByTarget("target2")
+	require.NotNil(t, extra)
+	extraCtx := extra.Ctx
+	require.Equal(t, "target2", tm.ActiveTab().Target)
+
+	require.True(t, tm.ResetToDefaults(), "ResetToDefaults should succeed when not streaming")
+
+	require.Equal(t, len(ministers.DefaultTabIDs), tm.TabCount())
+	for i, id := range ministers.DefaultTabIDs {
+		assert.Equal(t, id, tm.tabs[i].Target, "tab %d should be the default minister tab", i)
+	}
+	assert.Equal(t, ministers.DefaultTabIDs[0], tm.ActiveTab().Target, "activeTab should be reset to the first tab")
+	assert.Nil(t, tm.TabByTarget("target2"), "extra tabs must be discarded")
+	select {
+	case <-extraCtx.Done():
+	default:
+		t.Error("discarded tab's context must be cancelled")
+	}
+	// Greetings are re-seeded on the default tabs.
+	for _, tab := range tm.tabs {
+		found := false
+		for _, msg := range tab.Content.Chat.Messages {
+			if msg.Type == MessageTypeGreeting {
+				found = true
+			}
+		}
+		assert.True(t, found, "tab %q should be greeted after reset", tab.Target)
+	}
+}
+
+// TestResetToDefaults_RefusesWhileStreaming mirrors the handler guard: a
+// streaming tab must never be torn down.
+func TestResetToDefaults_RefusesWhileStreaming(t *testing.T) {
+	defs, err := ministers.LoadMinisters()
+	require.NoError(t, err)
+	tm := NewTabManager(80, 24, true, func() string { return "" }, defs)
+	tm.DismissWelcome()
+	before := tm.TabCount()
+	tm.SetStreamingTab()
+
+	require.False(t, tm.ResetToDefaults(), "ResetToDefaults must refuse while streaming")
+	assert.Equal(t, before, tm.TabCount(), "tabs must be left untouched on refusal")
+}
+
 // TestSubmitPrompt_RitualTabPendingZhengming_DeliveredAsAnswer verifies the
 // e892 scenario: while a zhengming raised by a running ritual step is pending
 // on the ritual tab, the next submitted prompt is delivered as the zhengming

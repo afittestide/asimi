@@ -1507,6 +1507,38 @@ func (s *Court) GetEdict(edictID uint) (*storage.Edict, error) {
 	return &edict, nil
 }
 
+// EnsureEdictWorktree idempotently creates edictID's worktree (git worktree
+// add -B asimi/e<N>, `just install`, and the ignored-file copy) and returns its
+// project-root-relative path. It exists so the TUI's `:switch` can create a
+// worktree without knowing whether the project runs on the host or in a podman
+// sandbox: repo mutations always take the host path, and the per-edict runner
+// factory is left to the ritual path.
+func (s *Court) EnsureEdictWorktree(ctx context.Context, edictID uint) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("court not initialized")
+	}
+	if edictID == 0 {
+		return "", fmt.Errorf("worktree: edict ID 0 is not an edict worktree")
+	}
+	root := ""
+	if s.ritualGuard != nil {
+		root = s.ritualGuard.repoInfo.ProjectRoot
+	}
+	if root == "" && s.toolCtxRepoInfo != nil {
+		root = s.toolCtxRepoInfo.ProjectRoot
+	}
+	if root == "" {
+		return "", fmt.Errorf("worktree: project root not set")
+	}
+	// Repo mutations always run on the host (the same discipline as verifyInit):
+	// the container bind-mounts a single worktree, so a sandboxed shell cannot
+	// add a sibling worktree next to itself.
+	runner := runners.NewHostRunner(0, root)
+	runner.SetTimeouts(s.hostTimeouts())
+	_, rel, _, _, err := worktree.Ensure(ctx, runner, root, edictID)
+	return rel, err
+}
+
 // handleSealGranted reacts to a granted seal. Only the ruler's seal triggers the
 // worktree merge-and-remove; other seals are ignored.
 func (s *Court) handleSealGranted(e Event) {

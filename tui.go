@@ -3000,6 +3000,12 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toastMsg:
 		m.commandLine.AddToast(msg.message, msg.msgType, msg.timeout)
 
+	case repoSwitchedMsg:
+		if m.repoInfo != nil {
+			m.repoInfo.RefreshDiff()
+		}
+		return m, nil
+
 	case updateCheckMsg:
 		if msg.err != nil {
 			m.tabs.Content().Chat.AddMessage(fmt.Sprintf("%s❌ Failed to check for updates: %v", systemPrefix, msg.err))
