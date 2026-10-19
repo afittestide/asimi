@@ -1303,6 +1303,48 @@ func TestCourt_AppendToIntent_InvalidatesSeals(t *testing.T) {
 	assert.Equal(t, storage.EdictActive, status, "edict should be active after seal invalidation")
 }
 
+// TestCourt_GetEdictSealsExcludesStaleSeals verifies the Court's seal-chain
+// accessor mirrors GetEdictStatus: seals invalidated by an intent change must
+// not surface as granted, so the UI can re-seal the edict (edict 967).
+func TestCourt_GetEdictSealsExcludesStaleSeals(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Username = "testuser"
+	cfg.Project = "testproject"
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	edict := storage.Edict{Intent: "original intent", Username: "testuser", Project: "testproject"}
+	require.NoError(t, db.Create(&edict).Error)
+
+	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
+	sealSvc := s.GetSealService()
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "ruler", storage.JSON{}))
+
+	// Sanity: the live chain reaches the Court before the intent changes.
+	seals, err := s.GetEdictSeals(key)
+	require.NoError(t, err)
+	require.Len(t, seals, 3)
+
+	require.NoError(t, s.AppendToIntent(edict.ID, "additional clarification"))
+
+	seals, err = s.GetEdictSeals(key)
+	require.NoError(t, err)
+	for _, seal := range seals {
+		if seal.StaleAt != nil {
+			t.Errorf("Court.GetEdictSeals returned stale seal for %s", seal.MinisterID)
+		}
+	}
+	assert.Empty(t, seals, "all seals should be stale and excluded after appendToIntent")
+
+	// The Court and the derived status agree: the edict is active, not sealed.
+	status, err := sealSvc.GetEdictStatus(key)
+	require.NoError(t, err)
+	assert.Equal(t, storage.EdictActive, status, "edict should be active after seal invalidation")
+}
+
 // TestCourt_DeliverZhengmingAnswer verifies the Court-owned zhengming dispatch:
 // WaitForZhengming blocks until DeliverZhengmingAnswer is called.
 func TestCourt_DeliverZhengmingAnswer(t *testing.T) {

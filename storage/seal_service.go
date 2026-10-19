@@ -107,7 +107,9 @@ func (s *SealService) InvalidateSeals(key EdictKey) error {
 	return nil
 }
 
-// GetSeals retrieves all seals for an edict
+// GetSeals retrieves the full seal history for an edict, including
+// invalidated tombstones (stale_at set). Use it when the history matters;
+// use GetActiveSeals for the live chain that gates sealing decisions.
 func (s *SealService) GetSeals(key EdictKey) ([]Seal, error) {
 	var seals []Seal
 	err := s.db.Where("edict_id = ? AND username = ? AND project = ?", key.ID, key.Username, key.Project).
@@ -115,6 +117,20 @@ func (s *SealService) GetSeals(key EdictKey) ([]Seal, error) {
 		Find(&seals).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to get seals: %w", err)
+	}
+	return seals, nil
+}
+
+// GetActiveSeals retrieves the live seal chain for an edict: only seals
+// with stale_at IS NULL. Invalidated tombstones (from intent changes) are
+// excluded, so callers can treat each returned row as a granted seal.
+func (s *SealService) GetActiveSeals(key EdictKey) ([]Seal, error) {
+	var seals []Seal
+	err := s.db.Where("edict_id = ? AND username = ? AND project = ? AND stale_at IS NULL", key.ID, key.Username, key.Project).
+		Order("sealed_at ASC").
+		Find(&seals).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active seals: %w", err)
 	}
 	return seals, nil
 }

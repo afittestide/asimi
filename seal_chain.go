@@ -21,9 +21,12 @@ func renderSealChain(seals []storage.Seal, w int) string {
 	defs, _ := ministers.LoadMinisters()
 	defsByID := ministers.LookupMap(defs)
 
-	// Build set of granted seals
+	// Build set of granted seals, skipping invalidated tombstones.
 	granted := make(map[string]bool)
 	for _, seal := range seals {
+		if seal.StaleAt != nil {
+			continue
+		}
 		granted[seal.MinisterID] = true
 	}
 

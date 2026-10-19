@@ -273,6 +273,55 @@ func TestInvalidateSealsMarksExistingSealsStale(t *testing.T) {
 	}
 }
 
+func TestGetActiveSealsExcludesStaleTombstones(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	edict := Edict{ID: 1, Username: "testuser", Project: "testproject", Intent: "Original intent"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	for _, ministerID := range []string{"judge", "chancellor", "ruler"} {
+		if err := svc.GrantSeal(edict.Key(), ministerID, JSON{}); err != nil {
+			t.Fatalf("failed to grant %s seal: %v", ministerID, err)
+		}
+	}
+
+	if err := svc.InvalidateSeals(edict.Key()); err != nil {
+		t.Fatalf("InvalidateSeals: %v", err)
+	}
+
+	active, err := svc.GetActiveSeals(edict.Key())
+	if err != nil {
+		t.Fatalf("GetActiveSeals: %v", err)
+	}
+	if len(active) != 0 {
+		t.Errorf("Expected 0 active seals after invalidation, got %d", len(active))
+	}
+
+	// GetSeals remains the history accessor and still exposes the tombstones.
+	history, err := svc.GetSeals(edict.Key())
+	if err != nil {
+		t.Fatalf("GetSeals: %v", err)
+	}
+	if len(history) != 3 {
+		t.Errorf("Expected 3 historical seals after invalidation, got %d", len(history))
+	}
+
+	// Re-sealing only the ruler leaves judge/chancellor stale.
+	if err := svc.GrantSeal(edict.Key(), "ruler", JSON{}); err != nil {
+		t.Fatalf("failed to re-grant ruler seal: %v", err)
+	}
+	active, err = svc.GetActiveSeals(edict.Key())
+	if err != nil {
+		t.Fatalf("GetActiveSeals after re-seal: %v", err)
+	}
+	if len(active) != 1 || active[0].MinisterID != "ruler" || active[0].StaleAt != nil {
+		t.Errorf("Expected only the fresh ruler seal, got %+v", active)
+	}
+}
+
 func TestResealAfterStalenessRestoresStatus(t *testing.T) {
 	db := setupSealServiceTestDB(t)
 	svc := NewSealService(db)

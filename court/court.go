@@ -1688,7 +1688,7 @@ func (s *Court) SealEdict(edictID uint, notes string) (string, error) {
 	return "", nil
 }
 
-// GetEdictSeals returns the seal chain for an edict.
+// GetEdictSeals returns the live seal chain (invalidated/stale seals excluded).
 func (s *Court) GetEdictSeals(key storage.EdictKey) ([]storage.Seal, error) {
 	if s == nil {
 		return nil, fmt.Errorf("court not initialized")
@@ -1697,7 +1697,7 @@ func (s *Court) GetEdictSeals(key storage.EdictKey) ([]storage.Seal, error) {
 	if sealer == nil {
 		return nil, fmt.Errorf("seal service not available")
 	}
-	return sealer.GetSeals(key)
+	return sealer.GetActiveSeals(key)
 }
 
 // ListActiveEdicts returns edicts in the current scope that aren't cancelled or sealed.
