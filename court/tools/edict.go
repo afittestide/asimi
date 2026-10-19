@@ -198,6 +198,10 @@ type TransitionEdictTool struct {
 	DB       *gorm.DB
 	Username string
 	Project  string
+	// Sealer, when set, lands the ruler seal through the Court so sealing
+	// also squash-merges and removes the edict's worktree. Without it a
+	// sealing call records the seal but leaves the work unmerged.
+	Sealer EdictSealer
 }
 
 func (t TransitionEdictTool) Name() string {
@@ -265,6 +269,29 @@ func (t TransitionEdictTool) Call(ctx context.Context, input string) (string, er
 			return "", fmt.Errorf("cancel edict: %w", err)
 		}
 	case "sealed":
+		if t.Sealer != nil {
+			// Seal through the Court so the ruler's seal also lands the
+			// edict's worktree; a merge failure is surfaced in the result
+			// (and recorded as EventWorktreeMergeFailed) rather than masked
+			// by the seal's success.
+			mergeFailure, err := t.Sealer.SealEdict(params.EdictID, "transitioned_by: transition_edict")
+			if err != nil {
+				return "", fmt.Errorf("seal edict: %w", err)
+			}
+			result := map[string]any{
+				"edict_id":        params.EdictID,
+				"previous_status": string(currentStatus),
+				"new_status":      params.Status,
+			}
+			if params.Reason != "" {
+				result["reason"] = params.Reason
+			}
+			if mergeFailure != "" {
+				result["merge_failure"] = mergeFailure
+			}
+			resultJSON, _ := json.Marshal(result)
+			return string(resultJSON), nil
+		}
 		if err := sealService.GrantSeal(key, "ruler", storage.JSON{"transitioned_by": "transition_edict"}); err != nil {
 			return "", fmt.Errorf("seal edict: %w", err)
 		}

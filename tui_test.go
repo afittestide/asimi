@@ -7751,3 +7751,66 @@ func TestHostApproval_HandsoffDrainsQueue(t *testing.T) {
 	assert.Empty(t, model4.pendingHostApprovals, "queue should be drained")
 	assert.Nil(t, cmd4, "no command once the queue is empty")
 }
+
+// TestEventWorktreeMergeFailed_WarnsNotSuccess verifies a failed seal is not
+// masked by the ruler-seal success toast: it renders a warning/error toast and
+// a persistent chat line for the ruler.
+func TestEventWorktreeMergeFailed_WarnsNotSuccess(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+
+	eventMsg := court.EventNotificationMsg{
+		ChannelID: "secretary",
+		EventType: storage.EventWorktreeMergeFailed,
+		EdictKey:  storage.EdictKey{ID: 7, Username: "test", Project: "test"},
+		Payload: map[string]interface{}{
+			"reason": "rebase onto main failed: CONFLICT",
+		},
+	}
+
+	newModel, _ := model.handleCustomMessages(eventMsg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	require.NotEmpty(t, updated.commandLine.toasts, "expected a toast for the merge failure")
+	toast := updated.commandLine.toasts[0]
+	assert.NotEqual(t, "success", toast.Type, "a failed merge must not be reported as plain success")
+	assert.Contains(t, toast.Message, "work NOT merged")
+
+	chat := updated.tabs.ChatByTab("secretary")
+	found := false
+	for _, m := range chat.Messages {
+		if strings.Contains(m.Content, "sealed but work NOT merged") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a persistent chat line for the merge failure")
+}
+
+// TestEventWorktreeMergeFailed_MergedCleanupVariant verifies the merged-but-
+// cleanup-failed variant renders distinctly from the not-merged case.
+func TestEventWorktreeMergeFailed_MergedCleanupVariant(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+
+	eventMsg := court.EventNotificationMsg{
+		ChannelID: "secretary",
+		EventType: storage.EventWorktreeMergeFailed,
+		EdictKey:  storage.EdictKey{ID: 7, Username: "test", Project: "test"},
+		Payload: map[string]interface{}{
+			"reason": "worktree remove failed",
+			"merged": true,
+		},
+	}
+
+	newModel, _ := model.handleCustomMessages(eventMsg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	require.NotEmpty(t, updated.commandLine.toasts, "expected a toast for the cleanup failure")
+	toast := updated.commandLine.toasts[0]
+	assert.NotEqual(t, "success", toast.Type, "a cleanup failure must not be reported as plain success")
+	assert.Contains(t, toast.Message, "cleanup failed")
+}

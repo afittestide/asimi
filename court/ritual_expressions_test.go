@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
@@ -3077,7 +3078,13 @@ func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
 		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
 	}}
 	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
-	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+	// The guard has a buffered channel to capture the published failure and,
+	// deliberately, a nil logger: publishing must degrade safely, never panic
+	// on an unwired dependency.
+	s.ritualGuard = &RitualGuard{
+		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
+		eventCh:      make(chan Event, 4),
+	}
 
 	s.handleSealGranted(Event{
 		Type:     storage.EventSealGranted,
@@ -3088,6 +3095,17 @@ func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
 	joined := mock.joined()
 	assert.NotContains(t, joined, "merge --squash", "no squash-merge after a failed rebase")
 	assert.NotContains(t, joined, "worktree remove", "worktree must survive a conflict")
+
+	// The seal is already recorded, so the only user-visible signal of the
+	// unlanded work is the event. It must carry a non-empty reason.
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		assert.Equal(t, storage.EventWorktreeMergeFailed, ev.Type, "merge failure is published")
+		reason, _ := ev.Payload["reason"].(string)
+		assert.NotEmpty(t, reason, "merge failure reason must be non-empty")
+	default:
+		t.Fatal("expected EventWorktreeMergeFailed to be published on a failed rebase")
+	}
 }
 
 // TestSwiftStrike_HasWorktreeBackground asserts the opt-in and that system-level
@@ -3141,4 +3159,101 @@ func TestEdictCommitSummary_UsesRecordedSummary(t *testing.T) {
 
 	// A nil db degrades to the same safe default.
 	assert.Equal(t, "chore: merge edict worktree e531", (&Court{}).edictCommitSummary(531))
+}
+
+// TestSealEdict_FailedMergeIsReportedNotSilent covers the transition_edict
+// path: sealing records the ruler's seal AND lands the worktree, but a merge
+// failure is surfaced to the caller and published as EventWorktreeMergeFailed
+// rather than swallowed by the seal's success.
+func TestSealEdict_FailedMergeIsReportedNotSilent(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	db := setupCourtTestDB(t)
+	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p", Intent: "x"}).Error)
+
+	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
+	}}
+	s := &Court{db: db, logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	base := NewMinisterBase(db, mock, slog.Default(), "u", "p", nil)
+	rg := NewRitualGuard(RitualGuardOpts{Base: base})
+	rg.repoInfo = repo.RepoInfo{ProjectRoot: root}
+	s.ritualGuard = rg
+
+	mergeFailure, err := s.SealEdict(531, "notes")
+	require.NoError(t, err)
+	assert.NotEmpty(t, mergeFailure, "a failed merge must be surfaced to the caller")
+
+	// The seal is still recorded — the failure is reported alongside it, not
+	// instead of it.
+	seals, err := s.GetEdictSeals(s.EdictKey(531))
+	require.NoError(t, err)
+	require.Len(t, seals, 1)
+	assert.Equal(t, "ruler", seals[0].MinisterID)
+
+	// And the merge failure is announced on the bus.
+	var published []Event
+	for {
+		select {
+		case ev := <-rg.eventCh:
+			published = append(published, ev)
+			continue
+		default:
+		}
+		break
+	}
+	var failed *Event
+	for i := range published {
+		if published[i].Type == storage.EventWorktreeMergeFailed {
+			failed = &published[i]
+		}
+	}
+	require.NotNil(t, failed, "expected EventWorktreeMergeFailed to be published")
+	reason, _ := failed.Payload["reason"].(string)
+	assert.NotEmpty(t, reason, "merge failure reason must be non-empty")
+}
+
+// TestBuildToolRegistry_WiresEdictSealer covers the production wiring site: the
+// Court's freshly built registry must hand the registered transition_edict tool
+// a Sealer (the Court itself). Without that field the tool's seal path stamps
+// the ruler's seal and never lands the worktree — a silent no-op.
+func TestBuildToolRegistry_WiresEdictSealer(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Username = "u"
+	cfg.Project = "p"
+
+	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"rebase": {Output: "CONFLICT", ExitCode: "1"},
+	}}
+	s := NewCourt(db, cfg, mock, slog.Default())
+	s.SetRepoInfo(repo.RepoInfo{ProjectRoot: root})
+	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p", Intent: "x"}).Error)
+
+	// The forge holds intent Write (人:--w-), so transition_edict is reachable
+	// through exactly this permission class.
+	intentWrite := tools.Permissions{Intent: tools.Access{Write: true}}
+
+	var transition tools.TransitionEdictTool
+	for _, tool := range s.GetToolRegistry().ForPermissions(intentWrite) {
+		if tt, ok := tool.(tools.TransitionEdictTool); ok {
+			transition = tt
+		}
+	}
+	require.NotNil(t, transition.Sealer, "transition_edict must be registered with the Court as its Sealer")
+
+	out, err := transition.Call(context.Background(), `{"edict_id":531,"status":"sealed"}`)
+	require.NoError(t, err)
+	assert.Contains(t, out, "merge_failure", "a failed merge must surface in the tool result: %s", out)
+
+	// The seal is still recorded; the failure is reported alongside it.
+	seals, err := s.GetEdictSeals(s.EdictKey(531))
+	require.NoError(t, err)
+	require.Len(t, seals, 1)
+	assert.Equal(t, "ruler", seals[0].MinisterID)
 }

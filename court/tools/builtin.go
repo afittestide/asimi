@@ -42,6 +42,9 @@ type ToolRegistrationOpts struct {
 	// MinisterIDs lists all registered minister IDs, used to build
 	// dynamic descriptions for tools like consult_minister.
 	MinisterIDs []string
+	// EdictSealer, when set, lands a ruler seal through the Court so
+	// transition_edict's "sealed" transition also merges the worktree.
+	EdictSealer EdictSealer
 }
 
 // RegisterBuiltinTools populates the registry with all builtin tools,
@@ -119,7 +122,7 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 
 	r.Register(InsertLingTool{Ctx: opts.Ctx, Igniter: opts.LingIgniter}, intentWrite)
 	r.Register(UpdateLingStatusTool{Ctx: opts.Ctx}, intentWrite)
-	r.Register(TransitionEdictTool{DB: opts.Ctx.DB, Username: opts.Ctx.Username, Project: opts.Ctx.Project}, intentWrite)
+	r.Register(TransitionEdictTool{DB: opts.Ctx.DB, Username: opts.Ctx.Username, Project: opts.Ctx.Project, Sealer: opts.EdictSealer}, intentWrite)
 	r.Register(CreateIncidentTool{Ctx: opts.Ctx}, intentWrite)
 	r.Register(ResolveIncidentTool{Ctx: opts.Ctx}, intentWrite)
 

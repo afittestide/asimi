@@ -8,6 +8,7 @@ asimi_linux
 *.swp
 *.swo
 *.log
+*.txt
 coverage.*
 worktrees/
 .agents/worktrees/
@@ -19,3 +20,4 @@ dist/
 jobs/
 # auto-synced to github
 intent/issues
+

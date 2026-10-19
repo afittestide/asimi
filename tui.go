@@ -2760,6 +2760,28 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			text := fmt.Sprintf("⛔ Edict %d cancelled", msg.EdictKey.ID)
 			chat.AddToRawHistory("CONTEXT", text)
 			m.commandLine.AddToast(text, "info", 3*time.Second)
+		case storage.EventWorktreeMergeFailed:
+			// The seal is already recorded, so a bare success toast would hide
+			// that the work never landed. Warn with a persistent chat line and
+			// a longer-lived warning/error toast.
+			reason, _ := msg.Payload["reason"].(string)
+			if merged, _ := msg.Payload["merged"].(bool); merged {
+				text := fmt.Sprintf("⚠️  Edict %d sealed; work merged but worktree cleanup failed: %s",
+					msg.EdictKey.ID, reason)
+				chat.AddToRawHistory("CONTEXT", text)
+				chat.AddMessage(text)
+				m.commandLine.AddToast(
+					fmt.Sprintf("⚠️  Edict %d merged, cleanup failed", msg.EdictKey.ID),
+					"warning", 8*time.Second)
+				return m, nil
+			}
+			text := fmt.Sprintf("⚠️  Edict %d sealed but work NOT merged: %s", msg.EdictKey.ID, reason)
+			chat.AddToRawHistory("CONTEXT", text)
+			chat.AddMessage(text)
+			m.commandLine.AddToast(
+				fmt.Sprintf("⚠️  Edict %d sealed, work NOT merged", msg.EdictKey.ID),
+				"error", 8*time.Second)
+			return m, nil
 		}
 
 		if len(cmds) > 0 {

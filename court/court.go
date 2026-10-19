@@ -390,6 +390,10 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		RitualLauncher:     ritualLauncher,
 		LingIgniter:        s,
 		MinisterIDs:        ministerIDs,
+		// The Court implements tools.EdictSealer: wiring it here makes the
+		// transition_edict "sealed" path land the edict's worktree instead of
+		// recording a seal that never merges (edict 955).
+		EdictSealer: s,
 	}
 
 	tools.RegisterBuiltinTools(registry, opts)
@@ -1540,49 +1544,74 @@ func (s *Court) EnsureEdictWorktree(ctx context.Context, edictID uint) (string, 
 }
 
 // handleSealGranted reacts to a granted seal. Only the ruler's seal triggers the
-// worktree merge-and-remove; other seals are ignored.
+// worktree merge-and-remove; other seals are ignored. A payload flag
+// ("merge_handled") lets a synchronous caller (transition_edict) perform the
+// merge itself and report the outcome, so the handler must not merge again.
 func (s *Court) handleSealGranted(e Event) {
 	minister, _ := e.Payload["minister_id"].(string)
 	if minister != "ruler" {
 		return
 	}
+	if handled, _ := e.Payload["merge_handled"].(bool); handled {
+		return
+	}
 	s.mergeEdictWorktree(context.Background(), e.EdictKey.ID)
 }
 
-// mergeEdictWorktree squash-merges the edict's worktree into the default branch
-// and removes it. It is a no-op when the edict has no worktree (i.e. its rituals
-// never opted in). On a merge failure the worktree is left intact so the forge
+// mergeEdictWorktree squash-merges the edict's worktree into the merge target
+// and removes it. It is a no-op (nil) when the edict has no worktree (i.e. its
+// rituals never opted in). On a merge or cleanup failure it publishes
+// EventWorktreeMergeFailed and returns the failure so a synchronous caller
+// (transition_edict) can surface it; the worktree is left intact so the forge
 // (工部) can resolve conflicts before the ruler reviews.
-func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) {
+func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) error {
 	if s == nil {
-		return
+		return nil
 	}
 	root := ""
 	if s.ritualGuard != nil {
 		root = s.ritualGuard.repoInfo.ProjectRoot
 	}
 	if root == "" {
-		return
+		return nil
 	}
 	rel := worktree.RelPath(edictID) // exact: e531 is not e5310
 	abs := filepath.Join(root, rel)
 	if _, err := os.Stat(abs); err != nil {
-		return // no worktree → nothing to do
+		return nil // no worktree → nothing to do
 	}
 	branch := worktree.Branch(edictID)
 	summary := s.edictCommitSummary(edictID)
 	if err := worktree.SquashMergeToDefault(ctx, s.runner, root, abs, branch, summary); err != nil {
 		s.logger.Error("worktree merge failed; left intact for inspection/rollback",
 			"edict", edictID, "err", err)
-		return // forge resolves conflicts; do NOT remove on failure
+		// The ruler's seal is already recorded, so the TUI would otherwise
+		// report an unqualified success (🥂 sealed). Publish a dedicated event
+		// so the failure is visible: edict sealed, work NOT merged.
+		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
+			"minister_id": "ruler",
+			"reason":      err.Error(),
+			"worktree":    rel,
+			"branch":      branch,
+		})
+		return err // forge resolves conflicts; do NOT remove on failure
 	}
 	if err := worktree.Remove(ctx, s.runner, root, abs, branch); err != nil {
 		s.logger.Error("worktree removal failed after successful merge", "edict", edictID, "err", err)
-		return // keep the edict runner so the worktree can be inspected
+		cleanupErr := fmt.Errorf("work merged but worktree removal failed: %w", err)
+		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
+			"minister_id": "ruler",
+			"reason":      cleanupErr.Error(),
+			"worktree":    rel,
+			"branch":      branch,
+			"merged":      true,
+		})
+		return cleanupErr // keep the edict runner so the worktree can be inspected
 	}
 	// The worktree is gone; tear down the edict's container too. The next
 	// ritual for the edict lazily recreates a runner.
 	s.CloseEdictRunner(ctx, edictID)
+	return nil
 }
 
 // edictCommitSummary builds the squash-merge commit message for an edict from
@@ -1622,6 +1651,41 @@ func (s *Court) GrantRulerSeal(edictID uint, notes string) error {
 		"timestamp":   timestamp,
 	})
 	return nil
+}
+
+// SealEdict stamps the ruler's seal, lands the edict's worktree, and reports
+// the merge outcome to the caller. It is the synchronous counterpart of the
+// seal→merge event path used by `:edict seal`: the seal is still announced via
+// EventSealGranted (so the TUI's seal toast is unchanged), but the event carries
+// merge_handled=true so the async handler does not merge a second time. A
+// non-empty mergeFailure (also published as EventWorktreeMergeFailed) tells a
+// calling minister the edict is sealed while its work did NOT land.
+func (s *Court) SealEdict(edictID uint, notes string) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("court not initialized")
+	}
+	sealer := s.GetSealService()
+	if sealer == nil {
+		return "", fmt.Errorf("seal service not available")
+	}
+	key := s.EdictKey(edictID)
+	timestamp := time.Now().Format(time.RFC3339)
+	if err := sealer.GrantSeal(key, "ruler", storage.JSON{
+		"notes":     notes,
+		"timestamp": timestamp,
+	}); err != nil {
+		return "", err
+	}
+	s.PublishEvent(key, storage.EventSealGranted, storage.JSON{
+		"minister_id":   "ruler",
+		"notes":         notes,
+		"timestamp":     timestamp,
+		"merge_handled": true,
+	})
+	if err := s.mergeEdictWorktree(context.Background(), edictID); err != nil {
+		return err.Error(), nil
+	}
+	return "", nil
 }
 
 // GetEdictSeals returns the seal chain for an edict.

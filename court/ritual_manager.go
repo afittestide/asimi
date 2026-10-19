@@ -155,7 +155,15 @@ func (rg *RitualGuard) Tasks() chan<- *Task {
 // --- Event lifecycle ---
 
 // PublishEvent persists an event to the DB and sends it to the event channel.
+//
+// Publishing never fails: a nil dependency degrades to a logged no-op rather
+// than a panic. Bare guards (nil db, nil eventCh, nil logger) occur in tests
+// and during partial construction, and a failure event such as
+// EventWorktreeMergeFailed must not take the process down on its way out.
 func (rg *RitualGuard) PublishEvent(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint {
+	if rg == nil {
+		return key.ID
+	}
 	if rg.db != nil {
 		dbEvent := storage.TianEvent{
 			EdictID:   key.ID,
@@ -164,14 +172,18 @@ func (rg *RitualGuard) PublishEvent(key storage.EdictKey, eventType storage.Cour
 			EventType: eventType,
 			Payload:   payload,
 		}
-		if err := rg.db.Create(&dbEvent).Error; err != nil {
+		if err := rg.db.Create(&dbEvent).Error; err != nil && rg.logger != nil {
 			rg.logger.Error("failed to persist event", "type", eventType, "error", err)
 		}
 	}
 	select {
 	case rg.eventCh <- Event{Type: eventType, EdictKey: key, Payload: map[string]interface{}(payload)}:
 	default:
-		rg.logger.Warn("event channel full, persisted to DB only", "type", eventType)
+		// A nil eventCh is never sendable, so this branch also covers the
+		// not-yet-wired guard; only log when a logger was supplied.
+		if rg.logger != nil {
+			rg.logger.Warn("event channel full, persisted to DB only", "type", eventType)
+		}
 	}
 	return key.ID
 }
@@ -438,6 +450,14 @@ func (rg *RitualGuard) buildEventNotification(event Event) EventNotificationMsg 
 		ritual, _ := event.Payload["ritual"].(string)
 		reason, _ := event.Payload["reason"].(string)
 		msg.Message = fmt.Sprintf("Ritual %s aborted: %s", ritual, reason)
+
+	case storage.EventWorktreeMergeFailed:
+		reason, _ := event.Payload["reason"].(string)
+		if merged, _ := event.Payload["merged"].(bool); merged {
+			msg.Message = fmt.Sprintf("Edict %d sealed; work merged but worktree cleanup failed: %s", edictID, reason)
+		} else {
+			msg.Message = fmt.Sprintf("Edict %d sealed but work NOT merged: %s", edictID, reason)
+		}
 
 	case storage.EventEdictCancelled:
 		msg.Message = fmt.Sprintf("Edict %d cancelled", edictID)

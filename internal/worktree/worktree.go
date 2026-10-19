@@ -158,17 +158,28 @@ func Remove(ctx context.Context, r runners.Runner, root, abs, branch string) err
 	return nil
 }
 
-// DefaultBranch resolves the repository's default branch, preferring the
-// remote HEAD (origin/HEAD) and falling back to root's current branch, then
-// to "main". Resolution never fails: an unreadable answer degrades to "main".
+// DefaultBranch resolves the branch edict worktrees are rebased onto and
+// squash-merged into. SquashMergeToDefault commits into root's checked-out
+// branch, so that branch is the merge target and the rebase base must equal
+// it — otherwise the worktree is replayed through history the target already
+// carries. Root's checked-out branch is therefore preferred, then origin/HEAD
+// (when it is a locally valid upstream), then "main". Resolution never fails:
+// an unreadable answer degrades to the next candidate.
 //
 // The remote HEAD name is only used when it is a locally valid upstream: a
-// local branch b, else the remote-tracking ref origin/b, else the fallbacks.
-// Returning the bare b when only origin/b exists makes git rebase/merge fail
-// with "invalid upstream 'b'" (see edict 955).
+// local branch b, else the remote-tracking ref origin/b. Returning the bare b
+// when only origin/b exists makes git rebase/merge fail with "invalid upstream
+// 'b'" (see edict 955).
 func DefaultBranch(ctx context.Context, r runners.Runner, root string) string {
 	if r == nil || root == "" {
 		return "main"
+	}
+	head := fmt.Sprintf("git -C %s rev-parse --abbrev-ref HEAD", shellescape.Quote(root))
+	if out, err := run(ctx, r, head, "resolve default branch"); err == nil {
+		// "HEAD" means detached — no checked-out branch to merge into.
+		if b := strings.TrimSpace(out.Output); b != "" && b != "HEAD" {
+			return b
+		}
 	}
 	symRef := fmt.Sprintf("git -C %s symbolic-ref --short refs/remotes/origin/HEAD", shellescape.Quote(root))
 	if out, err := run(ctx, r, symRef, "resolve default branch"); err == nil {
@@ -180,12 +191,6 @@ func DefaultBranch(ctx context.Context, r runners.Runner, root string) string {
 			if refExists(ctx, r, root, "refs/remotes/origin/"+b) {
 				return "origin/" + b
 			}
-		}
-	}
-	head := fmt.Sprintf("git -C %s rev-parse --abbrev-ref HEAD", shellescape.Quote(root))
-	if out, err := run(ctx, r, head, "resolve default branch"); err == nil {
-		if b := strings.TrimSpace(out.Output); b != "" {
-			return b
 		}
 	}
 	return "main"

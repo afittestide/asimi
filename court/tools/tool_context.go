@@ -104,3 +104,12 @@ type RitualLauncher interface {
 type MinisterConsultant interface {
 	ConsultMinister(ctx context.Context, callerMinisterID, ministerID, channelID string, key storage.EdictKey, work string) (string, error)
 }
+
+// EdictSealer grants the ruler's seal AND lands the edict's worktree so a seal
+// stopped being a silent no-op: sealing without the merge records the seal but
+// leaves the work unmerged. SealEdict returns a non-empty mergeFailure string
+// (already reported via EventWorktreeMergeFailed) when the work could not land.
+// Implemented by the Court.
+type EdictSealer interface {
+	SealEdict(edictID uint, notes string) (mergeFailure string, err error)
+}

@@ -1432,3 +1432,33 @@ func TestRitualsSerializeWithinSameEdict(t *testing.T) {
 
 	close(runner.release)
 }
+
+// TestBuildEventNotification_WorktreeMergeFailed verifies the ruler-facing
+// message for a failed seal: the work NOT merging and the merged-but-cleanup
+// variant are distinct, and both quote the reason.
+func TestBuildEventNotification_WorktreeMergeFailed(t *testing.T) {
+	rg := &RitualGuard{}
+
+	failed := rg.buildEventNotification(Event{
+		Type:     storage.EventWorktreeMergeFailed,
+		EdictKey: storage.EdictKey{ID: 7, Username: "test", Project: "test"},
+		Payload: map[string]interface{}{
+			"reason": "rebase onto main failed: CONFLICT",
+		},
+	})
+	if failed.Message != "Edict 7 sealed but work NOT merged: rebase onto main failed: CONFLICT" {
+		t.Errorf("unexpected message: %q", failed.Message)
+	}
+
+	cleanup := rg.buildEventNotification(Event{
+		Type:     storage.EventWorktreeMergeFailed,
+		EdictKey: storage.EdictKey{ID: 7, Username: "test", Project: "test"},
+		Payload: map[string]interface{}{
+			"reason": "work merged but worktree removal failed",
+			"merged": true,
+		},
+	})
+	if cleanup.Message != "Edict 7 sealed; work merged but worktree cleanup failed: work merged but worktree removal failed" {
+		t.Errorf("unexpected message: %q", cleanup.Message)
+	}
+}

@@ -219,11 +219,13 @@ func TestDefaultBranch_FallsBackToMain(t *testing.T) {
 }
 
 func TestDefaultBranch_StripsRemotePrefix(t *testing.T) {
-	// origin/trunk has no local counterpart, so the bare name would be an
-	// invalid upstream: DefaultBranch must return the remote-tracking ref.
+	// HEAD is detached, so root has no checked-out branch to prefer. origin/trunk
+	// has no local counterpart, so the bare name would be an invalid upstream:
+	// DefaultBranch must return the remote-tracking ref.
 	mock := &recordingRunner{outputs: map[string]runners.Output{
-		"symbolic-ref":              {Output: "origin/trunk\n", ExitCode: "0"},
-		"refs/remotes/origin/trunk": {Output: "abc123\n", ExitCode: "0"},
+		"rev-parse --abbrev-ref HEAD": {Output: "HEAD\n", ExitCode: "0"},
+		"symbolic-ref":                {Output: "origin/trunk\n", ExitCode: "0"},
+		"refs/remotes/origin/trunk":   {Output: "abc123\n", ExitCode: "0"},
 	}}
 	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "origin/trunk" {
 		t.Errorf("DefaultBranch = %q, want origin/trunk", got)
@@ -232,28 +234,41 @@ func TestDefaultBranch_StripsRemotePrefix(t *testing.T) {
 
 // TestDefaultBranch_LocalBranchWins: when the remote HEAD name also exists as
 // a local branch, the bare name is a valid upstream and must be returned
-// without the origin/ prefix.
+// without the origin/ prefix (HEAD is detached here).
 func TestDefaultBranch_LocalBranchWins(t *testing.T) {
 	mock := &recordingRunner{outputs: map[string]runners.Output{
-		"symbolic-ref":              {Output: "origin/trunk\n", ExitCode: "0"},
-		"refs/heads/trunk":          {Output: "abc123\n", ExitCode: "0"},
-		"refs/remotes/origin/trunk": {Output: "abc123\n", ExitCode: "0"},
+		"rev-parse --abbrev-ref HEAD": {Output: "HEAD\n", ExitCode: "0"},
+		"symbolic-ref":                {Output: "origin/trunk\n", ExitCode: "0"},
+		"refs/heads/trunk":            {Output: "abc123\n", ExitCode: "0"},
+		"refs/remotes/origin/trunk":   {Output: "abc123\n", ExitCode: "0"},
 	}}
 	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "trunk" {
 		t.Errorf("DefaultBranch = %q, want trunk", got)
 	}
 }
 
-// TestDefaultBranch_FallsBackToCurrentBranch: remote HEAD names a branch that
-// exists neither locally nor as origin/<b>. Resolution must not return the
-// invalid upstream; it falls through to root's current branch.
-func TestDefaultBranch_FallsBackToCurrentBranch(t *testing.T) {
+// TestDefaultBranch_PrefersCheckedOutBranch: the squash-merge target is root's
+// checked-out branch, so the rebase base must equal it. Root's branch wins even
+// when a remote HEAD names a different (stale) branch.
+func TestDefaultBranch_PrefersCheckedOutBranch(t *testing.T) {
 	mock := &recordingRunner{outputs: map[string]runners.Output{
-		"symbolic-ref":                {Output: "origin/trunk\n", ExitCode: "0"},
 		"rev-parse --abbrev-ref HEAD": {Output: "release\n", ExitCode: "0"},
+		"symbolic-ref":                {Output: "origin/trunk\n", ExitCode: "0"},
 	}}
 	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "release" {
 		t.Errorf("DefaultBranch = %q, want release", got)
+	}
+}
+
+// TestDefaultBranch_FallsBackToMain: a detached HEAD and an origin/HEAD that
+// names no valid upstream degrades to "main" rather than an invalid ref.
+func TestDefaultBranch_FallsBackToMain_Detached(t *testing.T) {
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"rev-parse --abbrev-ref HEAD": {Output: "HEAD\n", ExitCode: "0"},
+		"symbolic-ref":                {Output: "origin/trunk\n", ExitCode: "0"},
+	}}
+	if got := DefaultBranch(context.Background(), mock, t.TempDir()); got != "main" {
+		t.Errorf("DefaultBranch = %q, want main", got)
 	}
 }
 
@@ -282,12 +297,76 @@ func TestDefaultBranch_QuotesRefInCommands(t *testing.T) {
 	}
 }
 
-// TestDefaultBranch_RealGit_RemoteOnlyBranch reproduces edict 955: the local
-// checkout is on main while the remote HEAD points at dev, which exists only
-// as origin/dev. DefaultBranch must return origin/dev (a valid upstream) and
-// SquashMergeToDefault must rebase onto it rather than fail with
+// TestDefaultBranch_RealGit_CheckedOutBranchWins reproduces the seal failure:
+// the checkout is on main (786 commits ahead of a stale origin/dev) while the
+// remote HEAD points at dev, which exists only as origin/dev. DefaultBranch
+// must return the checked-out main — the squash-merge target — so the worktree
+// is not rebased back through ~780 already-landed commits, and the merge lands
+// as a single squash commit.
+func TestDefaultBranch_RealGit_CheckedOutBranchWins(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+
+	// Pin origin/dev to the first commit — a stale ancestor of main.
+	out, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := strings.TrimSpace(string(out))
+	if err := os.WriteFile(filepath.Join(root, "landed.txt"), []byte("landed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "land later work")
+	runGit(t, root, "update-ref", "refs/remotes/origin/dev", stale)
+	runGit(t, root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/dev")
+
+	runner := &realLightRunner{root: root}
+	if got := DefaultBranch(context.Background(), runner, root); got != "main" {
+		t.Fatalf("DefaultBranch = %q, want main (the squash-merge target)", got)
+	}
+
+	before := countCommits(t, root)
+
+	abs := filepath.Join(root, ".agents", "worktrees", "e955")
+	runGit(t, root, "worktree", "add", "-b", "asimi/e955", abs, "main")
+	if err := os.WriteFile(filepath.Join(abs, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, abs, "add", ".")
+	runGit(t, abs, "commit", "-m", "bug: feature e955")
+
+	if err := SquashMergeToDefault(context.Background(), runner, root, abs, "asimi/e955", "bug: feature e955"); err != nil {
+		t.Fatalf("SquashMergeToDefault: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "feature.txt")); err != nil {
+		t.Errorf("squash-merge did not land feature.txt on main: %v", err)
+	}
+	if after := countCommits(t, root); after != before+1 {
+		t.Errorf("expected exactly one new commit (a squash), got %d", after-before)
+	}
+	if err := Remove(context.Background(), runner, root, abs, "asimi/e955"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+}
+
+// TestDefaultBranch_RealGit_DetachedRemoteOnlyBranch: with a detached HEAD there
+// is no checked-out branch to merge into, so the remote HEAD name is used. It
+// exists only as origin/dev, so DefaultBranch returns origin/dev (a valid
+// upstream) and SquashMergeToDefault rebases onto it rather than failing with
 // "invalid upstream 'dev'".
-func TestDefaultBranch_RealGit_RemoteOnlyBranch(t *testing.T) {
+func TestDefaultBranch_RealGit_DetachedRemoteOnlyBranch(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -304,6 +383,7 @@ func TestDefaultBranch_RealGit_RemoteOnlyBranch(t *testing.T) {
 	// origin/dev exists as a remote-tracking ref; there is no local dev.
 	runGit(t, root, "update-ref", "refs/remotes/origin/dev", "HEAD")
 	runGit(t, root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/dev")
+	runGit(t, root, "checkout", "--detach", "HEAD")
 
 	runner := &realLightRunner{root: root}
 	if got := DefaultBranch(context.Background(), runner, root); got != "origin/dev" {
@@ -322,11 +402,25 @@ func TestDefaultBranch_RealGit_RemoteOnlyBranch(t *testing.T) {
 		t.Fatalf("SquashMergeToDefault: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "feature.txt")); err != nil {
-		t.Errorf("squash-merge did not land feature.txt on main: %v", err)
+		t.Errorf("squash-merge did not land feature.txt: %v", err)
 	}
 	if err := Remove(context.Background(), runner, root, abs, "asimi/e955"); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
+}
+
+// countCommits returns the number of commits reachable from HEAD.
+func countCommits(t *testing.T, dir string) int {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-list", "--count", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-list --count: %v", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("rev-list --count: %v", err)
+	}
+	return n
 }
 
 // TestEnsure_RealGit exercises Ensure against a real repository. It skips when
