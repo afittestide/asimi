@@ -699,7 +699,7 @@ func NewSpecGenerator(arg string, rootfs bool) *SpecGenerator {
 	}
 }
 
-// NewSpecGenerator returns a SpecGenerator struct given one of two mandatory inputs
+// NewSpecGeneratorWithRootfs returns a SpecGenerator configured with the given root filesystem.
 func NewSpecGeneratorWithRootfs(rootfs string) *SpecGenerator {
 	csc := ContainerStorageConfig{Rootfs: rootfs}
 	return &SpecGenerator{

@@ -208,7 +208,7 @@ func (n NetworkMode) IsPasta() bool {
 
 // IsNS indicates a network namespace passed in by path (ns:<path>)
 func (n NetworkMode) IsNS() bool {
-	return strings.HasPrefix(string(n), nsType)
+	return strings.HasPrefix(string(n), nsType+":")
 }
 
 // NS gets the path associated with a ns:<path> network ns
@@ -224,5 +224,5 @@ func (n NetworkMode) IsPod() bool {
 
 // IsUserDefined indicates user-created network
 func (n NetworkMode) IsUserDefined() bool {
-	return !n.IsDefault() && !n.IsBridge() && !n.IsHost() && !n.IsNone() && !n.IsContainer() && !n.IsPasta() && !n.IsNS()
+	return !n.IsDefault() && !n.IsBridge() && !n.IsHost() && !n.IsNone() && !n.IsContainer() && !n.IsPasta() && !n.IsNS() && !n.IsPod()
 }
