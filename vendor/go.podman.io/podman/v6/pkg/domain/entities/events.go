@@ -1,6 +1,7 @@
 package entities
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -12,22 +13,22 @@ import (
 type Event = types.Event
 
 // ConvertToLibpodEvent converts an entities event to a libpod one.
-func ConvertToLibpodEvent(e Event) *libpodEvents.Event {
+func ConvertToLibpodEvent(e Event) (*libpodEvents.Event, error) {
 	var exitCode int
 	if ec, ok := e.Actor.Attributes["containerExitCode"]; ok {
 		var err error
 		exitCode, err = strconv.Atoi(ec)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("parsing containerExitCode %q: %w", ec, err)
 		}
 	}
 	status, err := libpodEvents.StringToStatus(string(e.Action))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	t, err := libpodEvents.StringToType(string(e.Type))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var (
 		oomKilled bool
@@ -71,7 +72,7 @@ func ConvertToLibpodEvent(e Event) *libpodEvents.Event {
 	if hasOOM {
 		newEvent.OOMKilled = &oomKilled
 	}
-	return newEvent
+	return newEvent, nil
 }
 
 // ConvertToEntitiesEvent converts a libpod event to an entities one.
