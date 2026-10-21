@@ -108,6 +108,30 @@ func (r *RitualRunner) recoverFromPreviousExec(ctx context.Context, ritualName s
 	return recoveryResult{}, nil
 }
 
+// abortPromptMarker renders the marker embedded in an abort prompt so a pending
+// prompt for a given execution can be recognized and not duplicated.
+func abortPromptMarker(executionID string) string {
+	return fmt.Sprintf("[exec:%s]", executionID)
+}
+
+// hasPendingAbortPrompt reports whether a PENDING abort prompt already exists
+// for this execution. Dedup is by execution identity, embedded in the question
+// text as abortPromptMarker — the same aborted execution may be re-scanned on
+// every startup and event, and each scan must not raise another prompt (e968).
+func (rg *RitualGuard) hasPendingAbortPrompt(exec *RitualExecution) bool {
+	if rg.db == nil || exec == nil {
+		return false
+	}
+	var count int64
+	// instr, not LIKE: the question column carries BLOB affinity (the driver
+	// stores []byte that way), and SQLite's LIKE yields false on BLOBs.
+	err := rg.db.Model(&storage.Zhengming{}).
+		Where("edict_id = ? AND username = ? AND project = ? AND status = ? AND instr(question, ?) > 0",
+			exec.EdictID, exec.Username, exec.Project, storage.ZhengmingPending, abortPromptMarker(exec.ID)).
+		Count(&count).Error
+	return err == nil && count > 0
+}
+
 // promptForAbortedRituals scans for aborted/stopped/failed ritual executions
 // and prompts the user (via zhengming) to recover, mark as completed, or pass.
 // It runs at startup and sets recoveryComplete when done.
@@ -202,6 +226,16 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 		rg.db.Where("execution_id = ?", exec.ID).Order("step_index").Find(&stepStates)
 		incompleteStep := findFirstIncompleteStep(stepStates)
 
+		// Raise the abort prompt at most once per execution: if a PENDING
+		// zhengming already carries this execution's marker, do not raise
+		// another duplicate (e968).
+		if rg.hasPendingAbortPrompt(&exec) {
+			rg.logger.Info("abort prompt already pending, suppressing duplicate",
+				"execution_id", exec.ID,
+				"edict_id", exec.EdictID)
+			continue
+		}
+
 		// Build description text, preferring summary over intent
 		description := edict.Summary
 		if description == "" {
@@ -229,7 +263,8 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 
 		questions := storage.ZhengmingQuestions{
 			{
-				Text:    fmt.Sprintf("Ritual %q (e%d: %s) was aborted at step %d. What should we do?", exec.RitualName, exec.EdictID, description, incompleteStep),
+				Text: fmt.Sprintf("Ritual %q (e%d: %s) was aborted at step %d. What should we do? [exec:%s]",
+					exec.RitualName, exec.EdictID, description, incompleteStep, exec.ID),
 				Options: options,
 			},
 		}

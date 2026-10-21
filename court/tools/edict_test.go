@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -274,5 +275,129 @@ func TestGetEdictStatusTool_NonExistentEdict(t *testing.T) {
 	_, err := tool.Call(context.Background(), `{"edict_id": 999}`)
 	if err == nil {
 		t.Fatal("Expected error for non-existent edict")
+	}
+}
+
+// TestListEdictsTool_EmptyScopeReportsScope covers edict 968: when a scoped read
+// matches zero rows it must name the queried (username, project) and any nearby
+// match, never silently look like "no rows at all".
+func TestListEdictsTool_EmptyScopeReportsScope(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	// Rows live under another scope — exactly the reported split-brain: origin
+	// slug (daonb/...) vs pinned slug (oct7-io/...).
+	edict := storage.Edict{ID: 927, Username: "daonb", Project: "oct7-io/data-poisoning-benchmark", Intent: "Give the sandbox gh CLI"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "daonb", Project: "daonb/data-poisoning-benchmark"}
+	result, err := tool.Call(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	var report ScopeReport
+	if err := json.Unmarshal([]byte(result), &report); err != nil {
+		t.Fatalf("empty-scope result is not the scope-report shape: %v\n%s", err, result)
+	}
+	if report.Rows != 0 {
+		t.Errorf("report.Rows = %d, want 0", report.Rows)
+	}
+	if report.Username != "daonb" || report.Project != "daonb/data-poisoning-benchmark" {
+		t.Errorf("report queried scope = %q/%q, want daonb/daonb/data-poisoning-benchmark", report.Username, report.Project)
+	}
+	if len(report.Nearby) != 1 {
+		t.Fatalf("report.Nearby = %+v, want 1 nearby match", report.Nearby)
+	}
+	if report.Nearby[0].Project != "oct7-io/data-poisoning-benchmark" || report.Nearby[0].Count != 1 {
+		t.Errorf("nearby = %+v, want 1 row for oct7-io/data-poisoning-benchmark", report.Nearby[0])
+	}
+
+	// The Format path must surface the report rather than "Found 0 edicts".
+	rendered := tool.Format(`{}`, result, nil)
+	if !containsSubstring(rendered, "oct7-io/data-poisoning-benchmark") {
+		t.Errorf("Format output %q should surface the scope report", rendered)
+	}
+}
+
+// TestGetEdictStatusTool_EmptyScopeReportsScope covers edict 968 for the
+// single-row reader: a wrong-scope lookup must not collapse into a bare
+// "record not found".
+func TestGetEdictStatusTool_EmptyScopeReportsScope(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	edict := storage.Edict{ID: 927, Username: "daonb", Project: "oct7-io/data-poisoning-benchmark", Intent: "Give the sandbox gh CLI"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	tool := GetEdictStatusTool{DB: db, Username: "daonb", Project: "daonb/data-poisoning-benchmark"}
+	result, err := tool.Call(context.Background(), `{"edict_id": 927}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	var report ScopeReport
+	if err := json.Unmarshal([]byte(result), &report); err != nil {
+		t.Fatalf("empty-scope result is not the scope-report shape: %v\n%s", err, result)
+	}
+	if report.Rows != 0 || len(report.Nearby) != 1 {
+		t.Errorf("report = %+v, want 0 rows and 1 nearby match", report)
+	}
+	if report.Nearby[0].Project != "oct7-io/data-poisoning-benchmark" {
+		t.Errorf("nearby project = %q, want oct7-io/data-poisoning-benchmark", report.Nearby[0].Project)
+	}
+
+	rendered := tool.Format(`{"edict_id": 927}`, result, nil)
+	if !containsSubstring(rendered, "oct7-io/data-poisoning-benchmark") {
+		t.Errorf("Format output %q should surface the scope report", rendered)
+	}
+}
+
+// TestListEdictsTool_StatusFilterMissDoesNotLie covers the Chancellor-found
+// blocking defect in edict 968: when rows DO exist in scope but the optional
+// status filter excludes them all, list_edicts must NOT emit the "0 rows for
+// username=… project=…" report — that message is the very false "edicts are
+// gone" the edict exists to eliminate.
+func TestListEdictsTool_StatusFilterMissDoesNotLie(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	// One row in scope, active (no seal, no pending zhengming).
+	edict := storage.Edict{ID: 1, Username: "testuser", Project: "testproject", Intent: "Active edict"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "testuser", Project: "testproject"}
+	result, err := tool.Call(context.Background(), `{"status": "blocked"}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	// Must not claim the scope is empty: the row exists, it just does not match.
+	if containsSubstring(result, `0 rows for username="testuser" project="testproject"`) {
+		t.Errorf("status-filter miss emitted a FALSE empty-scope report: %s", result)
+	}
+
+	var payload struct {
+		InScope int    `json:"in_scope"`
+		Matched int    `json:"matched"`
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		t.Fatalf("filter-miss result is not the expected shape: %v\n%s", err, result)
+	}
+	if payload.InScope != 1 || payload.Matched != 0 || payload.Status != "blocked" {
+		t.Errorf("payload = %+v, want in_scope=1 matched=0 status=blocked", payload)
+	}
+	if !containsSubstring(payload.Message, "1 edicts in scope") || !containsSubstring(payload.Message, `status="blocked"`) {
+		t.Errorf("message %q should name the in-scope count and filter", payload.Message)
+	}
+
+	rendered := tool.Format(`{"status": "blocked"}`, result, nil)
+	if !containsSubstring(rendered, "in scope") {
+		t.Errorf("Format output %q should surface the filter-miss message", rendered)
 	}
 }

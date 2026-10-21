@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -168,5 +169,60 @@ func TestInsertLingTool_NilIgniterDoesNotPanic(t *testing.T) {
 
 	if _, err := tool.Call(context.Background(), `{"edict_id":10,"description":"task"}`); err != nil {
 		t.Fatalf("insert_ling with nil igniter failed: %v", err)
+	}
+}
+
+// TestListLingTool_EmptyScopeReportsScope covers edict 968: a scoped list_ling
+// that matches zero rows must name the queried scope and any nearby match, not
+// return a bare "No ling found for this edict".
+func TestListLingTool_EmptyScopeReportsScope(t *testing.T) {
+	db := setupLingTestDB(t)
+
+	ling := storage.Ling{
+		LingID: "f0a1", EdictID: 7, Username: "daonb",
+		Project: "oct7-io/data-poisoning-benchmark", Description: "task", Status: storage.LingDone,
+	}
+	if err := db.Create(&ling).Error; err != nil {
+		t.Fatalf("failed to create ling: %v", err)
+	}
+
+	tool := ListLingTool{Ctx: ToolContext{DB: db, Username: "daonb", Project: "daonb/data-poisoning-benchmark"}}
+	result, err := tool.Call(context.Background(), `{"edict_id":7}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	var report ScopeReport
+	if err := json.Unmarshal([]byte(result), &report); err != nil {
+		t.Fatalf("empty-scope result is not the scope-report shape: %v\n%s", err, result)
+	}
+	if report.Rows != 0 {
+		t.Errorf("report.Rows = %d, want 0", report.Rows)
+	}
+	if report.Username != "daonb" || report.Project != "daonb/data-poisoning-benchmark" {
+		t.Errorf("report queried scope = %q/%q, want daonb/daonb/data-poisoning-benchmark", report.Username, report.Project)
+	}
+	if len(report.Nearby) != 1 {
+		t.Fatalf("report.Nearby = %+v, want 1 nearby match", report.Nearby)
+	}
+	if report.Nearby[0].Project != "oct7-io/data-poisoning-benchmark" || report.Nearby[0].Count != 1 {
+		t.Errorf("nearby = %+v, want 1 row for oct7-io/data-poisoning-benchmark", report.Nearby[0])
+	}
+	if !strings.Contains(result, "oct7-io/data-poisoning-benchmark") {
+		t.Errorf("result %q should name the nearby scope", result)
+	}
+
+	// A key that matches nowhere still looks like an empty-scope report, so the
+	// caller can never confuse it with a populated list.
+	result, err = tool.Call(context.Background(), `{"edict_id":999}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	var noMatch ScopeReport
+	if err := json.Unmarshal([]byte(result), &noMatch); err != nil {
+		t.Fatalf("no-match result is not the scope-report shape: %v\n%s", err, result)
+	}
+	if noMatch.Rows != 0 || len(noMatch.Nearby) != 0 {
+		t.Errorf("no-match report = %+v, want 0 rows and no nearby match", noMatch)
 	}
 }

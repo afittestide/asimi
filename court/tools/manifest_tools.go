@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/afittestide/asimi/storage"
+	"gorm.io/gorm"
 )
 
 // --- CreateManifestTool ---
@@ -308,7 +309,10 @@ func (t ListPendingManifestsTool) Call(ctx context.Context, input string) (strin
 	}
 
 	if len(manifests) == 0 {
-		return "No pending manifests found", nil
+		// Fail loud: report the queried scope and any nearby match instead of a
+		// bare "none" (e968).
+		return emptyScopeReport(t.Ctx.DB, &storage.ForgeManifest{}, "edict_id = ? AND status = ?",
+			[]any{params.EdictID, storage.ManifestForged}, t.Ctx.Username, t.Ctx.Project), nil
 	}
 
 	result, err := json.MarshalIndent(manifests, "", "  ")
@@ -436,6 +440,13 @@ func (t GetManifestByCommitTool) Call(ctx context.Context, input string) (string
 	var manifest storage.ForgeManifest
 	if err := t.Ctx.DB.Where("commit_hash = ? AND username = ? AND project = ?", params.CommitHash, t.Ctx.Username, t.Ctx.Project).
 		First(&manifest).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Distinguish "no such commit" (error) from "no row in this scope"
+			// (report the queried scope and any nearby match, e968).
+			if report, ok := scopeMissReport(t.Ctx.DB, &storage.ForgeManifest{}, "commit_hash = ?", []any{params.CommitHash}, t.Ctx.Username, t.Ctx.Project); ok {
+				return report, nil
+			}
+		}
 		return "", fmt.Errorf("manifest not found for commit: %s", params.CommitHash)
 	}
 

@@ -160,7 +160,10 @@ func (t ListQuenchedManifestsTool) Call(ctx context.Context, input string) (stri
 	}
 
 	if len(manifests) == 0 {
-		return "No quenched manifests found", nil
+		// Fail loud: report the queried scope and any nearby match instead of
+		// returning an empty-looking list (e968).
+		return emptyScopeReport(t.Ctx.DB, &storage.ForgeManifest{}, "edict_id = ? AND status = ?",
+			[]any{params.EdictID, storage.ManifestQuenched}, t.Ctx.Username, t.Ctx.Project), nil
 	}
 
 	result, err := json.MarshalIndent(manifests, "", "  ")

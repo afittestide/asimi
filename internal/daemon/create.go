@@ -46,13 +46,22 @@ func createCourt(
 	}
 
 	courtCfg := config.DefaultCourtConfig()
-	if hp.Username != "" {
+	// Pinned [court] username/project from .agents/asimi.conf take effect on the
+	// daemon path too — matching the TUI provider — so the same checkout cannot
+	// resolve to two different Court scopes. The pinned config wins over the
+	// handshake slug (which the client derived with the same shared resolver,
+	// edict 968); the handshake fills in what the config leaves unset.
+	if projectCfg.Court.Username != "" {
+		courtCfg.Username = projectCfg.Court.Username
+	} else if hp.Username != "" {
 		courtCfg.Username = hp.Username
 	}
-	if hp.Project != "" {
+	if projectCfg.Court.Project != "" {
+		courtCfg.Project = projectCfg.Court.Project
+	} else if hp.Project != "" {
 		courtCfg.Project = hp.Project
-	} else if repoInfo.Slug != "" {
-		courtCfg.Project = repoInfo.Slug
+	} else {
+		courtCfg.Project = repo.ResolveProjectSlug("", repoInfo.ProjectRoot, repoInfo.HasVCS)
 	}
 	if projectCfg.Court.OutputLimit > 0 {
 		courtCfg.OutputLimit = projectCfg.Court.OutputLimit

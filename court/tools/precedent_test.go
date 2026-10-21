@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -600,5 +601,43 @@ func TestRecordPrecedent_PrincipleInSchema(t *testing.T) {
 	}
 	if req["principle"] {
 		t.Errorf("principle must remain optional, not required")
+	}
+}
+
+// TestListQuenchedManifestsTool_EmptyScopeReportsScope covers edict 968: a
+// scoped list_quenched_manifests that matches zero rows must name the queried
+// scope and any nearby match instead of returning an empty-looking list.
+func TestListQuenchedManifestsTool_EmptyScopeReportsScope(t *testing.T) {
+	db := setupPrecedentTestDB(t)
+
+	// The manifest is quenched but lives under the pinned slug, not the origin
+	// slug the tool is scoped to — the reported split-brain.
+	if err := db.Create(&storage.ForgeManifest{
+		ManifestID: "m1", EdictID: 7, Username: "daonb",
+		Project: "oct7-io/data-poisoning-benchmark", FilePath: "a.go", Status: storage.ManifestQuenched,
+	}).Error; err != nil {
+		t.Fatalf("failed to create manifest: %v", err)
+	}
+
+	tool := ListQuenchedManifestsTool{Ctx: ToolContext{
+		DB: db, Username: "daonb", Project: "daonb/data-poisoning-benchmark",
+	}}
+	result, err := tool.Call(context.Background(), `{"edict_id":7}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	var report ScopeReport
+	if err := json.Unmarshal([]byte(result), &report); err != nil {
+		t.Fatalf("empty-scope result is not the scope-report shape: %v\n%s", err, result)
+	}
+	if report.Rows != 0 || report.Username != "daonb" || report.Project != "daonb/data-poisoning-benchmark" {
+		t.Errorf("report = %+v, want 0 rows scoped to daonb/daonb/data-poisoning-benchmark", report)
+	}
+	if len(report.Nearby) != 1 {
+		t.Fatalf("report.Nearby = %+v, want 1 nearby match", report.Nearby)
+	}
+	if report.Nearby[0].Project != "oct7-io/data-poisoning-benchmark" || report.Nearby[0].Count != 1 {
+		t.Errorf("nearby = %+v, want 1 quenched row for oct7-io/data-poisoning-benchmark", report.Nearby[0])
 	}
 }

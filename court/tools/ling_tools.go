@@ -192,7 +192,10 @@ func (t ListLingTool) Call(ctx context.Context, input string) (string, error) {
 	}
 
 	if len(lingList) == 0 {
-		return "No ling found for this edict", nil
+		// Pass the edict key as the natural key: the same edict id may hold ling
+		// under a different (username, project) scope — report that instead of a
+		// bare "none" (e968).
+		return emptyScopeReport(t.Ctx.DB, &storage.Ling{}, "edict_id = ?", []any{params.EdictID}, t.Ctx.Username, t.Ctx.Project), nil
 	}
 
 	result, err := json.MarshalIndent(lingList, "", "  ")

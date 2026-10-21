@@ -408,7 +408,9 @@ func ProvideCourt(params CourtParams) *court.Court {
 	if params.Config.Court.Project != "" {
 		cfg.Project = params.Config.Court.Project
 	} else if params.RepoInfo.Slug != "" {
-		cfg.Project = params.RepoInfo.Slug
+		// Shared resolver: tracked-remote → origin → basename, warning when the
+		// remotes disagree — never an origin-only pick. (edict 968)
+		cfg.Project = repo.ResolveProjectSlug("", params.RepoInfo.ProjectRoot, params.RepoInfo.HasVCS)
 	}
 	cfg.IsolatedHost = params.Config.Court.IsolatedHost
 	if params.Config.Court.OutputLimit > 0 {

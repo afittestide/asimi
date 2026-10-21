@@ -346,12 +346,60 @@ func TestProjectSlugLowercasesRemoteSegments(t *testing.T) {
 	require.NoError(t, err)
 	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
 
-	slug := projectSlug(dir, true)
+	slug := ProjectSlug(dir, true)
 	require.Equal(t, "myorg/myproject", slug)
 
 	// Gitless ground falls back to the sanitized directory basename.
 	gitless := t.TempDir()
-	require.Equal(t, SanitizeSegment(filepath.Base(gitless)), projectSlug(gitless, false))
+	require.Equal(t, SanitizeSegment(filepath.Base(gitless)), ProjectSlug(gitless, false))
+}
+
+// TestProjectSlug_TwoRemotesUsesTrackedRemote covers edict 968: with two remotes
+// the slug must follow the branch's tracked remote, not whichever is named
+// origin, and an explicit [court] project must win on every path.
+func TestProjectSlug_TwoRemotesUsesTrackedRemote(t *testing.T) {
+	dir := t.TempDir()
+	_, err := runGitCommand(dir, "init", "-b", "main")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.email", "test@example.com")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.name", "Test")
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x\n"), 0o644))
+	_, err = runGitCommand(dir, "add", "f.txt")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "commit", "-m", "init")
+	require.NoError(t, err)
+
+	// origin is the fork; upstream is the canonical (tracked) remote.
+	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "remote", "add", "upstream", "https://github.com/OCT7-IO/data-poisoning-benchmark.git")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "branch.main.remote", "upstream")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "branch.main.merge", "refs/heads/main")
+	require.NoError(t, err)
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	// The tracked remote wins over origin.
+	require.Equal(t, "oct7-io/data-poisoning-benchmark", ProjectSlug(dir, true))
+
+	// Both remote slugs are derivable — the ambiguity signal for the resolver.
+	require.Equal(t, []string{
+		"daonb/data-poisoning-benchmark",
+		"oct7-io/data-poisoning-benchmark",
+	}, DerivedSlugs(dir))
+
+	// An explicit [court] project wins over any remote-derived slug.
+	require.Equal(t, "oct7-io/data-poisoning-benchmark",
+		ResolveProjectSlug("oct7-io/data-poisoning-benchmark", dir, true))
+
+	// Without a tracked branch, the resolver falls back to origin.
+	_, err = runGitCommand(dir, "config", "--unset", "branch.main.remote")
+	require.NoError(t, err)
+	require.Equal(t, "daonb/data-poisoning-benchmark", ProjectSlug(dir, true))
 }
 
 // newTestRepo creates a RepoInfo backed by a real git repo in a temp dir.

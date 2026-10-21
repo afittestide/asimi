@@ -2392,3 +2392,59 @@ func TestPromptForAbortedRituals_StaleSealsNotAutoCompleted(t *testing.T) {
 		t.Error("aborted ritual with stale seals should NOT be auto-completed — it should remain pending for re-execution")
 	}
 }
+
+// TestPromptForAbortedRituals_SuppressesDuplicatePrompt covers edict 968: the
+// abort prompt is raised at most once per execution. A PENDING zhengming that
+// already carries the execution's marker suppresses a second prompt.
+func TestPromptForAbortedRituals_SuppressesDuplicatePrompt(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+
+	edict := storage.Edict{Intent: "Duplicate prompt suppression", Username: "testuser", Project: "testproject"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	abortedExecID := "aborted-duplicate-prompt"
+	abortedExec := &RitualExecution{
+		ID: abortedExecID, RitualName: "swift-strike", EdictID: edict.ID,
+		Username: "testuser", Project: "testproject", State: RitualStateAborted, CurrentStep: 0,
+	}
+	if err := db.Save(abortedExec).Error; err != nil {
+		t.Fatalf("failed to create aborted ritual: %v", err)
+	}
+
+	// A prior scan already raised the prompt; it is still pending.
+	pending := storage.Zhengming{
+		RequestID: "pending-abort-prompt", EdictID: edict.ID, Username: "testuser",
+		Project: "testproject", MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{Text: "aborted at step 0. What should we do? [exec:" + abortedExecID + "]"}},
+		Status:    storage.ZhengmingPending, Priority: storage.PriorityUrgent, TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&pending).Error; err != nil {
+		t.Fatalf("failed to create pending zhengming: %v", err)
+	}
+
+	raised := 0
+	chancellor := newMockZhengmingMinister(
+		func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error) {
+			raised++
+			return "req-dup", nil
+		},
+		func(ctx context.Context, requestID string) (string, error) { return "Pass", nil },
+	)
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister {
+		if id == "secretary" {
+			return chancellor
+		}
+		return nil
+	}, chancellor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rg.promptForAbortedRituals(ctx)
+
+	if raised != 0 {
+		t.Errorf("raised %d duplicate abort prompts, want 0", raised)
+	}
+}

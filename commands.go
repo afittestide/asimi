@@ -396,8 +396,10 @@ func handleInitCommand(model *TUIModel, args []string) tea.Cmd {
 
 	// Check if project name is already set in config
 	if model.config.Court.Project == "" {
-		// Auto-derive slug from git remote
-		slug := model.status.repoInfo.Slug
+		// Auto-derive slug with the shared resolver (tracked-remote → origin →
+		// basename) rather than blindly trusting the origin remote (edict 968).
+		ri := model.status.repoInfo
+		slug := repo.ResolveProjectSlug("", ri.ProjectRoot, ri.HasVCS)
 		if slug == "" {
 			return func() tea.Msg {
 				return showContextMsg{content: "No git remote found. Please set up a git remote origin before running :init."}

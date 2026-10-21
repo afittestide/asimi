@@ -645,3 +645,64 @@ func TestDaemonTwoClientsIsolation(t *testing.T) {
 	default:
 	}
 }
+
+// TestCreateCourtHonoursPinnedProject covers edict 968: the daemon path must
+// apply the pinned [court] project (and username) from .agents/asimi.conf, so
+// the same checkout cannot resolve to two different Court scopes — the TUI path
+// already honours it, and the daemon used to ignore it entirely.
+func TestCreateCourtHonoursPinnedProject(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	agentsDir := filepath.Join(projectRoot, ".agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	conf := "[court]\nproject = \"oct7-io/data-poisoning-benchmark\"\nusername = \"pinned-user\"\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(conf), 0o644); err != nil {
+		t.Fatalf("write asimi.conf: %v", err)
+	}
+
+	projectCfg, err := config.LoadProjectConfig(projectRoot, false)
+	if err != nil {
+		t.Fatalf("LoadProjectConfig: %v", err)
+	}
+	if projectCfg.Court.Project != "oct7-io/data-poisoning-benchmark" {
+		t.Fatalf("config project = %q, want pinned slug", projectCfg.Court.Project)
+	}
+
+	// The handshake carries an origin-derived slug (daonb/...); the pinned config
+	// must win so the daemon scope matches the TUI's.
+	repoInfo := repo.RepoInfo{
+		ProjectRoot: projectRoot,
+		Slug:        "daonb/data-poisoning-benchmark",
+		Branch:      "main",
+	}
+	c, _, err := createCourt(
+		context.Background(),
+		shared,
+		1,
+		types.SetContextParams{
+			Project:     "daonb/data-poisoning-benchmark",
+			Username:    testUsername(),
+			ProjectRoot: projectRoot,
+		},
+		projectCfg,
+		repoInfo,
+		nil,
+		true, // isolatedHost avoids a podman runner
+	)
+	if err != nil {
+		t.Fatalf("createCourt: %v", err)
+	}
+	defer c.Stop()
+
+	key := c.EdictKey(1)
+	if key.Project != "oct7-io/data-poisoning-benchmark" {
+		t.Errorf("Court project = %q, want pinned %q", key.Project, "oct7-io/data-poisoning-benchmark")
+	}
+	if key.Username != "pinned-user" {
+		t.Errorf("Court username = %q, want pinned %q", key.Username, "pinned-user")
+	}
+}

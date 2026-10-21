@@ -45,6 +45,14 @@ func (t GetEdictStatusTool) Call(ctx context.Context, input string) (string, err
 	key := storage.EdictKey{ID: params.EdictID, Username: t.Username, Project: t.Project}
 	var edict storage.Edict
 	if err := t.DB.First(&edict, "id = ? AND username = ? AND project = ?", key.ID, key.Username, key.Project).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Distinguish "no such row" (error, as before) from "no row in this
+			// scope" (report the queried scope and any nearby match, e968).
+			if report, ok := scopeMissReport(t.DB, &storage.Edict{}, "id = ?", []any{key.ID}, key.Username, key.Project); ok {
+				return report, nil
+			}
+			return "", fmt.Errorf("get edict: %w", err)
+		}
 		return "", fmt.Errorf("get edict: %w", err)
 	}
 
@@ -80,8 +88,14 @@ func (t GetEdictStatusTool) Format(input, result string, err error) string {
 		var res struct {
 			Status string `json:"status"`
 		}
-		json.Unmarshal([]byte(result), &res)
-		msg.Writef("[%s]", res.Status)
+		if json.Unmarshal([]byte(result), &res) == nil && res.Status != "" {
+			msg.Writef("[%s]", res.Status)
+		} else if scopeMsg, ok := scopeReportMessage(result); ok {
+			// Fail-loud scope report: show the human message, not the JSON.
+			msg.Writef("%s", scopeMsg)
+		} else {
+			msg.Writef("%s", result)
+		}
 	}
 
 	return msg.String() + "\n"
@@ -157,6 +171,22 @@ func (t ListEdictsTool) Call(ctx context.Context, input string) (string, error) 
 		})
 	}
 
+	// Only a genuinely empty scope may raise the fail-loud scope report. When
+	// the scope holds rows and the optional status filter excluded them all,
+	// return a message that says so — never the false "0 rows" report (e968).
+	if len(edicts) == 0 {
+		return emptyScopeReport(t.DB, &storage.Edict{}, "", nil, t.Username, t.Project), nil
+	}
+	if len(results) == 0 {
+		resultJSON, _ := json.Marshal(map[string]any{
+			"in_scope": len(edicts),
+			"matched":  0,
+			"status":   params.Status,
+			"message":  fmt.Sprintf("%d edicts in scope for username=%q project=%q, none match status=%q", len(edicts), t.Username, t.Project, params.Status),
+		})
+		return string(resultJSON), nil
+	}
+
 	resultJSON, _ := json.Marshal(results)
 	return string(resultJSON), nil
 }
@@ -169,8 +199,14 @@ func (t ListEdictsTool) Format(input, result string, err error) string {
 		msg.Writef("Error: %v", err)
 	} else {
 		var edicts []map[string]any
-		json.Unmarshal([]byte(result), &edicts)
-		msg.Writef("Found %d edicts", len(edicts))
+		if json.Unmarshal([]byte(result), &edicts) == nil {
+			msg.Writef("Found %d edicts", len(edicts))
+		} else if scopeMsg, ok := scopeReportMessage(result); ok {
+			// Fail-loud scope report / filter miss: show the human message.
+			msg.Writef("%s", scopeMsg)
+		} else {
+			msg.Writef("%s", result)
+		}
 	}
 
 	return msg.String() + "\n"
