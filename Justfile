@@ -38,6 +38,83 @@ hello-harbor *args:
         {{args}} 2>&1
     echo "<== results written to ${ROOT}/jobs"
 
+# Fetch failed CI runs since the last success, with their entire logs, to heaven/runs.
+#
+# Scope (Ruler ruling 2026-10-21): ALL workflows, all branches — includes
+# Dependabot/Copilot/Dependency-Graph noise. "Since the last success" = the most
+# recent run (any workflow) that concluded success; every run that concluded
+# failure and is newer than it is downloaded.
+#
+# Layout (additive — never deletes):
+#   heaven/runs/<run-id>/run.json        metadata incl. provenance (sha, branch, event, url)
+#   heaven/runs/<run-id>/<job-id>-<job>.log   full log per job (gh run view --job --log)
+# A run whose run.json already exists is skipped, so re-running only fetches
+# newly-failed runs. A partial run (dir without run.json) is re-fetched.
+fetch-runs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # gh is the instrument; a missing one is a hard failure, not an empty
+    # success — the Judge must never mistake "no runs" for "tool absent".
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "ERROR: gh (GitHub CLI) is not installed or not on PATH." >&2
+        exit 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        echo "ERROR: gh is not authenticated. Run 'gh auth login' first." >&2
+        exit 1
+    fi
+
+    dest="heaven/runs"
+    mkdir -p "$dest"
+
+    echo "==> listing runs (all workflows, all branches)"
+    # Newest-first. Walking from the top, runs before the first success are
+    # newer than it and in scope; the first success is the cutoff; everything
+    # after is ignored. A run still in progress is neither. gh --jq is embedded
+    # gojq, so this needs no external jq/python.
+    ids="$(gh run list --limit 300 \
+        --json databaseId,conclusion,status \
+        --jq 'reduce .[] as $r ({cut: false, ids: []};
+                if .cut then .
+                elif ($r.conclusion == "success") then .cut = true
+                elif ($r.conclusion == "failure" and $r.status == "completed")
+                  then .ids += [$r.databaseId]
+                else . end)
+              | .ids[]')"
+
+    if [ -z "$ids" ]; then
+        echo "==> no failed runs since the last success; nothing to fetch"
+        exit 0
+    fi
+
+    count="$(printf '%s\n' "$ids" | grep -c .)"
+    echo "==> ${count} failed run(s) to fetch"
+    printf '%s\n' "$ids" | while IFS= read -r id; do
+        [ -z "$id" ] && continue
+        dir="$dest/$id"
+        if [ -f "$dir/run.json" ]; then
+            echo "==> skip run $id (already fetched)"
+            continue
+        fi
+        echo "==> fetching run $id"
+        mkdir -p "$dir"
+        gh run view "$id" \
+            --json databaseId,displayTitle,name,number,attempt,workflowName,workflowDatabaseId,event,headBranch,headSha,status,conclusion,createdAt,startedAt,updatedAt,url \
+            > "$dir/run.json"
+        # One full log per job. Job names may contain spaces or slashes, so slug
+        # them to a filesystem-safe name and prefix the job id for uniqueness.
+        gh run view "$id" --json jobs \
+            --jq '.jobs[] | [.databaseId, .name] | @tsv' \
+        | while IFS=$'\t' read -r jobid jobname; do
+            [ -z "$jobid" ] && continue
+            safe="$(printf '%s' "$jobname" | tr -c '[:alnum:]._-' '_')"
+            if ! gh run view "$id" --job "$jobid" --log > "$dir/${jobid}-${safe}.log" 2>/dev/null; then
+                echo "WARN: could not fetch log for job $jobid ($jobname)" >&2
+            fi
+        done
+    done
+    echo "==> done; artifacts in $dest"
+
 # Run with debug logging
 run:
     pkill -9 asimi || true
