@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -189,6 +190,32 @@ func TestHeadlessSink_ToolCallSuccess_PrintsResult(t *testing.T) {
 		t.Fatal("should not signal done on ToolCallSuccessMsg")
 	default:
 	}
+}
+
+// TestHeadlessSink_ToolCallSuccess_MarkdownEnvelopePrintsContent verifies the
+// edict-975 headless path: a markdown result envelope is printed as plain
+// content rather than raw envelope JSON.
+func TestHeadlessSink_ToolCallSuccess_MarkdownEnvelopePrintsContent(t *testing.T) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stdout = w
+	t.Cleanup(func() { os.Stdout = old })
+
+	sink := newHeadlessSink(nil)
+	sink.handle(runners.ToolCallSuccessMsg{
+		ToolName: "edict",
+		Result:   `{"format":"markdown","content":"# Title\n\nbody"}`,
+	})
+	require.NoError(t, w.Close())
+	os.Stdout = old
+
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "# Title", "markdown content must be printed")
+	assert.Contains(t, string(out), "body", "markdown content must be printed")
+	assert.NotContains(t, string(out), `"format"`,
+		"the raw envelope JSON must not be printed verbatim")
 }
 
 // TestHeadlessSink_ToolCallError_PrintsError verifies that

@@ -1139,6 +1139,115 @@ func TestBackgroundGiven(t *testing.T) {
 	}
 }
 
+// TestBackgroundGiven_EdictDetailsRendersMarkdown pins the edict-975 fix: the
+// "the edict details" background given emits a markdown result envelope
+// carrying the edict's full Intent, while exec.Data["edict"] keeps the plain
+// map so ritual templates are unaffected.
+func TestBackgroundGiven_EdictDetailsRendersMarkdown(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}))
+
+	intent := "# Goal\n\nRender the full intent\n\n- untruncated"
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 975, Username: "testuser", Project: "testproject", Intent: intent,
+	}).Error)
+
+	ritual := &RitualDef{
+		Name:       "bg-edict-test",
+		Background: []string{"the edict details"},
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	court := newRitualTestCourt(t, "step-done\n", nil)
+	runner := NewRitualRunner(registry, court.GetMinister, nil, db, &mockCallCountRunner{}, nil, repo.RepoInfo{})
+
+	var messages []any
+	notify := func(msg any) { messages = append(messages, msg) }
+
+	ctx := context.Background()
+	exec, err := runner.Start(ctx, "bg-edict-test", testEK(975), nil, notify)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(ctx, exec))
+
+	var success *runners.ToolCallSuccessMsg
+	for i := range messages {
+		if m, ok := messages[i].(runners.ToolCallSuccessMsg); ok && m.ToolName == "edict" {
+			success = &m
+		}
+	}
+	require.NotNil(t, success, "expected a ToolCallSuccessMsg for the edict given")
+
+	var env map[string]string
+	require.NoError(t, json.Unmarshal([]byte(success.Result), &env))
+	assert.Equal(t, "markdown", env["format"])
+	assert.Equal(t, intent, env["content"], "the full Intent must ride untruncated")
+
+	data, ok := exec.Data["edict"].(map[string]interface{})
+	require.True(t, ok, "exec.Data[\"edict\"] must stay a plain map for templates")
+	assert.Equal(t, intent, data["intent"])
+	assert.Equal(t, "active", data["status"])
+}
+
+// TestStepLevelGiven_EdictDetailsRendersMarkdown pins the step-level given
+// counterpart of the edict-975 fix: a step's `given: the edict details` must
+// emit the same markdown result envelope as the background given, while
+// exec.Data["edict"] keeps the plain map so templates are unaffected.
+func TestStepLevelGiven_EdictDetailsRendersMarkdown(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}))
+
+	intent := "# Goal\n\nStep-level intent\n\n- untruncated"
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 975, Username: "testuser", Project: "testproject", Intent: intent,
+	}).Error)
+
+	ritual := &RitualDef{
+		Name: "step-given-edict-test",
+		Steps: []RitualStep{
+			{
+				Name:     "work",
+				Minister: "forge",
+				Task:     "do work",
+				Given:    []string{"the edict details"},
+			},
+		},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	court := newRitualTestCourt(t, "step-done\n", nil)
+	runner := NewRitualRunner(registry, court.GetMinister, nil, db, &mockCallCountRunner{}, nil, repo.RepoInfo{})
+
+	var messages []any
+	notify := func(msg any) { messages = append(messages, msg) }
+
+	ctx := context.Background()
+	exec, err := runner.Start(ctx, "step-given-edict-test", testEK(975), nil, notify)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(ctx, exec))
+
+	var success *runners.ToolCallSuccessMsg
+	for i := range messages {
+		if m, ok := messages[i].(runners.ToolCallSuccessMsg); ok && m.ToolName == "edict" {
+			success = &m
+		}
+	}
+	require.NotNil(t, success, "expected a ToolCallSuccessMsg for the step-level edict given")
+
+	var env map[string]string
+	require.NoError(t, json.Unmarshal([]byte(success.Result), &env))
+	assert.Equal(t, "markdown", env["format"])
+	assert.Equal(t, intent, env["content"], "the full Intent must ride untruncated")
+
+	data, ok := exec.Data["edict"].(map[string]interface{})
+	require.True(t, ok, "exec.Data[\"edict\"] must stay a plain map for templates")
+	assert.Equal(t, intent, data["intent"])
+}
+
 func TestBackgroundGivenFailureNotifies(t *testing.T) {
 	db := setupRitualTestDB(t)
 

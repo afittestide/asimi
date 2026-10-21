@@ -37,6 +37,7 @@ const (
 	MessageTypeThinking                     // AI thinking/reasoning content
 	MessageTypeShell                        // Shell command input/output
 	MessageTypeGreeting                     // Welcome/onboarding messages
+	MessageTypeMarkdown                     // expression/step replies rendered through the shared markdown path
 )
 
 // ChatMessage represents a single message with its indent level
@@ -777,6 +778,12 @@ func (c *ChatComponent) renderSystemMessage(message string, msgType MessageType)
 			}
 		}
 		return c.renderMarkdown(builder.String())
+
+	case MessageTypeMarkdown:
+		// Raw markdown re-rendered on every UpdateContent via the shared
+		// cached renderer, so it reflows at the live width on resize —
+		// exactly like MessageTypeAI.
+		return checkPrefix + " " + c.renderMarkdown(message)
 	}
 
 	// Other messages (system, tool calls, etc.)
@@ -813,14 +820,32 @@ func (c *ChatComponent) renderMarkdown(content string) string {
 // a JSON object carrying this format rather than a bare value.
 const markdownTableFormat = "markdown_table"
 
+// markdownFormat is the result-envelope opt-in for a bare markdown block: the
+// TUI renders Content through the shared markdown pipeline.
+const markdownFormat = "markdown"
+
 // resultEnvelope is the generic result shape a tool may emit to ask the TUI
 // to render it as a markdown table. Columns and rows are plain strings so the
 // tool stays free of any layout concern; the TUI owns widths.
 type resultEnvelope struct {
 	Format  string     `json:"format"`
-	Title   string     `json:"title"`
-	Columns []string   `json:"columns"`
-	Rows    [][]string `json:"rows"`
+	Title   string     `json:"title,omitempty"`
+	Columns []string   `json:"columns,omitempty"`
+	Rows    [][]string `json:"rows,omitempty"`
+	Content string     `json:"content,omitempty"` // markdownFormat body
+}
+
+// markdownEnvelopeContent returns the markdown carried by a "markdown"
+// result envelope, or ok=false for any other result.
+func markdownEnvelopeContent(result string) (string, bool) {
+	var env resultEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		return "", false
+	}
+	if env.Format != markdownFormat || env.Content == "" {
+		return "", false
+	}
+	return env.Content, true
 }
 
 // formatToolResult builds the line shown for a successful tool call. A result
@@ -1216,11 +1241,21 @@ func (c *ChatComponent) HandleToolCallExecuting(msg runners.ToolCallExecutingMsg
 
 // HandleToolCallSuccess handles a successful tool call message
 func (c *ChatComponent) HandleToolCallSuccess(msg runners.ToolCallSuccessMsg) {
+	md, isMD := markdownEnvelopeContent(msg.Result)
 	formatted, table := c.formatToolResult(msg)
+	if isMD {
+		formatted = md // raw; rendered by renderSystemMessage on every pass
+	}
+
 	// Update the existing message if we have its index
 	if idx, exists := c.GetToolCallMessageIndex(msg.CallID); exists && idx < len(c.Messages) {
 		c.Messages[idx].Content = formatted
 		c.Messages[idx].Table = table
+		if isMD {
+			c.Messages[idx].Type = MessageTypeMarkdown
+		} else {
+			c.Messages[idx].Type = MessageTypeSystem
+		}
 		c.contentDirty = true
 		// Clean up the index mapping
 		c.DeleteToolCallMessageIndex(msg.CallID)
@@ -1229,6 +1264,16 @@ func (c *ChatComponent) HandleToolCallSuccess(msg runners.ToolCallSuccessMsg) {
 		// table re-lays-out on later renders and resizes.
 		c.Messages = append(c.Messages, ChatMessage{
 			Content: formatted, Indent: c.Indent, Type: MessageTypeSystem, Table: table,
+		})
+		if !c.ScrollLocked {
+			c.AutoScroll = true
+			c.UserScrolled = false
+		}
+		c.contentDirty = true
+	} else if isMD {
+		// Fallback: append the raw markdown so it re-renders at the live width.
+		c.Messages = append(c.Messages, ChatMessage{
+			Content: md, Indent: c.Indent, Type: MessageTypeMarkdown,
 		})
 		if !c.ScrollLocked {
 			c.AutoScroll = true

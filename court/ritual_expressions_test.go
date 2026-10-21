@@ -61,6 +61,57 @@ func TestStepDefRegistry(t *testing.T) {
 	}
 }
 
+// TestGetEdict_ReturnsDisplayEnvelope pins the edict-975 fix at the source:
+// getEdict returns a displayEnvelope whose Data map keeps the template-facing
+// keys while Markdown carries the full untruncated Intent for the TUI.
+func TestGetEdict_ReturnsDisplayEnvelope(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}))
+
+	intent := "# Goal\n\nLine one\nLine two"
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 975, Username: "testuser", Project: "testproject", Intent: intent,
+	}).Error)
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, nil, repo.RepoInfo{})
+
+	result, err := runner.getEdict(testEK(975))
+	require.NoError(t, err)
+
+	de, ok := result.(displayEnvelope)
+	require.True(t, ok, "getEdict must return a displayEnvelope")
+	assert.Equal(t, intent, de.Markdown, "Markdown must be the full Intent")
+
+	data, ok := de.Data.(map[string]interface{})
+	require.True(t, ok, "Data must be the template-facing map")
+	assert.Equal(t, intent, data["intent"])
+	assert.Equal(t, "active", data["status"])
+	assert.EqualValues(t, 975, data["edict_id"])
+}
+
+// TestGetEdict_SummaryFallbackWhenIntentEmpty pins the display text fallback:
+// an edict with no Intent must still render its Summary as the markdown block
+// rather than an empty reply.
+func TestGetEdict_SummaryFallbackWhenIntentEmpty(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}))
+
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 976, Username: "testuser", Project: "testproject",
+		Summary: "A one-line summary",
+	}).Error)
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, nil, repo.RepoInfo{})
+
+	result, err := runner.getEdict(testEK(976))
+	require.NoError(t, err)
+
+	de, ok := result.(displayEnvelope)
+	require.True(t, ok, "getEdict must return a displayEnvelope")
+	assert.Equal(t, "A one-line summary", de.Markdown,
+		"an empty Intent must fall back to the Summary")
+}
+
 // TestStepDefRegistry_WorktreeGivenRegistered guards against the swift-strike
 // background regression where "an edict's worktree" was declared in the YAML
 // but had no step definition to dispatch to its handler.

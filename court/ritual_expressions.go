@@ -2,6 +2,7 @@ package court
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -483,10 +484,17 @@ func (r *RitualRunner) getEdict(key storage.EdictKey) (interface{}, error) {
 	if err != nil {
 		status = storage.EdictActive // default if error
 	}
-	return map[string]interface{}{
-		"edict_id": edict.ID,
-		"intent":   edict.Intent,
-		"status":   string(status),
+	text := edict.Intent
+	if text == "" {
+		text = edict.Summary
+	}
+	return displayEnvelope{
+		Data: map[string]interface{}{
+			"edict_id": edict.ID,
+			"intent":   edict.Intent,
+			"status":   string(status),
+		},
+		Markdown: text,
 	}, nil
 }
 
@@ -1659,6 +1667,25 @@ func storeGivenResult(exec *RitualExecution, key string, result interface{}) {
 	} else {
 		exec.Data[key] = result
 	}
+}
+
+// displayEnvelope is a given result that also carries a markdown block for
+// the TUI reply line. Data is what gets stored for templates; Markdown is
+// what the ruler sees.
+type displayEnvelope struct {
+	Data     interface{}
+	Markdown string
+}
+
+// markdownResultFormat matches the TUI's markdown result-envelope format. The
+// daemon duplicates the constant because the two binaries share no constants
+// package (cf. court/tools/tian_events_tool.go).
+const markdownResultFormat = "markdown"
+
+// formatMarkdownResult encodes md as the TUI "markdown" result envelope.
+func formatMarkdownResult(md string) string {
+	b, _ := json.Marshal(map[string]string{"format": markdownResultFormat, "content": md})
+	return string(b)
 }
 
 // runGivenStep executes a single given step and returns its result

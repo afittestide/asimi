@@ -814,15 +814,20 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 			})
 			return fmt.Errorf("background given %q failed: %w", raw, err)
 		}
-		exec.notifyAny(runners.ToolCallSuccessMsg{
+		success := runners.ToolCallSuccessMsg{
 			ChannelID: exec.ChannelID(),
 			CallID:    callID,
 			ToolName:  entry.Key,
 			Input:     raw,
-			Result:    "",
 			Formatted: raw,
-		})
-		storeGivenResult(exec, entry.Key, result)
+		}
+		stored := result
+		if de, ok := result.(displayEnvelope); ok {
+			success.Result = formatMarkdownResult(de.Markdown)
+			stored = de.Data
+		}
+		exec.notifyAny(success)
+		storeGivenResult(exec, entry.Key, stored)
 	}
 
 	for exec.CurrentStep < len(exec.def.Steps) {
@@ -1068,15 +1073,20 @@ func (r *RitualRunner) executeStep(ctx context.Context, exec *RitualExecution, s
 				})
 				return "", fmt.Errorf("given %q failed: %w", raw, err)
 			}
-			exec.notifyAny(runners.ToolCallSuccessMsg{
+			success := runners.ToolCallSuccessMsg{
 				ChannelID: exec.ChannelID(),
 				CallID:    callID,
 				ToolName:  entry.Key,
 				Input:     raw,
-				Result:    "",
 				Formatted: raw,
-			})
-			storeGivenResult(exec, entry.Key, result)
+			}
+			stored := result
+			if de, ok := result.(displayEnvelope); ok {
+				success.Result = formatMarkdownResult(de.Markdown)
+				stored = de.Data
+			}
+			exec.notifyAny(success)
+			storeGivenResult(exec, entry.Key, stored)
 		}
 	}
 

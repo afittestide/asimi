@@ -259,7 +259,11 @@ func (s *headlessSink) handle(msg any) {
 		}
 
 	case runners.ToolCallSuccessMsg:
-		if m.Result != "" {
+		if md, ok := markdownEnvelopeContent(m.Result); ok {
+			if md != "" {
+				fmt.Printf("\n[%s]\n%s\n", m.ToolName, md)
+			}
+		} else if m.Result != "" {
 			fmt.Printf("\n[%s] %s\n", m.ToolName, m.Result)
 		}
 

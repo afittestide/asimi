@@ -541,11 +541,12 @@ func TestHandleToolCallSuccess_MarkdownTableNarrowWidth(t *testing.T) {
 // result (or an envelope with an unknown format) keeps the old path.
 func TestHandleToolCallSuccess_NonEnvelopeUsesFormatted(t *testing.T) {
 	cases := map[string]string{
-		"plain":         `not json at all`,
-		"bare array":    `[{"id":1,"event_type":"x"}]`,
-		"wrong format":  `{"format":"plain_text","title":"T","columns":["a"],"rows":[["1"]]}`,
-		"missing cols":  `{"format":"markdown_table","title":"T","rows":[["1"]]}`,
-		"unrelated obj": `{"foo":"bar"}`,
+		"plain":          `not json at all`,
+		"bare array":     `[{"id":1,"event_type":"x"}]`,
+		"wrong format":   `{"format":"plain_text","title":"T","columns":["a"],"rows":[["1"]]}`,
+		"missing cols":   `{"format":"markdown_table","title":"T","rows":[["1"]]}`,
+		"unrelated obj":  `{"foo":"bar"}`,
+		"empty markdown": `{"format":"markdown"}`,
 	}
 	for name, result := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -556,8 +557,91 @@ func TestHandleToolCallSuccess_NonEnvelopeUsesFormatted(t *testing.T) {
 			})
 			assert.Equal(t, checkPrefix+" tool: summary", chat.Messages[0].Content,
 				"non-envelope results must fall back to the Formatted line")
+			assert.Equal(t, MessageTypeSystem, chat.Messages[0].Type,
+				"non-envelope results keep MessageTypeSystem")
 		})
 	}
+}
+
+// TestHandleToolCallSuccess_MarkdownEnvelope verifies the generic markdown
+// opt-in: an envelope's content is retained raw and rendered through the shared
+// renderer, overriding the tool's Formatted step name.
+func TestHandleToolCallSuccess_MarkdownEnvelope(t *testing.T) {
+	envelope := `{"format":"markdown","content":"# Title\n\nbody"}`
+	md, ok := markdownEnvelopeContent(envelope)
+	assert.True(t, ok, "a markdown envelope must be recognized")
+	assert.Equal(t, "# Title\n\nbody", md, "raw markdown must be returned verbatim")
+
+	chat := NewChatComponent(80, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-md", ToolName: "edict",
+		Result: envelope, Formatted: "the edict details",
+	})
+
+	assert.Equal(t, "# Title\n\nbody", chat.Messages[0].Content,
+		"the raw markdown must be retained as Content")
+	assert.Equal(t, MessageTypeMarkdown, chat.Messages[0].Type,
+		"a markdown envelope must yield MessageTypeMarkdown")
+
+	rendered := chat.Messages[0].Content
+	chat.UpdateContent()
+	rendered = chat.Viewport.View()
+	assert.Contains(t, rendered, "Title", "the markdown title must be rendered")
+	assert.Contains(t, rendered, "body", "the markdown body must be rendered")
+	assert.NotContains(t, rendered, "the edict details",
+		"the Formatted step name must be overridden by the markdown block")
+}
+
+// TestHandleToolCallSuccess_MarkdownEnvelopeReflowsOnResize pins the edict's
+// width-sizing invariant for the markdown reply: the block is re-rendered from
+// its raw Content at the live component width, so a narrow component re-wraps
+// it rather than clipping it.
+func TestHandleToolCallSuccess_MarkdownEnvelopeReflowsOnResize(t *testing.T) {
+	long := strings.Repeat("word ", 40)
+	envelope := `{"format":"markdown","content":"` + strings.TrimSpace(long) + `"}`
+
+	chat := NewChatComponent(30, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-md-narrow", ToolName: "edict",
+		Result: envelope, Formatted: "the edict details",
+	})
+	chat.UpdateContent()
+
+	for _, line := range strings.Split(chat.Viewport.View(), "\n") {
+		assert.LessOrEqual(t, lipgloss.Width(line), chat.Width,
+			"narrow markdown block must not exceed the component width")
+	}
+	assert.Contains(t, chat.Messages[0].Content, "word word",
+		"the raw Content must stay unwrapped so it can reflow")
+}
+
+// TestHandleToolCallSuccess_MarkdownEnvelopeUpdatesInPlace covers the branch
+// where a scheduled tool call is updated in place with a markdown envelope:
+// the message must flip to MessageTypeMarkdown, keep the raw markdown as
+// Content (so it re-renders at the live width), and not append a duplicate.
+func TestHandleToolCallSuccess_MarkdownEnvelopeUpdatesInPlace(t *testing.T) {
+	envelope := `{"format":"markdown","content":"# Title\n\nbody"}`
+
+	chat := NewChatComponent(80, 20, true)
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-md-upd", ToolName: "edict", Formatted: "the edict details",
+	})
+	chat.UpdateContent()
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-md-upd", ToolName: "edict",
+		Result: envelope, Formatted: "the edict details",
+	})
+
+	assert.Len(t, chat.Messages, 1, "update-in-place must not append a new message")
+	assert.Equal(t, MessageTypeMarkdown, chat.Messages[0].Type,
+		"the updated message must flip to MessageTypeMarkdown")
+	assert.Equal(t, "# Title\n\nbody", chat.Messages[0].Content,
+		"the raw markdown must be retained as Content")
+
+	chat.UpdateContent()
+	assert.Contains(t, chat.Viewport.View(), "Title", "the markdown title must be rendered")
+	assert.NotContains(t, chat.Viewport.View(), "the edict details",
+		"the Formatted step name must be overridden on the update path too")
 }
 
 // TestHandleToolCallSuccess_MalformedEnvelopeFallsBack ensures malformed JSON
