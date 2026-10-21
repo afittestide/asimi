@@ -697,6 +697,39 @@ safe_run_on_host = ["^kubectl\\s+get"]
 	assert.Equal(t, []string{`^kubectl\s+get`}, cfg.Sandbox.SafeRunOnHost)
 }
 
+func TestLoadProjectConfig_IgnoreCopyGlobs(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := `[sandbox]
+ignore_copy_globs = [".env", "config/*.local"]
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, []string{".env", "config/*.local"}, cfg.Sandbox.IgnoreCopyGlobs)
+}
+
+// An absent ignore_copy_globs key must fall back to the safe built-in set.
+func TestLoadProjectConfig_IgnoreCopyGlobsDefault(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	cfg, err := LoadProjectConfig(t.TempDir(), false)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultIgnoreCopyGlobs(), cfg.Sandbox.IgnoreCopyGlobs)
+}
+
 func TestLoadProjectConfig_ResolveKeysTrue(t *testing.T) {
 	tempHome := t.TempDir()
 	originalHome := os.Getenv("HOME")

@@ -30,13 +30,14 @@ func RelPath(edictID uint) string {
 }
 
 // Ensure idempotently creates the edict's branch and worktree, installs
-// dependencies inside it, and carries over gitignored files. It returns the
-// absolute path, the project-root-relative path, the branch name, and whether
-// the worktree was created (false when an existing one was reused).
+// dependencies inside it, and carries over the allowlisted gitignored files
+// (copyGlobs). It returns the absolute path, the project-root-relative path,
+// the branch name, and whether the worktree was created (false when an
+// existing one was reused).
 //
 // Creating depends on the runner supporting shell pipelines: dependency
 // install and ignored-file copy are single shell invocations.
-func Ensure(ctx context.Context, r runners.Runner, root string, edictID uint) (abs, rel, branch string, created bool, err error) {
+func Ensure(ctx context.Context, r runners.Runner, root string, edictID uint, copyGlobs []string) (abs, rel, branch string, created bool, err error) {
 	if root == "" {
 		return "", "", "", false, fmt.Errorf("worktree: empty project root")
 	}
@@ -67,27 +68,42 @@ func Ensure(ctx context.Context, r runners.Runner, root string, edictID uint) (a
 		return "", "", "", false, err
 	}
 
-	if err := CopyIgnored(ctx, r, root, abs); err != nil {
+	if err := CopyIgnored(ctx, r, root, abs, copyGlobs); err != nil {
 		return "", "", "", false, err
 	}
 
 	return abs, rel, branch, true, nil
 }
 
-// CopyIgnored copies untracked-ignored files from root into the worktree at
-// abs, so local-only files (env files, caches) travel with the worktree.
-func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string) error {
+// CopyIgnored copies the gitignored files matching copyGlobs from root into
+// the worktree at abs, so local-only config travels with the worktree. The
+// globs are an opt-in allowlist: only what the caller declares is copied.
+// With no globs there is nothing to copy and the call is a no-op, matching
+// the gitless path.
+func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, copyGlobs []string) error {
 	if r == nil {
 		return fmt.Errorf("worktree: no runner configured")
+	}
+	if len(copyGlobs) == 0 {
+		return nil
+	}
+	// Build the pathspec: `-- <glob>...` restricts git to the declared
+	// allowlist, so an unbounded `--ignored` sweep can never happen. Quoted
+	// globs survive the shell, but git expands them as pathspecs (shell
+	// globbing does not apply to an unexpanded literal in a non-matching
+	// directory).
+	quoted := make([]string, 0, len(copyGlobs))
+	for _, g := range copyGlobs {
+		quoted = append(quoted, shellescape.Quote(g))
 	}
 	// .agents/worktrees is itself gitignored, so without the tar --exclude a
 	// new worktree would copy every other worktree — and any nested copies
 	// they carry — into itself, growing the tree on every edict. --exclude
 	// must precede -T: GNU tar treats it as positional and silently drops it
 	// when it follows a file list.
-	cmd := fmt.Sprintf("cd %s && git ls-files -z --others --ignored --exclude-standard | tar --null --exclude=%s -T - -cf - | tar -xf - -C %s",
-		shellescape.Quote(root), shellescape.Quote(".agents/worktrees/*"), shellescape.Quote(abs))
-	if _, err := run(ctx, r, cmd, "copy gitignored files into worktree"); err != nil {
+	cmd := fmt.Sprintf("cd %s && git ls-files -z --others --ignored --exclude-standard -- %s | tar --null --exclude=%s -T - -cf - | tar -xf - -C %s",
+		shellescape.Quote(root), strings.Join(quoted, " "), shellescape.Quote(".agents/worktrees/*"), shellescape.Quote(abs))
+	if _, err := run(ctx, r, cmd, "copy allowlisted gitignored files into worktree"); err != nil {
 		return err
 	}
 	return nil

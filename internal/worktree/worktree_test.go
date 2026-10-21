@@ -51,7 +51,7 @@ func TestEnsure_CreatesWorktreeUnderProjectRoot(t *testing.T) {
 	root := t.TempDir()
 	mock := &recordingRunner{}
 
-	abs, rel, branch, created, err := Ensure(context.Background(), mock, root, 42)
+	abs, rel, branch, created, err := Ensure(context.Background(), mock, root, 42, []string{".env"})
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestEnsure_IdempotentReuse(t *testing.T) {
 	}
 
 	mock := &recordingRunner{}
-	gotAbs, _, _, created, err := Ensure(context.Background(), mock, root, 7)
+	gotAbs, _, _, created, err := Ensure(context.Background(), mock, root, 7, nil)
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestEnsure_IdempotentReuse(t *testing.T) {
 }
 
 func TestEnsure_EmptyRoot(t *testing.T) {
-	if _, _, _, _, err := Ensure(context.Background(), &recordingRunner{}, "", 1); err == nil {
+	if _, _, _, _, err := Ensure(context.Background(), &recordingRunner{}, "", 1, nil); err == nil {
 		t.Error("expected error for empty project root")
 	}
 }
@@ -117,7 +117,7 @@ func TestCopyIgnored(t *testing.T) {
 	abs := filepath.Join(root, ".agents", "worktrees", "e1")
 	mock := &recordingRunner{}
 
-	if err := CopyIgnored(context.Background(), mock, root, abs); err != nil {
+	if err := CopyIgnored(context.Background(), mock, root, abs, []string{".env", ".envrc", "*.local"}); err != nil {
 		t.Fatalf("CopyIgnored: %v", err)
 	}
 	joined := strings.Join(mock.commands, "\n")
@@ -126,11 +126,33 @@ func TestCopyIgnored(t *testing.T) {
 			t.Errorf("CopyIgnored command missing %q: %s", needle, joined)
 		}
 	}
+	// The allowlist must be carried as a pathspec after `--` so git only
+	// considers the declared globs. The unbounded form (no pathspec) is what
+	// copied every gitignored artifact (caches, binaries, jobs/, logs).
+	if !strings.Contains(joined, "-- .env .envrc") {
+		t.Errorf("CopyIgnored must pass the allowlist after `--`: %s", joined)
+	}
+	if !strings.Contains(joined, `'*.local'`) {
+		t.Errorf("CopyIgnored must quote each glob: %s", joined)
+	}
 	// GNU tar treats --exclude as positional: placed after -T it is
 	// silently ignored, re-opening the recursive copy bug.
 	exclude, list := strings.Index(joined, "--exclude="), strings.Index(joined, "-T -")
 	if exclude == -1 || list == -1 || exclude > list {
 		t.Errorf("--exclude must precede -T: %s", joined)
+	}
+}
+
+func TestCopyIgnored_NoGlobsIsNoOp(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e1")
+	mock := &recordingRunner{}
+
+	if err := CopyIgnored(context.Background(), mock, root, abs, nil); err != nil {
+		t.Fatalf("CopyIgnored: %v", err)
+	}
+	if len(mock.commands) != 0 {
+		t.Errorf("no globs must mean no copy command, got %v", mock.commands)
 	}
 }
 
@@ -534,7 +556,7 @@ func TestEnsure_RealGit(t *testing.T) {
 	runGit(t, root, "init", "-b", "main")
 	runGit(t, root, "config", "user.email", "test@example.com")
 	runGit(t, root, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.agents/worktrees/\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.gocache/\njobs/\nasimi\n.agents/worktrees/\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
@@ -548,6 +570,23 @@ func TestEnsure_RealGit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "local.env"), []byte("SECRET=1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Plant ignored artifacts that must NOT travel into the new worktree:
+	// a build cache, a secrets-bearing jobs/ directory, and a built binary.
+	if err := os.MkdirAll(filepath.Join(root, ".gocache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gocache", "trim.txt"), []byte("cache\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "jobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "jobs", "secret"), []byte("token\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "asimi"), []byte("binary\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	// Plant an ignored nested worktree copy that must not travel into the
 	// new worktree.
 	nested := filepath.Join(root, ".agents", "worktrees", "e999")
@@ -559,7 +598,7 @@ func TestEnsure_RealGit(t *testing.T) {
 	}
 
 	runner := &realLightRunner{root: root}
-	abs, _, branch, created, err := Ensure(context.Background(), runner, root, 123)
+	abs, _, branch, created, err := Ensure(context.Background(), runner, root, 123, []string{"local.env"})
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -573,7 +612,13 @@ func TestEnsure_RealGit(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(abs, "local.env")); err != nil {
 		t.Errorf("ignored file not copied: %v", err)
 	}
-	// ...but worktrees are never copied into worktrees.
+	// ...but the allowlist excluded caches, jobs/, and built binaries.
+	for _, forbidden := range []string{".gocache", "jobs", "asimi"} {
+		if _, err := os.Stat(filepath.Join(abs, forbidden)); !os.IsNotExist(err) {
+			t.Errorf("CopyIgnored must not copy %q, stat err = %v", forbidden, err)
+		}
+	}
+	// ...and worktrees are never copied into worktrees.
 	if _, err := os.Stat(filepath.Join(abs, ".agents", "worktrees")); !os.IsNotExist(err) {
 		t.Errorf("CopyIgnored must not copy .agents/worktrees, stat err = %v", err)
 	}

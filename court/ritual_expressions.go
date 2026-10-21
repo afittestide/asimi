@@ -287,7 +287,7 @@ func (r *RitualRunner) prepareWorktree(ctx context.Context, exec *RitualExecutio
 	if exec.runner == nil {
 		return nil, fmt.Errorf("prepare_worktree: no runner configured")
 	}
-	abs, rel, branch, _, err := worktree.Ensure(ctx, exec.runner, root, exec.EdictID)
+	abs, rel, branch, _, err := worktree.Ensure(ctx, exec.runner, root, exec.EdictID, r.ignoreCopyGlobs())
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +298,17 @@ func (r *RitualRunner) prepareWorktree(ctx context.Context, exec *RitualExecutio
 	}
 	r.logger.Info("worktree prepared", "path", abs, "edict", exec.EdictID, "branch", branch)
 	return map[string]string{"path": abs, "branch": branch}, nil
+}
+
+// ignoreCopyGlobs returns the configured allowlist of gitignored files to
+// carry into a new edict worktree. It falls back to the built-in safe
+// defaults when no sandbox config was injected, so a worktree always gets
+// local config and never an unbounded ignored-file sweep.
+func (r *RitualRunner) ignoreCopyGlobs() []string {
+	if r.sandboxConfig != nil && r.sandboxConfig.IgnoreCopyGlobs != nil {
+		return r.sandboxConfig.IgnoreCopyGlobs
+	}
+	return config.DefaultIgnoreCopyGlobs()
 }
 
 func (r *RitualRunner) getUnsealedEdicts(ctx context.Context, exec *RitualExecution) (interface{}, error) {

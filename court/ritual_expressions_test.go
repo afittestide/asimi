@@ -3648,3 +3648,20 @@ func TestBuildToolRegistry_WiresEdictSealer(t *testing.T) {
 	require.Len(t, seals, 1)
 	assert.Equal(t, "ruler", seals[0].MinisterID)
 }
+
+// RitualRunner.ignoreCopyGlobs must fall back to the built-in safe allowlist
+// before sandbox config is injected, and prefer the configured globs after.
+// Threading this value into worktree.Ensure is what bounds the ignored-file
+// copy to declared local config.
+func TestRitualRunner_ignoreCopyGlobs_FallbackAndConfigured(t *testing.T) {
+	r := &RitualRunner{}
+	assert.Equal(t, config.DefaultIgnoreCopyGlobs(), r.ignoreCopyGlobs(),
+		"no sandbox config → built-in safe allowlist")
+
+	want := []string{"local.env"}
+	r.sandboxConfig = &config.SandboxConfig{IgnoreCopyGlobs: want}
+	assert.Equal(t, want, r.ignoreCopyGlobs(), "configured globs win")
+
+	r.sandboxConfig = &config.SandboxConfig{IgnoreCopyGlobs: []string{}}
+	assert.Empty(t, r.ignoreCopyGlobs(), "explicit empty allowlist means copy nothing")
+}

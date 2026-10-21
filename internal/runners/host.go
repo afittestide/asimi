@@ -27,6 +27,7 @@ const (
 // HostRunner runs commands directly on the host system
 type HostRunner struct {
 	projectRoot     string
+	cacheRoot       string       // main project root; GOCACHE anchor (never a worktree)
 	rootMu          sync.RWMutex // guards projectRoot (re-targeted on worktree entry)
 	msgChan         chan<- Msg
 	timeout         time.Duration // per-command deadline (0 → DefaultCommandTimeout)
@@ -37,6 +38,7 @@ type HostRunner struct {
 func NewHostRunner(connID uint64, projectRoot string) *HostRunner {
 	return &HostRunner{
 		projectRoot:     projectRoot,
+		cacheRoot:       projectRoot,
 		timeout:         DefaultCommandTimeout,
 		approvalTimeout: DefaultApprovalTimeout,
 	}
@@ -61,9 +63,13 @@ func (r *HostRunner) SetMessageChannel(msgChan chan<- Msg) {
 
 // SetRepoInfo re-targets the runner at a different working root (e.g. the
 // edict's worktree) so host shell commands execute inside the worktree.
+// cacheRoot stays anchored on the main project root so GOCACHE remains shared.
 func (r *HostRunner) SetRepoInfo(repoInfo repo.RepoInfo) {
 	r.rootMu.Lock()
 	defer r.rootMu.Unlock()
+	if repoInfo.ProjectRoot != "" {
+		r.cacheRoot = repoInfo.ProjectRoot
+	}
 	r.projectRoot = repoInfo.EffectiveRoot()
 }
 
@@ -91,6 +97,14 @@ func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
+	// Retarget the effective working root before building the child env:
+	// the working directory is the (possibly worktree) root, but GOCACHE is
+	// pinned to the main project root so all worktrees share one cache.
+	r.rootMu.RLock()
+	projectRoot := r.projectRoot
+	goCacheRoot := r.cacheRoot
+	r.rootMu.RUnlock()
+
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.CommandContext(runCtx, "cmd.exe", "/c", input.Command)
@@ -98,16 +112,17 @@ func (r *HostRunner) Run(ctx context.Context, input Input) (Output, error) {
 		cmd = exec.CommandContext(runCtx, "bash", "-c", input.Command)
 	}
 	// Children must never emit interactive credential prompts; see
-	// NonInteractiveGitEnv for why.
-	cmd.Env = append(os.Environ(), NonInteractiveGitEnv()...)
+	// NonInteractiveGitEnv for why. GOCACHE is pinned to the project root so
+	// every edict worktree reuses one shared build cache (see GoCacheEnv);
+	// any inherited GOCACHE is dropped first so our value is authoritative.
+	cmd.Env = EnvWithout(os.Environ(), "GOCACHE")
+	cmd.Env = append(cmd.Env, NonInteractiveGitEnv()...)
+	cmd.Env = append(cmd.Env, GoCacheEnv(goCacheRoot)...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	r.rootMu.RLock()
-	projectRoot := r.projectRoot
-	r.rootMu.RUnlock()
 	if projectRoot != "" {
 		cmd.Dir = projectRoot
 	}

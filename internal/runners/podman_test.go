@@ -1068,3 +1068,26 @@ func TestPodmanImageExistsErrorPodmanMissing(t *testing.T) {
 		t.Fatalf("error = %q, want install guidance", err)
 	}
 }
+
+// projectCacheRoot must always return the main project root — never the
+// worktree — so GOCACHE is shared across edicts. This is the anchor that keeps
+// a worktree's `go build`/`go test` reusing the main build cache once the
+// ignored-file copy no longer carries `.gocache` into the worktree.
+func TestPodmanRunnerProjectCacheRootStaysOnMainRoot(t *testing.T) {
+	root := t.TempDir()
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: root, Slug: "test/project"}, "1", nil)
+	require.NotNil(t, runner)
+
+	assert.Equal(t, root, runner.projectCacheRoot(), "no worktree → main root")
+
+	runner.SetRepoInfo(repo.RepoInfo{
+		ProjectRoot:  root,
+		WorktreePath: filepath.Join(".agents", "worktrees", "e946"),
+		IsWorktree:   true,
+	})
+
+	assert.Equal(t, root, runner.projectCacheRoot(),
+		"GOCACHE anchor must stay the main root even inside a worktree")
+	assert.NotEqual(t, runner.projectWorkingRoot(), runner.projectCacheRoot(),
+		"worktree working root and shared cache root must differ")
+}

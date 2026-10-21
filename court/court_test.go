@@ -3195,3 +3195,22 @@ func TestStop_ClosesEdictRunners(t *testing.T) {
 		assert.True(t, r.closeCalled, "every edict runner must be closed on Stop")
 	}
 }
+
+// Court.ignoreCopyGlobs must fall back to the built-in safe allowlist when no
+// session config is injected, and prefer the configured globs once it is. The
+// fallback is what guarantees a worktree never regresses to an unbounded
+// ignored-file sweep.
+func TestCourt_ignoreCopyGlobs_FallbackAndConfigured(t *testing.T) {
+	s := &Court{}
+	assert.Equal(t, config.DefaultIgnoreCopyGlobs(), s.ignoreCopyGlobs(),
+		"no session config → built-in safe allowlist")
+
+	want := []string{"custom.env", "config/*.local"}
+	s.sessionCfg = &SessionConfig{Sandbox: config.SandboxConfig{IgnoreCopyGlobs: want}}
+	assert.Equal(t, want, s.ignoreCopyGlobs(), "configured globs win")
+
+	// An explicitly empty (non-nil) allowlist is honored as "copy nothing",
+	// not silently replaced by the default.
+	s.sessionCfg = &SessionConfig{Sandbox: config.SandboxConfig{IgnoreCopyGlobs: []string{}}}
+	assert.Empty(t, s.ignoreCopyGlobs(), "explicit empty allowlist means copy nothing")
+}

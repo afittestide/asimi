@@ -122,6 +122,23 @@ type SandboxConfig struct {
 	PassthroughEnv []string `koanf:"passthrough_env"`
 	// PlatformOverlays are project-relative paths to isolate per-platform using named volumes
 	PlatformOverlays []string `koanf:"platform_overlays"`
+	// IgnoreCopyGlobs is the allowlist of gitignore-style globs whose
+	// gitignored files travel from the main tree into a new edict worktree.
+	// A worktree is a fresh checkout, so local-only files are absent there;
+	// this list carries the ones the worktree actually needs (local config)
+	// without dragging in caches, built binaries, logs or jobs/ — which the
+	// former unbounded `--ignored` copy did, multiplying secrets exposure and
+	// duplicating gigabytes per edict. Empty means copy nothing.
+	IgnoreCopyGlobs []string `koanf:"ignore_copy_globs"`
+}
+
+// DefaultIgnoreCopyGlobs is the built-in safe allowlist for
+// SandboxConfig.IgnoreCopyGlobs: common local-config names only. It must
+// never include caches (.gocache), built binaries (asimi), logs (*.log),
+// coverage, dist/, tmp/ or jobs/ (which .gitignore flags as possibly
+// secret-bearing).
+func DefaultIgnoreCopyGlobs() []string {
+	return []string{".env", ".envrc", "*.local"}
 }
 
 // CourtConfig holds configuration for the Court.

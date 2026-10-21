@@ -48,6 +48,47 @@ func TestHostRunnerForcesNonInteractiveGitEnv(t *testing.T) {
 	assert.Contains(t, output.Output, "never")
 }
 
+// GoCacheEnv pins GOCACHE to the project root so worktrees share one cache.
+func TestGoCacheEnv(t *testing.T) {
+	assert.Nil(t, GoCacheEnv(""), "empty root must yield no GOCACHE fragment")
+	got := GoCacheEnv("/repo")
+	assert.Equal(t, []string{"GOCACHE=/repo/.gocache"}, got)
+}
+
+// EnvWithout removes every matching NAME=... entry so an override cannot be
+// shadowed by a duplicate key.
+func TestEnvWithout(t *testing.T) {
+	env := []string{"PATH=/usr/bin", "GOCACHE=/dev/cache", "HOME=/root", "GOCACHE=/other"}
+	got := EnvWithout(env, "GOCACHE")
+	assert.NotContains(t, got, "GOCACHE=/dev/cache")
+	assert.NotContains(t, got, "GOCACHE=/other")
+	assert.Contains(t, got, "PATH=/usr/bin")
+	assert.Contains(t, got, "HOME=/root")
+}
+
+// GOCACHE is anchored on the main project root even after the runner is
+// re-targeted at a worktree, so all edicts share one build cache.
+func TestHostRunnerGoCacheAnchorsOnProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, ".agents", "worktrees", "e42")
+	require.NoError(t, os.MkdirAll(wt, 0o755))
+
+	runner := NewHostRunner(0, root)
+	runner.SetRepoInfo(repo.RepoInfo{
+		ProjectRoot:  root,
+		WorktreePath: filepath.Join(".agents", "worktrees", "e42"),
+		IsWorktree:   true,
+	})
+
+	// A stale inherited GOCACHE must not shadow the pinned value.
+	t.Setenv("GOCACHE", filepath.Join(wt, ".gocache"))
+	out, err := runner.Run(context.Background(), Input{Command: "printenv GOCACHE", BypassApproval: true})
+	require.NoError(t, err)
+	assert.Equal(t, "0", out.ExitCode)
+	assert.Contains(t, out.Output, filepath.Join(root, ".gocache"))
+	assert.NotContains(t, out.Output, filepath.Join(wt, ".gocache"))
+}
+
 // The fragment must not clobber env vars the child legitimately needs.
 func TestHostRunnerEnvPreservesPath(t *testing.T) {
 	runner := NewHostRunner(0, t.TempDir())

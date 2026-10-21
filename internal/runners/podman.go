@@ -281,6 +281,16 @@ func (r *PodmanRunner) projectWorkingRoot() string {
 	return repoInfo.ProjectRoot
 }
 
+// projectCacheRoot returns the main project root (never the worktree), the
+// anchor for the shared GOCACHE. The main root is bind-mounted into the
+// container at the same absolute path, so <ProjectRoot>/.gocache is stable
+// from inside the container regardless of the worktree the shell runs in.
+func (r *PodmanRunner) projectCacheRoot() string {
+	r.repoMu.RLock()
+	defer r.repoMu.RUnlock()
+	return r.repoInfo.ProjectRoot
+}
+
 // healthcheck runs a simple exec command to verify the container is responsive.
 func (r *PodmanRunner) healthcheck(ctx context.Context) error {
 	r.mu.Lock()
@@ -509,7 +519,16 @@ func (r *PodmanRunner) sendContainerLaunched(containerID string) {
 func (r *PodmanRunner) execCommand(ctx context.Context, command string) (string, int, error) {
 	env := []string{"BASH_ENV=/root/.bashrc", "TERM=dumb"}
 	env = append(env, NonInteractiveGitEnv()...)
+	// Pin GOCACHE to the main project root (never the worktree) so every
+	// edict's worktree reuses one shared, bind-mounted Go build cache.
+	env = append(env, GoCacheEnv(r.projectCacheRoot())...)
 	for _, name := range r.config.PassthroughEnv {
+		if name == "GOCACHE" {
+			// GOCACHE is pinned by the runner (shared worktree cache); a
+			// passthrough value would be a duplicate env key with
+			// implementation-defined precedence.
+			continue
+		}
 		if val, ok := os.LookupEnv(name); ok {
 			env = append(env, fmt.Sprintf("%s=%s", name, val))
 		}

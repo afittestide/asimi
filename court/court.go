@@ -1539,8 +1539,18 @@ func (s *Court) EnsureEdictWorktree(ctx context.Context, edictID uint) (string, 
 	// add a sibling worktree next to itself.
 	runner := runners.NewHostRunner(0, root)
 	runner.SetTimeouts(s.hostTimeouts())
-	_, rel, _, _, err := worktree.Ensure(ctx, runner, root, edictID)
+	_, rel, _, _, err := worktree.Ensure(ctx, runner, root, edictID, s.ignoreCopyGlobs())
 	return rel, err
+}
+
+// ignoreCopyGlobs returns the allowlist of gitignored files carried into a
+// new edict worktree, defaulting to the built-in safe set when no session
+// config has been injected yet.
+func (s *Court) ignoreCopyGlobs() []string {
+	if s != nil && s.sessionCfg != nil && s.sessionCfg.Sandbox.IgnoreCopyGlobs != nil {
+		return s.sessionCfg.Sandbox.IgnoreCopyGlobs
+	}
+	return config.DefaultIgnoreCopyGlobs()
 }
 
 // handleSealGranted reacts to a granted seal. Only the ruler's seal triggers the

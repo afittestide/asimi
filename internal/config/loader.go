@@ -90,6 +90,7 @@ func DefaultConfig() Config {
 			RunOnHost:       []string{`^gh\s`, `^podman\s`},
 			SafeRunOnHost:   []string{`^gh\s+(issue|pr)\s+(view|list)`},
 			ApprovalTimeout: 120 * time.Second,
+			IgnoreCopyGlobs: DefaultIgnoreCopyGlobs(),
 		},
 	}
 }
