@@ -993,6 +993,79 @@ func TestTestRecipes_ThrottleGoBuilds(t *testing.T) {
 	}
 }
 
+// TestPruneBranches_SafetyInvariants guards the most destructive recipe in the
+// Justfile: `prune-branches` deletes branches and worktrees. Like
+// TestRaceGate_FailsClosed it is a static check — it reads the recipe body and
+// asserts the safety properties the Chancellor's seal requires, so a later edit
+// cannot silently weaken them. The runtime behaviour is exercised by the recipe
+// author's scratch tests; these invariants are the durable lock.
+//
+// The shim (.agents/sandbox/bashrc) forbids -D/--force; `git branch -d` is
+// legal and re-checks the merge. A squash-subsumed branch is not an ancestor of
+// the default branch (SquashMergeToDefault rebases first), so it is retired via
+// `git update-ref -d` — the same plumbing worktree.Remove uses — only after the
+// identical-tree proof. A dirty worktree is skipped, never forced.
+func TestPruneBranches_SafetyInvariants(t *testing.T) {
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "Justfile"))
+	if err != nil {
+		t.Fatalf("read Justfile: %v", err)
+	}
+
+	body := recipeBody(string(data), "prune-branches:")
+	if body == "" {
+		t.Fatal("could not extract `prune-branches:` recipe body from Justfile")
+	}
+
+	// Scope: only the Court's own asimi/* branches may be swept.
+	if !strings.Contains(body, `--list 'asimi/*'`) {
+		t.Error("`prune-branches` must scope its sweep to --list 'asimi/*' so the ruler's named branches are never touched")
+	}
+
+	// Branch deletion must be the merge-checking `-d`, never the forcing `-D`.
+	if !strings.Contains(body, "git branch -d") {
+		t.Error("`prune-branches` must delete ancestry-merged branches with `git branch -d` (re-checks the merge)")
+	}
+	if strings.Contains(body, "branch -D") || strings.Contains(body, "-D \"") {
+		t.Error("`prune-branches` must never use `git branch -D` (Li 礼 forbids it)")
+	}
+	// No force flags anywhere in the body.
+	for _, forbidden := range []string{"--force", "--hard", "--no-verify", "--overwrite-ignore"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("`prune-branches` must not use %s (Li 礼 forbids it)", forbidden)
+		}
+	}
+
+	// The current branch must be skipped: removing the checked-out branch's
+	// worktree is not a valid operation.
+	if !strings.Contains(body, `[ "${branch}" = "${current}" ] && continue`) {
+		t.Error("`prune-branches` must skip the currently checked-out branch")
+	}
+
+	// A dirty worktree must be skipped (message + continue), not forced.
+	if !strings.Contains(body, "SKIP ${branch}") {
+		t.Error("`prune-branches` must SKIP a worktree it cannot remove cleanly instead of forcing")
+	}
+
+	// The squash-subsumed case must be handled: a content-equality check via
+	// merge-tree, and retirement via update-ref (branch -d would refuse it).
+	if !strings.Contains(body, "git merge-tree --write-tree") {
+		t.Error("`prune-branches` must detect squash-subsumed branches with `git merge-tree --write-tree` (ancestry alone misses them)")
+	}
+	if !strings.Contains(body, "git update-ref -d") {
+		t.Error("`prune-branches` must retire squash-subsumed branches with `git update-ref -d` (not a forcing branch flag)")
+	}
+
+	// Worktree removal must precede branch deletion so a refusal leaves no
+	// half-pruned edict.
+	if wt, br := strings.Index(body, "git worktree remove"), strings.Index(body, "git branch -d"); wt < 0 || br < 0 || wt > br {
+		t.Error("`prune-branches` must remove the worktree before deleting its branch")
+	}
+}
+
 // recipeBody returns the indented body of the recipe whose header line starts
 // with header (e.g. "test:" or "test-race"). It stops at the next unindented,
 // non-blank line.

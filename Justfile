@@ -137,6 +137,96 @@ clean:
     rm -rf test_tmp
     rm -rf profiles
 
+# Remove edict worktrees whose branch has nothing left to land, and their
+# asimi/* branches. Scoped to asimi/* : other local branches (adk, shifu, ...)
+# are the ruler's and are never touched. A branch with unlanded work is left
+# alone, and a dirty worktree is skipped (the git shim forbids force flags,
+# Li 礼), so resolve those by hand.
+prune-branches:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The merge target: local main/master, then origin/HEAD when it names a
+    # locally valid branch (origin/HEAD may point at a remote-only branch such
+    # as dev, which would make `branch --merged` fail).
+    #
+    # This precedence deliberately differs from worktree.DefaultBranch, which
+    # prefers the root's checked-out branch first: that function's target must
+    # be the branch the seal actually commits into, whereas this recipe prunes
+    # in bulk and a checked-out side branch is not the land target. Ruler-ruled
+    # 2026-10-21; documented here so the divergence reads as intent.
+    default=""
+    for cand in main master; do
+        if git rev-parse --verify --quiet "refs/heads/${cand}" >/dev/null; then
+            default="${cand}"
+            break
+        fi
+    done
+    if [ -z "${default}" ]; then
+        cand="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+        if [ -n "${cand}" ] && git rev-parse --verify --quiet "refs/heads/${cand}" >/dev/null; then
+            default="${cand}"
+        fi
+    fi
+    default="${default:-main}"
+    default_tree="$(git rev-parse "${default}^{tree}")"
+    current="$(git rev-parse --abbrev-ref HEAD)"
+
+    # A branch is subsumed when nothing of it is left to land into the target.
+    # Two cases: it is an ancestor of the target (fast-forward/true merge), or
+    # the Court's squash-merge already landed its content. The latter is why
+    # ancestry alone is not enough: SquashMergeToDefault rebases the branch onto
+    # the target first, leaving a DESCENDANT of the target with no ancestral
+    # relation, so `branch --merged` never lists it. Instead, ask what merging
+    # the branch would change: if the merged tree is identical to the target's
+    # tree, the branch adds nothing. Read-only introspection only (merge-tree
+    # writes loose objects, no refs).
+    subsumed() {
+        local branch="$1" mt tree
+        if git merge-base --is-ancestor "${branch}" "${default}"; then
+            return 0
+        fi
+        if mt="$(git merge-tree --write-tree "${default}" "${branch}" 2>/dev/null)"; then
+            tree="$(git rev-parse "${mt%%$'\n'*}^{tree}" 2>/dev/null || true)"
+            [ -n "${tree}" ] && [ "${tree}" = "${default_tree}" ]
+            return
+        fi
+        return 1
+    }
+
+    echo "==> pruning asimi/* worktrees subsumed by ${default} (current: ${current})"
+    # Clear metadata for worktrees whose directories are already gone.
+    git worktree prune
+    git branch --list 'asimi/*' --format='%(refname:short)' | while read -r branch; do
+        [ -z "${branch}" ] && continue
+        [ "${branch}" = "${current}" ] && continue
+        if ! subsumed "${branch}"; then
+            echo "keep ${branch}: still has work to land into ${default}"
+            continue
+        fi
+        # Resolve the branch's worktree, if it has one, and remove it first.
+        wt="$(git worktree list --porcelain | awk -v ref="refs/heads/${branch}" \
+            '$1=="worktree"{w=$2} $1=="branch"&&$2==ref{print w}')"
+        if [ -n "${wt}" ]; then
+            if git worktree remove "${wt}"; then
+                echo "removed worktree ${wt}"
+            else
+                echo "SKIP ${branch}: worktree ${wt} is not clean; remove it by hand" >&2
+                continue
+            fi
+        fi
+        # Ancestry-merged branches go through `branch -d` (the shim permits -d
+        # and it re-checks the merge). A squash-subsumed descendant is not an
+        # ancestor, so `branch -d` would refuse it; retire its ref with the same
+        # plumbing worktree.Remove uses, gated on the identical-tree proof above.
+        if git merge-base --is-ancestor "${branch}" "${default}"; then
+            git branch -d "${branch}"
+        else
+            git update-ref -d "refs/heads/${branch}"
+            echo "deleted squash-subsumed branch ${branch}"
+        fi
+    done
+    git worktree prune
+
 # Install development tools
 bootstrap:
     go install golang.org/x/tools/cmd/goimports@latest
