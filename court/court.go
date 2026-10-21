@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1291,7 +1292,7 @@ func (s *Court) Subscribe(ctx context.Context) <-chan any {
 					}
 					// ClearSchedulerMsg is an in-process request/reply — handle it here
 					if clearMsg, ok := msg.(runners.ClearSchedulerMsg); ok {
-						count := s.clearAllSchedulers()
+						count := s.clearSchedulersForRunner(clearMsg.RunnerName)
 						clearMsg.ResultChan <- count
 						continue // do NOT forward to out
 					}
@@ -1311,6 +1312,14 @@ func (s *Court) Subscribe(ctx context.Context) <-chan any {
 // clearAllSchedulers iterates all ministers with sessions and calls
 // scheduler.ClearQueue() on each, returning the total aborted count.
 func (s *Court) clearAllSchedulers() int {
+	return s.clearSchedulersForRunner("")
+}
+
+// clearSchedulersForRunner aborts queued and in-flight tool calls. When
+// runnerName is empty it clears every session's scheduler (the legacy
+// behavior); otherwise it clears only sessions bound to that runner, so
+// restarting one container no longer cancels unrelated edicts' tool calls.
+func (s *Court) clearSchedulersForRunner(runnerName string) int {
 	total := 0
 	for _, m := range s.ministers {
 		if m == nil {
@@ -1325,10 +1334,50 @@ func (s *Court) clearAllSchedulers() int {
 			if sess == nil || sess.scheduler == nil {
 				continue
 			}
+			if runnerName != "" && !s.sessionUsesRunner(sess, runnerName) {
+				continue
+			}
 			total += sess.scheduler.ClearQueue()
 		}
 	}
 	return total
+}
+
+// sessionUsesRunner reports whether sess executes its shell commands through
+// the runner named runnerName. A session on a ritual channel ("e<N>") is bound
+// to that edict's runner; every other session runs on the Court-wide runner.
+// Edicts 0 and 1 (system) fall back to the Court-wide runner.
+func (s *Court) sessionUsesRunner(sess *Session, runnerName string) bool {
+	if s == nil || sess == nil || runnerName == "" {
+		return false
+	}
+	if edictID, ok := edictIDFromChannel(sess.ChannelID()); ok && edictID > 1 {
+		s.edictRunnersMu.Lock()
+		r := s.edictRunners[edictID]
+		s.edictRunnersMu.Unlock()
+		return runnerNameOf(r) == runnerName
+	}
+	return runnerNameOf(s.runner) == runnerName
+}
+
+// runnerNameOf returns a runner's identity when it exposes one, else "".
+func runnerNameOf(r runners.Runner) string {
+	if nr, ok := r.(interface{ RunnerName() string }); ok {
+		return nr.RunnerName()
+	}
+	return ""
+}
+
+// edictIDFromChannel parses a per-edict channel ID ("e<N>") into its edict ID.
+func edictIDFromChannel(channelID string) (uint, bool) {
+	if len(channelID) < 2 || channelID[0] != 'e' {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(channelID[1:], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return uint(id), true
 }
 
 // GetRitualRegistry returns the ritual registry

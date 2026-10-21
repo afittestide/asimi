@@ -859,6 +859,31 @@ func TestCreateContainerStaleCleanupRemoveFails(t *testing.T) {
 	mock.mu.Unlock()
 }
 
+// TestPodmanRunnerRestartCarriesRunnerIdentity verifies edict 957: Restart's
+// ClearSchedulerMsg carries the container name so the Court can scope the
+// scheduler abort to the restarted runner's sessions.
+func TestPodmanRunnerRestartCarriesRunnerIdentity(t *testing.T) {
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/restart-scope"}, "e42", nil)
+	msgChan := make(chan Msg, 1)
+	runner.SetMessageChannel(msgChan)
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Restart(context.Background()) }()
+
+	select {
+	case msg := <-msgChan:
+		clearMsg, ok := msg.(ClearSchedulerMsg)
+		require.True(t, ok, "expected ClearSchedulerMsg, got %T", msg)
+		assert.Equal(t, "asimi-shell-test-restart-scope-e42", clearMsg.RunnerName,
+			"ClearSchedulerMsg must carry the runner's container name")
+		assert.Equal(t, runner.RunnerName(), clearMsg.RunnerName)
+		clearMsg.ResultChan <- 0
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ClearSchedulerMsg during Restart")
+	}
+	require.NoError(t, <-done)
+}
+
 // TestContainerLaunchedMsgAllPaths verifies Edict 639: ContainerLaunchedMsg is
 // sent on all three initialize() paths where containerStarted transitions to true.
 func TestContainerLaunchedMsgAllPaths(t *testing.T) {

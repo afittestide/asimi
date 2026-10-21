@@ -75,6 +75,13 @@ func (r *PodmanRunner) SetMessageChannel(msgChan chan<- Msg) {
 	r.msgChan = msgChan
 }
 
+// RunnerName returns the container name this runner executes commands in. The
+// Court uses it to scope scheduler aborts (ClearSchedulerMsg) to the sessions
+// bound to the restarted runner.
+func (r *PodmanRunner) RunnerName() string {
+	return r.containerName
+}
+
 // SetRepoInfo re-targets the runner at a different working root (e.g. the
 // edict's worktree). projectWorkingRoot() derives the exec working directory
 // from repoInfo, so this routes subsequent shell commands into the worktree.
@@ -668,7 +675,7 @@ func (r *PodmanRunner) Restart(ctx context.Context) error {
 
 	if r.msgChan != nil {
 		resultChan := make(chan int, 1)
-		r.msgChan <- ClearSchedulerMsg{ResultChan: resultChan}
+		r.msgChan <- ClearSchedulerMsg{RunnerName: r.containerName, ResultChan: resultChan}
 		abortedCount := <-resultChan
 		if abortedCount > 0 {
 			slog.Info("aborted pending tool calls during restart", "count", abortedCount)

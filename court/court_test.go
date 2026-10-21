@@ -462,6 +462,15 @@ func (r *msgForwardingRunner) AllowFallback(bool)            {}
 func (r *msgForwardingRunner) RunnerType() string            { return "msg_forwarding" }
 func (r *msgForwardingRunner) GetOS() string                 { return runtime.GOOS }
 
+// namedMsgRunner is a msgForwardingRunner with an identity so ClearSchedulerMsg
+// scoping can be exercised (edict 957).
+type namedMsgRunner struct {
+	msgForwardingRunner
+	name string
+}
+
+func (r *namedMsgRunner) RunnerName() string { return r.name }
+
 // TestClearAllSchedulers_NoSessions verifies that clearAllSchedulers returns 0
 // when ministers exist but have no sessions.
 func TestClearAllSchedulers_NoSessions(t *testing.T) {
@@ -556,6 +565,126 @@ func TestClearAllSchedulers_MinistersWithNilScheduler(t *testing.T) {
 	// Should not panic and return 0
 	count := court.clearAllSchedulers()
 	assert.Equal(t, 0, count)
+}
+
+// TestClearSchedulersForRunner_ScopesToRunner is the edict 957 regression
+// test: a ClearSchedulerMsg carrying a runner identity must abort only the
+// sessions bound to that runner, leaving other runners' in-flight calls alive.
+// The bare message still aborts every session.
+func TestClearSchedulersForRunner_ScopesToRunner(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+
+	runnerA := &namedMsgRunner{name: "A"}
+	court := NewCourt(db, cfg, runnerA, nil)
+	require.NotNil(t, court)
+	court.ConfigureModel(nil, &SessionConfig{}, repo.RepoInfo{})
+
+	// Edict 42 has its own runner "B".
+	court.edictRunnersMu.Lock()
+	court.edictRunners[42] = &namedMsgRunner{name: "B"}
+	court.edictRunnersMu.Unlock()
+
+	doneA := make(chan struct{})
+	doneB := make(chan struct{})
+	defer close(doneA)
+	defer close(doneB)
+
+	schedA := runners.NewCoreToolScheduler(nil)
+	resA := schedA.Schedule(context.Background(), &blockingTool{name: "tool_a", done: doneA}, `{}`)
+
+	schedB := runners.NewCoreToolScheduler(nil)
+	resB := schedB.Schedule(context.Background(), &blockingTool{name: "tool_b", done: doneB}, `{}`)
+
+	mockLLM := mocks.NewLLMProvider()
+	// Interactive session, bound to the Court-wide runner "A".
+	sessA, err := NewSession(mockLLM, &SessionConfig{}, nil, schedA, nil, "", "secretary")
+	require.NoError(t, err)
+	// Ritual session e42, bound to edict 42's runner "B".
+	sessB, err := NewSession(mockLLM, &SessionConfig{}, nil, schedB, nil, "", "e42")
+	require.NoError(t, err)
+
+	sec := court.GetMinister("secretary")
+	require.NotNil(t, sec)
+	if base, ok := sec.(interface{ SetSession(*Session, ...string) }); ok {
+		base.SetSession(sessA)
+	}
+	forge := court.GetMinister("forge")
+	require.NotNil(t, forge)
+	if base, ok := forge.(interface{ SetSession(*Session, ...string) }); ok {
+		base.SetSession(sessB, "e42")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := court.Subscribe(ctx)
+	require.NotNil(t, out)
+	require.NotNil(t, runnerA.msgChan, "Subscribe should set the runner msg channel")
+
+	// Scoped clear: only B aborted.
+	resultChan := make(chan int, 1)
+	runnerA.msgChan <- runners.ClearSchedulerMsg{RunnerName: "B", ResultChan: resultChan}
+	select {
+	case count := <-resultChan:
+		assert.Equal(t, 1, count, "only B's in-flight call should be aborted")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for scoped ClearSchedulerMsg result")
+	}
+	select {
+	case res := <-resB:
+		assert.Error(t, res.Error, "B's call must be aborted")
+	case <-time.After(time.Second):
+		t.Fatal("B's in-flight call should have been aborted")
+	}
+	select {
+	case res := <-resA:
+		t.Fatalf("A's in-flight call must survive a scoped clear, got %+v", res)
+	default:
+	}
+
+	// The bare message (no identity) preserves the all-sessions abort.
+	resultChan = make(chan int, 1)
+	runnerA.msgChan <- runners.ClearSchedulerMsg{ResultChan: resultChan}
+	select {
+	case count := <-resultChan:
+		assert.Equal(t, 1, count, "bare clear must abort A's remaining call")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for bare ClearSchedulerMsg result")
+	}
+	select {
+	case res := <-resA:
+		assert.Error(t, res.Error, "A's call must be aborted by the legacy all-sessions clear")
+	case <-time.After(time.Second):
+		t.Fatal("A's in-flight call should have been aborted by the bare clear")
+	}
+}
+
+// TestClearSchedulersForRunner_UnknownRunnerAbortsNothing guards against a
+// scoped clear silently falling back to the legacy all-sessions behavior.
+func TestClearSchedulersForRunner_UnknownRunnerAbortsNothing(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+
+	court := NewCourt(db, cfg, &namedMsgRunner{name: "A"}, nil)
+	require.NotNil(t, court)
+	court.ConfigureModel(nil, &SessionConfig{}, repo.RepoInfo{})
+
+	done := make(chan struct{})
+	defer close(done)
+	sched := runners.NewCoreToolScheduler(nil)
+	sched.Schedule(context.Background(), &blockingTool{name: "tool_a", done: done}, `{}`)
+
+	mockLLM := mocks.NewLLMProvider()
+	sess, err := NewSession(mockLLM, &SessionConfig{}, nil, sched, nil, "", "secretary")
+	require.NoError(t, err)
+	sec := court.GetMinister("secretary")
+	require.NotNil(t, sec)
+	if base, ok := sec.(interface{ SetSession(*Session, ...string) }); ok {
+		base.SetSession(sess)
+	}
+
+	assert.Equal(t, 0, court.clearSchedulersForRunner("no-such-runner"),
+		"an unknown runner identity must not abort any session")
 }
 
 // TestSubscribe_HandlesClearSchedulerMsg verifies the core fix from edict 532:

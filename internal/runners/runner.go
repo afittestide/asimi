@@ -75,7 +75,11 @@ type ApprovalRequestMsg struct {
 
 // ClearSchedulerMsg is sent when the runner needs to clear the scheduler queue.
 // Always in-process only.
+//
+// RunnerName, when set, scopes the abort to the sessions bound to that runner.
+// An empty RunnerName preserves the legacy all-sessions abort.
 type ClearSchedulerMsg struct {
+	RunnerName string   `msgpack:"runner_name,omitempty"`
 	ResultChan chan int `msgpack:"-"`
 }
 
