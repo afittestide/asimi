@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/utils"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -42,6 +44,19 @@ type ChatMessage struct {
 	Content string
 	Indent  int
 	Type    MessageType // Type of message for proper rendering
+
+	// Table, when set, carries the raw markdown_table envelope so the table can
+	// be re-laid-out from its cells at the live component width on every render
+	// (and therefore on resize). Content then caches the latest rendering.
+	Table *tableMessage
+}
+
+// tableMessage is a markdown_table tool result kept in raw form: the envelope
+// is retained so the table can be rebuilt at the live width, and Fallback is
+// the tool's plain summary used when the component cannot hold a table.
+type tableMessage struct {
+	Env      resultEnvelope
+	Fallback string
 }
 
 // ChatComponent represents the chat view
@@ -634,86 +649,13 @@ func (c *ChatComponent) UpdateContent() {
 		var rendered string
 		message := msg.Content
 
-		// Route rendering based on message type
-		switch msg.Type {
-		case MessageTypeShell:
-			// Shell command input styling
-			messageStyle := lipgloss.NewStyle().
-				Foreground(globalTheme.PromptBorder)
-			rendered = messageStyle.Render(fmt.Sprintf("$ %s", message))
-
-		case MessageTypeThinking:
-			// Thinking/reasoning content styling
-			thinkingStyle := lipgloss.NewStyle().
-				Foreground(globalTheme.ThinkingColor)
-			builder := NewChatMsgBuilder("💭   ")
-			// Word wrap and split into lines (c.Width-1 for gutter, -6 for prefix)
-			wrapped := wordwrap.String(message, c.Width-7)
-			lines := strings.Split(wrapped, "\n")
-			for i, line := range lines {
-				if i < len(lines)-1 {
-					builder.WriteLn(line)
-				} else {
-					builder.WriteString(line)
-				}
-			}
-			rendered = thinkingStyle.Render(builder.String())
-
-		case MessageTypeUser:
-			// User message styling
-			messageStyle := lipgloss.NewStyle().
-				Foreground(globalTheme.PromptBorder)
-
-			wrapWidth := c.Width - 1 // -1 for gutter
-			const indentSpaces = 0
-			if wrapWidth > indentSpaces {
-				wrapWidth -= indentSpaces
-			}
-			if wrapWidth < 1 {
-				wrapWidth = 1
-			}
-
-			wrapped := wordwrap.String(message, wrapWidth)
-			userIndent := strings.Repeat(" ", indentSpaces)
-			lines := strings.Split(wrapped, "\n")
-			for i := range lines {
-				lines[i] = userIndent + lines[i]
-			}
-
-			rendered = messageStyle.Render(fmt.Sprintf("%s %s", userPrefix, strings.Join(lines, "\n")))
-
-		case MessageTypeAI, MessageTypeAISuccess, MessageTypeAIFailure:
-			// Render AI messages with markdown using Type field
-			var prefix string
-			switch msg.Type {
-			case MessageTypeAISuccess:
-				prefix = lipgloss.NewStyle().Bold(true).Render(completeSuccessPrefix)
-			case MessageTypeAIFailure:
-				prefix = lipgloss.NewStyle().Bold(true).Render(completeFailurePrefix)
-			default: // MessageTypeAI (streaming, not finalized)
-				prefix = lipgloss.NewStyle().Bold(true).Render(asimiPrefix)
-			}
-			rendered = prefix + c.renderMarkdown(message)
-
-		case MessageTypeGreeting:
-			builder := NewChatMsgBuilder(greetingPrefix + " ")
-			// Word wrap and split into lines (c.Width-1 for gutter, -6 for prefix)
-			wrapped := wordwrap.String(message, c.Width-7)
-			lines := strings.Split(wrapped, "\n")
-			for i, line := range lines {
-				if i < len(lines)-1 {
-					builder.WriteLn(line)
-				} else {
-					builder.WriteString(line)
-				}
-			}
-			rendered = c.renderMarkdown(builder.String())
-
-		default:
-			// Other messages (system, tool calls, etc.)
-			messageStyle := lipgloss.NewStyle().
-				Foreground(globalTheme.TextColor)
-			rendered = messageStyle.Render(wordwrap.String(message, c.Width-1)) // -1 for gutter
+		if msg.Table != nil {
+			// Re-lay-out the table from its raw cells at the live width so it
+			// reflows on resize, and refresh the cached rendering.
+			rendered = c.renderTableMessage(msg.Table)
+			c.Messages[msgIdx].Content = rendered
+		} else {
+			rendered = c.renderSystemMessage(message, msg.Type)
 		}
 
 		// Apply indentation if needed
@@ -759,6 +701,90 @@ func (c *ChatComponent) UpdateContent() {
 	}
 }
 
+// renderSystemMessage routes a non-table message to its type-specific
+// renderer. Split out of UpdateContent so the table-reflow path stays clear.
+func (c *ChatComponent) renderSystemMessage(message string, msgType MessageType) string {
+	switch msgType {
+	case MessageTypeShell:
+		// Shell command input styling
+		messageStyle := lipgloss.NewStyle().
+			Foreground(globalTheme.PromptBorder)
+		return messageStyle.Render(fmt.Sprintf("$ %s", message))
+
+	case MessageTypeThinking:
+		// Thinking/reasoning content styling
+		thinkingStyle := lipgloss.NewStyle().
+			Foreground(globalTheme.ThinkingColor)
+		builder := NewChatMsgBuilder("💭   ")
+		// Word wrap and split into lines (c.Width-1 for gutter, -6 for prefix)
+		wrapped := wordwrap.String(message, c.Width-7)
+		lines := strings.Split(wrapped, "\n")
+		for i, line := range lines {
+			if i < len(lines)-1 {
+				builder.WriteLn(line)
+			} else {
+				builder.WriteString(line)
+			}
+		}
+		return thinkingStyle.Render(builder.String())
+
+	case MessageTypeUser:
+		// User message styling
+		messageStyle := lipgloss.NewStyle().
+			Foreground(globalTheme.PromptBorder)
+
+		wrapWidth := c.Width - 1 // -1 for gutter
+		const indentSpaces = 0
+		if wrapWidth > indentSpaces {
+			wrapWidth -= indentSpaces
+		}
+		if wrapWidth < 1 {
+			wrapWidth = 1
+		}
+
+		wrapped := wordwrap.String(message, wrapWidth)
+		userIndent := strings.Repeat(" ", indentSpaces)
+		lines := strings.Split(wrapped, "\n")
+		for i := range lines {
+			lines[i] = userIndent + lines[i]
+		}
+
+		return messageStyle.Render(fmt.Sprintf("%s %s", userPrefix, strings.Join(lines, "\n")))
+
+	case MessageTypeAI, MessageTypeAISuccess, MessageTypeAIFailure:
+		// Render AI messages with markdown using Type field
+		var prefix string
+		switch msgType {
+		case MessageTypeAISuccess:
+			prefix = lipgloss.NewStyle().Bold(true).Render(completeSuccessPrefix)
+		case MessageTypeAIFailure:
+			prefix = lipgloss.NewStyle().Bold(true).Render(completeFailurePrefix)
+		default: // MessageTypeAI (streaming, not finalized)
+			prefix = lipgloss.NewStyle().Bold(true).Render(asimiPrefix)
+		}
+		return prefix + c.renderMarkdown(message)
+
+	case MessageTypeGreeting:
+		builder := NewChatMsgBuilder(greetingPrefix + " ")
+		// Word wrap and split into lines (c.Width-1 for gutter, -6 for prefix)
+		wrapped := wordwrap.String(message, c.Width-7)
+		lines := strings.Split(wrapped, "\n")
+		for i, line := range lines {
+			if i < len(lines)-1 {
+				builder.WriteLn(line)
+			} else {
+				builder.WriteString(line)
+			}
+		}
+		return c.renderMarkdown(builder.String())
+	}
+
+	// Other messages (system, tool calls, etc.)
+	messageStyle := lipgloss.NewStyle().
+		Foreground(globalTheme.TextColor)
+	return messageStyle.Render(wordwrap.String(message, c.Width-1)) // -1 for gutter
+}
+
 // renderMarkdown renders markdown content with glamour
 func (c *ChatComponent) renderMarkdown(content string) string {
 	if !c.markdownEnabled || c.markdownRenderer == nil {
@@ -780,6 +806,212 @@ func (c *ChatComponent) renderMarkdown(content string) string {
 	wrapped := wordwrap.String(rendered, c.Width-3)
 
 	return strings.TrimSpace(wrapped)
+}
+
+// markdownTableFormat is the generic envelope opt-in. A daemon-side tool that
+// wants the TUI to lay its result out as a width-aware markdown table returns
+// a JSON object carrying this format rather than a bare value.
+const markdownTableFormat = "markdown_table"
+
+// resultEnvelope is the generic result shape a tool may emit to ask the TUI
+// to render it as a markdown table. Columns and rows are plain strings so the
+// tool stays free of any layout concern; the TUI owns widths.
+type resultEnvelope struct {
+	Format  string     `json:"format"`
+	Title   string     `json:"title"`
+	Columns []string   `json:"columns"`
+	Rows    [][]string `json:"rows"`
+}
+
+// formatToolResult builds the line shown for a successful tool call. A result
+// that opts into markdown_table rendering is laid out as a table sized to the
+// component; anything else falls back to the tool's plain Formatted line.
+//
+// When the result is a table envelope, the returned tableMessage retains the
+// raw envelope so the table can be re-laid-out at the live width on later
+// renders and resizes.
+func (c *ChatComponent) formatToolResult(msg runners.ToolCallSuccessMsg) (string, *tableMessage) {
+	var env resultEnvelope
+	if err := json.Unmarshal([]byte(msg.Result), &env); err != nil ||
+		env.Format != markdownTableFormat || len(env.Columns) == 0 {
+		return checkPrefix + " " + msg.Formatted, nil
+	}
+	table := &tableMessage{Env: env, Fallback: checkPrefix + " " + msg.Formatted}
+	return c.renderTableMessage(table), table
+}
+
+// renderTableMessage renders a retained table envelope at the live component
+// width, degrading to the tool's plain summary when the component is too narrow
+// to hold a table. Because it reads c.Width here, every render and resize
+// re-lays-out the table from its raw cells.
+func (c *ChatComponent) renderTableMessage(tm *tableMessage) string {
+	table, ok := c.markdownTable(tm.Env)
+	if !ok {
+		return tm.Fallback
+	}
+	return checkPrefix + " " + c.renderMarkdown(table)
+}
+
+// markdownTable builds a GitHub-style markdown table whose columns are
+// truncated to fit the component. Glamour lays a table out to the natural
+// width of its cells and adds 3 framing columns per column plus 1, so the
+// total cell budget is capped to keep the rendered table within c.Width-3.
+// The live c.Width is read here, so a resize re-lays-out the table.
+//
+// ok is false when the component is too narrow to hold even one rune per
+// column; the caller then falls back rather than emitting a broken table.
+func (c *ChatComponent) markdownTable(env resultEnvelope) (string, bool) {
+	cols := env.Columns
+	n := len(cols)
+	budget := c.Width - 3 - (3*n + 1)
+	if budget < n {
+		return "", false
+	}
+	widths := columnWidths(cols, env.Rows)
+
+	// Separators require at least one dash; also cap columns to a sane width
+	// so a single long column does not starve the rest before shrinking.
+	minWidth := budget / n
+	if minWidth > 3 {
+		minWidth = 3
+	}
+	shrinkColumns(widths, budget, minWidth)
+
+	var b strings.Builder
+	if env.Title != "" {
+		b.WriteString("**")
+		b.WriteString(env.Title)
+		b.WriteString("**\n\n")
+	}
+
+	writeRow := func(cells []string) {
+		b.WriteString("|")
+		for i, w := range widths {
+			var cell string
+			if i < len(cells) {
+				cell = cells[i]
+			}
+			b.WriteString(" ")
+			b.WriteString(mdCell(cell, w))
+			b.WriteString(" |")
+		}
+		b.WriteString("\n")
+	}
+
+	writeRow(cols)
+	b.WriteString("|")
+	for _, w := range widths {
+		b.WriteString(strings.Repeat("-", w))
+		b.WriteString("|")
+	}
+	b.WriteString("\n")
+	for _, row := range env.Rows {
+		writeRow(row)
+	}
+	return b.String(), true
+}
+
+// escapeCell escapes the characters that would break the markdown table
+// structure: pipes (which would open a new column) and the newlines that
+// strings.Fields has already collapsed to single spaces.
+func escapeCell(cell string) string {
+	return strings.ReplaceAll(strings.Join(strings.Fields(cell), " "), "|", "\\|")
+}
+
+// columnWidths returns the natural content width of each column: the widest of
+// its header and every cell, measured in display columns on the escaped cell
+// that is actually rendered. Display columns (not rune count) are required
+// because wide glyphs — CJK and emoji, which appear in real event `detail`
+// text — occupy two columns each.
+func columnWidths(cols []string, rows [][]string) []int {
+	widths := make([]int, len(cols))
+	for i, c := range cols {
+		widths[i] = lipgloss.Width(escapeCell(c))
+	}
+	for _, row := range rows {
+		for i := range widths {
+			if i >= len(row) {
+				continue
+			}
+			if n := lipgloss.Width(escapeCell(row[i])); n > widths[i] {
+				widths[i] = n
+			}
+		}
+	}
+	return widths
+}
+
+// shrinkColumns narrows the widest column repeatedly until the total fits
+// within budget, never below minWidth.
+func shrinkColumns(widths []int, budget, minWidth int) {
+	total := 0
+	for _, w := range widths {
+		total += w
+	}
+	for total > budget {
+		widest := 0
+		for i := 1; i < len(widths); i++ {
+			if widths[i] > widths[widest] {
+				widest = i
+			}
+		}
+		if widths[widest] <= minWidth {
+			return
+		}
+		widths[widest]--
+		total--
+	}
+}
+
+// mdCell renders one table cell: flattened and escaped, then truncated to fit
+// the column width measured in display columns. Truncation can cut between an
+// escape backslash and its pipe, leaving a bare pipe that would open a phantom
+// column; such a survivor is swapped for a broken bar (same width) so the row
+// keeps its shape.
+func mdCell(cell string, width int) string {
+	out := strings.TrimRight(truncateDisplay(escapeCell(cell), width), "\\")
+
+	var b strings.Builder
+	escaped := false
+	for _, r := range out {
+		switch {
+		case r == '\\':
+			escaped = true
+		case r == '|' && !escaped:
+			r = '¦'
+			escaped = false
+		default:
+			escaped = false
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// truncateDisplay cuts s to at most width display columns, keeping the head and
+// tail around an ellipsis. utils.TruncateMiddle does the cutting but counts
+// runes, so its rune budget is stepped down until the rendered width (in display
+// columns) fits — otherwise a cell of wide glyphs would overrun its column.
+func truncateDisplay(s string, width int) string {
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	if width <= 0 {
+		return ""
+	}
+	lo, hi := 0, len([]rune(s))
+	best := ""
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		candidate := utils.TruncateMiddle(s, mid)
+		if lipgloss.Width(candidate) <= width {
+			best = candidate
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
 }
 
 func (c *ChatComponent) renderPlainText(content string) string {
@@ -984,13 +1216,25 @@ func (c *ChatComponent) HandleToolCallExecuting(msg runners.ToolCallExecutingMsg
 
 // HandleToolCallSuccess handles a successful tool call message
 func (c *ChatComponent) HandleToolCallSuccess(msg runners.ToolCallSuccessMsg) {
-	formatted := checkPrefix + " " + msg.Formatted
+	formatted, table := c.formatToolResult(msg)
 	// Update the existing message if we have its index
 	if idx, exists := c.GetToolCallMessageIndex(msg.CallID); exists && idx < len(c.Messages) {
 		c.Messages[idx].Content = formatted
+		c.Messages[idx].Table = table
 		c.contentDirty = true
 		// Clean up the index mapping
 		c.DeleteToolCallMessageIndex(msg.CallID)
+	} else if table != nil {
+		// Fallback: append a new message retaining the raw envelope so the
+		// table re-lays-out on later renders and resizes.
+		c.Messages = append(c.Messages, ChatMessage{
+			Content: formatted, Indent: c.Indent, Type: MessageTypeSystem, Table: table,
+		})
+		if !c.ScrollLocked {
+			c.AutoScroll = true
+			c.UserScrolled = false
+		}
+		c.contentDirty = true
 	} else {
 		// Fallback: add a new message if we don't have the index
 		c.AppendToolCallMessage(formatted)

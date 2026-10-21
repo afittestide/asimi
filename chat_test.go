@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -483,6 +484,223 @@ func TestHandleToolCallSuccess_FallbackWhenNoIndex(t *testing.T) {
 	assert.True(t, chat.contentDirty, "fallback success should mark contentDirty=true")
 	assert.Len(t, chat.Messages, 1, "fallback should append a new message")
 	assert.Equal(t, checkPrefix+" shell: ok", chat.Messages[0].Content)
+}
+
+// TestHandleToolCallSuccess_MarkdownTableEnvelope verifies the generic
+// markdown_table opt-in: an envelope result is rendered as a table sized
+// within the component width, and the tool-agnostic path needs no tool check.
+func TestHandleToolCallSuccess_MarkdownTableEnvelope(t *testing.T) {
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id","edict_id","event_type","created_at","detail"],` +
+		`"rows":[["1","5","ritual_started","2026-10-11T10:00:00Z","swift-strike"],` +
+		`["2","5","step_started","2026-10-11T10:00:01Z","forge"]]}`
+
+	chat := NewChatComponent(80, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-table", ToolName: "tian_ledger",
+		Result: envelope, Formatted: "Found 2 events",
+	})
+
+	content := chat.Messages[0].Content
+	assert.Contains(t, content, "Heaven Ledger", "title must be rendered")
+	assert.Contains(t, content, "ritual_started", "row cells must be rendered")
+	assert.Contains(t, content, "2026-10-11T10:00:00Z", "row cells must be rendered")
+	assert.Contains(t, content, "forge", "row cells must be rendered")
+	assert.NotContains(t, content, "Found 2 events",
+		"the formatted summary must be overridden by the table")
+
+	for _, line := range strings.Split(content, "\n") {
+		assert.LessOrEqual(t, lipgloss.Width(line), chat.Width,
+			"rendered table width must not exceed the component width")
+	}
+}
+
+// TestHandleToolCallSuccess_MarkdownTableNarrowWidth verifies the table keeps
+// fitting (by truncating cells) when the component is narrower than the
+// natural table width.
+func TestHandleToolCallSuccess_MarkdownTableNarrowWidth(t *testing.T) {
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id","edict_id","event_type","created_at","detail"],` +
+		`"rows":[["1","5","ritual_started","2026-10-11T10:00:00Z","swift-strike"]]}`
+
+	chat := NewChatComponent(50, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-narrow", ToolName: "tian_ledger",
+		Result: envelope, Formatted: "Found 1 events",
+	})
+
+	content := chat.Messages[0].Content
+	assert.Contains(t, content, "Heaven Ledger")
+	for _, line := range strings.Split(content, "\n") {
+		assert.LessOrEqual(t, lipgloss.Width(line), chat.Width,
+			"narrow table width must not exceed the component width")
+	}
+}
+
+// TestHandleToolCallSuccess_NonEnvelopeUsesFormatted guards that an ordinary
+// result (or an envelope with an unknown format) keeps the old path.
+func TestHandleToolCallSuccess_NonEnvelopeUsesFormatted(t *testing.T) {
+	cases := map[string]string{
+		"plain":         `not json at all`,
+		"bare array":    `[{"id":1,"event_type":"x"}]`,
+		"wrong format":  `{"format":"plain_text","title":"T","columns":["a"],"rows":[["1"]]}`,
+		"missing cols":  `{"format":"markdown_table","title":"T","rows":[["1"]]}`,
+		"unrelated obj": `{"foo":"bar"}`,
+	}
+	for name, result := range cases {
+		t.Run(name, func(t *testing.T) {
+			chat := NewChatComponent(80, 20, true)
+			chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+				CallID: "tc-" + name, ToolName: "some_tool",
+				Result: result, Formatted: "tool: summary",
+			})
+			assert.Equal(t, checkPrefix+" tool: summary", chat.Messages[0].Content,
+				"non-envelope results must fall back to the Formatted line")
+		})
+	}
+}
+
+// TestHandleToolCallSuccess_MalformedEnvelopeFallsBack ensures malformed JSON
+// degrades gracefully rather than panicking or dropping the result.
+func TestHandleToolCallSuccess_MalformedEnvelopeFallsBack(t *testing.T) {
+	chat := NewChatComponent(80, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-bad", ToolName: "tian_ledger",
+		Result: `{"format":"markdown_table","columns":["a",`, Formatted: "Found events",
+	})
+	assert.Equal(t, checkPrefix+" Found events", chat.Messages[0].Content)
+}
+
+// TestHandleToolCallSuccess_MarkdownTableTooNarrowFallsBack covers the
+// degrade path the edict requires when the component cannot hold even a
+// minimal table: the caller must fall back to the plain Formatted line rather
+// than emit a broken table.
+func TestHandleToolCallSuccess_MarkdownTableTooNarrowFallsBack(t *testing.T) {
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id","edict_id","event_type","created_at","detail"],` +
+		`"rows":[["1","5","ritual_started","2026-10-11T10:00:00Z","swift-strike"]]}`
+
+	chat := NewChatComponent(10, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-too-narrow", ToolName: "tian_ledger",
+		Result: envelope, Formatted: "Found 1 events",
+	})
+	assert.Equal(t, checkPrefix+" Found 1 events", chat.Messages[0].Content,
+		"a component too narrow for a minimal table must fall back to Formatted")
+}
+
+// TestHandleToolCallSuccess_MarkdownTableEscapesPipes covers the cell-escaping
+// the edict requires so that a pipe inside a cell cannot open a phantom column
+// or push the row past the component width.
+func TestHandleToolCallSuccess_MarkdownTableEscapesPipes(t *testing.T) {
+	envelope := `{"format":"markdown_table","title":"T",` +
+		`"columns":["a","b"],"rows":[["x|y","z"],["p q","r|s"]]}`
+
+	chat := NewChatComponent(40, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-pipe", ToolName: "some_tool",
+		Result: envelope, Formatted: "F",
+	})
+	content := chat.Messages[0].Content
+	for _, line := range strings.Split(content, "\n") {
+		assert.LessOrEqual(t, lipgloss.Width(line), chat.Width,
+			"an escaped pipe must not push a row past the component width")
+	}
+	assert.Contains(t, content, "x|y", "cell content must survive escaping")
+	assert.Contains(t, content, "r|s", "cell content must survive escaping")
+}
+
+// TestHandleToolCallSuccess_MarkdownTableReflowsOnResize pins the edict's
+// width-sizing invariant: "rendered table width ≤ component width, and it
+// re-lays-out on resize". The table is built from the live component width, so
+// growing must reveal previously truncated cells and shrinking must produce a
+// single-row header (not a word-wrapped fragment of the old layout).
+func TestHandleToolCallSuccess_MarkdownTableReflowsOnResize(t *testing.T) {
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id","edict_id","event_type","created_at","detail"],` +
+		`"rows":[["1","5","ritual_started","2026-10-11T10:00:00Z","swift-strike"]]}`
+
+	chat := NewChatComponent(50, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-resize", ToolName: "tian_ledger",
+		Result: envelope, Formatted: "Found 1 events",
+	})
+
+	// Grow: the wider component must re-lay-out the table, so no cell is still
+	// truncated from the narrow render.
+	chat.SetSize(120, 20)
+	content := chat.Messages[0].Content
+	assert.NotContains(t, content, "…",
+		"growing the component must re-lay-out the table, not keep narrow truncation")
+	assert.Contains(t, content, "edict_id", "header must be whole after growing")
+	assert.Contains(t, content, "created_at", "header must be whole after growing")
+
+	// Shrink: the table must re-lay-out to the new width — one header row, one
+	// separator, one data row — while still fitting the component.
+	chat.SetSize(60, 20)
+	content = chat.Messages[0].Content
+	tableLines := 0
+	for _, line := range strings.Split(content, "\n") {
+		assert.LessOrEqual(t, lipgloss.Width(line), chat.Width,
+			"re-laid-out table must not exceed the component width")
+		if strings.Contains(line, "|") {
+			tableLines++
+		}
+	}
+	assert.Equal(t, 3, tableLines,
+		"shrinking must re-lay-out to header + separator + one row, got wrapped fragments")
+}
+
+// TestHandleToolCallSuccess_MarkdownTableReflowsOnUpdatePath covers the branch
+// where a scheduled message is updated in place: the table must still be
+// retained on the message so it re-lays-out on resize.
+func TestHandleToolCallSuccess_MarkdownTableReflowsOnUpdatePath(t *testing.T) {
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id","edict_id","event_type","created_at","detail"],` +
+		`"rows":[["1","5","ritual_started","2026-10-11T10:00:00Z","swift-strike"]]}`
+
+	chat := NewChatComponent(50, 20, true)
+	chat.HandleToolCallScheduled(runners.ToolCallScheduledMsg{
+		CallID: "tc-upd", ToolName: "tian_ledger", Formatted: "scheduled",
+	})
+	chat.UpdateContent()
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-upd", ToolName: "tian_ledger",
+		Result: envelope, Formatted: "Found 1 events",
+	})
+	assert.Len(t, chat.Messages, 1, "update-in-place must not append a new message")
+	assert.NotNil(t, chat.Messages[0].Table, "in-place update must retain the envelope")
+
+	chat.SetSize(120, 20)
+	assert.NotContains(t, chat.Messages[0].Content, "…",
+		"growing must re-lay-out the table on the update path too")
+	assert.Contains(t, chat.Messages[0].Content, "created_at",
+		"header must be whole after growing")
+}
+
+// TestHandleToolCallSuccess_MarkdownTableWideGlyphWidth pins the §3 invariant
+// for the ledger's real data: `detail` is derived from the event payload's
+// `intent` (see tianEventDetail), which routinely carries wide glyphs — CJK and
+// emoji are present in ~10% of this court's edict intents. A cell's width must
+// be measured in display columns, not runes, or a 2-column glyph overruns the
+// component and the separator wraps, corrupting the table.
+func TestHandleToolCallSuccess_MarkdownTableWideGlyphWidth(t *testing.T) {
+	// 17 CJK glyphs = 34 display columns but only 17 runes.
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id","edict_id","event_type","created_at","detail"],` +
+		`"rows":[["26","26","edict_created","2026-10-14T11:40:32Z","三界正名与封印链天书台宽度自适应"]]}`
+
+	chat := NewChatComponent(80, 20, true)
+	chat.HandleToolCallSuccess(runners.ToolCallSuccessMsg{
+		CallID: "tc-cjk", ToolName: "tian_ledger",
+		Result: envelope, Formatted: "Found 1 events",
+	})
+	chat.UpdateContent()
+
+	for _, line := range strings.Split(chat.Messages[0].Content, "\n") {
+		assert.LessOrEqual(t, lipgloss.Width(line), chat.Width,
+			"a wide-glyph cell must not push the rendered table past the component width")
+	}
 }
 
 func TestHandleToolCallError_UpdatesAndClearsIndex(t *testing.T) {

@@ -4,12 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/utils"
 	"github.com/afittestide/asimi/storage"
 )
+
+// tianMarkdownTableFormat is the generic TUI opt-in format. Any daemon-side
+// tool may emit an envelope carrying this value to have the TUI lay its
+// result out as a width-aware markdown table.
+const tianMarkdownTableFormat = "markdown_table"
+
+// tianLedgerEnvelope is the human-facing result shape. Columns and rows are
+// plain strings so the TUI owns all layout; the raw summaries ride along under
+// "events" so the model keeps full fidelity (payload included).
+type tianLedgerEnvelope struct {
+	Format  string             `json:"format"`
+	Title   string             `json:"title"`
+	Columns []string           `json:"columns"`
+	Rows    [][]string         `json:"rows"`
+	Events  []tianEventSummary `json:"events"`
+}
 
 // tianEventTruncationSuffix marks a tail-truncated last_step_output in
 // summary mode. A leading ellipsis (via the ellipsis rune) signals that the
@@ -112,7 +130,23 @@ func (t TianLedgerTool) Call(ctx context.Context, input string) (string, error) 
 		}
 	}
 
-	resultJSON, _ := json.MarshalIndent(summaries, "", "  ") //nolint:errcheck // summaries are always marshallable
+	envelope := tianLedgerEnvelope{
+		Format:  tianMarkdownTableFormat,
+		Title:   "Heaven Ledger",
+		Columns: []string{"edict_id", "event", "time", "detail"},
+		Rows:    make([][]string, len(summaries)),
+		Events:  summaries,
+	}
+	for i, ev := range events {
+		envelope.Rows[i] = []string{
+			strconv.FormatUint(uint64(ev.EdictID), 10),
+			tianEventCell(ev.EventType, ev.Payload),
+			tianRelativeTime(ev.CreatedAt),
+			summaries[i].Detail,
+		}
+	}
+
+	resultJSON, _ := json.MarshalIndent(envelope, "", "  ") //nolint:errcheck // envelope is always marshallable
 	return string(resultJSON), nil
 }
 
@@ -162,10 +196,16 @@ func (t TianLedgerTool) Format(input, result string, err error) string {
 	if err != nil {
 		msg.Writef("Error: %v", err)
 	} else {
-		var events []tianEventSummary
+		var envelope tianLedgerEnvelope
 		// Best-effort parse; format degrades gracefully on failure.
-		_ = json.Unmarshal([]byte(result), &events) //nolint:errcheck // best-effort for display
-		msg.Writef("Found %d events", len(events))
+		if e := json.Unmarshal([]byte(result), &envelope); e == nil && envelope.Format != "" {
+			msg.Writef("Found %d events", len(envelope.Events))
+		} else {
+			// Legacy bare-array shape (or unparseable result).
+			var events []tianEventSummary
+			_ = json.Unmarshal([]byte(result), &events) //nolint:errcheck // best-effort for display
+			msg.Writef("Found %d events", len(events))
+		}
 	}
 	return msg.String() + "\n"
 }
@@ -204,16 +244,169 @@ func (t TianLedgerTool) ParameterSchema() map[string]any {
 	}
 }
 
-// tianEventDetail extracts a human-readable detail from an event payload.
-func tianEventDetail(ev storage.TianEvent) string {
-	if ev.Payload == nil {
-		return ""
+// tianEventCell builds the "event" column: the event type paired with the
+// per-type payload datum that identifies the specific occurrence — the step
+// number and name, the ritual name, or the acting minister.
+func tianEventCell(eventType storage.CourtEvent, payload storage.JSON) string {
+	p := map[string]interface{}(payload)
+	switch eventType {
+	case storage.EventStepStarted, storage.EventStepCompleted, storage.EventStepFailed:
+		step, _ := p["step"].(string)
+		if step == "" {
+			return string(eventType)
+		}
+		if idx, ok := tianPayloadInt(p["step_index"]); ok {
+			return fmt.Sprintf("step #%d: %s", idx, step)
+		}
+		return "step: " + step
+	case storage.EventRitualStarted, storage.EventRitualCompleted,
+		storage.EventRitualFailed, storage.EventRitualAborted, storage.EventRitualEnacted:
+		if ritual, ok := p["ritual"].(string); ok && ritual != "" {
+			return ritual
+		}
+	case storage.EventSealGranted, storage.EventZhengmingAnswered, "zhengming_requested":
+		if minister, ok := p["minister_id"].(string); ok && minister != "" {
+			return minister
+		}
 	}
-	payload := map[string]interface{}(ev.Payload)
+	return string(eventType)
+}
+
+// tianPayloadInt coerces a JSON-decoded numeric payload value to an int.
+// encoding/json yields float64; in-process publishers may pass int/int64.
+func tianPayloadInt(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i), true
+		}
+	}
+	return 0, false
+}
+
+// tianRelativeTime renders a timestamp relative to now, e.g. "12s ago",
+// "5m ago", "3h ago", "2d ago".
+func tianRelativeTime(t time.Time) string {
+	d := time.Since(t)
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// tianDetailMaxLen bounds the detail cell so one chatty event cannot dominate
+// the table.
+const tianDetailMaxLen = 80
+
+// tianEventDetail renders a per-type human summary for the "detail" column.
+func tianEventDetail(ev storage.TianEvent) string {
+	p := map[string]interface{}(ev.Payload)
+	switch ev.EventType {
+	case storage.EventEdictCreated:
+		if intent, ok := p["intent"].(string); ok && intent != "" {
+			return tianHeadline(intent)
+		}
+	case storage.EventRitualCompleted, storage.EventStepFailed, storage.EventRitualFailed:
+		if out, ok := p["last_step_output"].(string); ok && strings.TrimSpace(out) != "" {
+			return tianSnippet(tianLastLine(out))
+		}
+		if e, ok := p["error"].(string); ok && e != "" {
+			return tianSnippet(e)
+		}
+	case storage.EventZhengmingNeeded, "zhengming_requested":
+		if q := tianQuestionSummary(p["questions"]); q != "" {
+			return q
+		}
+	case storage.EventZhengmingAnswered:
+		if a, ok := p["answer"].(string); ok && a != "" {
+			return tianSnippet(a)
+		}
+	case storage.EventCourtStarted:
+		for _, key := range []string{"current_version", "version"} {
+			if v, ok := p[key].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	// Fallback for event types without a tailored summary: the same generic
+	// keys the column used before, so nothing regresses to empty.
 	for _, key := range []string{"ritual", "step", "minister_id", "intent"} {
-		if v, ok := payload[key].(string); ok && v != "" {
+		if v, ok := p[key].(string); ok && v != "" {
 			return v
 		}
 	}
 	return ""
+}
+
+// tianHeadline reduces an intent body to its first meaningful line, stripping
+// a leading markdown heading prefix such as "# Bug:".
+func tianHeadline(intent string) string {
+	for _, line := range strings.Split(intent, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		for _, prefix := range []string{"# Bug:", "# Feature:", "# feat:", "# bug:", "# chore:"} {
+			if strings.HasPrefix(line, prefix) {
+				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+				break
+			}
+		}
+		return tianSnippet(line)
+	}
+	return ""
+}
+
+// tianQuestionSummary picks the first zhengming question's short display text.
+func tianQuestionSummary(v interface{}) string {
+	items, ok := v.([]interface{})
+	if !ok || len(items) == 0 {
+		return ""
+	}
+	first, ok := items[0].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"summary", "text"} {
+		if s, ok := first[key].(string); ok && s != "" {
+			return tianSnippet(s)
+		}
+	}
+	return ""
+}
+
+// tianLastLine returns the last non-empty line of s, where verdicts land.
+func tianLastLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			return lines[i]
+		}
+	}
+	return s
+}
+
+// tianSnippet collapses whitespace and bounds length so the cell stays single-line.
+func tianSnippet(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	runes := []rune(s)
+	if len(runes) > tianDetailMaxLen {
+		return string(runes[:tianDetailMaxLen-1]) + "…"
+	}
+	return s
 }

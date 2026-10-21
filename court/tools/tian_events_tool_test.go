@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,18 @@ func seedTianEvent(t *testing.T, db *gorm.DB, edictID uint, eventType storage.Co
 	}
 }
 
+// decodeTianEvents parses a Call result envelope and returns its event list.
+// The result is a JSON object carrying the TUI table layout plus the raw
+// summaries under "events".
+func decodeTianEvents(t *testing.T, result string) []tianEventSummary {
+	t.Helper()
+	var env tianLedgerEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("failed to parse result envelope: %v", err)
+	}
+	return env.Events
+}
+
 func TestTianLedgerTool_Filters(t *testing.T) {
 	db := setupTianEventsTestDB(t)
 	ctx := context.Background()
@@ -58,10 +71,7 @@ func TestTianLedgerTool_Filters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var byEdict []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &byEdict); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	byEdict := decodeTianEvents(t, result)
 	if len(byEdict) != 2 {
 		t.Fatalf("edict_id filter: got %d events, want 2", len(byEdict))
 	}
@@ -76,10 +86,7 @@ func TestTianLedgerTool_Filters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var byType []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &byType); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	byType := decodeTianEvents(t, result)
 	if len(byType) != 2 {
 		t.Fatalf("event_type filter: got %d events, want 2", len(byType))
 	}
@@ -94,10 +101,7 @@ func TestTianLedgerTool_Filters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var limited []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &limited); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	limited := decodeTianEvents(t, result)
 	if len(limited) != 1 {
 		t.Fatalf("limit filter: got %d events, want 1", len(limited))
 	}
@@ -119,10 +123,7 @@ func TestTianLedgerTool_Detail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -147,6 +148,129 @@ func TestTianLedgerTool_Empty(t *testing.T) {
 	}
 	if !strings.Contains(result, "No Tian events found") {
 		t.Errorf("empty result should return a helpful message, got: %q", result)
+	}
+	// The empty case must stay a plain message, never a table envelope.
+	if strings.Contains(result, tianMarkdownTableFormat) {
+		t.Errorf("empty result must not be wrapped in a table envelope, got: %q", result)
+	}
+}
+
+// TestTianLedgerTool_EnvelopeShape asserts the Call result is the generic
+// markdown_table envelope: format/title/columns/ordered rows, with the raw
+// summaries preserved under "events" so model fidelity is intact.
+func TestTianLedgerTool_EnvelopeShape(t *testing.T) {
+	db := setupTianEventsTestDB(t)
+	ctx := context.Background()
+
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 3; i++ {
+		ev := storage.TianEvent{
+			EdictID:   5 + uint(i),
+			Username:  "testuser",
+			Project:   "testproject",
+			EventType: "step_started",
+			CreatedAt: base.Add(time.Duration(i) * time.Minute),
+			Payload:   storage.JSON{"step": "forge"},
+		}
+		if err := db.Create(&ev).Error; err != nil {
+			t.Fatalf("failed to seed event: %v", err)
+		}
+	}
+
+	tool := TianLedgerTool{Ctx: ToolContext{
+		DB:       db,
+		Username: "testuser",
+		Project:  "testproject",
+	}}
+
+	result, err := tool.Call(ctx, `{}`)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+
+	var env tianLedgerEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a JSON object envelope: %v", err)
+	}
+	if env.Format != tianMarkdownTableFormat {
+		t.Errorf("Format = %q, want %q", env.Format, tianMarkdownTableFormat)
+	}
+	if env.Title != "Heaven Ledger" {
+		t.Errorf("Title = %q, want %q", env.Title, "Heaven Ledger")
+	}
+	wantCols := []string{"edict_id", "event", "time", "detail"}
+	if !reflect.DeepEqual(env.Columns, wantCols) {
+		t.Errorf("Columns = %v, want %v", env.Columns, wantCols)
+	}
+	if len(env.Rows) != 3 {
+		t.Fatalf("Rows length = %d, want 3", len(env.Rows))
+	}
+	for _, row := range env.Rows {
+		if len(row) != len(env.Columns) {
+			t.Errorf("row has %d cells, want %d: %v", len(row), len(env.Columns), row)
+		}
+	}
+	// Rows must follow the same created_at DESC order as the events: the
+	// highest edict_id (newest) comes first.
+	if env.Rows[0][0] != "7" {
+		t.Errorf("first row edict_id = %q, want newest (7)", env.Rows[0][0])
+	}
+	if env.Rows[len(env.Rows)-1][0] != "5" {
+		t.Errorf("last row edict_id = %q, want oldest (5)", env.Rows[len(env.Rows)-1][0])
+	}
+	// The event cell carries the step number and name; time is relative.
+	if env.Rows[0][1] != "step: forge" {
+		t.Errorf("first row event = %q, want %q", env.Rows[0][1], "step: forge")
+	}
+	if !strings.HasSuffix(env.Rows[0][2], " ago") {
+		t.Errorf("first row time = %q, want relative (… ago)", env.Rows[0][2])
+	}
+	if env.Rows[0][3] != "forge" {
+		t.Errorf("first row detail = %q, want %q", env.Rows[0][3], "forge")
+	}
+	// Raw summaries (with payload) must still ride along for the model.
+	if len(env.Events) != 3 {
+		t.Fatalf("Events length = %d, want 3", len(env.Events))
+	}
+	if env.Events[0].Payload == nil {
+		t.Errorf("Events[0].Payload is nil, want raw payload preserved")
+	}
+}
+
+// TestTianLedgerTool_EnvelopeRowsAlignWithEvents ties the human-facing table
+// to the model-facing summaries: the same events, same order, same values.
+func TestTianLedgerTool_EnvelopeRowsAlignWithEvents(t *testing.T) {
+	db := setupTianEventsTestDB(t)
+	ctx := context.Background()
+
+	seedTianEvent(t, db, 7, "ritual_started", storage.JSON{"ritual": "swift-strike"})
+	seedTianEvent(t, db, 8, "seal_granted", storage.JSON{"minister_id": "judge"})
+
+	tool := TianLedgerTool{Ctx: ToolContext{
+		DB:       db,
+		Username: "testuser",
+		Project:  "testproject",
+	}}
+
+	result, err := tool.Call(ctx, `{}`)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+	var env tianLedgerEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a JSON object envelope: %v", err)
+	}
+	if len(env.Rows) != len(env.Events) {
+		t.Fatalf("Rows length %d != Events length %d", len(env.Rows), len(env.Events))
+	}
+	for i, ev := range env.Events {
+		row := env.Rows[i]
+		if row[0] != fmt.Sprintf("%d", ev.EdictID) {
+			t.Errorf("row %d edict_id = %q, want %d", i, row[0], ev.EdictID)
+		}
+		if row[3] != ev.Detail {
+			t.Errorf("row %d detail = %q, want %q", i, row[3], ev.Detail)
+		}
 	}
 }
 
@@ -180,10 +304,7 @@ func TestTianLedgerTool_OffsetPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var first []tianEventSummary
-	if err := json.Unmarshal([]byte(page1), &first); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	first := decodeTianEvents(t, page1)
 	if len(first) != 2 {
 		t.Fatalf("page 1: got %d events, want 2", len(first))
 	}
@@ -193,10 +314,7 @@ func TestTianLedgerTool_OffsetPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var second []tianEventSummary
-	if err := json.Unmarshal([]byte(page2), &second); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	second := decodeTianEvents(t, page2)
 	if len(second) != 2 {
 		t.Fatalf("page 2: got %d events, want 2", len(second))
 	}
@@ -222,10 +340,7 @@ func TestTianLedgerTool_OffsetPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("negative offset should be clamped, got error: %v", err)
 	}
-	var neg []tianEventSummary
-	if err := json.Unmarshal([]byte(page4), &neg); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	neg := decodeTianEvents(t, page4)
 	if len(neg) != 4 {
 		t.Fatalf("negative offset: got %d events, want all 4", len(neg))
 	}
@@ -259,10 +374,7 @@ func TestTianLedgerTool_OrderedByCreatedAtDesc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 3 {
 		t.Fatalf("got %d events, want 3", len(events))
 	}
@@ -304,10 +416,7 @@ func TestTianLedgerTool_DefaultLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 50 {
 		t.Fatalf("default limit: got %d events, want 50", len(events))
 	}
@@ -332,10 +441,7 @@ func TestTianLedgerTool_DetailKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 4 {
 		t.Fatalf("got %d events, want 4", len(events))
 	}
@@ -388,10 +494,7 @@ func TestTianLedgerTool_UnknownPayloadHasNoDetail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -455,10 +558,7 @@ func TestTianLedgerTool_SummaryTruncatesTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -508,10 +608,7 @@ func TestTianLedgerTool_ShortBodyPassesThroughVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -542,10 +639,7 @@ func TestTianLedgerTool_FullReturnsUntruncatedBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -573,10 +667,7 @@ func TestTianLedgerTool_CourtLevelLimitHonoured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	got, _ := events[0].Payload["last_step_output"].(string)
 	// The retained tail is exactly `limit` runes, plus the leading ellipsis
 	// and the truncation suffix — a hardcoded constant would fail here.
@@ -609,10 +700,7 @@ func TestTianLedgerTool_DetailDerivedFromFullPayloadInSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -652,10 +740,7 @@ func TestTianLedgerTool_SinceID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var all []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &all); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	all := decodeTianEvents(t, result)
 	if len(all) != 4 {
 		t.Fatalf("since_id=0: got %d events, want 4", len(all))
 	}
@@ -665,10 +750,7 @@ func TestTianLedgerTool_SinceID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call failed: %v", err)
 	}
-	var newer []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &newer); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	newer := decodeTianEvents(t, result)
 	if len(newer) != 2 {
 		t.Fatalf("since_id=%d: got %d events, want 2", ids[1], len(newer))
 	}
@@ -707,10 +789,7 @@ func TestTianLedgerTool_MalformedPayloadDoesNotFailQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("malformed payload failed the whole query: %v", err)
 	}
-	var events []tianEventSummary
-	if err := json.Unmarshal([]byte(result), &events); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
-	}
+	events := decodeTianEvents(t, result)
 	if len(events) != 3 {
 		t.Fatalf("got %d events, want 3 (valid rows must survive)", len(events))
 	}
@@ -740,6 +819,212 @@ func TestTianLedgerTool_MalformedPayloadDoesNotFailQuery(t *testing.T) {
 		if !ok || marker == "" {
 			t.Fatalf("malformed row payload = %#v, want %q marker", ev.Payload, storage.MalformedMarkerKey)
 		}
+	}
+}
+
+// TestTianLedgerTool_FormatStaysSummary asserts Format keeps rendering the
+// compact "Found N events" line for both the envelope and legacy array shapes.
+func TestTianLedgerTool_FormatStaysSummary(t *testing.T) {
+	tool := TianLedgerTool{}
+	envelope := `{"format":"markdown_table","title":"Heaven Ledger",` +
+		`"columns":["id"],"rows":[["1"],["2"]],` +
+		`"events":[{"id":1},{"id":2}]}`
+	got := tool.Format("", envelope, nil)
+	if !strings.Contains(got, "Found 2 events") {
+		t.Errorf("Format(envelope) = %q, want counted summary", got)
+	}
+
+	legacy := `[{"id":1}]`
+	got = tool.Format("", legacy, nil)
+	if !strings.Contains(got, "Found 1 events") {
+		t.Errorf("Format(legacy array) = %q, want counted summary", got)
+	}
+
+	got = tool.Format("", "", fmt.Errorf("boom"))
+	if !strings.Contains(got, "Error:") {
+		t.Errorf("Format(err) = %q, want error line", got)
+	}
+}
+
+// TestTianRelativeTime covers the "time" column formatter boundaries.
+func TestTianRelativeTime(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		when time.Time
+		want string
+	}{
+		{"seconds", now.Add(-12 * time.Second), "12s ago"},
+		{"minute boundary", now.Add(-59 * time.Second), "59s ago"},
+		{"minutes", now.Add(-5 * time.Minute), "5m ago"},
+		{"hour boundary", now.Add(-59 * time.Minute), "59m ago"},
+		{"hours", now.Add(-3 * time.Hour), "3h ago"},
+		{"day boundary", now.Add(-23 * time.Hour), "23h ago"},
+		{"days", now.Add(-48 * time.Hour), "2d ago"},
+		{"future clamps to zero", now.Add(time.Minute), "0s ago"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tianRelativeTime(tc.when); got != tc.want {
+				t.Errorf("tianRelativeTime = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTianEventCell covers the per-type "event" column content.
+func TestTianEventCell(t *testing.T) {
+	cases := []struct {
+		name      string
+		eventType storage.CourtEvent
+		payload   storage.JSON
+		want      string
+	}{
+		{"step with index", "step_started", storage.JSON{"step": "reviewing", "step_index": float64(2)}, "step #2: reviewing"},
+		{"step without index", "step_completed", storage.JSON{"step": "forge"}, "step: forge"},
+		{"ritual", "ritual_started", storage.JSON{"ritual": "swift-strike"}, "swift-strike"},
+		{"ritual completed", "ritual_completed", storage.JSON{"ritual": "castle-siege"}, "castle-siege"},
+		{"seal granted", "seal_granted", storage.JSON{"minister_id": "judge"}, "judge"},
+		{"zhengming answered", "zhengming_answered", storage.JSON{"minister_id": "forge"}, "forge"},
+		{"unknown falls back to type", "worktree_merge_failed", storage.JSON{"foo": "bar"}, "worktree_merge_failed"},
+		{"nil payload falls back to type", "ling_created", nil, "ling_created"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tianEventCell(tc.eventType, tc.payload); got != tc.want {
+				t.Errorf("tianEventCell = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTianEventDetail covers the per-type human "detail" column summary.
+func TestTianEventDetail(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   storage.TianEvent
+		want string
+	}{
+		{
+			"edict_created strips heading",
+			storage.TianEvent{EventType: "edict_created", Payload: storage.JSON{"intent": "# Bug: fix reconnect race\n\nmore"}},
+			"fix reconnect race",
+		},
+		{
+			"edict_created plain first line",
+			storage.TianEvent{EventType: "edict_created", Payload: storage.JSON{"intent": "add ledger polish\nsecond"}},
+			"add ledger polish",
+		},
+		{
+			"ritual_completed verdict tail",
+			storage.TianEvent{EventType: "ritual_completed", Payload: storage.JSON{"last_step_output": "reviewing...\nPASS: all good"}},
+			"PASS: all good",
+		},
+		{
+			"step_failed error snippet",
+			storage.TianEvent{EventType: "step_failed", Payload: storage.JSON{"error": "context canceled"}},
+			"context canceled",
+		},
+		{
+			"zhengming_requested question",
+			storage.TianEvent{EventType: "zhengming_requested", Payload: storage.JSON{"questions": []interface{}{
+				map[string]interface{}{"summary": "detail column", "text": "long text"},
+			}}},
+			"detail column",
+		},
+		{
+			"zhengming_answered answer",
+			storage.TianEvent{EventType: "zhengming_answered", Payload: storage.JSON{"answer": "use per-type"}},
+			"use per-type",
+		},
+		{
+			"court_started version",
+			storage.TianEvent{EventType: "court_started", Payload: storage.JSON{"current_version": "v0.14.5"}},
+			"v0.14.5",
+		},
+		{
+			"generic fallback",
+			storage.TianEvent{EventType: "some_event", Payload: storage.JSON{"ritual": "swift-strike"}},
+			"swift-strike",
+		},
+		{
+			"unknown empty",
+			storage.TianEvent{EventType: "some_event", Payload: storage.JSON{"unrelated": "x"}},
+			"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tianEventDetail(tc.ev); got != tc.want {
+				t.Errorf("tianEventDetail = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTianEventDetailBounded asserts a chatty payload is collapsed to one
+// bounded line.
+func TestTianEventDetailBounded(t *testing.T) {
+	ev := storage.TianEvent{EventType: "edict_created", Payload: storage.JSON{
+		"intent": "# Feature: " + strings.Repeat("word ", 100),
+	}}
+	got := tianEventDetail(ev)
+	if strings.Contains(got, "\n") {
+		t.Errorf("detail must be single-line, got %q", got)
+	}
+	if n := len([]rune(got)); n > tianDetailMaxLen {
+		t.Errorf("detail length = %d runes, want <= %d", n, tianDetailMaxLen)
+	}
+}
+
+// TestTianLedgerTool_EnvelopeEventAndTimeColumns ties the per-type event and
+// relative-time cells into the envelope rows end to end.
+func TestTianLedgerTool_EnvelopeEventAndTimeColumns(t *testing.T) {
+	db := setupTianEventsTestDB(t)
+	ctx := context.Background()
+
+	ev := storage.TianEvent{
+		EdictID:   9,
+		Username:  "testuser",
+		Project:   "testproject",
+		EventType: "step_failed",
+		CreatedAt: time.Now().Add(-5 * time.Minute),
+		Payload:   storage.JSON{"step": "reviewing", "step_index": 2, "error": "boom"},
+	}
+	if err := db.Create(&ev).Error; err != nil {
+		t.Fatalf("failed to seed event: %v", err)
+	}
+
+	tool := TianLedgerTool{Ctx: ToolContext{
+		DB:       db,
+		Username: "testuser",
+		Project:  "testproject",
+	}}
+
+	result, err := tool.Call(ctx, `{}`)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+	var env tianLedgerEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a JSON object envelope: %v", err)
+	}
+	if len(env.Rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(env.Rows))
+	}
+	row := env.Rows[0]
+	if row[1] != "step #2: reviewing" {
+		t.Errorf("event cell = %q, want %q", row[1], "step #2: reviewing")
+	}
+	if row[2] != "5m ago" {
+		t.Errorf("time cell = %q, want %q", row[2], "5m ago")
+	}
+	if row[3] != "boom" {
+		t.Errorf("detail cell = %q, want %q", row[3], "boom")
+	}
+	// Model-facing created_at stays an absolute timestamp.
+	if env.Events[0].CreatedAt.IsZero() {
+		t.Errorf("Events[0].CreatedAt is zero, want absolute timestamp")
 	}
 }
 

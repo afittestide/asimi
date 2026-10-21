@@ -205,9 +205,11 @@ func TestIsolation_TianLedger(t *testing.T) {
 	resultA, err := toolA.Call(context.Background(), fmt.Sprintf(`{"edict_id": %d}`, edictA.ID))
 	require.NoError(t, err)
 
-	var eventsA []map[string]interface{}
-	require.NoError(t, json.Unmarshal([]byte(resultA), &eventsA))
-	require.Len(t, eventsA, 1, "project A should see its own ledger event")
+	var envelopeA struct {
+		Events []map[string]interface{} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(resultA), &envelopeA))
+	require.Len(t, envelopeA.Events, 1, "project A should see its own ledger event")
 }
 
 // TestIsolation_CensorPrecedent verifies that CensorPrecedent queries are
