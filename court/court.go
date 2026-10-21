@@ -475,6 +475,35 @@ func (s *Court) SetNotify(notify internal.NotifyFunc) {
 			base.SetNotify(notify)
 		}
 	}
+
+	// approve_doc is registered as a placeholder at construction time (its
+	// permission classification must exist before notify is known). Install the
+	// live callback now that the Court has it, mirroring updateProjectRootTools.
+	if s.toolRegistry != nil {
+		s.toolRegistry.Update(tools.ApproveDocTool{Notify: notify})
+		// Live sessions snapshot their tools at creation; refresh any already
+		// open so a mid-session approve_doc call sees the repaired tool. Gate
+		// on the minister's actual entitlement (Tools() is permission-derived):
+		// approve_doc is intentExec, so injecting it into a minister that does
+		// not expose it would both escalate privilege and make a minister's
+		// tool set depend on whether its session predates SetNotify.
+		for _, minister := range s.Ministers() {
+			if !ministerHasTool(minister, "approve_doc") {
+				continue
+			}
+			holder, ok := minister.(interface{ GetSessions() map[string]*Session })
+			if !ok {
+				continue
+			}
+			for _, sess := range holder.GetSessions() {
+				if sess == nil {
+					continue
+				}
+				sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{Notify: notify}})
+			}
+		}
+	}
+
 	// Send deferred drain notification if events were recovered at startup.
 	// Use goroutine because notify may call program.Send before program.Run.
 	if len(s.drainedEvents) > 0 {
@@ -646,6 +675,21 @@ func (s *Court) GetMinister(id string) Minister {
 		}
 	}
 	return nil
+}
+
+// ministerHasTool reports whether the minister's permission-derived tool set
+// includes a tool with the given name. Used to gate late-bound refreshes so a
+// callback repair never grants a tool the minister cannot otherwise access.
+func ministerHasTool(minister Minister, name string) bool {
+	if minister == nil {
+		return false
+	}
+	for _, t := range minister.Tools() {
+		if t.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 // hostTimeouts resolves the host command/approval deadlines from the

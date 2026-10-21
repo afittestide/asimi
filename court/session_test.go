@@ -305,6 +305,67 @@ func TestSession_RegisterCourtTools(t *testing.T) {
 	assert.Contains(t, sess.toolCatalog, "tool2")
 }
 
+// Re-registering a tool must replace its catalog entry and def in place so a
+// session refreshed after late-bound config (e.g. SetNotify repairing
+// approve_doc) never accumulates duplicate definitions.
+func TestSession_RegisterCourtTools_ReplacesInPlace(t *testing.T) {
+	t.Parallel()
+
+	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{}})
+	before := len(sess.toolDefs)
+
+	sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{Notify: func(any) {}}})
+
+	assert.Equal(t, before, len(sess.toolDefs), "re-registration must not append a duplicate def")
+	tool, ok := sess.toolCatalog["approve_doc"].(tools.ApproveDocTool)
+	require.True(t, ok)
+	assert.NotNil(t, tool.Notify, "catalog entry must hold the refreshed instance")
+}
+
+// A runtime refresh (Court.SetNotify re-registering approve_doc) runs
+// concurrently with the streaming goroutine reading toolDefs/toolCatalog.
+// This exercises both sides under -race; it must not report a race.
+func TestSession_RegisterCourtTools_ConcurrentWithReaders(t *testing.T) {
+	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{}})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: stands in for the SetNotify refresh loop.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{Notify: func(any) {}}})
+		}
+		close(stop)
+	}()
+
+	// Reader: mirrors the streaming paths that snapshot defs, count their
+	// tokens, and resolve a tool by name.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			sess.toolDefsSnapshot()
+			sess.updateTokenCounts()
+			_, _ = sess.lookupTool("approve_doc")
+		}
+	}()
+
+	wg.Wait()
+}
+
 func TestSession_Messages(t *testing.T) {
 	t.Parallel()
 

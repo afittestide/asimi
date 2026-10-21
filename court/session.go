@@ -381,7 +381,14 @@ type Session struct {
 	systemPrompt        string
 	channelID           string
 
-	// Tool execution
+	// Tool execution.
+	//
+	// toolMu guards toolCatalog and toolDefs. Sessions are normally
+	// constructed on a single goroutine, but Court.SetNotify can re-register
+	// approve_doc at runtime (daemon reconnect / mid-session subscribe) while
+	// the streaming goroutine reads the same state, so both the read sites
+	// below and RegisterCourtTools must hold the lock.
+	toolMu      sync.RWMutex
 	toolCatalog map[string]Tool
 	toolDefs    []schemas.ChatTool
 	scheduler   *runners.CoreToolScheduler
@@ -624,29 +631,80 @@ func (s *Session) AddMessage(role schemas.ChatMessageRole, content string) {
 }
 
 // RegisterCourtTools adds court-specific tools to the session's tool catalog.
+// Re-registering a tool with the same name replaces it in place (catalog entry
+// and tool definition) instead of appending a duplicate def, so a session
+// refreshed after late-bound configuration (e.g. SetNotify) stays consistent.
+//
+// Safe for concurrent use with the streaming goroutine: holds toolMu so a
+// live refresh from Court.SetNotify cannot race the readers below.
 func (s *Session) RegisterCourtTools(tools []Tool) {
+	s.toolMu.Lock()
+	defer s.toolMu.Unlock()
 	for _, tool := range tools {
 		s.toolCatalog[tool.Name()] = tool
-		desc := tool.Description()
-
-		var params *schemas.ToolFunctionParameters
-		paramSchema := tool.ParameterSchema()
-		if paramSchema != nil {
-			data, err := json.Marshal(paramSchema)
-			if err == nil {
-				params = &schemas.ToolFunctionParameters{}
-				json.Unmarshal(data, params)
+		def := toolDef(tool)
+		replaced := false
+		for i := range s.toolDefs {
+			if s.toolDefs[i].Function != nil && s.toolDefs[i].Function.Name == tool.Name() {
+				s.toolDefs[i] = def
+				replaced = true
+				break
 			}
 		}
+		if !replaced {
+			s.toolDefs = append(s.toolDefs, def)
+		}
+	}
+}
 
-		s.toolDefs = append(s.toolDefs, schemas.ChatTool{
-			Type: schemas.ChatToolTypeFunction,
-			Function: &schemas.ChatToolFunction{
-				Name:        tool.Name(),
-				Description: &desc,
-				Parameters:  params,
-			},
-		})
+// toolDefsSnapshot returns a copy of the tool definitions slice. The copy
+// matters: RegisterCourtTools replaces defs in place, so handing out the
+// shared backing array would race the writer once a caller marshals it
+// outside toolMu (e.g. while building an LLM request).
+func (s *Session) toolDefsSnapshot() []schemas.ChatTool {
+	s.toolMu.RLock()
+	defer s.toolMu.RUnlock()
+	if len(s.toolDefs) == 0 {
+		return nil
+	}
+	out := make([]schemas.ChatTool, len(s.toolDefs))
+	copy(out, s.toolDefs)
+	return out
+}
+
+// lookupTool resolves a tool by name from the session's catalog.
+func (s *Session) lookupTool(name string) (Tool, bool) {
+	s.toolMu.RLock()
+	defer s.toolMu.RUnlock()
+	tool, ok := s.toolCatalog[name]
+	return tool, ok
+}
+
+// hasTool reports whether the session exposes a tool with the given name.
+func (s *Session) hasTool(name string) bool {
+	_, ok := s.lookupTool(name)
+	return ok
+}
+
+// toolDef builds the LLM-facing definition for a tool.
+func toolDef(tool Tool) schemas.ChatTool {
+	desc := tool.Description()
+
+	var params *schemas.ToolFunctionParameters
+	if paramSchema := tool.ParameterSchema(); paramSchema != nil {
+		if data, err := json.Marshal(paramSchema); err == nil {
+			params = &schemas.ToolFunctionParameters{}
+			json.Unmarshal(data, params)
+		}
+	}
+
+	return schemas.ChatTool{
+		Type: schemas.ChatToolTypeFunction,
+		Function: &schemas.ChatToolFunction{
+			Name:        tool.Name(),
+			Description: &desc,
+			Parameters:  params,
+		},
 	}
 }
 
@@ -654,7 +712,6 @@ func (s *Session) RegisterCourtTools(tools []Tool) {
 func (s *Session) AddTools(tools []Tool) {
 	slog.Info("adding court tools to session", "count", len(tools))
 	s.RegisterCourtTools(tools)
-	slog.Info("session tools after adding", "toolDefs", len(s.toolDefs), "toolCatalog", len(s.toolCatalog))
 }
 
 // --- Context Files Management ---
@@ -1121,10 +1178,11 @@ func (s *Session) countSystemPromptTokens() int {
 
 // countSystemToolsTokens counts tokens in tool definitions.
 func (s *Session) countSystemToolsTokens() int {
-	if len(s.toolDefs) == 0 {
+	defs := s.toolDefsSnapshot()
+	if len(defs) == 0 {
 		return 0
 	}
-	toolsJSON, err := json.Marshal(s.toolDefs)
+	toolsJSON, err := json.Marshal(defs)
 	if err != nil {
 		return 0
 	}
@@ -1766,8 +1824,8 @@ func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*resp
 		maxTokens = cap
 	}
 	params := &schemas.ChatParameters{}
-	if len(s.toolDefs) > 0 {
-		params.Tools = s.toolDefs
+	if defs := s.toolDefsSnapshot(); len(defs) > 0 {
+		params.Tools = defs
 		params.MaxCompletionTokens = &maxTokens
 		params.ToolChoice = &schemas.ChatToolChoice{ChatToolChoiceStr: &autoStr}
 	}
@@ -2241,7 +2299,7 @@ func (s *Session) processToolCalls(ctx context.Context, toolCalls []schemas.Chat
 			continue
 		}
 
-		tool, ok := s.toolCatalog[name]
+		tool, ok := s.lookupTool(name)
 		if !ok {
 			msg := schemas.ChatMessage{
 				Role:            schemas.ChatMessageRoleTool,
@@ -2606,30 +2664,9 @@ func buildLLMTools(tools []Tool) ([]schemas.ChatTool, map[string]Tool) {
 	execCatalog := map[string]Tool{}
 	defs := make([]schemas.ChatTool, 0, len(tools))
 
-	for i := range tools {
-		tool := tools[i]
+	for _, tool := range tools {
 		execCatalog[tool.Name()] = tool
-		desc := tool.Description()
-
-		// Convert map[string]any parameters to ToolFunctionParameters
-		var params *schemas.ToolFunctionParameters
-		paramSchema := tool.ParameterSchema()
-		if paramSchema != nil {
-			data, err := json.Marshal(paramSchema)
-			if err == nil {
-				params = &schemas.ToolFunctionParameters{}
-				json.Unmarshal(data, params)
-			}
-		}
-
-		defs = append(defs, schemas.ChatTool{
-			Type: schemas.ChatToolTypeFunction,
-			Function: &schemas.ChatToolFunction{
-				Name:        tool.Name(),
-				Description: &desc,
-				Parameters:  params,
-			},
-		})
+		defs = append(defs, toolDef(tool))
 	}
 
 	return defs, execCatalog

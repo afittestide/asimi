@@ -1555,6 +1555,92 @@ func TestCourt_WaitForZhengming_Cancel(t *testing.T) {
 	}
 }
 
+// TestSetNotify_WiresApproveDocTool verifies the fix for the permanently-nil
+// approve_doc Notify: the tool is registered as a zero-value placeholder at
+// construction, and SetNotify installs the live callback in the registry and
+// in any already-open session's tool catalog.
+func TestSetNotify_WiresApproveDocTool(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+
+	// Create a live session on a minister before notify is installed.
+	chancellor := s.GetMinister("secretary")
+	require.NotNil(t, chancellor)
+	mockLLM := mocks.NewLLMProvider()
+	sess, err := NewSession(mockLLM, &SessionConfig{}, nil, nil, nil, "test", "secretary")
+	require.NoError(t, err)
+	base, ok := chancellor.(interface{ SetSession(*Session, ...string) })
+	require.True(t, ok)
+	base.SetSession(sess)
+
+	// Before SetNotify the registered placeholder has a nil callback.
+	before := findApproveDoc(t, s.toolRegistry)
+	require.Nil(t, before.Notify, "placeholder registered before notify must have a nil callback")
+
+	s.SetNotify(func(any) {})
+
+	// Registry entry now carries the live callback.
+	after := findApproveDoc(t, s.toolRegistry)
+	require.NotNil(t, after.Notify, "SetNotify must install the live callback in the registry")
+
+	// The already-open session's catalog was refreshed too.
+	tool, ok := sess.toolCatalog["approve_doc"]
+	require.True(t, ok, "live session should expose approve_doc")
+	ad, ok := tool.(tools.ApproveDocTool)
+	require.True(t, ok, "session catalog entry should be an ApproveDocTool")
+	require.NotNil(t, ad.Notify, "live session's approve_doc must carry the callback")
+}
+
+// findApproveDoc returns the registry's approve_doc tool.
+func findApproveDoc(t *testing.T, r *tools.ToolRegistry) tools.ApproveDocTool {
+	t.Helper()
+	for _, tp := range r.Tools() {
+		if ad, ok := tp.Tool.(tools.ApproveDocTool); ok {
+			return ad
+		}
+	}
+	t.Fatal("approve_doc not registered")
+	return tools.ApproveDocTool{}
+}
+
+// TestSetNotify_DoesNotGrantApproveDocToUnauthorizedMinister pins the
+// permission gate on the late-bound refresh: approve_doc is intentExec, so a
+// minister without Intent Execute (forge) must not gain it in an already-open
+// session just because SetNotify ran. Without the gate the refresh bypasses
+// ForPermissions and the tool set depends on whether the session predates
+// SetNotify.
+func TestSetNotify_DoesNotGrantApproveDocToUnauthorizedMinister(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+
+	forge := s.GetMinister("forge")
+	require.NotNil(t, forge)
+	require.False(t, ministerHasTool(forge, "approve_doc"),
+		"precondition: forge must not be entitled to approve_doc")
+
+	// Construct the session with forge's real (permission-derived) tool set so
+	// the only way approve_doc could appear is the ungated refresh loop.
+	sess, err := NewSession(mocks.NewLLMProvider(), &SessionConfig{}, forge.Tools(), nil, nil, "test", "forge")
+	require.NoError(t, err)
+	require.False(t, sess.hasTool("approve_doc"),
+		"precondition: forge session must not start with approve_doc")
+	base, ok := forge.(interface{ SetSession(*Session, ...string) })
+	require.True(t, ok)
+	base.SetSession(sess)
+
+	s.SetNotify(func(any) {})
+
+	// The registry itself is repaired (permission classification preserved)...
+	require.NotNil(t, findApproveDoc(t, s.toolRegistry).Notify)
+	// ...but the unauthorized minister's live session must not gain the tool.
+	require.False(t, sess.hasTool("approve_doc"),
+		"SetNotify must not inject approve_doc into a minister that lacks Intent Execute")
+}
+
 // updateProjectRootTools re-registers the shell tool with the stored
 // hostChecker (and msgChan) rather than nil values.
 func TestUpdateProjectRootTools_PreservesHostChecker(t *testing.T) {

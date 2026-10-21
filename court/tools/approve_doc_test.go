@@ -116,6 +116,35 @@ func TestApproveDocTool(t *testing.T) {
 		}
 	})
 
+	t.Run("works when notify is installed after construction", func(t *testing.T) {
+		// Mirrors the Court's late binding: the tool is constructed as a
+		// zero-value placeholder, then the live callback is set once known.
+		tool := ApproveDocTool{}
+		tool.Notify = func(msg any) {
+			req, ok := msg.(EditorRequest)
+			if !ok {
+				return
+			}
+			req.ResultChan <- EditorResult{Content: req.Content, Saved: true}
+		}
+
+		input := map[string]any{"content": "late-bound notify"}
+		inputJSON, _ := json.Marshal(input)
+		result, err := tool.Call(context.Background(), string(inputJSON))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var res struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal([]byte(result), &res); err != nil {
+			t.Fatalf("failed to parse result: %v", err)
+		}
+		if res.Status != "approved" {
+			t.Fatalf("expected status 'approved', got: %s", res.Status)
+		}
+	})
+
 	t.Run("parameter schema is valid", func(t *testing.T) {
 		tool := ApproveDocTool{Notify: func(any) {}}
 		schema := tool.ParameterSchema()
