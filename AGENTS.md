@@ -9,7 +9,7 @@
 - **No build tags**: Keep builds simple
 - **Short, meaningful names**: Follow Go conventions
 - **Inline comments**: Only for non-trivial code
-- **Commit message **: start with "bug:", "feat:" or "chore:", follow by short description and end with "e123" for edict 123
+- **Commit message **: start with "fix:", "feat:" or "chore:", follow by short description and end with "e123" for edict 123
 - **Few testfiles**: don't start a new test file if the there's an exisiting file that can host your tests
 
 ## Reserved Edict IDs
