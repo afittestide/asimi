@@ -157,6 +157,23 @@ func TestEdictSelectWindowRenderList_MultipleEdicts(t *testing.T) {
 	assert.Contains(t, lines[4], "☯️")
 }
 
+func TestEdictSelectWindowRenderList_StripsLeadingWhitespaceAndHashes(t *testing.T) {
+	window := NewEdictSelectWindow()
+	window.SetSize(80, 10)
+
+	edicts := []storage.ActiveEdict{
+		{Edict: storage.Edict{ID: 5, Intent: "   # Goal: harmonize the realms"}},
+	}
+	window.SetItems(edicts)
+
+	render := window.RenderList(0, 0, window.GetVisibleSlots())
+	lines := strings.Split(render, "\n")
+
+	assert.Contains(t, lines[1], "[  5]")
+	assert.Contains(t, lines[1], "Goal: harmonize the realms")
+	assert.NotContains(t, lines[1], "# Goal")
+}
+
 func TestHandleExitKeys_EscInEdictList_GoesToChat(t *testing.T) {
 	c := NewContentComponent(80, 24, false)
 	c.activeView = ViewEdict

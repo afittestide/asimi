@@ -789,7 +789,8 @@ func (s *EdictSelectWindow) RenderList(selectedIndex, scrollOffset, visibleSlots
 				intentWidth = 0
 			}
 
-			intent := lipgloss.NewStyle().Inline(true).MaxWidth(intentWidth).Render(" " + edict.Intent)
+			cleaned :=  strings.TrimLeft(edict.Intent, " \t\r\n#")
+			intent := lipgloss.NewStyle().Inline(true).MaxWidth(intentWidth).Render(" " + cleaned)
 
 			style := lipgloss.NewStyle().Inline(true).MaxWidth(s.Width)
 			if isSelected {
