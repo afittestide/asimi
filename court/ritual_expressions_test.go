@@ -481,6 +481,141 @@ func TestAwaitRulerSeal_StageManifestFiles(t *testing.T) {
 	}
 }
 
+// TestAwaitRulerSeal_CommitsStagedWork is the seal-chain invariant: the staging
+// step must commit the manifest files inside the worktree so the edict branch
+// carries the work and the ruler's seal meets a clean worktree. Without the
+// commit, the seal's rebase aborts and the work never lands on the default
+// branch.
+func TestAwaitRulerSeal_CommitsStagedWork(t *testing.T) {
+	db := setupRitualTestDB(t)
+	if err := db.AutoMigrate(&storage.Edict{}, &storage.ForgeManifest{}); err != nil {
+		t.Fatalf("failed to migrate edict/manifest tables: %v", err)
+	}
+
+	registry := NewRitualRegistry()
+	edict := storage.Edict{ID: 1, SessionID: "test-session", Intent: "Test commit", Summary: "feat: committed work"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+	if err := db.Create(&storage.ForgeManifest{
+		ManifestID: "manifest-1", EdictID: edict.ID, Username: "testuser", Project: "testproject",
+		FilePath: "court/ritual.go", Status: storage.ManifestForged,
+	}).Error; err != nil {
+		t.Fatalf("failed to create manifest: %v", err)
+	}
+
+	// `diff --cached --quiet` exits 1 when staged work is present, so the
+	// runner must report a non-zero exit for that probe (and 0 for `git add`
+	// and `git commit`) or the commit would be skipped.
+	mockRunner := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"diff --cached": {ExitCode: "1"},
+	}}
+	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		ID: "test-await-commit", RitualName: "swift-strike",
+		EdictID: edict.ID, Username: "testuser", Project: "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "await_ruler_seal"); err != nil {
+		t.Fatalf("runThen(await_ruler_seal) error: %v", err)
+	}
+
+	joined := mockRunner.joined()
+	if !strings.Contains(joined, "git add court/ritual.go") {
+		t.Errorf("expected manifest files to be staged, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "diff --cached --quiet") {
+		t.Errorf("expected an empty-index check before committing, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "git commit -m") {
+		t.Errorf("expected staged work to be committed, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "e1") {
+		t.Errorf("expected the commit message to carry the edict suffix, got:\n%s", joined)
+	}
+}
+
+// TestAwaitRulerSeal_NoCommitWhenIndexEmpty guards the no-empty-commit case: a
+// worktree the forge already committed (or one with no staged work) must not
+// run `git commit`, which would fail with "nothing to commit".
+func TestAwaitRulerSeal_NoCommitWhenIndexEmpty(t *testing.T) {
+	db := setupRitualTestDB(t)
+	if err := db.AutoMigrate(&storage.Edict{}, &storage.ForgeManifest{}); err != nil {
+		t.Fatalf("failed to migrate edict/manifest tables: %v", err)
+	}
+
+	registry := NewRitualRegistry()
+	edict := storage.Edict{ID: 7, SessionID: "test-session", Intent: "Already committed"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+	if err := db.Create(&storage.ForgeManifest{
+		ManifestID: "manifest-1", EdictID: edict.ID, Username: "testuser", Project: "testproject",
+		FilePath: "court/ritual.go", Status: storage.ManifestForged,
+	}).Error; err != nil {
+		t.Fatalf("failed to create manifest: %v", err)
+	}
+
+	var commands []string
+	mockRunner := &mockCmdRunner{
+		// diff --cached --quiet exits 0 when nothing is staged.
+		exitCode: "0",
+		onRun:    func(cmd string) { commands = append(commands, cmd) },
+	}
+	runner := NewRitualRunner(registry, nil, nil, db, mockRunner, nil, repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		ID: "test-await-nocommit", RitualName: "swift-strike",
+		EdictID: edict.ID, Username: "testuser", Project: "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "await_ruler_seal"); err != nil {
+		t.Fatalf("runThen(await_ruler_seal) error: %v", err)
+	}
+
+	joined := strings.Join(commands, "\n")
+	if strings.Contains(joined, "git commit") {
+		t.Errorf("must not commit when the index is empty, got:\n%s", joined)
+	}
+}
+
+// TestSealEdict_PublishesSealGranted pins change #3: the ritual `seal_edict`
+// then-handler must publish EventSealGranted (not merely write the seal row),
+// so a ritual seal triggers the same worktree merge-and-remove path as
+// `:edict seal`. Without the event the edict is sealed while its work is
+// silently never landed on the default branch.
+func TestSealEdict_PublishesSealGranted(t *testing.T) {
+	db := setupRitualTestDB(t)
+	if err := db.AutoMigrate(&storage.Edict{}); err != nil {
+		t.Fatalf("failed to migrate edicts: %v", err)
+	}
+	if err := db.Create(&storage.Edict{ID: 42, Username: "testuser", Project: "testproject"}).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	var gotEvent storage.CourtEvent
+	var gotPayload storage.JSON
+	publish := func(_ storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint {
+		gotEvent = eventType
+		gotPayload = payload
+		return 0
+	}
+	runner := NewRitualRunner(NewRitualRegistry(), nil, publish, db, nil, nil, repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		ID: "test-seal-edict", RitualName: "swift-strike",
+		EdictID: 42, Username: "testuser", Project: "testproject",
+	}
+	if err := runner.runThen(context.Background(), exec, "seal_edict"); err != nil {
+		t.Fatalf("runThen(seal_edict) error: %v", err)
+	}
+	if gotEvent != storage.EventSealGranted {
+		t.Fatalf("expected EventSealGranted, got %q", gotEvent)
+	}
+	if gotPayload["minister_id"] != "ruler" {
+		t.Errorf("expected minister_id ruler, got %v", gotPayload["minister_id"])
+	}
+}
+
 func TestAwaitRulerSeal_NoManifests(t *testing.T) {
 	db := setupRitualTestDB(t)
 
@@ -3108,6 +3243,37 @@ func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
 	}
 }
 
+// TestMergeEdictWorktree_FailurePublishesEvent is the "stop lying" guard: the
+// ruler's seal is recorded before this handler runs, so a merge failure must
+// publish an event the TUI surfaces as "sealed but work NOT merged" rather than
+// letting the seal toast imply success.
+func TestMergeEdictWorktree_FailurePublishesEvent(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
+	}}
+	db := setupCourtTestDB(t)
+	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p"}).Error)
+
+	s := &Court{db: db, logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
+		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root}},
+	})
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	var ev storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 531, storage.EventWorktreeMergeFailed).First(&ev).Error)
+	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "rebase", "reason carries the failure")
+}
+
 // TestSwiftStrike_HasWorktreeBackground asserts the opt-in and that system-level
 // rituals stay on the main tree.
 func TestSwiftStrike_HasWorktreeBackground(t *testing.T) {
@@ -3152,6 +3318,14 @@ func TestEdictCommitSummary_UsesRecordedSummary(t *testing.T) {
 		config: &config.CourtConfig{Username: "testuser", Project: "testproject"},
 	}
 	assert.Equal(t, "feat: per-edict worktrees e531", s.edictCommitSummary(531))
+
+	// An edict with only an intent falls back to its first line rather than a
+	// generic label.
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 532, Username: "testuser", Project: "testproject",
+		Intent: "bug: fix the thing\n\nmore detail",
+	}).Error)
+	assert.Equal(t, "bug: fix the thing e532", s.edictCommitSummary(532))
 
 	// An unknown edict falls back to a conventional message rather than an
 	// empty subject; the edict suffix is always present.

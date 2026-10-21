@@ -13,6 +13,8 @@ import (
 
 	cucumberexpressions "github.com/cucumber/cucumber-expressions/go/v19"
 
+	"al.essio.dev/pkg/shellescape"
+
 	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
@@ -169,6 +171,55 @@ func (r *RitualRunner) seededExec(exec *RitualExecution) *RitualExecution {
 	}
 	r.ensureExecContext(exec)
 	return exec
+}
+
+// commitStagedWork commits whatever the manifest staging step left in the
+// index, inside the execution's effective root (the worktree when the edict is
+// routed into one). It is the seal-chain invariant: the edict branch must carry
+// the work, otherwise the ruler's seal cannot rebase and squash-merge a clean
+// worktree. It no-ops when nothing is staged, so an edict whose forge already
+// committed does not trip an empty-commit error.
+func (r *RitualRunner) commitStagedWork(ctx context.Context, exec *RitualExecution) error {
+	if exec.runner == nil {
+		return fmt.Errorf("no runner configured for committing manifests")
+	}
+	// Route into the worktree explicitly when we know it; otherwise fall back
+	// to the runner's own working directory (direct test/recovery launches).
+	prefix := "git "
+	if root := exec.repoInfo.EffectiveRoot(); root != "" {
+		prefix = fmt.Sprintf("git -C %s ", shellescape.Quote(root))
+	}
+
+	// `diff --cached --quiet` exits 0 when the index matches HEAD (nothing
+	// staged) and 1 when there is staged work.
+	diffOut, err := exec.runner.Run(ctx, runners.Input{
+		Command:        prefix + "diff --cached --quiet",
+		Description:    "check for staged work in the worktree",
+		BypassApproval: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to inspect the index: %w", err)
+	}
+	if diffOut.ExitCode == "0" {
+		return nil // nothing staged — avoid an empty-commit error
+	}
+	if diffOut.ExitCode != "1" {
+		return fmt.Errorf("git diff --cached failed (exit %s): %s", diffOut.ExitCode, diffOut.Output)
+	}
+
+	summary := edictCommitSummary(r.db, exec.Username, exec.Project, exec.EdictID)
+	commitOut, err := exec.runner.Run(ctx, runners.Input{
+		Command:        prefix + "commit -m " + shellescape.Quote(summary),
+		Description:    "commit staged work in the worktree",
+		BypassApproval: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to commit staged work: %w", err)
+	}
+	if commitOut.ExitCode != "0" {
+		return fmt.Errorf("git commit failed (exit %s): %s", commitOut.ExitCode, commitOut.Output)
+	}
+	return nil
 }
 
 // runGiven runs a builtin given function and returns the result
@@ -1185,9 +1236,22 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 	thenKey := exec.EdictKey()
 	switch fn {
 	case "seal_edict":
-		// Sealing is now done via the seal chain - grant ruler seal
+		// Sealing goes through the same path as `:edict seal`: grant the ruler
+		// seal, then publish EventSealGranted so the Court's handler
+		// squash-merges and removes the edict's worktree. Granting the seal
+		// without the event would seal the edict but silently leave its work
+		// unmerged on the edict branch.
 		sealService := storage.NewSealService(r.db)
-		return sealService.GrantSeal(thenKey, "ruler", storage.JSON{"ritual": exec.RitualName})
+		if err := sealService.GrantSeal(thenKey, "ruler", storage.JSON{"ritual": exec.RitualName}); err != nil {
+			return err
+		}
+		if r.publishEvent != nil {
+			r.publishEvent(thenKey, storage.EventSealGranted, storage.JSON{
+				"minister_id": "ruler",
+				"ritual":      exec.RitualName,
+			})
+		}
+		return nil
 	case "ask_ruler":
 		// Use the chancellor for zhengming requests, as it's the minister that interacts with the ruler
 		// and has a corresponding tab for displaying zhengming questions
@@ -1285,6 +1349,14 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			}
 			if output.ExitCode != "0" {
 				return fmt.Errorf("git add failed (exit %s): %s", output.ExitCode, output.Output)
+			}
+
+			// Commit inside the worktree so the edict branch carries the work
+			// and the worktree is clean when the ruler's seal later rebases it.
+			// Skip the commit when nothing is staged (avoids empty-commit
+			// errors when the forge already committed).
+			if err := r.commitStagedWork(ctx, exec); err != nil {
+				return err
 			}
 		}
 
