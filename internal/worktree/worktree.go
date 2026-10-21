@@ -98,6 +98,13 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string) error 
 // message. On a rebase conflict it returns an error and leaves the worktree
 // intact so the forge (工部) can resolve the conflict before the ruler reviews.
 //
+// A fully-subsumed branch is a successful no-op, not an error: when the
+// branch's patch is already on the target under a different commit (hand
+// rescue, cherry-pick, a sibling pane), the rebase skips it and the squash
+// merge stages nothing — git reports "Already up to date" and exits 0. The
+// commit is then skipped and nil is returned, so the caller proceeds to Remove
+// and the edict ascends with its worktree retired.
+//
 // The caller owns the commit message shape (AGENTS.md: feat:/bug:/chore: … e<N>).
 func SquashMergeToDefault(ctx context.Context, r runners.Runner, root, abs, branch, summary string) error {
 	if r == nil {
@@ -117,6 +124,19 @@ func SquashMergeToDefault(ctx context.Context, r runners.Runner, root, abs, bran
 	mergeCmd := fmt.Sprintf("git -C %s merge --squash %s", shellescape.Quote(root), shellescape.Quote(branch))
 	if _, err := run(ctx, r, mergeCmd, "squash-merge edict worktree"); err != nil {
 		return fmt.Errorf("squash-merge failed: %w", err)
+	}
+
+	// A branch whose patch is already on the target rebases to an ancestor of
+	// HEAD, so merge --squash succeeds having staged nothing. Committing then
+	// fails with "no changes added to commit" and the seal would report a false
+	// failure; an empty index means the work is already landed.
+	stagedCmd := fmt.Sprintf("git -C %s diff --cached --name-only", shellescape.Quote(root))
+	staged, err := run(ctx, r, stagedCmd, "check squash-merge staged changes")
+	if err != nil {
+		return fmt.Errorf("inspect staged changes: %w", err)
+	}
+	if strings.TrimSpace(staged.Output) == "" {
+		return nil
 	}
 
 	msg := strings.TrimSpace(summary)

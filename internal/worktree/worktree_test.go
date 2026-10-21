@@ -138,7 +138,8 @@ func TestSquashMergeToDefault_CommandSequence(t *testing.T) {
 	root := t.TempDir()
 	abs := filepath.Join(root, ".agents", "worktrees", "e3")
 	mock := &recordingRunner{outputs: map[string]runners.Output{
-		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "widget.go\n", ExitCode: "0"},
 	}}
 
 	if err := SquashMergeToDefault(context.Background(), mock, root, abs, "asimi/e3", "feat: widget e3"); err != nil {
@@ -156,11 +157,37 @@ func TestSquashMergeToDefault_CommandSequence(t *testing.T) {
 	}
 }
 
+// TestSquashMergeToDefault_EmptySquashIsNoOp: a fully-subsumed branch (its
+// patch already on main under another commit) rebases to an ancestor of HEAD,
+// so merge --squash stages nothing. The seal must not commit (git would exit 1
+// with "no changes added to commit") and must return nil, so the caller
+// proceeds to Remove and retires the worktree.
+func TestSquashMergeToDefault_EmptySquashIsNoOp(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e967")
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "", ExitCode: "0"},
+	}}
+
+	if err := SquashMergeToDefault(context.Background(), mock, root, abs, "asimi/e967", "bug: already landed e967"); err != nil {
+		t.Fatalf("empty squash must be a successful no-op, got: %v", err)
+	}
+	joined := strings.Join(mock.commands, "\n")
+	if !strings.Contains(joined, "merge --squash asimi/e967") {
+		t.Errorf("expected squash merge, got:\n%s", joined)
+	}
+	if mock.contains("commit -m") {
+		t.Errorf("must not commit when the squash staged nothing, got:\n%s", joined)
+	}
+}
+
 func TestSquashMergeToDefault_DefaultMessage(t *testing.T) {
 	root := t.TempDir()
 	abs := filepath.Join(root, ".agents", "worktrees", "e5")
 	mock := &recordingRunner{outputs: map[string]runners.Output{
-		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "widget.go\n", ExitCode: "0"},
 	}}
 
 	if err := SquashMergeToDefault(context.Background(), mock, root, abs, "asimi/e5", ""); err != nil {
@@ -358,6 +385,76 @@ func TestDefaultBranch_RealGit_CheckedOutBranchWins(t *testing.T) {
 	}
 	if err := Remove(context.Background(), runner, root, abs, "asimi/e955"); err != nil {
 		t.Fatalf("Remove: %v", err)
+	}
+}
+
+// TestSquashMergeToDefault_RealGit_SubsumedBranchIsNoOp reproduces the edict 967
+// seal failure: the worktree's patch is already on main under a different
+// commit (here, an identical cherry-pick). The rebase skips it, the squash
+// merge stages nothing, and SquashMergeToDefault must return nil without
+// creating a commit — a false "squash commit failed" left the worktree
+// stranded after the edict was already sealed.
+func TestSquashMergeToDefault_RealGit_SubsumedBranchIsNoOp(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+
+	abs := filepath.Join(root, ".agents", "worktrees", "e967")
+	runGit(t, root, "worktree", "add", "-b", "asimi/e967", abs, "main")
+	if err := os.WriteFile(filepath.Join(abs, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, abs, "add", ".")
+	runGit(t, abs, "commit", "-m", "bug: fix e967")
+
+	// Land the identical patch on main as a different commit (hand rescue).
+	patch, err := exec.Command("git", "-C", abs, "format-patch", "-1", "--stdout").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchPath := filepath.Join(root, "e967.patch")
+	if err := os.WriteFile(patchPath, patch, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "am", patchPath)
+
+	before := countCommits(t, root)
+	runner := &realLightRunner{root: root}
+
+	if err := SquashMergeToDefault(context.Background(), runner, root, abs, "asimi/e967", "bug: fix e967"); err != nil {
+		t.Fatalf("subsumed branch must be a successful no-op, got: %v", err)
+	}
+	if after := countCommits(t, root); after != before {
+		t.Errorf("no-op squash must not create a commit: %d -> %d", before, after)
+	}
+	// Main already carries the fix; the no-op must not alter it.
+	head, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainHead, err := exec.Command("git", "-C", root, "rev-parse", "main").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(head)) != strings.TrimSpace(string(mainHead)) {
+		t.Errorf("main moved: HEAD=%s main=%s", head, mainHead)
+	}
+
+	if err := Remove(context.Background(), runner, root, abs, "asimi/e967"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := os.Stat(abs); !os.IsNotExist(err) {
+		t.Errorf("worktree directory still present after Remove")
 	}
 }
 
