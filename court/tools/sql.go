@@ -27,12 +27,14 @@ func (t AsimiSQLTool) Name() string {
 func (t AsimiSQLTool) Description() string {
 	return `Execute SQL against the Court database.
 
-Schema reference (read before querying — do not guess tables or columns):
-- storage/court_schema.go — Court tables: edicts, seals, zhengming_requests, tian_events, tian_event_dlq, lings, forge_manifests, judge_verdicts, censor_precedents, incidents, ruler_councils, ritual_guard_checkpoint
-- storage/schema.go — core tables (sessions, messages, repositories, branches, ritual_executions, ritual_step_states, ...)
+Schema discovery (the live DB is authoritative — do not guess tables or columns):
+- List tables:   SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
+- List columns:  PRAGMA table_info(<table>);
+- Court tables: edicts, seals, zhengming_requests, tian_events, tian_event_dlq, lings, forge_manifests, judge_verdicts, censor_precedents, incidents, ruler_councils, ritual_guard_checkpoint
+- Core tables: sessions, messages, repositories, branches, ritual_executions, ritual_step_states, ...
 
 Most Court tables carry username and project columns; scope queries by both, e.g.
-	SELECT id, intent, created_at FROM edicts WHERE username = 'daonb' AND project = 'afittestide/asimi-cli' ORDER BY created_at DESC LIMIT 5;
+	SELECT id, intent, created_at FROM edicts WHERE username = '<user>' AND project = '<owner/repo>' ORDER BY created_at DESC LIMIT 5;
 
 Note: the edicts primary key column is id (there is no edict_id column); other tables reference it via edict_id.
 

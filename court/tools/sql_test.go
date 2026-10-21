@@ -146,6 +146,13 @@ func TestAsimiSQLTool_NameAndDescription(t *testing.T) {
 	desc := tool.Description()
 	assert.Contains(t, desc, "Execute SQL")
 	assert.Contains(t, desc, "Court database")
+	// The description must be self-contained in any project: no pointers to
+	// source files that exist only in the asimi repo.
+	assert.NotContains(t, desc, "storage/court_schema.go")
+	assert.NotContains(t, desc, "storage/schema.go")
+	// Introspection hints the tool can satisfy against the live DB.
+	assert.Contains(t, desc, "sqlite_master")
+	assert.Contains(t, desc, "PRAGMA table_info")
 }
 
 // TestAsimiSQLTool_RelativeDBPath verifies the DB handle is used as-is (the
