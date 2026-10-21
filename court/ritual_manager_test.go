@@ -534,6 +534,52 @@ func TestRitualGuard_EventNotification(t *testing.T) {
 		t.Errorf("expected ChannelID e5, got %s", notifications[0].ChannelID)
 	}
 	mu.Unlock()
+
+	// Test EventWorktreeMergeFailed notification: the ruler's seal is already
+	// recorded, so the failure must be spelled out rather than implied by a
+	// generic seal toast. "merged" distinguishes the post-merge cleanup failure.
+	for _, tc := range []struct {
+		name    string
+		payload map[string]interface{}
+		want    string
+	}{
+		{
+			name:    "merge failed",
+			payload: map[string]interface{}{"reason": "rebase onto main failed"},
+			want:    "Edict 6 sealed but work NOT merged: rebase onto main failed",
+		},
+		{
+			name:    "cleanup failed after merge",
+			payload: map[string]interface{}{"reason": "dirty tree", "merged": true},
+			want:    "Edict 6 sealed; work merged but worktree cleanup failed: dirty tree",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			notifications = nil
+			rg.DispatchEvent(Event{
+				Type:     storage.EventWorktreeMergeFailed,
+				EdictKey: storage.EdictKey{ID: 6},
+				Payload:  tc.payload,
+			})
+
+			time.Sleep(10 * time.Millisecond)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(notifications) != 1 {
+				t.Fatalf("expected 1 notification, got %d", len(notifications))
+			}
+			if notifications[0].EventType != storage.EventWorktreeMergeFailed {
+				t.Errorf("expected EventType EventWorktreeMergeFailed, got %s", notifications[0].EventType)
+			}
+			if notifications[0].Message != tc.want {
+				t.Errorf("expected message %q, got %q", tc.want, notifications[0].Message)
+			}
+			if notifications[0].ChannelID != "e6" {
+				t.Errorf("expected ChannelID e6, got %s", notifications[0].ChannelID)
+			}
+		})
+	}
 }
 
 // TestAbortStaleRitualsOnStart verifies that startRitual aborts stale running

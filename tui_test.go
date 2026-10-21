@@ -4019,6 +4019,66 @@ func TestEventZhengmingAnswered_ShowsAnswerInChat(t *testing.T) {
 	assert.Contains(t, updated.commandLine.toasts[0].Message, "yes, proceed with the plan")
 }
 
+// TestEventWorktreeMergeFailed_NeverReportsPlainSuccess is the "stop lying"
+// guard at the TUI layer: the ruler's seal is recorded before the worktree is
+// squash-merged, so a merge failure must surface as an explicit failure toast
+// rather than leaving the seal's success toast unchallenged. A worktree removal
+// failure after a successful merge is a distinct (warning) message.
+func TestEventWorktreeMergeFailed_NeverReportsPlainSuccess(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     map[string]interface{}
+		wantType    string
+		wantToast   string
+		wantChatSub string
+	}{
+		{
+			name:        "merge failed",
+			payload:     map[string]interface{}{"reason": "rebase onto main failed"},
+			wantType:    "error",
+			wantToast:   "Edict 42 sealed, work NOT merged",
+			wantChatSub: "work NOT merged",
+		},
+		{
+			name:        "cleanup failed after merge",
+			payload:     map[string]interface{}{"reason": "dirty tree", "merged": true},
+			wantType:    "warning",
+			wantToast:   "Edict 42 merged, cleanup failed",
+			wantChatSub: "worktree cleanup failed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockCourtClient{}
+			model := newTestModel(t)
+			model.court = mock
+
+			newModel, _ := model.handleCustomMessages(court.EventNotificationMsg{
+				ChannelID: "secretary",
+				EventType: storage.EventWorktreeMergeFailed,
+				EdictKey:  storage.EdictKey{ID: 42, Username: "test", Project: "test"},
+				Payload:   tt.payload,
+			})
+			updated, ok := newModel.(TUIModel)
+			require.True(t, ok)
+
+			require.NotEmpty(t, updated.commandLine.toasts, "expected a toast for a failed worktree merge")
+			toast := updated.commandLine.toasts[len(updated.commandLine.toasts)-1]
+			assert.Equal(t, tt.wantType, toast.Type)
+			assert.Contains(t, toast.Message, tt.wantToast)
+
+			chat := updated.tabs.ChatByTab("secretary")
+			require.NotNil(t, chat)
+			var rendered strings.Builder
+			for _, m := range chat.Messages {
+				rendered.WriteString(m.Content)
+				rendered.WriteString("\n")
+			}
+			assert.Contains(t, rendered.String(), tt.wantChatSub)
+		})
+	}
+}
+
 func TestEventEdictCreated_EntersYesNoMode(t *testing.T) {
 	mock := &mockCourtClient{}
 	model := newTestModel(t)

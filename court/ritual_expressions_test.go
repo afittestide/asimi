@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -576,6 +579,67 @@ func TestAwaitRulerSeal_NoCommitWhenIndexEmpty(t *testing.T) {
 	if strings.Contains(joined, "git commit") {
 		t.Errorf("must not commit when the index is empty, got:\n%s", joined)
 	}
+}
+
+// TestCommitStagedWork_RoutesIntoWorktreeAndSurfacesFailures pins the routing
+// and error handling of the seal-chain commit: when the execution is routed into
+// a worktree every git command must target that worktree (not the Court-wide
+// cwd), a runner failure or an unexpected exit must return an error rather than
+// silently reporting success, and a missing runner must be refused outright.
+func TestCommitStagedWork_RoutesIntoWorktreeAndSurfacesFailures(t *testing.T) {
+	t.Run("routes every command into the worktree", func(t *testing.T) {
+		mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+			"diff --cached": {ExitCode: "1"},
+		}}
+		r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, mock, nil, repo.RepoInfo{})
+		exec := &RitualExecution{
+			EdictID: 531, Username: "u", Project: "p",
+			repoInfo: repo.RepoInfo{ProjectRoot: "/tmp/proj", WorktreePath: ".agents/worktrees/e531"},
+		}
+		exec.runner = mock
+
+		require.NoError(t, r.commitStagedWork(context.Background(), exec))
+		joined := mock.joined()
+		assert.Contains(t, joined, "git -C /tmp/proj/.agents/worktrees/e531 diff --cached --quiet")
+		assert.Contains(t, joined, "git -C /tmp/proj/.agents/worktrees/e531 commit -m")
+	})
+
+	t.Run("no runner is refused", func(t *testing.T) {
+		r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, nil, nil, repo.RepoInfo{})
+		err := r.commitStagedWork(context.Background(), &RitualExecution{EdictID: 1})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no runner")
+	})
+
+	t.Run("index probe failure is surfaced", func(t *testing.T) {
+		// Exit 128 is not the documented 0/1 of diff --cached; it must not be
+		// mistaken for "nothing staged" nor for "work staged".
+		mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+			"diff --cached": {ExitCode: "128", Output: "fatal: not a git repository"},
+		}}
+		exec := &RitualExecution{EdictID: 531}
+		exec.runner = mock
+
+		r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, mock, nil, repo.RepoInfo{})
+		err := r.commitStagedWork(context.Background(), exec)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "git diff --cached failed")
+		assert.NotContains(t, mock.joined(), "commit -m", "must not commit after a failed index probe")
+	})
+
+	t.Run("commit failure is surfaced", func(t *testing.T) {
+		mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+			"diff --cached": {ExitCode: "1"},
+			"commit -m":     {ExitCode: "1", Output: "nothing to commit"},
+		}}
+		exec := &RitualExecution{EdictID: 531}
+		exec.runner = mock
+
+		r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, mock, nil, repo.RepoInfo{})
+		err := r.commitStagedWork(context.Background(), exec)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "git commit failed")
+	})
 }
 
 // TestSealEdict_PublishesSealGranted pins change #3: the ritual `seal_edict`
@@ -3272,6 +3336,159 @@ func TestMergeEdictWorktree_FailurePublishesEvent(t *testing.T) {
 	var ev storage.TianEvent
 	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 531, storage.EventWorktreeMergeFailed).First(&ev).Error)
 	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "rebase", "reason carries the failure")
+}
+
+// TestMergeEdictWorktree_RemovalFailurePublishesMergedEvent covers the other
+// half of change #4/#2: when the squash-merge lands but the worktree cannot be
+// removed (dirty tree, no --force allowed), the work IS merged, so the ruler must
+// see a distinct cleanup-failure notification — not the same "NOT merged" alarm,
+// and never a plain success. The event carries merged=true to make that
+// distinction; the worktree is left for inspection.
+func TestMergeEdictWorktree_RemovalFailurePublishesMergedEvent(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref":    {Output: "origin/main\n", ExitCode: "0"},
+		"rev-list":        {Output: "1\n", ExitCode: "0"},
+		"worktree remove": {Output: "contains modified or untracked files", ExitCode: "1"},
+	}}
+	db := setupCourtTestDB(t)
+	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p"}).Error)
+
+	s := &Court{db: db, logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
+		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root}},
+	})
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	// The merge itself happened; the worktree survived for inspection.
+	joined := mock.joined()
+	assert.Contains(t, joined, "merge --squash asimi/e531", "the work still lands on the default branch")
+	assert.NotContains(t, joined, "--force", "cleanup must not force-remove")
+
+	var ev storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 531, storage.EventWorktreeMergeFailed).First(&ev).Error)
+	assert.Equal(t, true, ev.Payload["merged"], "merged=true distinguishes cleanup failure from 'work not merged'")
+	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "removal failed")
+	_, err := os.Stat(filepath.Join(root, ".agents", "worktrees", "e531"))
+	assert.NoError(t, err, "worktree stays intact when cleanup fails")
+}
+
+// TestMergeEdictWorktree_EndToEndSealsStagedWork is the real acceptance gate for
+// the bug: an edict whose worktree holds unreviewed-but-staged work (never
+// committed by the forge) must, on the ruler's seal, land on the default branch
+// as exactly one commit, and the worktree and edict branch must be gone. This
+// exercises the Court handler against a real repository, not a mock, so the
+// rebase → squash-merge → remove chain is proven end to end.
+func TestMergeEdictWorktree_EndToEndSealsStagedWork(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".agents/worktrees/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+	baseline := strings.TrimSpace(gitOutput(t, root, "rev-parse", "HEAD"))
+
+	// The forge staged work in the edict's worktree but never committed it.
+	rel := worktree.RelPath(531)
+	abs := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "worktree", "add", "-B", worktree.Branch(531), abs)
+	if err := os.WriteFile(filepath.Join(abs, "feature.txt"), []byte("the fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, abs, "add", "feature.txt")
+
+	db := setupCourtTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}, &storage.ForgeManifest{}))
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: 531, Username: "u", Project: "p", Intent: "bug: fix the thing",
+	}).Error)
+	// The forge recorded the manifest; the seal-chain staging step commits it.
+	require.NoError(t, db.Create(&storage.ForgeManifest{
+		ManifestID: "m-e2e", EdictID: 531, Username: "u", Project: "p",
+		FilePath: "feature.txt", Status: storage.ManifestForged,
+	}).Error)
+
+	// The seal-chain runner executes inside the worktree, where the staged work
+	// lives (`git add` with no -C); the Court-wide runner that performs the
+	// merge/removal is rooted at the project root.
+	worktreeRunner := runners.NewHostRunner(0, abs)
+	courtRunner := runners.NewHostRunner(0, root)
+	s := &Court{db: db, logger: slog.Default(), runner: courtRunner, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
+		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root, HasVCS: true}},
+	})
+
+	// The seal-chain staging step commits the work before the ruler's seal
+	// reaches this handler; both are part of the same invariant.
+	ritualRunner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, worktreeRunner, nil,
+		repo.RepoInfo{ProjectRoot: root, WorktreePath: rel, HasVCS: true})
+	require.NoError(t, ritualRunner.runThen(context.Background(), &RitualExecution{
+		ID: "e2e", RitualName: "swift-strike", EdictID: 531, Username: "u", Project: "p",
+	}, "await_ruler_seal"))
+
+	s.handleSealGranted(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	// The work landed on main as exactly one commit carrying the edict suffix.
+	subject := strings.TrimSpace(gitOutput(t, root, "log", "-1", "--format=%s"))
+	assert.Contains(t, subject, "e531", "squash commit carries the edict suffix")
+	assert.Equal(t, 1, commitCount(t, root, baseline+"..HEAD"), "the edict lands as a single squash commit")
+
+	landed, err := os.ReadFile(filepath.Join(root, "feature.txt"))
+	require.NoError(t, err, "the worktree's work must be on the default branch")
+	assert.Equal(t, "the fix\n", string(landed))
+
+	// The worktree and the edict branch are both gone.
+	_, err = os.Stat(abs)
+	assert.True(t, os.IsNotExist(err), "worktree must be removed after a clean merge, stat err = %v", err)
+	branches := gitOutput(t, root, "branch", "--list", worktree.Branch(531))
+	assert.Empty(t, strings.TrimSpace(branches), "edict branch must be deleted, got %q", branches)
+}
+
+// gitOutput runs a git command and returns its stdout, failing the test on error.
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	return string(out)
+}
+
+// commitCount returns the number of commits in revRange (e.g. "a..b").
+func commitCount(t *testing.T, dir, revRange string) int {
+	t.Helper()
+	out := strings.TrimSpace(gitOutput(t, dir, "rev-list", "--count", revRange))
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		t.Fatalf("parse commit count %q: %v", out, err)
+	}
+	return n
 }
 
 // TestSwiftStrike_HasWorktreeBackground asserts the opt-in and that system-level
