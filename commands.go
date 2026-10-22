@@ -225,7 +225,7 @@ func handleQuitCommand(model *TUIModel, args []string) tea.Cmd {
 			model.commandLine.AddToast(err.Error(), "error", time.Second*3)
 			return nil
 		}
-		model.commandLine.AddToast("Tab closed", "success", time.Second*2)
+		model.commandLine.AddToast("Tab closed; `:qa` to close all", "success", time.Second*2)
 		return nil
 	}
 	// Single tab: quit the application
@@ -954,7 +954,7 @@ func handleTabCloseCommand(model *TUIModel, args []string) tea.Cmd {
 		model.commandLine.AddToast(err.Error(), "error", time.Second*3)
 		return nil
 	}
-	model.commandLine.AddToast("Tab closed", "success", time.Second*2)
+	model.commandLine.AddToast("Tab closed; `:qa` to close all", "success", time.Second*2)
 	return nil
 }
 
