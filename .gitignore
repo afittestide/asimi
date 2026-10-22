@@ -20,5 +20,7 @@ dist/
 jobs/
 # auto-synced to github
 intent/issues
-
-heaven/runs
+# heaven/ holds rented testimony — fetched CI runs, security reports, release                                            
+# logs. Local evidence, never committed (docs/the_three_realms.md). Ignore every                                         
+# subdirectory; root-level declarations (e.g. heaven.conf) stay tracked.                                                 
+heaven/*/

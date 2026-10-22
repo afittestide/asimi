@@ -310,18 +310,30 @@ bootstrap:
     go install golang.org/x/vuln/cmd/govulncheck@latest
 
 # Run vulnerability scanning (fails on any finding not in security/vuln-allowlist.txt)
+#
+# The full scan output is archived under heaven/security as
+# <tool>-<datetime>.txt (e.g. govulncheck-20260522T143000.txt), so a release's
+# security evidence outlives the terminal. Reports are write-only artifacts:
+# each run appends a new file, none is ever overwritten, and the directory is
+# gitignored (like heaven/runs).
 vuln:
     #!/usr/bin/env bash
     set -o pipefail
-    if ! command -v govulncheck > /dev/null 2>&1; then
-        echo "ERROR: govulncheck is not installed. Run 'just bootstrap' first."
+    tool="govulncheck"
+    if ! command -v "$tool" > /dev/null 2>&1; then
+        echo "ERROR: $tool is not installed. Run 'just bootstrap' first."
         exit 1
     fi
     allowlist="security/vuln-allowlist.txt"
+    report_dir="heaven/security"
+    mkdir -p "$report_dir"
+    report="$report_dir/${tool}-$(date +%Y%m%dT%H%M%S).txt"
     go build -tags containers_image_openpgp -o /tmp/asimi-vuln .
-    out=$(govulncheck -mode=binary /tmp/asimi-vuln 2>&1)
+    out=$("$tool" -mode=binary /tmp/asimi-vuln 2>&1)
     status=$?
     rm -f /tmp/asimi-vuln
+    printf '%s\n' "$out" > "$report"
+    echo "==> report saved to $report"
     if [ "$status" -eq 0 ]; then
         echo "$out"
         exit 0
@@ -352,6 +364,7 @@ vuln:
     if [ -n "$unaccepted" ]; then
         echo "VULN GATE FAILED: unaccepted vulnerabilities:$unaccepted"
         echo "Fix them, or add a justified entry to $allowlist (see docs/security.md)."
+        echo "report saved to $report"
         exit 1
     fi
     if [ -n "$stale" ]; then
