@@ -109,10 +109,71 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, copyGl
 	return nil
 }
 
+// fsyncLooseObjects is git's per-invocation durability switch: it makes git
+// fsync each loose object it writes. The default does not, so a just-written
+// object can be a torn read for a concurrent process on a stacked filesystem
+// (incident 9f8b980c998a6c32: "loose object … is corrupt" after git re-read a
+// tree it had itself just written, the object later proving byte-valid).
+const fsyncLooseObjects = "-c core.fsync=loose-object"
+
+// LooseObjectCorrupt reports whether err is git's "loose object … is corrupt".
+// That failure is a transient torn read of a freshly written object rather than
+// disk rot, so the caller may retry the operation once before giving up.
+func LooseObjectCorrupt(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "loose object") && strings.Contains(msg, "is corrupt")
+}
+
+// AbortRebase clears leftover rebase state in the worktree at abs so a retry can
+// start. A rebase writes a tree for every replayed commit, so a torn read at any
+// pick other than the last leaves .git/rebase-merge behind (or rebase-apply for
+// the apply backend); git then refuses a fresh `git rebase` with "It seems that
+// there is already a rebase-merge directory". Without this the seal's single
+// retry is a no-op that wedges the worktree (incident 9f8b980c998a6c32).
+//
+// The command is unconditional — git's "No rebase in progress?" answer is the
+// common case and is treated as success (abort has nothing to undo), so the
+// caller never needs to probe the git dir. A real abort failure is returned: the
+// retry must not proceed on stale in-progress rebase state.
+func AbortRebase(ctx context.Context, r runners.Runner, abs string) error {
+	if r == nil {
+		return fmt.Errorf("worktree: no runner configured")
+	}
+	if abs == "" {
+		return fmt.Errorf("worktree: missing path")
+	}
+	const description = "abort stale rebase before retry"
+	abortCmd := fmt.Sprintf("git -C %s rebase --abort", shellescape.Quote(abs))
+	out, err := r.Run(ctx, runners.Input{
+		Command:        abortCmd,
+		Description:    description,
+		BypassApproval: true,
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", description, err)
+	}
+	if out.ExitCode != "" && out.ExitCode != "0" {
+		// git exits 128 with "No rebase in progress?" when there is nothing to
+		// abort; that is the clean case, not a failure.
+		if strings.Contains(out.Output, "No rebase in progress") {
+			return nil
+		}
+		return fmt.Errorf("%s: exit %s: %s", description, out.ExitCode, strings.TrimSpace(out.Output))
+	}
+	return nil
+}
+
 // SquashMergeToDefault rebases the branch at abs onto the repository's default
 // branch, then squash-merges it into root as a single commit with the given
 // message. On a rebase conflict it returns an error and leaves the worktree
 // intact so the forge (工部) can resolve the conflict before the ruler reviews.
+//
+// Loose-object writes are fsynced (core.fsync=loose-object) rather than left to
+// git's default: the object writer and the reader that rejected it can be the
+// same process, so an unsynced object is a retryable torn read, not corruption.
 //
 // A fully-subsumed branch is a successful no-op, not an error: when the
 // branch's patch is already on the target under a different commit (hand
@@ -132,12 +193,12 @@ func SquashMergeToDefault(ctx context.Context, r runners.Runner, root, abs, bran
 
 	defaultBranch := DefaultBranch(ctx, r, root)
 
-	rebaseCmd := fmt.Sprintf("git -C %s rebase %s", shellescape.Quote(abs), shellescape.Quote(defaultBranch))
+	rebaseCmd := fmt.Sprintf("git -C %s %s rebase %s", shellescape.Quote(abs), fsyncLooseObjects, shellescape.Quote(defaultBranch))
 	if _, err := run(ctx, r, rebaseCmd, "rebase edict worktree onto default branch"); err != nil {
 		return fmt.Errorf("rebase onto %s failed (worktree left intact): %w", defaultBranch, err)
 	}
 
-	mergeCmd := fmt.Sprintf("git -C %s merge --squash %s", shellescape.Quote(root), shellescape.Quote(branch))
+	mergeCmd := fmt.Sprintf("git -C %s %s merge --squash %s", shellescape.Quote(root), fsyncLooseObjects, shellescape.Quote(branch))
 	if _, err := run(ctx, r, mergeCmd, "squash-merge edict worktree"); err != nil {
 		return fmt.Errorf("squash-merge failed: %w", err)
 	}
@@ -159,7 +220,7 @@ func SquashMergeToDefault(ctx context.Context, r runners.Runner, root, abs, bran
 	if msg == "" {
 		msg = "chore: merge edict worktree"
 	}
-	commitCmd := fmt.Sprintf("git -C %s commit -m %s", shellescape.Quote(root), shellescape.Quote(msg))
+	commitCmd := fmt.Sprintf("git -C %s %s commit -m %s", shellescape.Quote(root), fsyncLooseObjects, shellescape.Quote(msg))
 	if _, err := run(ctx, r, commitCmd, "commit squashed edict worktree"); err != nil {
 		return fmt.Errorf("squash commit failed: %w", err)
 	}
@@ -179,15 +240,15 @@ func Remove(ctx context.Context, r runners.Runner, root, abs, branch string) err
 	if r == nil {
 		return fmt.Errorf("worktree: no runner configured")
 	}
-	removeCmd := fmt.Sprintf("git -C %s worktree remove %s", shellescape.Quote(root), shellescape.Quote(abs))
+	removeCmd := fmt.Sprintf("git -C %s %s worktree remove %s", shellescape.Quote(root), fsyncLooseObjects, shellescape.Quote(abs))
 	if _, err := run(ctx, r, removeCmd, "remove sealed worktree"); err != nil {
 		return err
 	}
-	pruneCmd := fmt.Sprintf("git -C %s worktree prune", shellescape.Quote(root))
+	pruneCmd := fmt.Sprintf("git -C %s %s worktree prune", shellescape.Quote(root), fsyncLooseObjects)
 	if _, err := run(ctx, r, pruneCmd, "prune worktree metadata"); err != nil {
 		return err
 	}
-	branchCmd := fmt.Sprintf("git -C %s update-ref -d refs/heads/%s", shellescape.Quote(root), shellescape.Quote(branch))
+	branchCmd := fmt.Sprintf("git -C %s %s update-ref -d refs/heads/%s", shellescape.Quote(root), fsyncLooseObjects, shellescape.Quote(branch))
 	if _, err := run(ctx, r, branchCmd, "delete sealed worktree branch"); err != nil {
 		return err
 	}

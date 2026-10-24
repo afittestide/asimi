@@ -3260,9 +3260,10 @@ func TestMergeEdictWorktree_OnRulerSealEvent(t *testing.T) {
 		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
 	}}
 	s := &Court{
-		logger: slog.Default(),
-		runner: mock,
-		config: &config.CourtConfig{Username: "u", Project: "p"},
+		logger:         slog.Default(),
+		runner:         mock,
+		mutationRunner: mock,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
 	}
 	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
 
@@ -3327,7 +3328,7 @@ func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
 		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
 		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
 	}}
-	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s := &Court{logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
 	// The guard has a buffered channel to capture the published failure and,
 	// deliberately, a nil logger: publishing must degrade safely, never panic
 	// on an unwired dependency.
@@ -3373,7 +3374,7 @@ func TestMergeEdictWorktree_FailurePublishesEvent(t *testing.T) {
 	db := setupCourtTestDB(t)
 	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p"}).Error)
 
-	s := &Court{db: db, logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s := &Court{db: db, logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
 	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
 		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root}},
 	})
@@ -3407,7 +3408,7 @@ func TestMergeEdictWorktree_RemovalFailurePublishesMergedEvent(t *testing.T) {
 	db := setupCourtTestDB(t)
 	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p"}).Error)
 
-	s := &Court{db: db, logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s := &Court{db: db, logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
 	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
 		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root}},
 	})
@@ -3618,7 +3619,7 @@ func TestSealEdict_FailedMergeIsReportedNotSilent(t *testing.T) {
 		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
 		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
 	}}
-	s := &Court{db: db, logger: slog.Default(), runner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
+	s := &Court{db: db, logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Username: "u", Project: "p"}}
 	base := NewMinisterBase(db, mock, slog.Default(), "u", "p", nil)
 	rg := NewRitualGuard(RitualGuardOpts{Base: base})
 	rg.repoInfo = repo.RepoInfo{ProjectRoot: root}
@@ -3674,6 +3675,7 @@ func TestBuildToolRegistry_WiresEdictSealer(t *testing.T) {
 		"rebase": {Output: "CONFLICT", ExitCode: "1"},
 	}}
 	s := NewCourt(db, cfg, mock, slog.Default())
+	s.mutationRunner = mock // the injected host-mutation runner seam
 	s.SetRepoInfo(repo.RepoInfo{ProjectRoot: root})
 	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p", Intent: "x"}).Error)
 

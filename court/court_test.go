@@ -23,6 +23,7 @@ import (
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
@@ -3603,4 +3604,379 @@ func TestCourt_ignoreCopyGlobs_FallbackAndConfigured(t *testing.T) {
 	// not silently replaced by the default.
 	s.sessionCfg = &SessionConfig{Sandbox: config.SandboxConfig{IgnoreCopyGlobs: []string{}}}
 	assert.Empty(t, s.ignoreCopyGlobs(), "explicit empty allowlist means copy nothing")
+}
+
+// flakyMergeRunner fails the first `fails` commands containing failOn, then
+// delegates to worktreeTestRunner. It models a transient torn read of a
+// just-written loose object: the seal must retry once instead of aborting.
+type flakyMergeRunner struct {
+	worktreeTestRunner
+	failOn string
+	fails  int
+	output string
+}
+
+func (m *flakyMergeRunner) Run(ctx context.Context, input runners.Input) (runners.Output, error) {
+	// The abort only ever follows a failed rebase; never let it consume a
+	// failure, or a test could count it as the retry's rebase attempt.
+	if m.fails > 0 && strings.Contains(input.Command, m.failOn) && !strings.Contains(input.Command, "rebase --abort") {
+		m.fails--
+		m.commands = append(m.commands, input.Command)
+		return runners.Output{Output: m.output, ExitCode: "1"}, nil
+	}
+	return m.worktreeTestRunner.Run(ctx, input)
+}
+
+// mergeTestRunnerOpts builds the canned outputs the un-failed stages of the
+// merge need (stable default branch, a non-empty squash index).
+func mergeTestRunnerOutputs() map[string]runners.Output {
+	return map[string]runners.Output{
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "feature.txt\n", ExitCode: "0"},
+	}
+}
+
+// TestMergeEdictWorktree_RunsOnHostMutationRunnerNotCourtRunner is the
+// consistency repair of incident 9f8b980c998a6c32: EnsureEdictWorktree already
+// mutates the repo through a host runner, and the seal-time merge must do the
+// same. The Court-wide (podman) runner is asserted to receive nothing.
+func TestMergeEdictWorktree_RunsOnHostMutationRunnerNotCourtRunner(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	courtRunner := &worktreeTestRunner{}
+	mutation := &worktreeTestRunner{outputs: mergeTestRunnerOutputs()}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         courtRunner,
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+
+	s.mergeEdictWorktree(context.Background(), 531)
+
+	assert.Contains(t, mutation.joined(), "rebase", "the mutation goes through the host mutation runner")
+	assert.Contains(t, mutation.joined(), "worktree remove", "the post-merge removal uses the same runner")
+	assert.Empty(t, courtRunner.commands, "no repo mutation may go through the Court-wide runner")
+}
+
+// TestRepoMutationRunner_IsHost guards the production default: with no runner
+// injected, repo mutations resolve to a host runner rooted at the project.
+func TestRepoMutationRunner_IsHost(t *testing.T) {
+	s := &Court{logger: slog.Default(), runner: &worktreeTestRunner{}}
+
+	mutation := s.repoMutationRunner(t.TempDir())
+	assert.Equal(t, "host", mutation.RunnerType(), "repo mutations must always run on the host")
+}
+
+// TestEnsureEdictWorktree_UsesMutationRunner covers the creation path: it takes
+// the same host mutation runner as the seal-time merge, via the shared seam.
+func TestEnsureEdictWorktree_UsesMutationRunner(t *testing.T) {
+	root := t.TempDir()
+	mutation := &worktreeTestRunner{}
+	courtRunner := &worktreeTestRunner{}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         courtRunner,
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+
+	rel, err := s.EnsureEdictWorktree(context.Background(), 531)
+	require.NoError(t, err)
+	assert.Equal(t, worktree.RelPath(531), rel)
+	assert.Contains(t, mutation.joined(), "worktree add -B", "creation mutates via the host mutation runner")
+	assert.Empty(t, courtRunner.commands, "creation must not touch the Court-wide runner")
+}
+
+// TestMergeEdictWorktree_RetriesTransientCorruptLooseObject: a rebase that
+// fails once with "loose object … is corrupt" is a torn read, not disk rot, so
+// the seal retries the whole operation once and lands the work — without
+// publishing a failure the ruler would read as "sealed but not merged".
+func TestMergeEdictWorktree_RetriesTransientCorruptLooseObject(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e531")
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	mutation := &flakyMergeRunner{
+		worktreeTestRunner: worktreeTestRunner{outputs: mergeTestRunnerOutputs()},
+		failOn:             "rebase",
+		fails:              1,
+		output:             "fatal: loose object 585ccf60a5ba79b40f0b63e0f0f0d0e6b1f2c3d4 is corrupt",
+	}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         &worktreeTestRunner{},
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{
+		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
+		eventCh:      make(chan Event, 4),
+	}
+
+	s.mergeEdictWorktree(context.Background(), 531)
+
+	assert.Contains(t, mutation.joined(), "merge --squash asimi/e531", "the retry lands the work")
+	assert.Contains(t, mutation.joined(), "worktree remove", "the retry proceeds to retire the worktree")
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		t.Fatalf("a transient corruption must not publish a failure, got %s", ev.Type)
+	default:
+	}
+}
+
+// TestMergeEdictWorktree_PersistentCorruptionStillFails: when the object is
+// genuinely unreadable the retry is exhausted, the failure is published, and
+// the worktree stays intact — exactly today's failure-and-leave-intact
+// behaviour, with no retry loop.
+func TestMergeEdictWorktree_PersistentCorruptionStillFails(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e531")
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	mutation := &flakyMergeRunner{
+		worktreeTestRunner: worktreeTestRunner{outputs: mergeTestRunnerOutputs()},
+		failOn:             "rebase",
+		fails:              2,
+		output:             "fatal: loose object 585ccf60a5ba79b40f0b63e0f0f0d0e6b1f2c3d4 is corrupt",
+	}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         &worktreeTestRunner{},
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{
+		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
+		eventCh:      make(chan Event, 4),
+	}
+
+	s.mergeEdictWorktree(context.Background(), 531)
+
+	rebaseAttempts := 0
+	for _, cmd := range mutation.commands {
+		if strings.Contains(cmd, " rebase ") && !strings.Contains(cmd, "rebase --abort") {
+			rebaseAttempts++
+		}
+	}
+	assert.Equal(t, 2, rebaseAttempts, "the operation is retried exactly once, never looped")
+	assert.NotContains(t, mutation.joined(), "merge --squash", "no merge after a failed retry")
+	assert.NotContains(t, mutation.joined(), "worktree remove", "worktree is left intact on failure")
+	_, err := os.Stat(abs)
+	assert.NoError(t, err, "persistent corruption leaves the worktree for the forge")
+
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		assert.Equal(t, storage.EventWorktreeMergeFailed, ev.Type, "a second failure is announced")
+		reason, _ := ev.Payload["reason"].(string)
+		assert.Contains(t, reason, "is corrupt", "the reason carries the git error")
+	default:
+		t.Fatal("expected EventWorktreeMergeFailed after a failed retry")
+	}
+}
+
+// healingRunner runs real git through a host runner and, the first time a
+// command reports a torn loose object, restores the object's bytes — modelling
+// the incident's ephemeral torn read (byte-valid on disk, unreadable on the
+// first read, readable afterwards).
+type healingRunner struct {
+	runners.Runner
+	heal   func()
+	healed bool
+}
+
+func (h *healingRunner) Run(ctx context.Context, in runners.Input) (runners.Output, error) {
+	out, err := h.Runner.Run(ctx, in)
+	if !h.healed && strings.Contains(out.Output, "is corrupt") {
+		h.healed = true
+		h.heal()
+	}
+	return out, err
+}
+
+// TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject is the real-git
+// regression the mock-based retry tests cannot see. The incident's torn read is
+// not limited to the last object a rebase writes: git writes a tree for every
+// replayed commit, and a rebase that hits a corrupt object mid-replay leaves
+// .git/rebase-merge behind. The seal's retry must therefore not be a bare re-run
+// of `git rebase` — git refuses to start a rebase while another is in progress,
+// so the second attempt is a no-op that returns the same error and wedges the
+// worktree. With the corrupt object healed before the retry (a transient read),
+// the seal must still land the work.
+func TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".agents/worktrees/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "base"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+
+	// The forge's worktree carries several commits, so the rebase replays more
+	// than one pick and reads an intermediate tree.
+	abs := filepath.Join(root, worktree.RelPath(531))
+	require.NoError(t, os.MkdirAll(filepath.Dir(abs), 0o755))
+	runGit(t, root, "worktree", "add", "-B", worktree.Branch(531), abs)
+	for i, name := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(abs, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, abs, "add", ".")
+		runGit(t, abs, "commit", "-m", fmt.Sprintf("c%d", i+1))
+	}
+	// main diverges so the branch must be replayed.
+	if err := os.WriteFile(filepath.Join(root, "mainonly"), []byte("m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "m1")
+
+	// A torn read of an intermediate tree: the first replayed commit's tree.
+	treeSHA := strings.TrimSpace(gitOutput(t, abs, "rev-parse", worktree.Branch(531)+"~2^{tree}"))
+	objPath := filepath.Join(root, ".git", "objects", treeSHA[:2], treeSHA[2:])
+	good, err := os.ReadFile(objPath)
+	require.NoError(t, err, "the tree object must exist as a loose object")
+	require.NoError(t, os.WriteFile(objPath, []byte("garbage"), 0o644))
+
+	mutation := &healingRunner{
+		Runner: runners.NewHostRunner(0, root),
+		heal:   func() { require.NoError(t, os.WriteFile(objPath, good, 0o644)) },
+	}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         &worktreeTestRunner{},
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{
+		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
+		eventCh:      make(chan Event, 4),
+	}
+
+	require.NoError(t, s.mergeEdictWorktree(context.Background(), 531),
+		"a transient torn read must not abort the seal")
+
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		t.Fatalf("a transient torn read must not publish %s: %v", ev.Type, ev.Payload)
+	default:
+	}
+
+	// The branch's work landed on main and the worktree was retired.
+	for _, name := range []string{"a", "b", "c"} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Errorf("branch work %q did not land on main after the retry: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(abs); !os.IsNotExist(err) {
+		t.Errorf("worktree must be removed after a successful retry, stat err = %v", err)
+	}
+}
+
+// TestMergeEdictWorktree_AbortsRebaseStateBeforeRetry pins the ordering the
+// mid-replay regression depends on: a rebase that dies on a torn loose object
+// may have left .git/rebase-merge behind (git writes a tree per replayed
+// commit), and git refuses a fresh rebase while that state exists. The retry
+// must therefore clear the state with `git rebase --abort` BEFORE re-running the
+// rebase — a bare re-run is a refused no-op that wedges the worktree.
+func TestMergeEdictWorktree_AbortsRebaseStateBeforeRetry(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mutation := &flakyMergeRunner{
+		worktreeTestRunner: worktreeTestRunner{outputs: mergeTestRunnerOutputs()},
+		failOn:             "rebase",
+		fails:              1,
+		output:             "fatal: loose object 585ccf60 is corrupt",
+	}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         &worktreeTestRunner{},
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{
+		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
+		eventCh:      make(chan Event, 4),
+	}
+
+	s.mergeEdictWorktree(context.Background(), 531)
+
+	abortIdx, rebaseIdxs := -1, []int{}
+	for i, cmd := range mutation.commands {
+		if strings.Contains(cmd, "rebase --abort") {
+			abortIdx = i
+			continue
+		}
+		if strings.Contains(cmd, " rebase ") {
+			rebaseIdxs = append(rebaseIdxs, i)
+		}
+	}
+	require.Len(t, rebaseIdxs, 2, "exactly one retry: %v", mutation.commands)
+	require.NotEqual(t, -1, abortIdx, "stale rebase state must be aborted before the retry")
+	assert.Less(t, abortIdx, rebaseIdxs[1],
+		"--abort must precede the second rebase, commands:\n%s", mutation.joined())
+	assert.Less(t, rebaseIdxs[0], abortIdx,
+		"the abort is only needed after a failed rebase")
+}
+
+// TestMergeEdictWorktree_AbortFailureDoesNotWedgeTheSeal: if the stale rebase
+// state cannot be cleared, the seal must not pretend the retry happened — it
+// skips the second attempt and falls through to the normal failure-and-leave-
+// intact path, with the worktree still present for the forge.
+func TestMergeEdictWorktree_AbortFailureDoesNotWedgeTheSeal(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e531")
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	mutation := &flakyMergeRunner{
+		worktreeTestRunner: worktreeTestRunner{outputs: map[string]runners.Output{
+			"symbolic-ref":   {Output: "origin/main\n", ExitCode: "0"},
+			"rebase --abort": {Output: "error: cannot abort", ExitCode: "1"},
+		}},
+		failOn: "rebase main",
+		fails:  1,
+		output: "fatal: loose object 585ccf60 is corrupt",
+	}
+	s := &Court{
+		logger:         slog.Default(),
+		runner:         &worktreeTestRunner{},
+		mutationRunner: mutation,
+		config:         &config.CourtConfig{Username: "u", Project: "p"},
+	}
+	s.ritualGuard = &RitualGuard{
+		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
+		eventCh:      make(chan Event, 4),
+	}
+
+	s.mergeEdictWorktree(context.Background(), 531)
+
+	rebaseIdxs := 0
+	for _, cmd := range mutation.commands {
+		if strings.Contains(cmd, " rebase ") && !strings.Contains(cmd, "rebase --abort") {
+			rebaseIdxs++
+		}
+	}
+	assert.Equal(t, 1, rebaseIdxs, "a failed abort must not attempt the rebase again")
+
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		assert.Equal(t, storage.EventWorktreeMergeFailed, ev.Type)
+	default:
+		t.Fatal("expected EventWorktreeMergeFailed when the stale state cannot be cleared")
+	}
+	_, err := os.Stat(abs)
+	assert.NoError(t, err, "worktree stays intact for the forge")
 }

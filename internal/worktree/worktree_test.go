@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -237,6 +238,102 @@ func TestSquashMerge_ConflictLeavesWorktreeIntact(t *testing.T) {
 	}
 	if mock.contains("worktree remove") {
 		t.Error("must not remove the worktree on conflict — forge resolves it")
+	}
+}
+
+// TestLooseObjectCorrupt: the predicate gates the seal's single retry, so it
+// must match git's torn-read wording ("loose object … is corrupt") and nothing
+// else. A bare corruption error without the loose-object shape must not retry.
+func TestLooseObjectCorrupt(t *testing.T) {
+	if !LooseObjectCorrupt(errors.New("fatal: loose object 585ccf60 is corrupt")) {
+		t.Error("the torn-read wording must be recognised")
+	}
+	if LooseObjectCorrupt(errors.New("CONFLICT (content): merge conflict")) {
+		t.Error("a conflict is not a corrupt loose object")
+	}
+	if LooseObjectCorrupt(nil) {
+		t.Error("nil is not a corruption")
+	}
+}
+
+// TestSquashMergeToDefault_FsyncsLooseObjects: durability is set per command,
+// not left to git's defaults, so a just-written object is not a torn read for
+// the process that re-reads it.
+func TestSquashMergeToDefault_FsyncsLooseObjects(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e42")
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "widget.go\n", ExitCode: "0"},
+	}}
+
+	if err := SquashMergeToDefault(context.Background(), mock, root, abs, "asimi/e42", "feat: widget e42"); err != nil {
+		t.Fatalf("SquashMergeToDefault: %v", err)
+	}
+	// Every object-writing command (rebase, merge, commit) must carry the flag.
+	writing := 0
+	for _, cmd := range mock.commands {
+		for _, sub := range []string{"rebase", "merge --squash", "commit -m"} {
+			if strings.Contains(cmd, sub) {
+				writing++
+				if !strings.Contains(cmd, "-c core.fsync=loose-object") {
+					t.Errorf("%q must fsync loose objects: %s", sub, cmd)
+				}
+			}
+		}
+	}
+	if writing != 3 {
+		t.Errorf("expected rebase, merge and commit to be checked, got %d:\n%s", writing, strings.Join(mock.commands, "\n"))
+	}
+}
+
+// TestRemove_FsyncsLooseObjects: removal rewrites refs and prunes metadata, so
+// it takes the same durability flag as the merge.
+func TestRemove_FsyncsLooseObjects(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e42")
+	mock := &recordingRunner{}
+
+	if err := Remove(context.Background(), mock, root, abs, "asimi/e42"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	for _, cmd := range mock.commands {
+		if !strings.Contains(cmd, "-c core.fsync=loose-object") {
+			t.Errorf("removal command must fsync loose objects: %s", cmd)
+		}
+	}
+}
+
+// TestAbortRebase_ClearsStateAndToleratesNone: the abort runs before every
+// retry, so "No rebase in progress?" (git's exit 128 with no state) must be
+// treated as success — otherwise a torn read on the final pick, which leaves no
+// rebase state, would fail the retry for no reason.
+func TestAbortRebase_ClearsStateAndToleratesNone(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e984")
+
+	mock := &recordingRunner{}
+	if err := AbortRebase(context.Background(), mock, abs); err != nil {
+		t.Fatalf("AbortRebase: %v", err)
+	}
+	if len(mock.commands) != 1 || !strings.Contains(mock.commands[0], "rebase --abort") {
+		t.Fatalf("expected a single `git rebase --abort`, got %v", mock.commands)
+	}
+
+	// No rebase in progress: git's 128 answer is the clean case.
+	none := &recordingRunner{outputs: map[string]runners.Output{
+		"rebase --abort": {Output: "fatal: No rebase in progress?\n", ExitCode: "128"},
+	}}
+	if err := AbortRebase(context.Background(), none, abs); err != nil {
+		t.Errorf("no rebase in progress must be a successful no-op, got: %v", err)
+	}
+
+	// A genuine abort failure is surfaced so the caller does not retry on stale state.
+	broken := &recordingRunner{outputs: map[string]runners.Output{
+		"rebase --abort": {Output: "error: could not remove state", ExitCode: "1"},
+	}}
+	if err := AbortRebase(context.Background(), broken, abs); err == nil {
+		t.Error("a real abort failure must be returned")
 	}
 }
 

@@ -153,6 +153,12 @@ type Court struct {
 	edictRunnerLastUsed   map[uint]time.Time
 	newEdictRunner        func(edictID uint, base repo.RepoInfo) (runners.Runner, error)
 	runnerFlatlineTimeout time.Duration
+
+	// mutationRunner overrides the runner used for repo mutations (worktree
+	// creation, seal-time merge/remove). Nil in production, where
+	// repoMutationRunner hands out a fresh host runner; tests inject a runner
+	// to observe the commands a mutation would run.
+	mutationRunner runners.Runner
 }
 
 // NewCourt creates a new Court coordinator.
@@ -1630,9 +1636,7 @@ func (s *Court) EnsureEdictWorktree(ctx context.Context, edictID uint) (string, 
 	// Repo mutations always run on the host (the same discipline as verifyInit):
 	// the container bind-mounts a single worktree, so a sandboxed shell cannot
 	// add a sibling worktree next to itself.
-	runner := runners.NewHostRunner(0, root)
-	runner.SetTimeouts(s.hostTimeouts())
-	_, rel, _, _, err := worktree.Ensure(ctx, runner, root, edictID, s.ignoreCopyGlobs())
+	_, rel, _, _, err := worktree.Ensure(ctx, s.repoMutationRunner(root), root, edictID, s.ignoreCopyGlobs())
 	return rel, err
 }
 
@@ -1661,6 +1665,20 @@ func (s *Court) handleSealGranted(e Event) {
 	s.mergeEdictWorktree(context.Background(), e.EdictKey.ID)
 }
 
+// repoMutationRunner returns the runner that performs repository mutations
+// (worktree creation, seal-time rebase/merge/remove). Mutations always run on
+// the host, matching EnsureEdictWorktree: the sandbox bind-mounts a single
+// worktree, so a sandboxed shell cannot mutate the shared repo, and git writes
+// under a double FUSE/virtiofs stack can be torn reads (incident 9f8b980c998a6c32).
+func (s *Court) repoMutationRunner(root string) runners.Runner {
+	if s.mutationRunner != nil {
+		return s.mutationRunner
+	}
+	r := runners.NewHostRunner(0, root)
+	r.SetTimeouts(s.hostTimeouts())
+	return r
+}
+
 // mergeEdictWorktree squash-merges the edict's worktree into the merge target
 // and removes it. It is a no-op (nil) when the edict has no worktree (i.e. its
 // rituals never opted in). On a merge or cleanup failure it publishes
@@ -1685,7 +1703,28 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) error {
 	}
 	branch := worktree.Branch(edictID)
 	summary := s.edictCommitSummary(edictID)
-	if err := worktree.SquashMergeToDefault(ctx, s.runner, root, abs, branch, summary); err != nil {
+	runner := s.repoMutationRunner(root)
+	err := worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, summary)
+	if worktree.LooseObjectCorrupt(err) {
+		// A torn read of a just-written loose object, not disk rot. Retry the
+		// whole operation once; git wrote the object already, and fsync=loose-object
+		// makes the second attempt durable. A second failure keeps the
+		// failure-and-leave-intact behaviour below.
+		s.logger.Warn("retrying worktree merge after a corrupt loose object",
+			"edict", edictID, "err", err)
+		// A rebase writes a tree per replayed commit, so the torn read may have
+		// struck mid-replay and left .git/rebase-merge behind. git refuses a
+		// fresh rebase while that state exists, so the retry would be a refused
+		// no-op that wedges the worktree. Clear it first; --abort is a no-op when
+		// no rebase is in progress.
+		if abortErr := worktree.AbortRebase(ctx, runner, abs); abortErr != nil {
+			s.logger.Error("could not clear stale rebase state before retry",
+				"edict", edictID, "err", abortErr)
+		} else {
+			err = worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, summary)
+		}
+	}
+	if err != nil {
 		s.logger.Error("worktree merge failed; left intact for inspection/rollback",
 			"edict", edictID, "err", err)
 		// The ruler's seal is already recorded, so the TUI would otherwise
@@ -1699,7 +1738,7 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) error {
 		})
 		return err // forge resolves conflicts; do NOT remove on failure
 	}
-	if err := worktree.Remove(ctx, s.runner, root, abs, branch); err != nil {
+	if err := worktree.Remove(ctx, runner, root, abs, branch); err != nil {
 		s.logger.Error("worktree removal failed after successful merge", "edict", edictID, "err", err)
 		cleanupErr := fmt.Errorf("work merged but worktree removal failed: %w", err)
 		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
