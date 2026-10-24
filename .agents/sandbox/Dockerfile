@@ -35,10 +35,7 @@ RUN ARCH=$(uname -m | sed 's/aarch64/arm64/; s/x86_64/x86_64/') && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
 COPY Justfile .
-# Cache mounts keep the Go module and build caches OUT of the committed image
-# layer. Without them `just bootstrap` bakes ~180 MB into that layer, and on a
-# podman VM whose disk is nearly full the layer commit fails with:
-#   unpacking failed ... /root/.cache/go-build/...: no space left on device
+# Cache mounts keep the Go module and build caches shared among sandboxes
 # The caches persist across builds (so downloads are reused) yet never ship in
 # the image, shrinking the layer to just the installed binaries.
 RUN --mount=type=cache,target=/root/.cache/go-build \

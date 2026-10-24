@@ -3,6 +3,7 @@ module github.com/afittestide/asimi
 go 1.26.9
 
 require (
+	al.essio.dev/pkg/shellescape v1.5.1
 	github.com/alecthomas/kong v1.12.1
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/charmbracelet/bubbles v0.21.0
@@ -35,7 +36,6 @@ require (
 )
 
 require (
-	al.essio.dev/pkg/shellescape v1.5.1 // indirect
 	cyphar.com/go-pathrs v0.2.4 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect

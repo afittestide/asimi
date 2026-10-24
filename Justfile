@@ -384,6 +384,7 @@ build-sandbox: init-podman
 # Clean up the sandbox container
 clean-sandbox:
     podman rmi localhost/asimi/sandbox/{{PROJECT_NAME}}:latest
+    # TODO: add removel of the shared go's cache
 
 # Measure run_shell_command tool performance
 measure:
