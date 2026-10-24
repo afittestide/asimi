@@ -47,6 +47,7 @@ type HostInfo struct {
 	Kernel             string            `json:"kernel"`
 	LogDriver          string            `json:"logDriver"`
 	MemFree            int64             `json:"memFree"`
+	MemAvailable       int64             `json:"memAvailable"`
 	MemTotal           int64             `json:"memTotal"`
 	NetworkBackend     string            `json:"networkBackend"`
 	NetworkBackendInfo types.NetworkInfo `json:"networkBackendInfo"`

@@ -220,6 +220,10 @@ type ImageSearchOptions struct {
 	ListTags bool
 }
 
+// ImageSearchTrue is the string representation of true for
+// the Official and Automated fields in ImageSearchReport.
+const ImageSearchTrue = entitiesTypes.ImageSearchTrue
+
 // ImageSearchReport is the response from searching images.
 type ImageSearchReport = entitiesTypes.ImageSearchReport
 
