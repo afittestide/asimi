@@ -327,6 +327,12 @@ type SessionConfig struct {
 	WorkingDir      string
 	AtifAgentName   string // non-empty enables ATIF trajectory recording
 	RepoInfo        repo.RepoInfo
+	// Runner is the edict's shell runner (worktree-aware when the edict is
+	// routed into one). It is carried into each tool call's context so
+	// run_shell_command executes in the edict's effective root instead of the
+	// Court-wide runner bound to the project root. Nil falls back to the
+	// Court-wide runner, preserving system-ritual (edict <= 1) behavior.
+	Runner runners.Runner
 }
 
 // Session represents a chat session for a minister
@@ -345,6 +351,11 @@ type Session struct {
 	// call's context so 地 file tools resolve against the edict's effective root.
 	// Runtime state, not part of the persisted public contract.
 	RepoInfo repo.RepoInfo `json:"-"`
+
+	// runner is the edict's shell runner, carried into each tool call's context
+	// so run_shell_command executes in the edict's effective root. Nil means
+	// "use the tool's registered (Court-wide) runner".
+	runner runners.Runner `json:"-"`
 
 	// ReasoningEffort, when non-empty, sets the reasoning.effort parameter on
 	// outgoing chat requests ("low" | "medium" | "high"). Set by ritual steps
@@ -481,6 +492,7 @@ func NewSession(
 		session.Provider = cfg.LLM.Provider
 		session.Model = cfg.LLM.Model
 		session.RepoInfo = cfg.RepoInfo
+		session.runner = cfg.Runner
 		// The resolved reasoning effort (CLI flag > env var > config > default)
 		// becomes the session's default. Ritual-level `effort:` overrides (set on
 		// the session per step) take precedence for the steps that declare one.
@@ -2169,6 +2181,9 @@ func (s *Session) executeToolCall(ctx context.Context, tool Tool, toolCallID, to
 	ctx = context.WithValue(ctx, tools.ChannelIDKey{}, s.channelID)
 	if s.RepoInfo.ProjectRoot != "" {
 		ctx = context.WithValue(ctx, tools.RepoInfoKey{}, s.RepoInfo)
+	}
+	if s.runner != nil {
+		ctx = context.WithValue(ctx, tools.RunnerKey{}, s.runner)
 	}
 	var out string
 	var callErr error

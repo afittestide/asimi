@@ -6,6 +6,12 @@ The release gate runs `just vuln` (see `docs/release-management.md`), which
 builds the binary and runs `govulncheck -mode=binary` against it. The gate fails
 the release if the scan reports any *new* reachable vulnerability.
 
+Every run archives its full output under `heaven/security/` as
+`<tool>-<datetime>.txt` (e.g. `govulncheck-20260522T143000.txt`), alongside the
+failing-CI archive in `heaven/runs/`. Reports are append-only evidence — each
+run writes a new timestamped file and never overwrites one — and the directory
+is gitignored.
+
 ### Accepted findings
 
 A finding may be accepted only when it is present in `security/vuln-allowlist.txt`

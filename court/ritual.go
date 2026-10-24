@@ -1694,6 +1694,10 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 			WorkingDir:    exec.repoInfo.EffectiveRoot(),
 			AtifAgentName: r.atifAgentName,
 			RepoInfo:      exec.repoInfo,
+			// Carry the execution's (worktree-aware) runner into every tool
+			// call so run_shell_command executes in the edict's effective
+			// root — the registered Court-wide runner is bound to ProjectRoot.
+			Runner: exec.runner,
 		}
 		var err error
 		actSession, err = CreateSession(minister, minister.Model(), sessionConfig, notify, exec.ChannelID(), exec.EdictKey())

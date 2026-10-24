@@ -30,12 +30,12 @@ type sessionResumeErrorMsg struct {
 // ResumeWindow is a simplified component for displaying session selection
 // Navigation is handled by ContentComponent
 type ResumeWindow struct {
-	SelectWindow[court.Session]
+	SelectWindow[*court.Session]
 	loadingSession bool
 }
 
 func NewResumeWindow() ResumeWindow {
-	sw := NewSelectWindow[court.Session]()
+	sw := NewSelectWindow[*court.Session]()
 	sw.Height = 15 // Default height
 	sw.SetSize(70, 15)
 
@@ -45,8 +45,14 @@ func NewResumeWindow() ResumeWindow {
 	}
 }
 
+// SetSessions stores pointers to the sessions so the lock-bearing court.Session
+// value is never copied through the generic render callback (see copylocks).
 func (r *ResumeWindow) SetSessions(sessions []court.Session) {
-	r.SetItems(sessions)
+	items := make([]*court.Session, len(sessions))
+	for i := range sessions {
+		items[i] = &sessions[i]
+	}
+	r.SetItems(items)
 	r.loadingSession = false
 }
 
@@ -56,10 +62,14 @@ func (r *ResumeWindow) SetError(err error) {
 }
 
 func (r *ResumeWindow) GetSelectedSession(index int) *court.Session {
-	return r.GetSelectedItem(index)
+	p := r.GetSelectedItem(index)
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
-func sessionTitlePreview(session court.Session) string {
+func sessionTitlePreview(session *court.Session) string {
 
 	snippet := session.FirstPrompt
 	msgs := session.GetMessages()
@@ -155,7 +165,7 @@ func (r *ResumeWindow) RenderList(selectedIndex, scrollOffset, visibleSlots int)
 		Background(globalTheme.PaneBackground).
 		Padding(0, 1)
 
-	config := RenderConfig[court.Session]{
+	config := RenderConfig[*court.Session]{
 		ConstructTitle: func(selectedIndex, totalItems int) string {
 			return titleStyle.Render(fmt.Sprintf("Choose a session to resume [%3d/%3d]:", selectedIndex+1, totalItems))
 		},
@@ -181,7 +191,7 @@ func (r *ResumeWindow) RenderList(selectedIndex, scrollOffset, visibleSlots int)
 			sb.WriteString("Start chatting to create a new session!\n")
 			sb.WriteString("\n")
 		},
-		RenderItem: func(i int, session court.Session, isSelected bool, sb *strings.Builder) {
+		RenderItem: func(i int, session *court.Session, isSelected bool, sb *strings.Builder) {
 			prefix := "  "
 			if isSelected {
 				prefix = "▶ "

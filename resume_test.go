@@ -36,8 +36,8 @@ func TestResumeWindowSetSessionsAndRender(t *testing.T) {
 	now := time.Now()
 
 	sessions := []court.Session{
-		testSession("s-1", "Refactor prompt", now, "Need to refactor"),
-		testSession("s-2", "Investigate bug", now.Add(-2*time.Hour), "Bug details"),
+		*testSession("s-1", "Refactor prompt", now, "Need to refactor"),
+		*testSession("s-2", "Investigate bug", now.Add(-2*time.Hour), "Bug details"),
 	}
 
 	window.SetSessions(sessions)
@@ -45,8 +45,8 @@ func TestResumeWindowSetSessionsAndRender(t *testing.T) {
 	assert.Equal(t, 2, window.GetItemCount())
 
 	render := window.RenderList(0, 0, window.GetVisibleSlots())
-	assert.Contains(t, render, sessionTitlePreview(sessions[0]))
-	assert.Contains(t, render, sessionTitlePreview(sessions[1]))
+	assert.Contains(t, render, sessionTitlePreview(&sessions[0]))
+	assert.Contains(t, render, sessionTitlePreview(&sessions[1]))
 	assert.Contains(t, render, "▶ ")
 	assert.Contains(t, render, "]    1 Need to refactor")
 }
@@ -79,7 +79,7 @@ func TestResumeWindowScrollInfo(t *testing.T) {
 
 	var sessions []court.Session
 	for i := 0; i < 20; i++ {
-		sessions = append(sessions, testSession(
+		sessions = append(sessions, *testSession(
 			fmt.Sprintf("s-%d", i+1),
 			fmt.Sprintf("Prompt %d", i+1),
 			now.Add(-time.Duration(i)*time.Minute),
@@ -97,7 +97,7 @@ func TestResumeWindowScrollInfo(t *testing.T) {
 func TestResumeWindowGetSelectedSession(t *testing.T) {
 	window := NewResumeWindow()
 	window.SetSessions([]court.Session{
-		testSession("one", "First", time.Now(), "msg"),
+		*testSession("one", "First", time.Now(), "msg"),
 	})
 
 	assert.Nil(t, window.GetSelectedSession(-1))
@@ -122,13 +122,13 @@ func TestSessionTitlePreviewFallbacks(t *testing.T) {
 	assert.Equal(t, "User question", sessionTitlePreview(session))
 }
 
-func testSession(id, prompt string, updated time.Time, messageTexts ...string) court.Session {
+func testSession(id, prompt string, updated time.Time, messageTexts ...string) *court.Session {
 	var messages []schemas.ChatMessage
 	for _, text := range messageTexts {
 		messages = append(messages, textMessage(schemas.ChatMessageRoleUser, text))
 	}
 
-	s := court.Session{
+	s := &court.Session{
 		ID:           id,
 		FirstPrompt:  prompt,
 		LastUpdated:  updated,
@@ -155,7 +155,7 @@ func TestResumeRebuildBatch_CursorAdvancesAndCompletes(t *testing.T) {
 	model.resumeRebuildCursor = 0
 	model.resumeRebuildActive = true
 	session := testSession("resume-batch", "First", time.Now(), "msg")
-	model.resumeRebuildSession = &session
+	model.resumeRebuildSession = session
 
 	// First batch appends 4 and continues paging.
 	cmd := model.handleResumeRebuildBatch(resumeRebuildBatchMsg{messages: msgs, cursor: 0})

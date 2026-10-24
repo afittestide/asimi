@@ -3,12 +3,15 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -257,6 +260,63 @@ func TestRunShellCommandHostOverride_NonNilPointerNilChannel(t *testing.T) {
 	}
 }
 
+// TestRunShellCommand_PrefersContextRunnerOverRegistered is the isolation
+// regression guard: a runner carried in context (the edict's worktree-aware
+// runner) must win over the tool's registered Court-wide runner, which is bound
+// to the project root. Without this, a ritual step's shell command silently
+// mutates the main tree (edict 987).
+func TestRunShellCommand_PrefersContextRunnerOverRegistered(t *testing.T) {
+	var registeredCalls, contextCalls int
+	registered := &mockRunner{runFn: func(context.Context, runners.Input) (runners.Output, error) {
+		registeredCalls++
+		return runners.Output{Output: "root tree", ExitCode: "0"}, nil
+	}}
+	contextRunner := &mockRunner{runFn: func(context.Context, runners.Input) (runners.Output, error) {
+		contextCalls++
+		return runners.Output{Output: "worktree", ExitCode: "0"}, nil
+	}}
+
+	tool := NewRunShellCommand(nil, registered, nil, "/registered/root")
+	ctx := context.WithValue(context.Background(), RunnerKey{}, contextRunner)
+
+	result, err := tool.Call(ctx, `{"command":"echo hi","description":"test"}`)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, contextCalls, "the context (edict) runner must execute the command")
+	assert.Equal(t, 0, registeredCalls, "the registered root runner must not execute the command")
+
+	var output runners.Output
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "worktree", output.Output)
+}
+
+// TestRunShellCommand_ContextRepoInfoRoutesHostToWorktree asserts the other
+// half of the invariant: when a command is routed to an ephemeral host runner,
+// it must run in the edict's effective root (worktree) rather than the tool's
+// registered project root.
+func TestRunShellCommand_ContextRepoInfoRoutesHostToWorktree(t *testing.T) {
+	root := t.TempDir()
+	worktreeRel := filepath.Join(".agents", "worktrees", "e42")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, worktreeRel), 0o755))
+
+	hostChecker := func(string) (bool, bool) { return true, false }
+	tool := NewRunShellCommand(hostChecker, nil, nil, root)
+	ctx := context.WithValue(context.Background(), RepoInfoKey{}, repo.RepoInfo{
+		ProjectRoot:  root,
+		WorktreePath: worktreeRel,
+		IsWorktree:   true,
+	})
+
+	result, err := tool.Call(ctx, `{"command":"pwd","description":"test"}`)
+	require.NoError(t, err)
+
+	var output runners.Output
+	require.NoError(t, json.Unmarshal([]byte(result), &output))
+	assert.Equal(t, "0", output.ExitCode)
+	assert.Contains(t, output.Output, worktreeRel,
+		"host shell execution must land in the edict worktree, not the project root")
+}
+
 // mockRunner implements runners.Runner for testing
 type mockRunner struct {
 	runFn               func(ctx context.Context, input runners.Input) (runners.Output, error)
@@ -388,7 +448,7 @@ func TestRunShellCommand_NilTimeoutsGetterKeepsRunnerDefaults(t *testing.T) {
 	hostChecker := func(cmd string) (bool, bool) { return true, false }
 	tool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir())
 
-	hostRunner := tool.newHostRunner()
+	hostRunner := tool.newHostRunner(t.TempDir())
 	require.NotNil(t, hostRunner, "newHostRunner should always return a runner")
 
 	// runner is a *runners.HostRunner from another package — read its

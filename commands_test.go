@@ -211,7 +211,7 @@ func TestHandleQuitCommand_MultiTabClosesTab(t *testing.T) {
 	// A success toast must have been shown.
 	toasts := model.commandLine.ActiveToasts()
 	require.Len(t, toasts, 1)
-	assert.Equal(t, "Tab closed", toasts[0].Message)
+	assert.Equal(t, "Tab closed; `:qa` to close all", toasts[0].Message)
 }
 
 // TestHandleQuitCommand_MultiTabStreamingShowsError verifies that :quit refuses

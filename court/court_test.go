@@ -2601,6 +2601,181 @@ func TestUpdateProjectRootTools_PreservesLazyTimeoutsGetter(t *testing.T) {
 	assert.Equal(t, 4*time.Second, after.Approval, "configured approval_timeout must survive re-registration via the lazy getter")
 }
 
+// worktreeAwareRunner is a shell runner that records the effective root its
+// commands execute in and accepts re-targeting, so a test can prove the shell
+// tool executes in the edict's worktree rather than the Court root (edict 987).
+type worktreeAwareRunner struct {
+	label        string
+	projectRoot  string
+	worktreePath string
+	mu           sync.Mutex
+	ranIn        []string
+}
+
+func (r *worktreeAwareRunner) Run(context.Context, runners.Input) (runners.Output, error) {
+	r.mu.Lock()
+	r.ranIn = append(r.ranIn, r.effectiveRoot())
+	r.mu.Unlock()
+	return runners.Output{Output: "ok", ExitCode: "0"}, nil
+}
+
+func (r *worktreeAwareRunner) effectiveRoot() string {
+	if r.worktreePath == "" {
+		return r.projectRoot
+	}
+	return filepath.Join(r.projectRoot, r.worktreePath)
+}
+
+func (r *worktreeAwareRunner) SetRepoInfo(ri repo.RepoInfo) {
+	r.projectRoot = ri.ProjectRoot
+	r.worktreePath = ri.WorktreePath
+}
+
+func (r *worktreeAwareRunner) Restart(context.Context) error        { return nil }
+func (r *worktreeAwareRunner) Close(context.Context) error          { return nil }
+func (r *worktreeAwareRunner) AllowFallback(bool)                   {}
+func (r *worktreeAwareRunner) RunnerType() string                   { return "worktree-aware" }
+func (r *worktreeAwareRunner) GetOS() string                        { return runtime.GOOS }
+func (r *worktreeAwareRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (r *worktreeAwareRunner) HealthCheck(context.Context) error    { return nil }
+
+func (r *worktreeAwareRunner) onlyRoot(t *testing.T) string {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	require.Len(t, r.ranIn, 1, "runner should have executed exactly one command")
+	return r.ranIn[0]
+}
+
+// TestRitualStepShellUsesEdictEffectiveRoot is the end-to-end regression guard
+// for edict 987: an act step's session carries the execution's (per-edict)
+// runner, and a run_shell_command issued through it executes in the edict's
+// effective root (the worktree) — never the Court-wide runner bound to the
+// project root.
+func TestRitualStepShellUsesEdictEffectiveRoot(t *testing.T) {
+	db := setupCourtTestDB(t)
+
+	ritual := &RitualDef{
+		Name:        "shell-root-test",
+		Description: "Test that a step's shell command lands in the edict worktree",
+		Steps: []RitualStep{
+			{Name: "forging", Minister: "forge", Task: "do work"},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "done",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go forgeM.Run(ctx)
+
+	court := &Court{ministers: map[string]Minister{"forge": forgeM}, logger: slog.Default()}
+
+	const root = "/canonical/project/root"
+	worktreeRel := filepath.Join(".agents", "worktrees", "e42")
+	courtRunner := &worktreeAwareRunner{label: "court", projectRoot: root}
+	edictRunner := &worktreeAwareRunner{label: "e42"}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, courtRunner, slog.Default(), repo.RepoInfo{ProjectRoot: root})
+	// Mirror Court.RunnerForEdict: system rituals (edict <= 1) use the Court
+	// runner; a real edict gets its own worktree-aware runner.
+	runner.SetRunnerResolver(func(edictID uint) (runners.Runner, error) {
+		if edictID <= 1 {
+			return courtRunner, nil
+		}
+		return edictRunner, nil
+	}, nil)
+
+	exec, err := runner.Start(ctx, "shell-root-test", testEK(42), nil, func(any) {})
+	require.NoError(t, err)
+
+	// Simulate prepare_worktree's routing: the execution's repoInfo gains the
+	// worktree and its runner is re-targeted with it.
+	exec.repoInfo.WorktreePath = worktreeRel
+	exec.repoInfo.IsWorktree = true
+	edictRunner.SetRepoInfo(exec.repoInfo)
+
+	exec.State = RitualStateRunning
+	_, err = runner.executeMinisterStep(ctx, exec, ritual.Steps[0])
+	require.NoError(t, err)
+
+	actSession := exec.stepStates[exec.CurrentStep].Session
+	require.NotNil(t, actSession, "act session should exist for the step")
+
+	// A shell tool registered with the Court root runner, invoked through the
+	// step's session, must prefer the session's (edict) runner.
+	shellTool := tools.NewRunShellCommand(nil, courtRunner, nil, root)
+	actSession.executeToolCall(ctx, shellTool, "call-1", "run_shell_command",
+		`{"command":"pwd","description":"test"}`)
+
+	assert.Equal(t, filepath.Join(root, worktreeRel), edictRunner.onlyRoot(t),
+		"the edict's shell runner must execute in the worktree effective root")
+	assert.Empty(t, courtRunner.ranIn, "the Court-wide root runner must not execute the edict's command")
+}
+
+// TestRitualStepShellSystemEdictUsesRoot is the fail-safe half of edict 987:
+// system/court rituals (edict <= 1) must keep executing at the project root.
+func TestRitualStepShellSystemEdictUsesRoot(t *testing.T) {
+	db := setupCourtTestDB(t)
+
+	ritual := &RitualDef{
+		Name:        "shell-root-system-test",
+		Description: "Test that a system ritual's shell command stays at the root",
+		Steps: []RitualStep{
+			{Name: "forging", Minister: "forge", Task: "do work"},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "done",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go forgeM.Run(ctx)
+
+	court := &Court{ministers: map[string]Minister{"forge": forgeM}, logger: slog.Default()}
+
+	const root = "/canonical/project/root"
+	courtRunner := &worktreeAwareRunner{label: "court", projectRoot: root}
+	edictRunner := &worktreeAwareRunner{label: "e1"}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, courtRunner, slog.Default(), repo.RepoInfo{ProjectRoot: root})
+	runner.SetRunnerResolver(func(edictID uint) (runners.Runner, error) {
+		if edictID <= 1 {
+			return courtRunner, nil
+		}
+		return edictRunner, nil
+	}, nil)
+
+	exec, err := runner.Start(ctx, "shell-root-system-test", testEK(1), nil, func(any) {})
+	require.NoError(t, err)
+	exec.State = RitualStateRunning
+
+	_, err = runner.executeMinisterStep(ctx, exec, ritual.Steps[0])
+	require.NoError(t, err)
+
+	actSession := exec.stepStates[exec.CurrentStep].Session
+	require.NotNil(t, actSession)
+
+	shellTool := tools.NewRunShellCommand(nil, courtRunner, nil, root)
+	actSession.executeToolCall(ctx, shellTool, "call-1", "run_shell_command",
+		`{"command":"pwd","description":"test"}`)
+
+	assert.Equal(t, root, courtRunner.onlyRoot(t), "a system ritual's shell must still run at the project root")
+	assert.Empty(t, edictRunner.ranIn, "a system ritual must not be routed into a per-edict runner")
+}
+
 // TestCourt_CancelZhengmingDispatch verifies that CancelZhengmingDispatch
 // removes a pending wait, causing a blocked WaitForZhengming to return
 // without receiving an answer.

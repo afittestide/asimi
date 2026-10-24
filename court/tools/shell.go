@@ -64,14 +64,26 @@ func (t *RunShellCommand) msgChanValue() chan<- runners.Msg {
 }
 
 // newHostRunner builds an ephemeral HostRunner with the configured
-// command/approval timeouts and the shared approval channel.
-func (t *RunShellCommand) newHostRunner() *runners.HostRunner {
-	hostRunner := runners.NewHostRunner(0, t.projectRoot)
+// command/approval timeouts and the shared approval channel. root is the
+// effective root for this call (worktree when the edict is routed into one).
+func (t *RunShellCommand) newHostRunner(root string) *runners.HostRunner {
+	hostRunner := runners.NewHostRunner(0, root)
 	hostRunner.SetMessageChannel(t.msgChanValue())
 	if t.timeouts != nil {
 		hostRunner.SetTimeouts(t.timeouts())
 	}
 	return hostRunner
+}
+
+// runnerFor resolves the runner a call must use: the per-call runner carried in
+// context (the edict's worktree-aware runner) wins over the runner registered at
+// construction time (bound to the Court's project root). Without this, a ritual
+// step's shell command silently executes in the main tree.
+func (t *RunShellCommand) runnerFor(ctx context.Context) runners.Runner {
+	if r, ok := RunnerFromContext(ctx); ok {
+		return r
+	}
+	return t.runner
 }
 
 func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error) {
@@ -83,6 +95,11 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 
 	var output runners.Output
 	var runErr error
+
+	runner := t.runnerFor(ctx)
+	// Ephemeral host runners must also land in the edict's effective root, not
+	// the registered project root.
+	hostRoot := resolvedRoot(ctx, t.projectRoot)
 
 	runnerInput := runners.Input{
 		Command:        params.Command,
@@ -101,13 +118,13 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 		runnerInput.BypassApproval = !requiresApproval
 
 		// Create ephemeral host runner and run directly on host
-		hostRunner := t.newHostRunner()
+		hostRunner := t.newHostRunner(hostRoot)
 		runnerOutput, err := hostRunner.Run(ctx, runnerInput)
 		output.Output = runnerOutput.Output
 		output.ExitCode = runnerOutput.ExitCode
 		runErr = err
-	} else if t.runner != nil {
-		runnerOutput, err := t.runner.Run(ctx, runnerInput)
+	} else if runner != nil {
+		runnerOutput, err := runner.Run(ctx, runnerInput)
 		output.Output = runnerOutput.Output
 		output.ExitCode = runnerOutput.ExitCode
 		runErr = err
@@ -131,7 +148,7 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 		// back to host execution without attempting a restart.
 		if _, isMissing := runErr.(runners.SandboxMissingError); isMissing {
 			slog.Warn("sandbox not available, running on host", "command", runnerInput.Command)
-			hostRunner := t.newHostRunner()
+			hostRunner := t.newHostRunner(hostRoot)
 			bypassApproval := t.msgChan == nil || *t.msgChan == nil
 			hostOutput, hostErr := hostRunner.Run(ctx, runners.Input{
 				Command:        runnerInput.Command,
@@ -143,7 +160,7 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 			runErr = hostErr
 		} else if _, isSetupMissing := runErr.(runners.SandboxSetupMissingError); isSetupMissing {
 			slog.Warn("sandbox setup missing, running on host", "command", runnerInput.Command)
-			hostRunner := t.newHostRunner()
+			hostRunner := t.newHostRunner(hostRoot)
 			bypassApproval := t.msgChan == nil || *t.msgChan == nil
 			hostOutput, hostErr := hostRunner.Run(ctx, runners.Input{
 				Command:        runnerInput.Command,
@@ -155,11 +172,11 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 			runErr = hostErr
 		} else if runErr != nil {
 			// For transient harness errors, try to restart and retry once
-			if restartErr := t.runner.Restart(ctx); restartErr != nil {
+			if restartErr := runner.Restart(ctx); restartErr != nil {
 				return "", fmt.Errorf("command failed and restart failed: %w (restart error: %v)", runErr, restartErr)
 			}
 
-			runnerOutput, err = t.runner.Run(ctx, runnerInput)
+			runnerOutput, err = runner.Run(ctx, runnerInput)
 			output.Output = runnerOutput.Output
 			output.ExitCode = runnerOutput.ExitCode
 			runErr = err

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/afittestide/asimi/internal/repo"
+	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/storage"
 	"gorm.io/gorm"
 )
@@ -49,6 +50,22 @@ func RepoInfoFromContext(ctx context.Context) (repo.RepoInfo, bool) {
 		return v, true
 	}
 	return repo.RepoInfo{}, false
+}
+
+// RunnerKey carries the executing edict's (worktree-aware) shell runner. File
+// tools resolve 地 through RepoInfoKey, but a shell command needs an actual
+// runner, and the Court-wide registered runner is bound to the project root.
+// Carrying the per-edict runner per call keeps shell execution in the same tree
+// as the file tools. Never the shared, mutable Court runner unless the step
+// really owns it.
+type RunnerKey struct{}
+
+// RunnerFromContext returns the per-call shell runner, or false when unset.
+func RunnerFromContext(ctx context.Context) (runners.Runner, bool) {
+	if v, ok := ctx.Value(RunnerKey{}).(runners.Runner); ok && v != nil {
+		return v, true
+	}
+	return nil, false
 }
 
 // ToolContext carries shared identity and daemon-level resources to all tools.
