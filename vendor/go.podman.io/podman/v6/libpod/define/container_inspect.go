@@ -265,6 +265,12 @@ type InspectHostPort struct {
 	HostPort string `json:"HostPort"`
 }
 
+// HostIp allows Docker-compatible {{.HostIp}} access in Go templates.
+// See https://github.com/containers/podman/issues/29164
+func (hp InspectHostPort) HostIp() string {
+	return hp.HostIP
+}
+
 // InspectMount provides a record of a single mount in a container. It contains
 // fields for both named and normal volumes. Only user-specified volumes will be
 // included, and tmpfs volumes are not included even if the user specified them.

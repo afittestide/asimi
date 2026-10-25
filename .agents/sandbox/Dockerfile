@@ -1,4 +1,4 @@
-FROM golang:1.26.9-bookworm
+FROM golang:1.26.10-bookworm
 
 # The golang base image sets GOTOOLCHAIN=local, which makes the toolchain
 # refuse to fetch a newer Go when go.mod requires one (e.g. after a dependency
