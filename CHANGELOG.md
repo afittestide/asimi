@@ -9,7 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-edict git worktrees** — each edict now gets its own worktree at `.agents/worktrees/e{ID}` on branch `asimi/e{ID}`, created on first use and reused by every ritual of that edict, so concurrent edicts no longer mutate each other's working tree. The file tools (`read_file`, `write_file`, …) and `run_shell_command` run inside the edict's worktree instead of the project root, and the worktree is removed when the edict seals (e531, e943, e987)
 - **`:switch <target>`** — move the whole Court between branches and edict worktrees in place, without exiting Asimi and starting a new instance: `:switch e123` enters (creating it when missing) edict 123's worktree on `asimi/e123`, `:switch main` returns to the main working tree, and `:switch <branch>` resolves a named branch to its linked worktree via `git worktree list`. The switch re-targets every minister, the RitualRunner, and the shell runner through the existing `SetContext` path, then resets all tabs to the default minister tabs; it refuses while any tab is streaming (e952)
+- **`ignore_copy_globs`** — a new `[sandbox]` config option bounding which gitignored files travel from the main tree into a new edict worktree; the worktree is a fresh checkout, so this allowlist (common local-config names by default) carries the local-only files a worktree needs without copying build artifacts (e946)
+- **Width-aware `tian_ledger` table** — the human-facing Heaven ledger now renders as a markdown table (`edict_id`, `event`, `time`, `detail`) whose columns are sized to the chat component, via a generic JSON→markdown-table opt-in any daemon-side tool may emit; the raw event summaries still ride along so the model keeps full fidelity (e939)
+- **Edict details as a markdown block** — the swift-strike `given: "the edict details"` step now prints the edict's full, untruncated Intent as a rendered markdown block instead of the bare step name, so the Ruler can see what a ritual is about (e975)
+
+### Changed
+
+- **Sandbox resource ceilings** — the sandbox image now sets `GOFLAGS=-p=1`, `GOMAXPROCS=2`, and `GOMEMLIMIT=1500MiB` to bound Go build parallelism and runtime memory, so concurrent edict rituals can no longer OOM-kill the compiler in the ~2 GiB podman VM (e948)
+- **Single shared Go build cache** — every runner (host, podman, and each edict worktree) now points `GOCACHE` at one `<projectRoot>/.gocache`, so `go build`/`go test` reuse the same content-addressed cache instead of rebuilding the module graph per worktree; any inherited `GOCACHE` is dropped first (e946)
+- **One project-slug resolver; fail-loud scoping** — project slug resolution is now shared and honours a pinned config, and Court read tools (`list_edicts`, `get_edict_status`, `list_ling`, …) that match zero rows in the queried scope now report where rows actually exist (naming the nearby `(username, project)` buckets) instead of letting an empty scope be mistaken for "no rows at all" (e968)
+- **Edict list previews** — the `:edict` selector now strips leading whitespace and `#` from each edict's intent preview, so a `# Goal: …` markdown heading no longer shows its hash (666df1530)
+- **Tab-close messaging** — closing a tab now toasts "Tab closed; `:qa` to close all" instead of the ambiguous bare "Tab closed" (59753408f)
+- **Toolchain security floors** — bumped to Go 1.26.10 and podman v6.1.3 (with a vendor refresh) to remediate the 2026-10-22 govulncheck findings (e986)
+
+### Fixed
+
+- **Sealing a worktree edict** — sealing now rebases the edict branch onto the resolved default branch, commits any work still staged in the worktree, squash-merges it into the default branch as one commit, and removes the worktree and branch. Failed merges are surfaced (not silently swallowed), a fully-subsumed squash is treated as a no-op rather than a failure, and the rebase/merge runs through a host runner that retries once on an ephemeral corrupt loose object (e945, e955, e974, e984)
+- **`run_shell_command` ignored the edict worktree** — shell steps that omitted an explicit `cd` executed in the project root and mutated the main tree; they now run inside the edict's worktree (e987)
+- **File tools ignored the edict worktree** — `read_file`/`write_file` and friends now resolve paths against the edict's worktree root, closing the e531 isolation leak into the main tree (e943)
+- **Ritual abort on tab close** — closing a tab (`:q`) after a CTRL-C now aborts the running ritual instead of leaving it stuck and queueing every later ritual until restart (e921)
+- **Cancelling a ritual** — cancelling now context-cancels in-flight work and resolves the worktree branch even when the project root is nested inside another worktree (e928)
+- **Stale seal tombstones** — the seal UI/decision path now counts only live seals (`stale_at IS NULL`), so an edict whose intent was clarified can be re-sealed instead of being blocked by invalidated tombstones (e967)
+- **Runner restart aborting other sessions** — `PodmanRunner.Restart` now scopes its `ClearSchedulerMsg` abort to the restarted runner's own sessions instead of context-cancelling tool calls belonging to every other session (e957)
+- **`approve_doc` with a nil Notify** — the tool is no longer registered with a zero-value struct and a permanently-nil callback; it uses a lazy `NotifyFn` getter, fixing "approve_doc requires TUI notify to open editor" (e970)
+- **OOM from duplicated git/Go caches** — added a `.dockerignore` and bounded the builder context (pruning before build) so edict worktrees, `vendor/`, `.git/`, and build logs are no longer shipped into the podman VM, fixing "no space left on device" (b1bde5b4c)
 
 ## [0.14.5] - 2026-10-11
 

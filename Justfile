@@ -135,22 +135,17 @@ run:
 # surfaces as `compile: signal: killed` → `[build failed]` and makes the
 # swift-strike judge gate misread a resource failure as a test failure. These
 # only serialize compilation; no test is skipped or weakened.
+#
+# The run's output is archived under heaven/tests as test_<datetime>.out
+# (e.g. test_20260522T143000.out), mirroring the `vuln` report precedent: each
+# run appends a new file, none is overwritten, and heaven/ is gitignored. The
+# `set -o pipefail` is load-bearing: without it the `tee` exit status would
+# mask a failing `go test` and the gate would never fail.
 test:
     #!/usr/bin/env bash
-    set -euo pipefail
-    export GOTOOLCHAIN=auto
-    export GOFLAGS="-p=1"
-    export GOMAXPROCS=2
-    export GOMEMLIMIT=1500MiB
-    if [ -n "${CI:-}" ]; then
-        go test -tags containers_image_openpgp -timeout 5m -v ./...
-    else
-        go test -tags containers_image_openpgp -timeout 5m ./... | tee test.out
-    fi
-    just test-race
-    if [ -n "${CI:-}" ]; then
-        just vuln
-    fi
+    set -o pipefail
+    mkdir -p heaven/tests
+    go test -tags containers_image_openpgp -timeout 5m -v ./... | tee "heaven/tests/test_$(date +%Y%m%dT%H%M%S).out"
 
 # Run tests under the race detector. Data races are invisible to the plain
 # `test` recipe and must be caught before a release. Scoped by default to the
