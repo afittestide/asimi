@@ -263,6 +263,17 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 		config.Court.RunnerFlatlineTimeout = k.Duration("shogunate.runner_flatline_timeout")
 	}
 
+	// Expand a leading "~" in additional mount sources so consumers only
+	// ever see absolute host paths. Destination is a container path and is
+	// deliberately left untouched.
+	for i := range config.Sandbox.AdditionalMounts {
+		source, err := ExpandHome(config.Sandbox.AdditionalMounts[i].Source)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand home directory in additional_mounts source %q: %w", config.Sandbox.AdditionalMounts[i].Source, err)
+		}
+		config.Sandbox.AdditionalMounts[i].Source = source
+	}
+
 	// Resolve API keys from environment variables when requested
 	if resolveKeys {
 		resolveAPIKeys(&config)

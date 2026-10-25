@@ -116,9 +116,10 @@ safe_run_on_host = ['^gh\s+(issue|pr)\s+(view|list)', '^git\s+status']
 image_name = "localhost/my-custom-sandbox:latest"
 
 # Additional mount points for the container
-# Useful for mounting secrets, caches, or other project directories
+# Useful for mounting secrets, caches, or other project directories.
+# A source may start with "~/" to resolve relative to your home directory.
 [[sandbox.additional_mounts]]
-source = "/path/to/host/dir"
+source = "~/secrets"
 destination = "/path/in/container"
 
 [[sandbox.additional_mounts]]
