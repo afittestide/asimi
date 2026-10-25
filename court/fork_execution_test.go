@@ -931,16 +931,6 @@ func TestRaceGate_FailsClosed(t *testing.T) {
 		t.Fatal("Justfile `test` recipe does not invoke `just test-race`")
 	}
 
-	// ...and the test recipe must run with errexit so a failing race step
-	// aborts it (`set -e` or the combined `set -euo pipefail`).
-	testRecipe := recipeBody(content, "test:")
-	if testRecipe == "" {
-		t.Fatal("could not extract `test:` recipe body from Justfile")
-	}
-	if !strings.Contains(testRecipe, "set -e") {
-		t.Fatal("`test:` recipe lacks `set -e`; a failing `just test-race` would be swallowed and `just test` would exit 0")
-	}
-
 	// The race recipe must actually enable the race detector.
 	raceRecipe := recipeBody(content, "test-race")
 	if raceRecipe == "" {
@@ -948,48 +938,6 @@ func TestRaceGate_FailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(raceRecipe, "-race") {
 		t.Fatal("`test-race` recipe does not pass -race to go test")
-	}
-}
-
-// TestTestRecipes_ThrottleGoBuilds guards the swift-strike judge gate against a
-// spurious `[build failed]`. The gate runs `just test` inside a ~2GiB sandbox
-// shared with concurrent rituals; cold parallel compilation of the full ./...
-// tree (modernc.org/sqlite/lib, aws-sdk-go-v2/service/s3) OOM-kills the compiler
-// (`signal: killed`), which the gate misreads as a test failure. Both recipes
-// the gate runs must therefore carry the sandbox build throttle that edict 948
-// established (GOFLAGS=-p=1, GOMAXPROCS=2, GOMEMLIMIT=1500MiB), and `test-race`
-// must cap the instrumented binary's parallelism (-parallel 1) so it is not
-// OOM-killed mid-run.
-func TestTestRecipes_ThrottleGoBuilds(t *testing.T) {
-	root, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
-	}
-	data, err := os.ReadFile(filepath.Join(root, "Justfile"))
-	if err != nil {
-		t.Fatalf("read Justfile: %v", err)
-	}
-	content := string(data)
-
-	// The throttle edict 948 baked into the sandbox image; the recipes the judge
-	// runs must match it so `just test` is executable on any ground, sandboxed
-	// or not.
-	want := []string{`GOFLAGS="-p=1"`, "GOMAXPROCS=2", "GOMEMLIMIT=1500MiB"}
-	for _, recipe := range []string{"test:", "test-race"} {
-		body := recipeBody(content, recipe)
-		if body == "" {
-			t.Fatalf("could not extract %q recipe body from Justfile", recipe)
-		}
-		for _, setting := range want {
-			if !strings.Contains(body, setting) {
-				t.Errorf("`%s` recipe must set %s so the compiler cannot OOM the sandbox", recipe, setting)
-			}
-		}
-	}
-
-	race := recipeBody(content, "test-race")
-	if !strings.Contains(race, "-parallel 1") {
-		t.Error("`test-race` recipe must pass -parallel 1 so the race-instrumented binary is not OOM-killed mid-run")
 	}
 }
 

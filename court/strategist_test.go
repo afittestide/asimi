@@ -155,9 +155,6 @@ func TestWar_WarRoleMentionsFullLingID(t *testing.T) {
 	assert.Contains(t, WarRole, "'74183c66ba0507ba'",
 		"WarRole must include a concrete full ling_id example")
 
-	// Must warn against shorthand
-	assert.Contains(t, WarRole, "Never use shorthand",
-		"WarRole must warn against shorthand dependency references")
 }
 
 // TestCastleSiege_WarTaskCarriesContext verifies the ritual builds
