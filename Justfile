@@ -143,9 +143,14 @@ run:
 # mask a failing `go test` and the gate would never fail.
 test:
     #!/usr/bin/env bash
-    set -o pipefail
+    set -euo pipefail
+    export GOTOOLCHAIN=auto
+    export GOFLAGS="-p=1"
+    export GOMAXPROCS=2
+    export GOMEMLIMIT=1500MiB
     mkdir -p heaven/tests
     go test -tags containers_image_openpgp -timeout 5m -v ./... | tee "heaven/tests/test_$(date +%Y%m%dT%H%M%S).out"
+    just test-race
 
 # Run tests under the race detector. Data races are invisible to the plain
 # `test` recipe and must be caught before a release. Scoped by default to the
