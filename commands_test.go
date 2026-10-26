@@ -605,11 +605,17 @@ func TestHandleInitCommand_AutoDerivesSlug(t *testing.T) {
 		"config should contain the auto-derived slug")
 }
 
-// TestHandleInitCommand_NoSlugReturnsError tests that handleInitCommand returns
-// an error message when both config.Court.Project and repoInfo.Slug are empty.
-func TestHandleInitCommand_NoSlugReturnsError(t *testing.T) {
+// TestHandleInitCommand_GitlessDerivesBasenameSlug documents e968's contract:
+// :init in a gitless directory intentionally proceeds, deriving the sanitized
+// directory-basename slug instead of erroring ("No git remote found" only fires
+// when the resolver yields nothing at all, i.e. an empty project root).
+// This repurposes the former TestHandleInitCommand_NoSlugReturnsError — its old
+// premise (a gitless root yields no slug) is obsolete under ruling (A) of edict
+// 996, and the assertion was rewritten rather than weakened.
+func TestHandleInitCommand_GitlessDerivesBasenameSlug(t *testing.T) {
 	skipIfNotCI(t)
 	tmpDir := t.TempDir()
+	wantSlug := repo.SanitizeSegment(filepath.Base(tmpDir))
 
 	mock := &mockCourtClient{}
 	mockTUI := &TUIModel{
@@ -628,15 +634,18 @@ func TestHandleInitCommand_NoSlugReturnsError(t *testing.T) {
 	}
 
 	cmd := handleInitCommand(mockTUI, []string{})
-	require.NotNil(t, cmd)
-	msg := cmd()
+	// createInitEdict returns nil (no tea.Cmd) but publishes an event
+	require.Nil(t, cmd, "createInitEdict returns nil cmd")
 
-	sysMsg, ok := msg.(showContextMsg)
-	require.True(t, ok, "Expected showContextMsg when no slug, got %T", msg)
-	assert.Contains(t, sysMsg.content, "No git remote found")
+	// :init proceeds by design in a gitless directory, scoped to the basename.
+	require.Len(t, mock.publishedEvents, 1, "expected EventRitualEnacted to be published")
+	assert.Equal(t, storage.EventRitualEnacted, mock.publishedEvents[0].eventType)
 
-	// No events should have been published
-	assert.Empty(t, mock.publishedEvents)
+	confPath := filepath.Join(tmpDir, ".agents", "asimi.conf")
+	data, err := os.ReadFile(confPath)
+	require.NoError(t, err, "config file should exist")
+	require.Contains(t, string(data), wantSlug,
+		"config should contain the sanitized directory-basename slug")
 }
 
 // TestHandleInitCommand_ProjectAlreadySet tests that handleInitCommand proceeds

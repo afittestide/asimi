@@ -1,6 +1,8 @@
 package court
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"database/sql"
 	"fmt"
@@ -3845,9 +3847,26 @@ func TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject(t *testing.T
 
 	// A torn read of an intermediate tree: the first replayed commit's tree.
 	treeSHA := strings.TrimSpace(gitOutput(t, abs, "rev-parse", worktree.Branch(531)+"~2^{tree}"))
-	objPath := filepath.Join(root, ".git", "objects", treeSHA[:2], treeSHA[2:])
-	good, err := os.ReadFile(objPath)
-	require.NoError(t, err, "the tree object must exist as a loose object")
+	// Obtain canonical bytes through git so this works whether the object is
+	// loose or packed (the GitHub runner packs it, where a raw path read fails),
+	// then encode a proper loose object ourselves: the on-disk format is
+	// zlib-compressed "<type> <size>\0<content>". A loose object shadows a
+	// packed one, so corrupting this path tears the read on any git.
+	content := []byte(gitOutput(t, abs, "cat-file", "tree", treeSHA))
+	var packed bytes.Buffer
+	zw := zlib.NewWriter(&packed)
+	fmt.Fprintf(zw, "tree %d\x00", len(content))
+	zw.Write(content)
+	require.NoError(t, zw.Close())
+	good := packed.Bytes()
+
+	objDir := strings.TrimSpace(gitOutput(t, abs, "rev-parse", "--git-path", "objects"))
+	if !filepath.IsAbs(objDir) {
+		objDir = filepath.Join(abs, objDir)
+	}
+	objPath := filepath.Join(objDir, treeSHA[:2], treeSHA[2:])
+	require.NoError(t, os.MkdirAll(filepath.Dir(objPath), 0o755))
+	require.NoError(t, os.WriteFile(objPath, good, 0o644))
 	require.NoError(t, os.WriteFile(objPath, []byte("garbage"), 0o644))
 
 	mutation := &healingRunner{
