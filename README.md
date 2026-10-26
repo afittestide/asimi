@@ -95,7 +95,7 @@ Asimi will launch a container based on this image the first time the model calls
 The container will stay up as long as the program is running. 
 Once the program exits, the container is shutdown and removed.
 
-Some commands, like gh, can't run in the sandbox.
+Some commands, like iOS development tools, can't run in the sandbox.
 For these commands you can add a special exception in the config file.
 
 To run commands in the container use `:!<shell command>`.
