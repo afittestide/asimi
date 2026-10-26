@@ -3,6 +3,7 @@ package runners
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -483,6 +484,7 @@ type mockPodmanServer struct {
 	containerCreated    bool
 	removeCount         int
 	execCount           int
+	lastCreateBody      []byte
 	mu                  sync.Mutex
 }
 
@@ -526,8 +528,10 @@ func newMockPodmanServer(inspectResp string, inspectCode int) *mockPodmanServer 
 
 		// /containers/create
 		if parts[4] == "create" {
+			body, _ := io.ReadAll(r.Body)
 			m.mu.Lock()
 			m.createCount++
+			m.lastCreateBody = body
 			if m.containerCreated || m.createConflictCount > 0 {
 				if m.createConflictCount > 0 {
 					m.createConflictCount--
@@ -1157,4 +1161,82 @@ func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out.Output, "warm",
 		"a recreated container must see the shared module cache before downloading anything")
+}
+
+// TestCreateContainerEmitsCacheVolumeInSpec proves the consumer wiring for edict
+// 977: createContainer must put the cache entry on the create spec's Volumes
+// (not just that namedCacheVolumes builds it). The mock server records the
+// /containers/create body so the emitted named volume is inspected directly.
+func TestCreateContainerEmitsCacheVolumeInSpec(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	cfg := &Config{
+		CacheVolumes: []Mount{{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"}},
+	}
+	runner := NewPodmanRunner(cfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body, "createContainer must have posted a spec to /containers/create")
+
+	var spec struct {
+		Volumes []struct {
+			Name string `json:"Name"`
+			Dest string `json:"Dest"`
+		} `json:"volumes"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec), "create body must be a specgen JSON spec")
+
+	var found bool
+	for _, v := range spec.Volumes {
+		if v.Dest == "/go/pkg/mod" {
+			found = true
+			assert.Equal(t, "asimi-gomodcache-owner-repo", v.Name,
+				"cache volume name must be keyed by the sanitized project slug")
+		}
+	}
+	assert.True(t, found, "create spec must carry the cache volume at /go/pkg/mod: %s", body)
+}
+
+// TestCreateContainerNoCacheVolumesEmitsNone is the non-regression guard: with an
+// empty CacheVolumes, createContainer must not add any named volume (no
+// behavioural change from before edict 977).
+func TestCreateContainerNoCacheVolumesEmitsNone(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body)
+
+	var spec struct {
+		Volumes []struct {
+			Dest string `json:"Dest"`
+		} `json:"volumes"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec))
+	assert.Empty(t, spec.Volumes, "empty CacheVolumes must emit no named volumes")
 }
