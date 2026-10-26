@@ -95,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Ling execution engine (built, default off)** — lings (task orders) can now execute over a shared DAG engine that honors declared dependencies; lings carry an owning minister and batches of `insert_ling` calls with satisfied dependencies can be ignited automatically. **Ignition is disabled by default** (`ling_ignition_enabled = false`) until per-ling worktree isolation lands (e531) — concurrent lings on one working tree are unsafe without it (e847)
+- **Ling execution engine (built, default off)** — lings (task orders) can now execute over a shared DAG engine that honors declared dependencies; lings carry an owning minister and batches of `insert_ling` calls with satisfied dependencies can be ignited automatically. Ignition creates/reuses the edict's worktree and runs each ling inside it, so concurrent lings never share a working tree; on success a ling commits its own paths on the edict branch under a per-edict commit mutex (e923). **Ignition stays disabled by default** (`ling_ignition_enabled = false`) — flipping the default is a separate ruling (e923). The concurrent-ling bound is `court.ling_parallelism` (default 5)
 - **Kimi K3** — added Moonshot's Kimi K3 to the model roster/config defaults
 
 ### Changed

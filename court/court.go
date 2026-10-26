@@ -145,6 +145,12 @@ type Court struct {
 	lingIgniteMu sync.Mutex
 	lingIgniting map[uint]*sync.Mutex
 
+	// lingCommitMu guards lingCommitting, the per-edict mutexes that serialize
+	// the commit step of an edict's concurrent lings so they never collide on
+	// the shared worktree's .git/index (e923, ruler ruling R4).
+	lingCommitMu   sync.Mutex
+	lingCommitting map[uint]*sync.Mutex
+
 	// edictRunnersMu guards edictRunners/edictRunnerLastUsed, the per-edict
 	// shell runners (and their containers). Each edict gets its own runner so
 	// two edicts run concurrently without colliding on shared runner state.
@@ -173,6 +179,8 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		isolatedHost:        cfg != nil && cfg.IsolatedHost,
 		edictRunners:        make(map[uint]runners.Runner),
 		edictRunnerLastUsed: make(map[uint]time.Time),
+		lingIgniting:        make(map[uint]*sync.Mutex),
+		lingCommitting:      make(map[uint]*sync.Mutex),
 	}
 	if cfg != nil {
 		s.runnerFlatlineTimeout = cfg.RunnerFlatlineTimeout
@@ -1704,6 +1712,9 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) error {
 	branch := worktree.Branch(edictID)
 	summary := s.edictCommitSummary(edictID)
 	runner := s.repoMutationRunner(root)
+	// Nested per-ling worktrees (legacy shape, superseded by e923) under a live
+	// edict worktree cannot be removed with their parent, so sweep them first.
+	s.sweepLingWorktrees(ctx, edictID)
 	err := worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, summary)
 	if worktree.LooseObjectCorrupt(err) {
 		// A torn read of a just-written loose object, not disk rot. Retry the

@@ -4,7 +4,7 @@
 
 ### Full Parallelism
 - Git worktrees for concurrent rituals (issues/153)
-- Ling execution engine — built 0.13.5, default off until worktree isolation (e531)
+- Ling execution engine — runs each ling in the edict's worktree; default off (flip is a separate ruling, e923)
 
 ## V1.0
 

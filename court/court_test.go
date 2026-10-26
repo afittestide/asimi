@@ -2973,22 +2973,117 @@ func newLingTestCourt(t *testing.T, db *gorm.DB) (*Court, *recordingProvider) {
 	}
 	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
 	// Enable ignition explicitly: these tests exercise the engine; the
-	// production default is off until worktree isolation lands (e531).
+	// production default is off (separate ruling, e923).
 	cfg := config.DefaultCourtConfig()
 	cfg.LingIgnitionEnabled = true
 	s := &Court{
-		db:        db,
-		ministers: ministers,
-		logger:    slog.Default(),
-		notify:    func(any) {},
-		config:    cfg,
+		db:             db,
+		ministers:      ministers,
+		logger:         slog.Default(),
+		notify:         func(any) {},
+		config:         cfg,
+		lingIgniting:   map[uint]*sync.Mutex{},
+		lingCommitting: map[uint]*sync.Mutex{},
 	}
 	s.sessionCfg = &SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}
 	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
 		Base:        base,
 		GetMinister: s.GetMinister,
 	})
+	// Ignition now ensures the edict's worktree before dispatching (e923), so
+	// the test court needs a project root and a mutation runner that stands in
+	// for the host git commands. The runner records commands so a test can prove
+	// Ensure ran before any ling.
+	root := t.TempDir()
+	s.ritualGuard.repoInfo = repo.RepoInfo{ProjectRoot: root}
+	s.mutationRunner = &lingMutationRunner{}
 	return s, provider
+}
+
+// lingMutationRunner is the fake host runner standing in for git in ignition
+// tests. It records every command so a test can assert ordering (Ensure before
+// dispatch) and scripted output for path snapshots.
+type lingMutationRunner struct {
+	mu       sync.Mutex
+	commands []string
+	root     string
+	// statusOutputs scripts successive `git status --porcelain` answers; the
+	// last entry repeats once the queue is exhausted. The first answer is the
+	// pre-run snapshot, the second the post-run dirty set.
+	statusOutputs []string
+	statusCalls   int
+	// onAdd, when set, is invoked when a stage command runs; it lets a test
+	// detect two lings staging at once.
+	onAdd func()
+}
+
+func (r *lingMutationRunner) Run(_ context.Context, in runners.Input) (runners.Output, error) {
+	r.mu.Lock()
+	r.commands = append(r.commands, in.Command)
+	out := ""
+	onAdd := r.onAdd
+	switch {
+	case strings.Contains(in.Command, "status --porcelain"):
+		if len(r.statusOutputs) > 0 {
+			i := r.statusCalls
+			if i >= len(r.statusOutputs) {
+				i = len(r.statusOutputs) - 1
+			}
+			out = r.statusOutputs[i]
+			r.statusCalls++
+		}
+	case strings.Contains(in.Command, "diff --cached --name-only"):
+		out = "changed.go"
+	}
+	r.mu.Unlock()
+	if onAdd != nil && strings.Contains(in.Command, " add -- ") {
+		onAdd()
+	}
+	return runners.Output{Output: out, ExitCode: "0"}, nil
+}
+
+func (r *lingMutationRunner) Restart(context.Context) error        { return nil }
+func (r *lingMutationRunner) Close(context.Context) error          { return nil }
+func (r *lingMutationRunner) AllowFallback(bool)                   {}
+func (r *lingMutationRunner) RunnerType() string                   { return "ling-test" }
+func (r *lingMutationRunner) GetOS() string                        { return runtime.GOOS }
+func (r *lingMutationRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (r *lingMutationRunner) HealthCheck(context.Context) error    { return nil }
+
+// SetRepoInfo records the ProjectRoot it is aimed at. Ignition must never
+// re-aim the shared runner's ProjectRoot away from the main tree.
+func (r *lingMutationRunner) SetRepoInfo(ri repo.RepoInfo) {
+	r.mu.Lock()
+	r.root = ri.ProjectRoot
+	r.mu.Unlock()
+}
+
+func (r *lingMutationRunner) ran(fragment string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.commands {
+		if strings.Contains(c, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *lingMutationRunner) firstIndex(fragment string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, c := range r.commands {
+		if strings.Contains(c, fragment) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (r *lingMutationRunner) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string{}, r.commands...)
 }
 
 // newLingTestCourtPerMinister is like newLingTestCourt but gives each minister
@@ -3010,7 +3105,7 @@ func newLingTestCourtPerMinister(t *testing.T, db *gorm.DB) (*Court, map[string]
 	}
 	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
 	// Enable ignition explicitly: these tests exercise the engine; the
-	// production default is off until worktree isolation lands (e531).
+	// production default is off (flip is a separate ruling, e923).
 	cfg := config.DefaultCourtConfig()
 	cfg.LingIgnitionEnabled = true
 	s := &Court{
@@ -3025,6 +3120,9 @@ func newLingTestCourtPerMinister(t *testing.T, db *gorm.DB) (*Court, map[string]
 		Base:        base,
 		GetMinister: s.GetMinister,
 	})
+	root := t.TempDir()
+	s.ritualGuard.repoInfo = repo.RepoInfo{ProjectRoot: root}
+	s.mutationRunner = &lingMutationRunner{}
 	return s, providers
 }
 
@@ -3171,7 +3269,7 @@ func TestRunLing_FailingMinisterPublishesLingFailed(t *testing.T) {
 // of the gate: a trigger with LingIgnitionEnabled=false must (a) spawn no
 // minister session (no ling_started event), (b) record a ling_ignition_skipped
 // event carrying the reason, and (c) leave the ling pending and listable
-// (e531 gate).
+// (e923 gate; the recorded blocker used to name e531, which is sealed).
 func TestTriggerLingIgnition_GateOffSkipsAndStaysPending(t *testing.T) {
 	db := setupCourtTestDB(t)
 	s, provider := newLingTestCourt(t, db)
@@ -3204,7 +3302,8 @@ func TestTriggerLingIgnition_GateOffSkipsAndStaysPending(t *testing.T) {
 	assert.Equal(t, 1, counts[storage.EventLingIgnitionSkipped], "skip must be visible in the ledger")
 	require.NotNil(t, skipPayload)
 	assert.Equal(t, "ling_ignition_disabled_by_config", skipPayload["reason"])
-	assert.Equal(t, true, skipPayload["pending_e531"])
+	assert.Equal(t, true, skipPayload["pending_e923"], "the recorded blocker is this edict, not the sealed e531")
+	assert.Nil(t, skipPayload["pending_e531"], "the stale e531 reason must be gone")
 
 	var got storage.Ling
 	require.NoError(t, db.First(&got, "ling_id = ?", "ling-gated").Error)
@@ -3237,6 +3336,433 @@ func TestTriggerLingIgnition_GateOnIgnites(t *testing.T) {
 	n := len(provider.prompts)
 	provider.mu.Unlock()
 	assert.Equal(t, 1, n, "exactly one minister session runs")
+}
+
+// newLingWorktreeCourt extends newLingTestCourt for worktree tests: the edict's
+// worktree directory pre-exists (so Ensure reuses it rather than shelling out
+// `git worktree add`), and the mutation runner is returned so tests can inspect
+// the git commands ignition issued.
+func newLingWorktreeCourt(t *testing.T, db *gorm.DB, edictID uint) (*Court, *recordingProvider, *lingMutationRunner) {
+	t.Helper()
+	s, provider := newLingTestCourt(t, db)
+	runner := s.mutationRunner.(*lingMutationRunner)
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(s.projectRoot(), worktree.RelPath(edictID)), 0o755))
+	return s, provider, runner
+}
+
+// TestIgniteLings_EnsuresEdictWorktree verifies the edict worktree is ensured
+// before any ling is dispatched (e923): the worktree directory exists after
+// ignition, and each ling's session is bound to it (WorkingDir = worktree,
+// IsWorktree true) — never the main tree.
+func TestIgniteLings_EnsuresEdictWorktree(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider, _ := newLingWorktreeCourt(t, db, 48)
+
+	ling := storage.Ling{
+		LingID: "ling-wt", EdictID: 48, Username: "testuser", Project: "testproject",
+		Description: "worktree task", Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&ling).Error)
+
+	key := storage.EdictKey{ID: 48, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	wtRoot := filepath.Join(s.projectRoot(), worktree.RelPath(48))
+	_, err := os.Stat(wtRoot)
+	require.NoError(t, err, "the edict worktree must exist after ignition")
+
+	require.Len(t, provider.promptsSnapshot(), 1, "the ling must run")
+	var started storage.JSON
+	var events []storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ?", 48).Find(&events).Error)
+	for _, e := range events {
+		if e.EventType == storage.EventLingStarted {
+			started = e.Payload
+		}
+	}
+	require.NotNil(t, started, "the ling_started event must carry the routing")
+	assert.Equal(t, wtRoot, started["worktree"], "the ling must be routed into the edict worktree")
+	assert.Equal(t, true, started["is_worktree"], "the ling's session must be marked as worktree-bound")
+	assert.Equal(t, s.projectRoot(), s.mutationRunner.(*lingMutationRunner).repoInfoRoot(),
+		"ProjectRoot must stay the main tree")
+}
+
+// repoInfoRoot reports the last ProjectRoot the fake mutation runner was aimed at.
+func (r *lingMutationRunner) repoInfoRoot() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.root
+}
+
+// TestRunLing_UsesEdictWorktree pins runLing's binding contract directly: the
+// ling's session resolves to the edict worktree (WorkingDir + runner) while the
+// shared ToolContext.RepoInfo/registry are left untouched (e923 §2).
+func TestRunLing_UsesEdictWorktree(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _, mut := newLingWorktreeCourt(t, db, 55)
+	s.toolCtxRepoInfo = &repo.RepoInfo{ProjectRoot: "/sentinel"}
+	before := *s.toolCtxRepoInfo
+
+	var ling storage.Ling
+	ling = storage.Ling{
+		LingID: "ling-route", EdictID: 55, Username: "testuser", Project: "testproject",
+		Description: "route me", Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&ling).Error)
+
+	key := storage.EdictKey{ID: 55, Username: "testuser", Project: "testproject"}
+	wtRoot := filepath.Join(s.projectRoot(), worktree.RelPath(55))
+	require.NoError(t, s.runLing(context.Background(), key,
+		dagUnit{ID: "ling-route", Index: 0, Item: "ling-route"}, wtRoot))
+
+	// The shared pointer must not have been re-pointed at the worktree.
+	assert.Equal(t, before, *s.toolCtxRepoInfo, "the shared RepoInfo must stay untouched")
+	assert.Equal(t, "/sentinel", s.toolCtxRepoInfo.ProjectRoot)
+	// The ling's git commands must all have run inside the worktree.
+	for _, c := range mut.snapshot() {
+		if strings.Contains(c, "git -C") {
+			assert.Contains(t, c, wtRoot, "ling commands must execute in the edict worktree")
+		}
+	}
+}
+
+// aborts ignition: no ling runs, a failure event is recorded, and the main tree
+// is never used as a fallback (e923).
+// TestIgniteLings_EnsureFailureAborts verifies that a worktree Ensure failure
+// aborts ignition: no ling runs, a failure event is recorded, and the main tree
+// is never used as a fallback (e923).
+func TestIgniteLings_EnsureFailureAborts(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider := newLingTestCourt(t, db)
+
+	ling := storage.Ling{
+		LingID: "ling-nofail", EdictID: 49, Username: "testuser", Project: "testproject",
+		Description: "should not run", Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&ling).Error)
+
+	// A runner whose git commands fail makes Ensure (git worktree add) fail.
+	s.mutationRunner = &failingLingRunner{}
+
+	key := storage.EdictKey{ID: 49, Username: "testuser", Project: "testproject"}
+	err := s.igniteLings(context.Background(), key)
+	require.Error(t, err, "ignition must fail when the worktree cannot be ensured")
+
+	assert.Empty(t, provider.promptsSnapshot(), "no ling may run when Ensure fails")
+
+	var got storage.Ling
+	require.NoError(t, db.First(&got, "ling_id = ?", "ling-nofail").Error)
+	assert.Equal(t, storage.LingPending, got.Status, "the ling must stay pending for a later retry")
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ?", 49).Find(&events).Error)
+	var failed storage.JSON
+	for _, e := range events {
+		if e.EventType == storage.EventLingFailed {
+			failed = e.Payload
+		}
+	}
+	require.NotNil(t, failed, "the Ensure failure must be visible in the ledger")
+	assert.Equal(t, "worktree_ensure_failed", failed["reason"])
+}
+
+// failingLingRunner fails every command, so worktree.Ensure aborts.
+type failingLingRunner struct{}
+
+func (r *failingLingRunner) Run(context.Context, runners.Input) (runners.Output, error) {
+	return runners.Output{Output: "boom", ExitCode: "1"}, nil
+}
+func (r *failingLingRunner) Restart(context.Context) error        { return nil }
+func (r *failingLingRunner) Close(context.Context) error          { return nil }
+func (r *failingLingRunner) AllowFallback(bool)                   {}
+func (r *failingLingRunner) RunnerType() string                   { return "ling-fail" }
+func (r *failingLingRunner) GetOS() string                        { return runtime.GOOS }
+func (r *failingLingRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (r *failingLingRunner) HealthCheck(context.Context) error    { return nil }
+func (r *failingLingRunner) SetRepoInfo(repo.RepoInfo)            {}
+
+// TestIgniteLings_ParallelNoSharedStateRace verifies that independent lings run
+// concurrently, each in the edict's worktree, without mutating the shared
+// ToolContext.RepoInfo. Run under -race this is the guard for e923 §5.
+func TestIgniteLings_ParallelNoSharedStateRace(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider, _ := newLingWorktreeCourt(t, db, 50)
+
+	// Seed the shared pointer with a sentinel so any mutation is detectable.
+	if s.toolCtxRepoInfo == nil {
+		s.toolCtxRepoInfo = &repo.RepoInfo{ProjectRoot: "/sentinel"}
+	}
+	before := *s.toolCtxRepoInfo
+
+	for _, id := range []string{"ling-p1", "ling-p2", "ling-p3"} {
+		require.NoError(t, db.Create(&storage.Ling{
+			LingID: id, EdictID: 50, Username: "testuser", Project: "testproject",
+			Description: "parallel " + id, Status: storage.LingPending,
+		}).Error)
+	}
+
+	key := storage.EdictKey{ID: 50, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	assert.Len(t, provider.promptsSnapshot(), 3, "all independent lings must run")
+	assert.Equal(t, before, *s.toolCtxRepoInfo, "the shared RepoInfo must never be mutated")
+
+	// Every ling must have been routed into the edict worktree (asserted from
+	// its own ledger event, since concurrent sessions share the minister's map).
+	wtRoot := filepath.Join(s.projectRoot(), worktree.RelPath(50))
+	var started int
+	var events []storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ?", 50).Find(&events).Error)
+	for _, e := range events {
+		if e.EventType != storage.EventLingStarted {
+			continue
+		}
+		started++
+		assert.Equal(t, wtRoot, e.Payload["worktree"], "every ling session must be bound to the edict worktree")
+		assert.Equal(t, true, e.Payload["is_worktree"])
+	}
+	assert.Equal(t, 3, started, "every ling must report its routing")
+}
+
+// TestIgniteLings_CommitsOnSuccess verifies that a completed ling commits its
+// own paths on the edict branch with the ling id in the subject, under the
+// per-edict commit mutex (e923, ruler ruling R4).
+func TestIgniteLings_CommitsOnSuccess(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _, mut := newLingWorktreeCourt(t, db, 51)
+	mut.statusOutputs = []string{"", " M changed.go\n"}
+
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "ling-commit", EdictID: 51, Username: "testuser", Project: "testproject",
+		Description: "commit me", Status: storage.LingPending,
+	}).Error)
+
+	key := storage.EdictKey{ID: 51, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	// The fake git reports a dirty path at completion that was clean at start,
+	// so the ling must stage exactly that path and commit.
+	wtRoot := filepath.Join(s.projectRoot(), worktree.RelPath(51))
+	assert.True(t, mut.ran("git -C "+wtRoot+" add --"),
+		"the ling must stage its own paths: %v", mut.snapshot())
+
+	subjects := mut.subjectsContaining("ling-commit")
+	require.Len(t, subjects, 1, "the ling must produce one commit: %v", mut.snapshot())
+	assert.Contains(t, subjects[0], "ling-commit", "the commit subject must name the ling")
+	assert.Contains(t, subjects[0], "e51", "the commit subject must carry the edict suffix")
+
+	var got storage.Ling
+	require.NoError(t, db.First(&got, "ling_id = ?", "ling-commit").Error)
+	assert.Equal(t, storage.LingDone, got.Status)
+}
+
+// subjectsContaining returns the commit -m arguments of recorded commands that
+// mention fragment.
+func (r *lingMutationRunner) subjectsContaining(fragment string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, c := range r.commands {
+		if strings.Contains(c, " commit -m ") && strings.Contains(c, fragment) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// TestIgniteLings_ParallelCommitsSerialized verifies the per-edict commit mutex
+// keeps two lings' stage/commit windows from interleaving on the shared
+// worktree's .git/index: while one ling holds the commit lock no other ling may
+// enter its stage step (e923 §4).
+func TestIgniteLings_ParallelCommitsSerialized(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _, mut := newLingWorktreeCourt(t, db, 52)
+
+	// Two lings commit concurrently; the fake reports a dirty path for each.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	inStage := false
+	var overlap bool
+	mut.onAdd = func() {
+		mu.Lock()
+		if inStage {
+			overlap = true
+		}
+		inStage = true
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		mu.Lock()
+		inStage = false
+		mu.Unlock()
+	}
+	mut.statusOutputs = []string{" M own.go\n"}
+
+	key := storage.EdictKey{ID: 52, Username: "testuser", Project: "testproject"}
+	wtRoot := filepath.Join(s.projectRoot(), worktree.RelPath(52))
+	for _, id := range []string{"ling-c1", "ling-c2"} {
+		ling := storage.Ling{LingID: id, EdictID: 52, Username: "testuser", Project: "testproject"}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.commitLing(context.Background(), key, ling, wtRoot, nil)
+		}()
+	}
+	wg.Wait()
+
+	assert.False(t, overlap, "two lings must never stage at the same time")
+	assert.Len(t, mut.subjectsContaining("e52"), 2, "both commits must have happened: %v", mut.snapshot())
+}
+
+// TestIgniteLings_BatchSizeBound verifies the configured parallelism bound is
+// honoured: with LingParallelism=1 two independent lings never run at the same
+// time (e923 §3).
+func TestIgniteLings_BatchSizeBound(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, provider, _ := newLingWorktreeCourt(t, db, 53)
+	s.config.LingParallelism = 1
+	assert.Equal(t, 1, s.lingBatchSize())
+
+	for _, id := range []string{"ling-b1", "ling-b2"} {
+		require.NoError(t, db.Create(&storage.Ling{
+			LingID: id, EdictID: 53, Username: "testuser", Project: "testproject",
+			Description: "bounded " + id, Status: storage.LingPending,
+		}).Error)
+	}
+
+	key := storage.EdictKey{ID: 53, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	prompts := provider.promptsSnapshot()
+	require.Len(t, prompts, 2, "both lings must still run")
+	assert.Contains(t, prompts[0], "bounded ling-b1", "with a bound of 1 the lings run one after the other")
+	assert.Contains(t, prompts[1], "bounded ling-b2")
+}
+
+// TestCleanup_CascadesLingWorktrees verifies the seal-time sweep removes a
+// legacy nested per-ling worktree before the edict worktree is removed (a
+// parent with live children cannot be removed reliably) — e923 §4.
+func TestCleanup_CascadesLingWorktrees(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _, mut := newLingWorktreeCourt(t, db, 54)
+
+	parent := filepath.Join(s.projectRoot(), worktree.RelPath(54))
+	child := filepath.Join(parent, "ling-legacy")
+	require.NoError(t, os.MkdirAll(child, 0o755))
+	// A linked worktree is marked by a .git file; a plain directory is not ours.
+	require.NoError(t, os.WriteFile(filepath.Join(child, ".git"), []byte("gitdir: x\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(parent, "later"), 0o755))
+
+	s.sweepLingWorktrees(context.Background(), 54)
+
+	cmds := mut.snapshot()
+	childRemove := -1
+	parentRemove := -1
+	for i, c := range cmds {
+		if strings.Contains(c, "worktree remove") && strings.Contains(c, child) {
+			childRemove = i
+		}
+		if strings.Contains(c, "worktree remove") && strings.Contains(c, parent) && !strings.Contains(c, child) {
+			parentRemove = i
+		}
+	}
+	require.NotEqual(t, -1, childRemove, "the nested ling worktree must be swept: %v", cmds)
+	if parentRemove != -1 {
+		assert.Less(t, childRemove, parentRemove, "the child must be removed before the parent")
+	}
+	assert.True(t, mut.ran("/ling-legacy"), "the nested branch must be deleted too: %v", cmds)
+	assert.False(t, mut.ran("later"), "a plain directory is not a ling worktree and must be left alone: %v", cmds)
+}
+
+// TestIgniteLings_EnsureRunsBeforeDispatch proves the ordering the edict
+// demands on the path TestIgniteLings_EnsuresEdictWorktree skips by
+// pre-creating the directory: when the edict's worktree does not yet exist,
+// ignition must create it (worktree.Ensure shells `git worktree add`) *before*
+// it snapshots that worktree for the first ling (e923 §1).
+func TestIgniteLings_EnsureRunsBeforeDispatch(t *testing.T) {
+	db := setupCourtTestDB(t)
+	// Deliberately no pre-created worktree, unlike newLingWorktreeCourt.
+	s, _ := newLingTestCourt(t, db)
+	mut := s.mutationRunner.(*lingMutationRunner)
+
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "ling-order", EdictID: 56, Username: "testuser", Project: "testproject",
+		Description: "order me", Status: storage.LingPending,
+	}).Error)
+
+	key := storage.EdictKey{ID: 56, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	addIdx := mut.firstIndex("worktree add")
+	require.NotEqual(t, -1, addIdx, "ignition must ensure the worktree: %v", mut.snapshot())
+	snapIdx := mut.firstIndex("status --porcelain")
+	require.NotEqual(t, -1, snapIdx, "the ling must snapshot its worktree: %v", mut.snapshot())
+	assert.Less(t, addIdx, snapIdx, "Ensure must precede the ling's worktree snapshot")
+}
+
+// TestDirtyPaths_ParsesPorcelain pins the path attribution that decides which
+// paths a ling commits (e923 R4): modified, renamed, and quoted porcelain lines
+// must all resolve to the correct path — a mis-parse would let one ling claim
+// another's work, or miss its own.
+func TestDirtyPaths_ParsesPorcelain(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+	mut := s.mutationRunner.(*lingMutationRunner)
+	mut.statusOutputs = []string{" M changed.go\nR  old.go -> new.go\n?? \"sp ace.go\"\n"}
+
+	got := s.dirtyPaths(context.Background(), s.projectRoot())
+	assert.True(t, got["changed.go"], "a modified path must be reported")
+	assert.True(t, got["new.go"], "a rename must attribute the new path")
+	assert.False(t, got["old.go"], "a rename must not attribute the old path")
+	assert.True(t, got["sp ace.go"], "a quoted path must be unquoted")
+}
+
+// TestDirtyPaths_GitFailureYieldsEmptySet pins the documented degradation: a
+// gitless tree or git failure yields an empty set, never a partial one, so path
+// attribution falls back to "commit everything dirty" rather than mis-claiming.
+func TestDirtyPaths_GitFailureYieldsEmptySet(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+	s.mutationRunner = &failingLingRunner{}
+	assert.Empty(t, s.dirtyPaths(context.Background(), "/any"))
+}
+
+// TestCommitLing_NothingNewOfItsOwnCommitsNothing proves the R4 guard that a
+// path already dirty before the ling ran (another concurrent ling, or the
+// forge's uncommitted work) is never claimed: the ling stages and commits
+// nothing.
+func TestCommitLing_NothingNewOfItsOwnCommitsNothing(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+	mut := s.mutationRunner.(*lingMutationRunner)
+	mut.statusOutputs = []string{" M shared.go\n"}
+
+	key := storage.EdictKey{ID: 57, Username: "testuser", Project: "testproject"}
+	ling := storage.Ling{LingID: "ling-clean", EdictID: 57}
+	before := map[string]bool{"shared.go": true}
+
+	require.NoError(t, s.commitLing(context.Background(), key, ling, s.projectRoot(), before))
+	assert.False(t, mut.ran(" add -- "), "a ling with no new paths must not stage: %v", mut.snapshot())
+	assert.False(t, mut.ran(" commit -m "), "a ling with no new paths must not commit")
+}
+
+// TestRunGitSerialized_NonZeroExitIsError pins that a failed git mutation is
+// surfaced, never swallowed — a silent stage/commit failure would mark a ling
+// done with its work uncommitted.
+func TestRunGitSerialized_NonZeroExitIsError(t *testing.T) {
+	err := runGitSerialized(context.Background(), &failingLingRunner{}, "git commit", "commit ling paths")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exit 1")
+}
+
+// TestShortDescription pins the commit-subject normalizer: whitespace collapsed
+// to one line, capped at 60 characters, and never empty (the subject always
+// carries the ling id and edict suffix set by commitLing).
+func TestShortDescription(t *testing.T) {
+	assert.Equal(t, "ling work", shortDescription(""))
+	assert.Equal(t, "a b c", shortDescription("  a   b \n c  "))
+	got := shortDescription(strings.Repeat("x", 80) + " tail")
+	assert.Equal(t, strings.Repeat("x", 60), got)
 }
 
 // TestSetContext_PreservesHasVCSDetection pins edict 888's single-authoritative

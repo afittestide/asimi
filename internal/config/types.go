@@ -153,10 +153,19 @@ type CourtConfig struct {
 	// before it is stopped and removed (default 15m). 0 disables the sweep.
 	RunnerFlatlineTimeout time.Duration `koanf:"runner_flatline_timeout"`
 	// LingIgnitionEnabled gates automatic execution of lings. It defaults to
-	// false (zero value) because concurrent lings share one working tree and
-	// are unsafe until per-ling worktree isolation lands (e531).
+	// false (zero value). Ling ignition itself is safe — lings run in the
+	// edict's worktree (e923) — but flipping the default is a separate ruling.
 	LingIgnitionEnabled bool `koanf:"ling_ignition_enabled"`
+	// LingParallelism bounds how many lings of one edict execute concurrently
+	// during ignition. Lings share the edict's worktree and are only disjoint
+	// if the Ministry of War planned them so, hence a bounded value rather than
+	// unbounded fan-out. 0 falls back to DefaultLingParallelism.
+	LingParallelism int `koanf:"ling_parallelism"`
 }
+
+// DefaultLingParallelism is the fallback concurrent-ling bound when
+// court.ling_parallelism is unset (or non-positive).
+const DefaultLingParallelism = 5
 
 // DefaultOutputLimit is the fallback truncation length for heavy output
 // fields when court.output_limit is unset in summary mode.
