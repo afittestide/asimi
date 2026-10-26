@@ -309,21 +309,26 @@ func TestStartRitualFailureNotifies(t *testing.T) {
 	key := storage.EdictKey{ID: 99, Username: "testuser", Project: "testproject"}
 	rg.startRitual("start-fail-test", key, nil)
 
-	// Wait for the goroutine to complete
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify ritual_failed notification was sent
-	mu.Lock()
-	defer mu.Unlock()
+	// Wait for the goroutine to deliver the ritual_failed notification. Poll
+	// rather than sleep: under -race on a loaded host a fixed sleep is flaky.
 	var failedMsg *RitualStepMsg
-	for i := range notified {
-		if notified[i].Status == "ritual_failed" {
-			failedMsg = &notified[i]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		for i := range notified {
+			if notified[i].Status == "ritual_failed" {
+				failedMsg = &notified[i]
+				break
+			}
+		}
+		mu.Unlock()
+		if failedMsg != nil {
 			break
 		}
-	}
-	if failedMsg == nil {
-		t.Fatalf("expected a ritual_failed notification from startRitual, got: %+v", notified)
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for a ritual_failed notification from startRitual, got: %+v", notified)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if failedMsg.RitualName != "start-fail-test" {
 		t.Errorf("expected RitualName 'start-fail-test', got %q", failedMsg.RitualName)
@@ -1136,12 +1141,19 @@ func TestAbortRitual_CancelsContext(t *testing.T) {
 	key := storage.EdictKey{ID: 88, Username: "testuser", Project: "testproject"}
 	rg.startRitual("abort-cancel-test", key, nil)
 
-	// Wait for the ritual goroutine to acquire the lock and block in the runner.
-	time.Sleep(100 * time.Millisecond)
-
+	// Wait for the ritual goroutine to persist its running row and block in
+	// the runner. Poll rather than sleep: under -race the goroutine start is
+	// slow enough that a fixed sleep is flaky.
 	var exec RitualExecution
-	if err := db.First(&exec, "edict_id = ?", 88).Error; err != nil {
-		t.Fatalf("failed to load running ritual: %v", err)
+	startDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := db.First(&exec, "edict_id = ?", 88).Error; err == nil {
+			break
+		}
+		if time.Now().After(startDeadline) {
+			t.Fatal("timed out waiting for the ritual to start")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if err := rg.abortRitual(context.Background(), &exec, "test abort"); err != nil {
