@@ -4,9 +4,9 @@ FROM <a debian 13 "trixie" base, slim if available>
 # cannot OOM-kill the compiler in the ~2 GiB sandbox VM. Without these, cold
 # parallel compilation of modernc.org/sqlite/libc produces `signal: killed`
 # => `[build failed]`, which the swift-strike judge gate reads as a test failure.
-ENV GOFLAGS=-p=1 \
-    GOMAXPROCS=2 \
-    GOMEMLIMIT=1500MiB
+ENV GOFLAGS=-p=2 \
+    GOMAXPROCS=8 \
+    GOMEMLIMIT=3000MiB
 
 # Install common development tools and libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \

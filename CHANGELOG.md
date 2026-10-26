@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ignore_copy_globs`** — a new `[sandbox]` config option bounding which gitignored files travel from the main tree into a new edict worktree; the worktree is a fresh checkout, so this allowlist (common local-config names by default) carries the local-only files a worktree needs without copying build artifacts (e946)
 - **Width-aware `tian_ledger` table** — the human-facing Heaven ledger now renders as a markdown table (`edict_id`, `event`, `time`, `detail`) whose columns are sized to the chat component, via a generic JSON→markdown-table opt-in any daemon-side tool may emit; the raw event summaries still ride along so the model keeps full fidelity (e939)
 - **Edict details as a markdown block** — the swift-strike `given: "the edict details"` step now prints the edict's full, untruncated Intent as a rendered markdown block instead of the bare step name, so the Ruler can see what a ritual is about (e975)
+- **`~` in mount sources** — a `[[sandbox.additional_mounts]]` `source` may now begin with `~/` (or be exactly `~`) and is expanded to the user's home directory at config load, so consumers only ever see absolute host paths; a leading tilde that cannot be resolved is a hard config error. `destination` is a container path and is deliberately left untouched (e992)
+- **`gh` runs in the sandbox** — the sandbox image now installs the GitHub CLI (fixing the install to run as root and adding `wget`), and `gh` is no longer carved out to the host by default, so GitHub commands execute inside the sandbox; this repo's `.agents/asimi.conf` mounts `~/.config/gh` so auth travels with the worktree (303fb78ad, 0911315a2)
 
 ### Changed
 
@@ -23,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Edict list previews** — the `:edict` selector now strips leading whitespace and `#` from each edict's intent preview, so a `# Goal: …` markdown heading no longer shows its hash (666df1530)
 - **Tab-close messaging** — closing a tab now toasts "Tab closed; `:qa` to close all" instead of the ambiguous bare "Tab closed" (59753408f)
 - **Toolchain security floors** — bumped to Go 1.26.10 and podman v6.1.3 (with a vendor refresh) to remediate the 2026-10-22 govulncheck findings (e986)
+- **Empty `run_on_host` defaults** — the default `run_on_host` and `safe_run_on_host` pattern lists are now empty, so no command is silently diverted to the host by default; projects whose toolchains cannot run in the sandbox opt in explicitly via `[run_shell_command]` (0911315a2)
 
 ### Fixed
 
@@ -35,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Runner restart aborting other sessions** — `PodmanRunner.Restart` now scopes its `ClearSchedulerMsg` abort to the restarted runner's own sessions instead of context-cancelling tool calls belonging to every other session (e957)
 - **`approve_doc` with a nil Notify** — the tool is no longer registered with a zero-value struct and a permanently-nil callback; it uses a lazy `NotifyFn` getter, fixing "approve_doc requires TUI notify to open editor" (e970)
 - **OOM from duplicated git/Go caches** — added a `.dockerignore` and bounded the builder context (pruning before build) so edict worktrees, `vendor/`, `.git/`, and build logs are no longer shipped into the podman VM, fixing "no space left on device" (b1bde5b4c)
+- **`:init` project-slug regression** — `:init` again trusts `repoInfo.Slug` (already resolved through the tracked-remote → origin → basename precedence) and only falls back to the shared resolver when it is empty, restoring the gitless `:init` flow that the e968 resolver change had broken (e996)
+
+### Developer tooling
+
+- **New `just` recipes** — `just fetch-runs` downloads every CI run that failed since the last success (per-run `run.json` metadata plus full per-job logs) into the gitignored `heaven/runs/`, skipping runs already fetched; `just prune-branches` removes edict worktrees and `asimi/*` branches whose work has landed, leaving unlanded work and dirty worktrees alone. Both are additive and never overwrite (f2ca4c6c0, c8d62421c)
+- **`heaven/` evidence archiving** — `just vuln` now writes each govulncheck report to `heaven/security/` and `just test` writes its output to `heaven/tests/` (write-only, timestamped, gitignored), so a release's evidence outlives the terminal (505db5e61)
+- **`gh-issue-sync` skill** — a new minister skill that syncs GitHub issues to local Markdown under `intent/issues/`, for triaging, editing, and creating issues without leaving the editor (dd2b48a56)
+- **三界 cosmology doc** — added `docs/the_three_realms.md` and sharpened the Judge/Chancellor role definitions in the minister config (e971)
 
 ## [0.14.5] - 2026-10-11
 
