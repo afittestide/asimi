@@ -221,6 +221,46 @@ func TestDiscover_SkipsNonDirectoryEntries(t *testing.T) {
 	assert.Empty(t, m)
 }
 
+// TestShippedWriteRitualsSkill guards the acceptance criteria of edict 995: the
+// write-rituals skill must ship in .agents/skills, parse under ParseFrontmatter,
+// and be discoverable by (and only by) the ministers who author rituals. Unlike
+// the fixture-based tests above, this asserts the real artifact — a later edit
+// that breaks its frontmatter or widens its minister scope must fail here.
+func TestShippedWriteRitualsSkill(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	require.NoError(t, err)
+
+	skillPath := filepath.Join(root, ".agents", "skills", "write-rituals", "SKILL.md")
+	data, err := os.ReadFile(skillPath)
+	require.NoError(t, err, "shipped write-rituals SKILL.md must exist")
+
+	info, err := ParseFrontmatter(data)
+	require.NoError(t, err, "shipped write-rituals frontmatter must parse")
+	assert.Equal(t, "write-rituals", info.Name)
+	assert.NotEmpty(t, info.Description, "description must render in the skills index")
+	assert.Equal(t, []string{"secretary", "strategist"}, info.Ministers)
+
+	m := Discover(root)
+	require.NotNil(t, m)
+
+	for _, want := range []string{"secretary", "strategist"} {
+		names := skillNames(m[want])
+		assert.Contains(t, names, "write-rituals", "write-rituals must be discoverable by %s", want)
+	}
+	for _, other := range []string{"forge", "judge", "chancellor"} {
+		names := skillNames(m[other])
+		assert.NotContains(t, names, "write-rituals", "write-rituals must not be discoverable by %s", other)
+	}
+}
+
+func skillNames(skills []SkillInfo) []string {
+	names := make([]string, 0, len(skills))
+	for _, s := range skills {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
 func TestDiscover_SkipsDirWithoutSkillFile(t *testing.T) {
 	dir := setupTestSkillsDir(t)
 	// Create a directory but no SKILL.md inside it
