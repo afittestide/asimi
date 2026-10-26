@@ -674,6 +674,48 @@ func TestLoadProjectConfig_NoEnvVarResolution(t *testing.T) {
 	assert.Empty(t, cfg.LLM.Provider)
 }
 
+func TestDefaultConfContent_SurfacesCacheVolumes(t *testing.T) {
+	content := DefaultConfContent()
+	// A config field with no template entry is a bad-boy-scout violation
+	// (the e966 prior-rejection finding): the cache_volumes block must be
+	// present in the embedded template.
+	if !strings.Contains(content, "cache_volumes") {
+		t.Error("default.conf must surface cache_volumes")
+	}
+	if !strings.Contains(content, "#destination = \"/go/pkg/mod\"") {
+		t.Error("default.conf must show the module-cache destination example")
+	}
+}
+
+func TestLoadProjectConfig_CacheVolumesDefault(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	cfg, err := LoadProjectConfig(t.TempDir(), false)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultCacheVolumes(), cfg.Sandbox.CacheVolumes)
+}
+
+func TestLoadProjectConfig_CacheVolumesOverride(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := "[[sandbox.cache_volumes]]\nsource = \"asimi-gomodcache-<slug>\"\ndestination = \"/go/pkg/mod\"\n"
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.Len(t, cfg.Sandbox.CacheVolumes, 1)
+	assert.Equal(t, "/go/pkg/mod", cfg.Sandbox.CacheVolumes[0].Destination)
+}
+
 func TestLoadProjectConfig_SandboxFromProjectConfig(t *testing.T) {
 	tempHome := t.TempDir()
 	originalHome := os.Getenv("HOME")

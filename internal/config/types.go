@@ -122,6 +122,16 @@ type SandboxConfig struct {
 	PassthroughEnv []string `koanf:"passthrough_env"`
 	// PlatformOverlays are project-relative paths to isolate per-platform using named volumes
 	PlatformOverlays []string `koanf:"platform_overlays"`
+	// CacheVolumes are absolute in-container cache paths persisted in named
+	// volumes keyed by project, so a recreated sandbox starts warm instead of
+	// recompiling/re-downloading the world. The Mount overload is deliberate:
+	// unlike AdditionalMounts (host path -> container path), Source here is a
+	// volume-name pattern and Destination an absolute container path, and
+	// Source is never stat()ed on the host. The runner expands "<slug>" in
+	// Source to SanitizeSegment(repoInfo.Slug) at container-create time, so all
+	// edicts of one project share a cache while different projects stay
+	// separate — keyed by project, not by worktree path.
+	CacheVolumes []Mount `koanf:"cache_volumes"`
 	// IgnoreCopyGlobs is the allowlist of gitignore-style globs whose
 	// gitignored files travel from the main tree into a new edict worktree.
 	// A worktree is a fresh checkout, so local-only files are absent there;
@@ -139,6 +149,20 @@ type SandboxConfig struct {
 // secret-bearing).
 func DefaultIgnoreCopyGlobs() []string {
 	return []string{".env", ".envrc", "*.local"}
+}
+
+// DefaultCacheVolumes is the built-in cache_volumes set: Go's real module
+// cache path persisted in a project-keyed named volume. GOCACHE is
+// deliberately absent — edict 946 already pins GOCACHE to
+// <projectRoot>/.gocache, a bind-mounted directory keyed by project and
+// shared across every worktree, so registering it here too would mount a
+// named volume over the same path and fight that pin (recreating the
+// per-worktree cache fracture ruling 3 retired). The "<slug>" placeholder is
+// expanded by the runner at container-create time (see SandboxConfig).
+func DefaultCacheVolumes() []Mount {
+	return []Mount{
+		{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"},
+	}
 }
 
 // CourtConfig holds configuration for the Court.

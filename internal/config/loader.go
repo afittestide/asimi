@@ -91,6 +91,7 @@ func DefaultConfig() Config {
 			SafeRunOnHost:   []string{`^gh\s+(issue|pr)\s+(view|list)`},
 			ApprovalTimeout: 120 * time.Second,
 			IgnoreCopyGlobs: DefaultIgnoreCopyGlobs(),
+			CacheVolumes:    DefaultCacheVolumes(),
 		},
 	}
 }

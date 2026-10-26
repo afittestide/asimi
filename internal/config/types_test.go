@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDefaultIgnoreCopyGlobs_IsSafeAllowlist(t *testing.T) {
 	globs := DefaultIgnoreCopyGlobs()
@@ -40,6 +43,36 @@ func TestDefaultConfig_IgnoreCopyGlobsIsSafeSet(t *testing.T) {
 		case ".gocache", "asimi", "jobs", "jobs/", "*.log":
 			t.Errorf("DefaultConfig IgnoreCopyGlobs must not include %q", g)
 		}
+	}
+}
+
+func TestDefaultCacheVolumes_ModuleCacheOnly(t *testing.T) {
+	vols := DefaultCacheVolumes()
+	if len(vols) != 1 {
+		t.Fatalf("DefaultCacheVolumes must be exactly one entry, got %d", len(vols))
+	}
+	got := vols[0]
+	if got.Source != "asimi-gomodcache-<slug>" {
+		t.Errorf("source = %q, want %q", got.Source, "asimi-gomodcache-<slug>")
+	}
+	if got.Destination != "/go/pkg/mod" {
+		t.Errorf("destination = %q, want %q", got.Destination, "/go/pkg/mod")
+	}
+	// The destination must be absolute (not project-relative like overlays).
+	if !strings.HasPrefix(got.Destination, "/") {
+		t.Errorf("destination %q must be absolute", got.Destination)
+	}
+	// GOCACHE is pinned by e946 to <projectRoot>/.gocache; a cache volume over
+	// the same path would fight that pin, so it must not be registered.
+	if strings.Contains(got.Source, "gocache") && !strings.Contains(got.Source, "gomodcache") {
+		t.Errorf("DefaultCacheVolumes must not register a GOCACHE volume: %q", got.Source)
+	}
+}
+
+func TestDefaultConfig_CacheVolumesIsLive(t *testing.T) {
+	cfg := DefaultConfig()
+	if len(cfg.Sandbox.CacheVolumes) == 0 {
+		t.Fatal("DefaultConfig must set Sandbox.CacheVolumes (field must be live)")
 	}
 }
 

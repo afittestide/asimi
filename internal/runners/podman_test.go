@@ -1116,3 +1116,45 @@ func TestPodmanRunnerProjectCacheRootStaysOnMainRoot(t *testing.T) {
 	assert.NotEqual(t, runner.projectWorkingRoot(), runner.projectCacheRoot(),
 		"worktree working root and shared cache root must differ")
 }
+
+// TestCacheVolumeSurvivesContainerRemoval is the load-bearing proof for edict
+// 977: a cache_volumes entry mounts a *named* volume, and the containers.Remove
+// calls that pass Volumes:true (Close, healthcheck recovery, stale cleanup) must
+// reap only anonymous volumes. Create a cache entry, remove the container, then
+// recreate and confirm the module cache is still there — do not assume.
+func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
+	if os.Getenv("container") != "" {
+		t.Skip("Skipping Podman test when running inside a container")
+	}
+	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
+		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test")
+	}
+
+	slug := "test/project"
+	volumeName := "asimi-gomodcache-" + repo.SanitizeSegment(slug)
+	removeVolume := func() { _ = exec.Command("podman", "volume", "rm", "-f", volumeName).Run() }
+	removeVolume()
+	t.Cleanup(removeVolume)
+
+	repoInfo := repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: slug}
+	cfg := &Config{
+		CacheVolumes: []Mount{{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"}},
+	}
+
+	runner1 := NewPodmanRunner(cfg, repoInfo, "9001", nil)
+	_, err := runner1.Run(context.Background(), Input{Command: "touch /go/pkg/mod/e977-survives"})
+	require.NoError(t, err)
+	require.NoError(t, runner1.Close(context.Background()))
+
+	// The named volume must outlive the container that wrote to it.
+	if err := exec.Command("podman", "volume", "inspect", volumeName).Run(); err != nil {
+		t.Fatalf("named volume %s was reaped with its container: %v", volumeName, err)
+	}
+
+	runner2 := NewPodmanRunner(cfg, repoInfo, "9001", nil)
+	defer runner2.Close(context.Background())
+	out, err := runner2.Run(context.Background(), Input{Command: "test -f /go/pkg/mod/e977-survives && echo warm"})
+	require.NoError(t, err)
+	assert.Contains(t, out.Output, "warm",
+		"a recreated container must see the shared module cache before downloading anything")
+}

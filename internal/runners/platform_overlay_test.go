@@ -136,6 +136,41 @@ func TestOverlayNamedVolumes(t *testing.T) {
 	assert.Equal(t, overlayFilePath, mounts[1].Source, "file overlay mount source must be the overlay file path")
 }
 
+func TestCacheVolumesEmptyEmitsNoNamedVolume(t *testing.T) {
+	assert.Empty(t, namedCacheVolumes(nil, "owner/repo"),
+		"nil CacheVolumes must emit no named volumes")
+	assert.Empty(t, namedCacheVolumes([]Mount{}, "owner/repo"),
+		"empty CacheVolumes must emit no named volumes")
+}
+
+// Cache volumes are named volumes with absolute destinations, keyed by the
+// sanitized project slug (so all worktrees/edicts of one project share a cache
+// and the name is stable across worktrees).
+func TestCacheVolumesAbsoluteDestKeyedBySlug(t *testing.T) {
+	cacheVolumes := []Mount{
+		{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"},
+	}
+
+	namedVolumes := namedCacheVolumes(cacheVolumes, "Owner/Repo")
+
+	assert.Len(t, namedVolumes, 1, "one cache volume per entry")
+	assert.Equal(t, "/go/pkg/mod", namedVolumes[0].Dest, "destination must be absolute")
+	assert.True(t, strings.HasPrefix(namedVolumes[0].Dest, "/"), "destination must be absolute")
+	// Raw "Owner/Repo" carries "/" and uppercase; sanitize lowercases and
+	// hyphenates so the volume name is legal and stable.
+	assert.Equal(t, "asimi-gomodcache-owner-repo", namedVolumes[0].Name,
+		"volume name must be keyed by the sanitized project slug")
+
+	// Same project, different worktree path → same volume name (stability).
+	assert.Equal(t, cacheVolumeName("asimi-gomodcache-<slug>", "owner/repo"),
+		cacheVolumeName("asimi-gomodcache-<slug>", "owner/repo"),
+		"volume name must be stable for the same project")
+	// Different project → different volume name (isolation).
+	assert.NotEqual(t, cacheVolumeName("asimi-gomodcache-<slug>", "owner/repo"),
+		cacheVolumeName("asimi-gomodcache-<slug>", "owner/other"),
+		"different projects must not share a cache volume")
+}
+
 func TestDirectoryOverlayUsesNamedVolume(t *testing.T) {
 	// Create a temp project root with a directory overlay
 	tmpDir := t.TempDir()
