@@ -298,6 +298,42 @@ func (r *PodmanRunner) projectCacheRoot() string {
 	return r.repoInfo.ProjectRoot
 }
 
+// repoSlug returns the project slug (e.g. "owner/repo") without holding the
+// lock for callers that only need a snapshot.
+func (r *PodmanRunner) repoSlug() string {
+	r.repoMu.RLock()
+	defer r.repoMu.RUnlock()
+	return r.repoInfo.Slug
+}
+
+// cacheVolumeName expands a cache_volumes source pattern into a concrete
+// volume name. The "<slug>" placeholder becomes the sanitized project slug —
+// the same sanitize path the container name uses, and necessary because a raw
+// "owner/repo" slug contains "/" which is illegal in a volume name. Keying by
+// slug (not by path) is what makes the cache shared across edicts and
+// worktrees of one project while different projects stay separate.
+func cacheVolumeName(source, slug string) string {
+	return strings.ReplaceAll(source, "<slug>", repo.SanitizeSegment(slug))
+}
+
+// namedCacheVolumes builds the named volumes for a set of cache_volumes
+// entries. Destinations are absolute in-container paths: no host stat and no
+// worktree-relative resolution happens, unlike PlatformOverlays. Nil entries
+// yield nil, so an empty CacheVolumes is a strict no-op.
+func namedCacheVolumes(cacheVolumes []Mount, slug string) []*specgen.NamedVolume {
+	if len(cacheVolumes) == 0 {
+		return nil
+	}
+	volumes := make([]*specgen.NamedVolume, 0, len(cacheVolumes))
+	for _, cv := range cacheVolumes {
+		volumes = append(volumes, &specgen.NamedVolume{
+			Name: cacheVolumeName(cv.Source, slug),
+			Dest: cv.Destination,
+		})
+	}
+	return volumes
+}
+
 // healthcheck runs a simple exec command to verify the container is responsive.
 func (r *PodmanRunner) healthcheck(ctx context.Context) error {
 	r.mu.Lock()
@@ -474,6 +510,16 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 				Destination: overlayDest,
 			})
 		}
+	}
+
+	// Cache volumes: absolute-destination named volumes, no host stat and no
+	// worktree-relative resolution. The name is keyed by project slug (not by
+	// path), so all edicts of a project share one cache and it survives
+	// container removal — Remove passes Volumes:true, which reaps only
+	// anonymous volumes.
+	for _, v := range namedCacheVolumes(r.config.CacheVolumes, r.repoSlug()) {
+		slog.Debug("adding cache volume", "volume", v.Name, "destination", v.Dest)
+		s.Volumes = append(s.Volumes, v)
 	}
 
 	s.Mounts = mounts

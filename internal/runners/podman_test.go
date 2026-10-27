@@ -3,11 +3,13 @@ package runners
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -483,6 +485,8 @@ type mockPodmanServer struct {
 	containerCreated    bool
 	removeCount         int
 	execCount           int
+	lastCreateBody      []byte
+	lastRemoveQuery     string
 	mu                  sync.Mutex
 }
 
@@ -526,8 +530,10 @@ func newMockPodmanServer(inspectResp string, inspectCode int) *mockPodmanServer 
 
 		// /containers/create
 		if parts[4] == "create" {
+			body, _ := io.ReadAll(r.Body)
 			m.mu.Lock()
 			m.createCount++
+			m.lastCreateBody = body
 			if m.containerCreated || m.createConflictCount > 0 {
 				if m.createConflictCount > 0 {
 					m.createConflictCount--
@@ -552,6 +558,7 @@ func newMockPodmanServer(inspectResp string, inspectCode int) *mockPodmanServer 
 		if len(parts) == 5 && r.Method == http.MethodDelete {
 			m.mu.Lock()
 			m.removeCount++
+			m.lastRemoveQuery = r.URL.RawQuery
 			m.containerCreated = false
 			m.inspectResp = ""
 			m.inspectCode = http.StatusNotFound
@@ -1115,4 +1122,166 @@ func TestPodmanRunnerProjectCacheRootStaysOnMainRoot(t *testing.T) {
 		"GOCACHE anchor must stay the main root even inside a worktree")
 	assert.NotEqual(t, runner.projectWorkingRoot(), runner.projectCacheRoot(),
 		"worktree working root and shared cache root must differ")
+}
+
+// TestCacheVolumeSurvivesContainerRemoval is the load-bearing proof for edict
+// 977: a cache_volumes entry mounts a *named* volume, and the containers.Remove
+// calls that pass Volumes:true (Close, healthcheck recovery, stale cleanup) must
+// reap only anonymous volumes. Create a cache entry, remove the container, then
+// recreate and confirm the module cache is still there — do not assume.
+func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
+	if os.Getenv("container") != "" {
+		t.Skip("Skipping Podman test when running inside a container")
+	}
+	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
+		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test")
+	}
+
+	slug := "test/project"
+	volumeName := "asimi-gomodcache-" + repo.SanitizeSegment(slug)
+	removeVolume := func() { _ = exec.Command("podman", "volume", "rm", "-f", volumeName).Run() }
+	removeVolume()
+	t.Cleanup(removeVolume)
+
+	repoInfo := repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: slug}
+	makeSandboxFiles(t, repoInfo.ProjectRoot)
+	cfg := &Config{
+		CacheVolumes: []Mount{{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"}},
+	}
+
+	runner1 := NewPodmanRunner(cfg, repoInfo, "9001", nil)
+	_, err := runner1.Run(context.Background(), Input{Command: "touch /go/pkg/mod/e977-survives"})
+	require.NoError(t, err)
+	require.NoError(t, runner1.Close(context.Background()))
+
+	// The named volume must outlive the container that wrote to it.
+	if err := exec.Command("podman", "volume", "inspect", volumeName).Run(); err != nil {
+		t.Fatalf("named volume %s was reaped with its container: %v", volumeName, err)
+	}
+
+	runner2 := NewPodmanRunner(cfg, repoInfo, "9001", nil)
+	defer runner2.Close(context.Background())
+	out, err := runner2.Run(context.Background(), Input{Command: "test -f /go/pkg/mod/e977-survives && echo warm"})
+	require.NoError(t, err)
+	assert.Contains(t, out.Output, "warm",
+		"a recreated container must see the shared module cache before downloading anything")
+}
+
+// TestCreateContainerEmitsCacheVolumeInSpec proves the consumer wiring for edict
+// 977: createContainer must put the cache entry on the create spec's Volumes
+// (not just that namedCacheVolumes builds it). The mock server records the
+// /containers/create body so the emitted named volume is inspected directly.
+func TestCreateContainerEmitsCacheVolumeInSpec(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	cfg := &Config{
+		CacheVolumes: []Mount{{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"}},
+	}
+	runner := NewPodmanRunner(cfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body, "createContainer must have posted a spec to /containers/create")
+
+	var spec struct {
+		Volumes []struct {
+			Name string `json:"Name"`
+			Dest string `json:"Dest"`
+		} `json:"volumes"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec), "create body must be a specgen JSON spec")
+
+	var found bool
+	for _, v := range spec.Volumes {
+		if v.Dest == "/go/pkg/mod" {
+			found = true
+			assert.Equal(t, "asimi-gomodcache-owner-repo", v.Name,
+				"cache volume name must be keyed by the sanitized project slug")
+		}
+	}
+	assert.True(t, found, "create spec must carry the cache volume at /go/pkg/mod: %s", body)
+}
+
+// TestCreateContainerNoCacheVolumesEmitsNone is the non-regression guard: with an
+// empty CacheVolumes, createContainer must not add any named volume (no
+// behavioural change from before edict 977).
+func TestCreateContainerNoCacheVolumesEmitsNone(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body)
+
+	var spec struct {
+		Volumes []struct {
+			Dest string `json:"Dest"`
+		} `json:"volumes"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec))
+	assert.Empty(t, spec.Volumes, "empty CacheVolumes must emit no named volumes")
+}
+
+// TestCloseRemovesContainerWithVolumesFlag is the deterministic (CI-runnable)
+// half of edict 977's load-bearing survival claim. Podman reaps anonymous
+// volumes with their container but leaves *named* volumes unless the remove
+// request carries volumes=true; so the cache survives Close only because Close
+// passes Volumes:true. TestCacheVolumeSurvivesContainerRemoval proves the
+// survival end to end but self-skips without a real podman lane, leaving the
+// contract unguarded in CI. This test inspects the DELETE /containers/{name}
+// query — the same seam the mock already observes for create — so a regression
+// that flips Volumes off is caught without podman. It also asserts force=true,
+// which the stale-cleanup and reap paths rely on.
+func TestCloseRemovesContainerWithVolumesFlag(t *testing.T) {
+	mock := newMockPodmanServer(mockInspectJSON(true), http.StatusOK)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/close-volumes"}, "0", nil)
+	runner.conn = connCtx
+	runner.containerStarted = true
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.Close(context.Background()))
+
+	mock.mu.Lock()
+	removeCount := mock.removeCount
+	query := mock.lastRemoveQuery
+	mock.mu.Unlock()
+
+	require.Equal(t, 1, removeCount, "Close must remove the container once")
+	require.NotEmpty(t, query, "Close must have issued a removal request the mock could observe")
+
+	params, err := url.ParseQuery(query)
+	require.NoError(t, err)
+	assert.Equal(t, "true", params.Get("volumes"),
+		"Close must pass volumes=true; otherwise podman reaps the project-keyed cache volume and the warm start is lost")
+	assert.Equal(t, "true", params.Get("force"), "Close must force-remove")
 }

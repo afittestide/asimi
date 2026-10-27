@@ -91,6 +91,7 @@ func DefaultConfig() Config {
 			SafeRunOnHost:   []string{},
 			ApprovalTimeout: 120 * time.Second,
 			IgnoreCopyGlobs: DefaultIgnoreCopyGlobs(),
+			CacheVolumes:    DefaultCacheVolumes(),
 		},
 	}
 }
