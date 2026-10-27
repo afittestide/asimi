@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -485,6 +486,7 @@ type mockPodmanServer struct {
 	removeCount         int
 	execCount           int
 	lastCreateBody      []byte
+	lastRemoveQuery     string
 	mu                  sync.Mutex
 }
 
@@ -556,6 +558,7 @@ func newMockPodmanServer(inspectResp string, inspectCode int) *mockPodmanServer 
 		if len(parts) == 5 && r.Method == http.MethodDelete {
 			m.mu.Lock()
 			m.removeCount++
+			m.lastRemoveQuery = r.URL.RawQuery
 			m.containerCreated = false
 			m.inspectResp = ""
 			m.inspectCode = http.StatusNotFound
@@ -1240,4 +1243,45 @@ func TestCreateContainerNoCacheVolumesEmitsNone(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(body, &spec))
 	assert.Empty(t, spec.Volumes, "empty CacheVolumes must emit no named volumes")
+}
+
+// TestCloseRemovesContainerWithVolumesFlag is the deterministic (CI-runnable)
+// half of edict 977's load-bearing survival claim. Podman reaps anonymous
+// volumes with their container but leaves *named* volumes unless the remove
+// request carries volumes=true; so the cache survives Close only because Close
+// passes Volumes:true. TestCacheVolumeSurvivesContainerRemoval proves the
+// survival end to end but self-skips without a real podman lane, leaving the
+// contract unguarded in CI. This test inspects the DELETE /containers/{name}
+// query — the same seam the mock already observes for create — so a regression
+// that flips Volumes off is caught without podman. It also asserts force=true,
+// which the stale-cleanup and reap paths rely on.
+func TestCloseRemovesContainerWithVolumesFlag(t *testing.T) {
+	mock := newMockPodmanServer(mockInspectJSON(true), http.StatusOK)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/close-volumes"}, "0", nil)
+	runner.conn = connCtx
+	runner.containerStarted = true
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.Close(context.Background()))
+
+	mock.mu.Lock()
+	removeCount := mock.removeCount
+	query := mock.lastRemoveQuery
+	mock.mu.Unlock()
+
+	require.Equal(t, 1, removeCount, "Close must remove the container once")
+	require.NotEmpty(t, query, "Close must have issued a removal request the mock could observe")
+
+	params, err := url.ParseQuery(query)
+	require.NoError(t, err)
+	assert.Equal(t, "true", params.Get("volumes"),
+		"Close must pass volumes=true; otherwise podman reaps the project-keyed cache volume and the warm start is lost")
+	assert.Equal(t, "true", params.Get("force"), "Close must force-remove")
 }
