@@ -141,6 +141,15 @@ run:
 # run appends a new file, none is overwritten, and heaven/ is gitignored. The
 # `set -o pipefail` is load-bearing: without it the `tee` exit status would
 # mask a failing `go test` and the gate would never fail.
+#
+# Two test modes, separated by the CI env var (the only such flag):
+#   - Dev station: set CI=1 to enable the podman integration tests. Requires
+#     podman plus network access to pull the integration image
+#     docker.io/library/golang:1.26.10-bookworm (no sandbox build or tagging).
+#   - CI: the same mode on a Linux runner with podman installed; CI is set by
+#     the runner, so the integration tests run. In the sandbox and CI the
+#     runner is Linux (native podman, /tmp shared); on macOS podman runs in a
+#     VM that does not share /tmp.
 test:
     #!/usr/bin/env bash
     set -euo pipefail

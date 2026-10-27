@@ -7,7 +7,7 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y libgpgme-dev btrfs-progs libbtrfs-dev just
+        sudo apt-get install -y libgpgme-dev btrfs-progs libbtrfs-dev just podman
     - name: Install Go tools
       shell: bash
       run: just bootstrap

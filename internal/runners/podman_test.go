@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -197,16 +198,18 @@ func TestPodmanRunnerIntegration(t *testing.T) {
 		t.Skip("Skipping Podman test when running inside a container")
 	}
 
-	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
-		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test (requires podman and sandbox image)")
+	if os.Getenv("CI") == "" {
+		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
 	}
 
 	repoInfo := repo.RepoInfo{
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: sandboxProjectRoot(t),
 		Slug:        "test/project",
 	}
+	makeSandboxFiles(t, repoInfo.ProjectRoot)
 
 	config := &Config{
+		ImageName:         integrationImage,
 		AllowHostFallback: false,
 	}
 
@@ -244,16 +247,18 @@ func TestPodmanRunnerContainerLaunchMessage(t *testing.T) {
 		t.Skip("Skipping Podman test when running inside a container")
 	}
 
-	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
-		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test")
+	if os.Getenv("CI") == "" {
+		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
 	}
 
 	repoInfo := repo.RepoInfo{
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: sandboxProjectRoot(t),
 		Slug:        "test/project",
 	}
+	makeSandboxFiles(t, repoInfo.ProjectRoot)
 
 	config := &Config{
+		ImageName:         integrationImage,
 		AllowHostFallback: false,
 	}
 
@@ -283,16 +288,18 @@ func TestPodmanRunnerHealthcheckPass(t *testing.T) {
 		t.Skip("Skipping Podman test when running inside a container")
 	}
 
-	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
-		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test")
+	if os.Getenv("CI") == "" {
+		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
 	}
 
 	repoInfo := repo.RepoInfo{
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: sandboxProjectRoot(t),
 		Slug:        "test/hc-pass",
 	}
+	makeSandboxFiles(t, repoInfo.ProjectRoot)
 
 	config := &Config{
+		ImageName:         integrationImage,
 		AllowHostFallback: false,
 	}
 
@@ -330,16 +337,18 @@ func TestPodmanRunnerHealthcheckRecovery(t *testing.T) {
 		t.Skip("Skipping Podman test when running inside a container")
 	}
 
-	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
-		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test")
+	if os.Getenv("CI") == "" {
+		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
 	}
 
 	repoInfo := repo.RepoInfo{
-		ProjectRoot: t.TempDir(),
+		ProjectRoot: sandboxProjectRoot(t),
 		Slug:        "test/hc-recover",
 	}
+	makeSandboxFiles(t, repoInfo.ProjectRoot)
 
 	config := &Config{
+		ImageName:         integrationImage,
 		AllowHostFallback: false,
 	}
 
@@ -696,6 +705,34 @@ func makeConnCtx(t *testing.T, host string) context.Context {
 	connCtx, err := bindings.NewConnection(context.Background(), uri)
 	require.NoError(t, err, "failed to connect to mock podman server")
 	return connCtx
+}
+
+// integrationImage is a minimal public image the runner only passes to podman.
+// It needs bash + coreutils, which this has — so integration tests need no
+// sandbox build or tagging.
+const integrationImage = "docker.io/library/golang:1.26.10-bookworm"
+
+// sandboxProjectRoot returns a temp dir the podman VM can bind-mount. On
+// macOS the machine shares /Users, /private and /var/folders but NOT /tmp,
+// and os.TempDir() is /tmp when TMPDIR is unset — so a bare t.TempDir()
+// fails at container create with "statfs …: no such file or directory".
+func sandboxProjectRoot(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		dir := os.TempDir()
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			dir = resolved // /tmp is a symlink to /private/tmp
+		}
+		for _, base := range []string{"/Users", "/private", "/var/folders"} {
+			if strings.HasPrefix(dir, base) {
+				root, err := os.MkdirTemp(dir, "asimi-sandbox-test-")
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = os.RemoveAll(root) })
+				return root
+			}
+		}
+	}
+	return t.TempDir()
 }
 
 // makeSandboxFiles creates the .agents/sandbox directory structure required by
@@ -1133,8 +1170,8 @@ func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
 	if os.Getenv("container") != "" {
 		t.Skip("Skipping Podman test when running inside a container")
 	}
-	if os.Getenv("ASIMI_TEST_PODMAN") == "" {
-		t.Skip("Skipping Podman integration test. Set ASIMI_TEST_PODMAN=1 to run this test")
+	if os.Getenv("CI") == "" {
+		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
 	}
 
 	slug := "test/project"
@@ -1143,9 +1180,10 @@ func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
 	removeVolume()
 	t.Cleanup(removeVolume)
 
-	repoInfo := repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: slug}
+	repoInfo := repo.RepoInfo{ProjectRoot: sandboxProjectRoot(t), Slug: slug}
 	makeSandboxFiles(t, repoInfo.ProjectRoot)
 	cfg := &Config{
+		ImageName:    integrationImage,
 		CacheVolumes: []Mount{{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"}},
 	}
 
