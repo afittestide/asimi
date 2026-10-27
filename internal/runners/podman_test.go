@@ -1141,6 +1141,7 @@ func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
 	t.Cleanup(removeVolume)
 
 	repoInfo := repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: slug}
+	makeSandboxFiles(t, repoInfo.ProjectRoot)
 	cfg := &Config{
 		CacheVolumes: []Mount{{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"}},
 	}
