@@ -126,6 +126,18 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// writeLooseObject overwrites a git loose object. git publishes loose objects
+// read-only (0444), so a plain os.WriteFile on an existing object fails with
+// "permission denied" (O_TRUNC cannot open a read-only file for writing).
+// Removing first is what makes the write an overwrite.
+func writeLooseObject(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove loose object %s: %v", path, err)
+	}
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+}
+
 func TestSetContext_InvalidProjectRoot(t *testing.T) {
 	db := setupCourtTestDB(t)
 	cfg := config.DefaultCourtConfig()
@@ -4392,12 +4404,12 @@ func TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject(t *testing.T
 	}
 	objPath := filepath.Join(objDir, treeSHA[:2], treeSHA[2:])
 	require.NoError(t, os.MkdirAll(filepath.Dir(objPath), 0o755))
-	require.NoError(t, os.WriteFile(objPath, good, 0o644))
-	require.NoError(t, os.WriteFile(objPath, []byte("garbage"), 0o644))
+	writeLooseObject(t, objPath, good)
+	writeLooseObject(t, objPath, []byte("garbage"))
 
 	mutation := &healingRunner{
 		Runner: runners.NewHostRunner(0, root),
-		heal:   func() { require.NoError(t, os.WriteFile(objPath, good, 0o644)) },
+		heal:   func() { writeLooseObject(t, objPath, good) },
 	}
 	s := &Court{
 		logger:         slog.Default(),
