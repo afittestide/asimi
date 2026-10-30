@@ -203,7 +203,7 @@ func (s *Session) requestContext() ProviderRequestContext {
 // method/path, HTTP status when present) to a provider failure.
 // Never includes credentials or request payloads.
 func (s *Session) wrapBifrostError(be *schemas.BifrostError) error {
-	return s.requestContext().Wrap("POST", bifrostStatusCode(be), bifrostErrorToGoError(be))
+	return s.requestContext().WrapBifrost("POST", be)
 }
 
 func bifrostStatusCode(be *schemas.BifrostError) *int {
@@ -1886,16 +1886,7 @@ func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*resp
 				}
 			}
 			if chunk.BifrostError != nil {
-				var errMsg string
-				if chunk.BifrostError.Error != nil && chunk.BifrostError.Error.Error != nil {
-					errMsg = chunk.BifrostError.Error.Error.Error()
-				} else if chunk.BifrostError.Error != nil {
-					errMsg = chunk.BifrostError.Error.Message
-				} else {
-					errMsg = "unknown streaming error"
-				}
-				return nil, s.requestContext().Wrap("POST", chunk.BifrostError.StatusCode,
-					fmt.Errorf("%s", errMsg))
+				return nil, s.wrapBifrostError(chunk.BifrostError)
 			}
 			if chunk.BifrostChatResponse == nil || len(chunk.BifrostChatResponse.Choices) == 0 {
 				// Check for usage on chunks without choices (some providers send usage separately)

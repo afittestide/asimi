@@ -1,6 +1,7 @@
 package court
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -56,6 +57,40 @@ func (c ProviderRequestContext) Wrap(method string, status *int, cause error) er
 	return fmt.Errorf("provider API error (%s @ %s, %s %s%s): %s",
 		provider, host, method, ChatPathFragment, statusFragment,
 		RedactProviderErrorMessage(cause.Error()))
+}
+
+// credentialExhaustionType is bifrost's synthetic error type, emitted when
+// every configured key returned a permanent per-key failure (401/402/403).
+const credentialExhaustionType = "upstream_credentials_exhausted"
+
+// WrapBifrost renders a bifrost failure with its request context. When
+// bifrost collapsed per-key 401/402/403 failures into its synthetic 502
+// (upstream_credentials_exhausted), a hint is appended because gateways also
+// return 403 for model-access denials: the configured model may be the
+// rejected party, not the key.
+func (c ProviderRequestContext) WrapBifrost(method string, be *schemas.BifrostError) error {
+	cause := bifrostErrorToGoError(be)
+	if cause == nil {
+		cause = errors.New("bifrost returned no error detail")
+	}
+	err := c.Wrap(method, bifrostStatusCode(be), cause)
+	if !isCredentialExhaustion(be) {
+		return err
+	}
+	return fmt.Errorf("%w — if the API key is valid, check that the configured model is available to it; some gateways reject unknown models with 403", err)
+}
+
+// isCredentialExhaustion reports whether bifrost replaced the provider's
+// per-key 401/402/403 failures with its synthetic upstream_credentials_exhausted
+// error. Bifrost populates both the top-level and ErrorField type; check both.
+func isCredentialExhaustion(be *schemas.BifrostError) bool {
+	if be == nil {
+		return false
+	}
+	if be.Type != nil && *be.Type == credentialExhaustionType {
+		return true
+	}
+	return be.Error != nil && be.Error.Type != nil && *be.Error.Type == credentialExhaustionType
 }
 
 // errSecretPatterns match the shapes credentials take when a provider (or a

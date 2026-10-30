@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -115,6 +116,94 @@ func TestProviderRequestContext_Wrap_NeverLeaksSecrets(t *testing.T) {
 	msg := err.Error()
 	require.NotContains(t, msg, "sk-real-secret-key-0001")
 	require.Contains(t, msg, "status 401")
+}
+
+// TestProviderRequestContext_WrapBifrost_CredentialExhaustionAddsModelHint
+// covers bifrost's synthetic 502: when every key is collapsed into
+// upstream_credentials_exhausted, the message must keep the model name on the
+// suspect list, since gateways also 403 on model-access denials.
+func TestProviderRequestContext_WrapBifrost_CredentialExhaustionAddsModelHint(t *testing.T) {
+	ctx := ChatRequestContext("openai", "https://zro.moonmath.ai")
+	status := 502
+	errType := "upstream_credentials_exhausted"
+	msg := "all configured keys returned permanent per-key errors (401/402/403)"
+	be := &schemas.BifrostError{
+		Type:       &errType,
+		StatusCode: &status,
+		Error:      &schemas.ErrorField{Type: &errType, Message: msg},
+	}
+	err := ctx.WrapBifrost("POST", be)
+	assert.Contains(t, err.Error(), msg)
+	assert.Contains(t, err.Error(), "check that the configured model is available")
+}
+
+// TestProviderRequestContext_WrapBifrost_ErrorFieldTypeOnly covers the same
+// hint when only ErrorField.Type carries the sentinel.
+func TestProviderRequestContext_WrapBifrost_ErrorFieldTypeOnly(t *testing.T) {
+	ctx := ChatRequestContext("openai", "https://zro.moonmath.ai")
+	status := 502
+	errType := "upstream_credentials_exhausted"
+	be := &schemas.BifrostError{
+		StatusCode: &status,
+		Error:      &schemas.ErrorField{Type: &errType, Message: "all configured keys returned permanent per-key errors"},
+	}
+	assert.True(t, isCredentialExhaustion(be))
+	assert.Contains(t, ctx.WrapBifrost("POST", be).Error(), "check that the configured model is available")
+}
+
+// TestProviderRequestContext_WrapBifrost_NoHintForOrdinaryErrors keeps the
+// model hint out of unrelated provider failures.
+func TestProviderRequestContext_WrapBifrost_NoHintForOrdinaryErrors(t *testing.T) {
+	ctx := ChatRequestContext("openai", "https://api.openai.com")
+	status := 404
+	be := &schemas.BifrostError{
+		StatusCode: &status,
+		Error:      &schemas.ErrorField{Message: "Not Found"},
+	}
+	err := ctx.WrapBifrost("POST", be)
+	assert.Contains(t, err.Error(), "status 404")
+	assert.NotContains(t, err.Error(), "check that the configured model")
+}
+
+// TestProviderRequestContext_WrapBifrost_HintGatedOnSentinelNotStatus pins the
+// gate itself: the hint must key off the upstream_credentials_exhausted
+// sentinel and never off a bare 401/402/403 status. Without this, an
+// implementation that guessed from the status code would keep every other
+// test green while re-mislabelling a genuine credential rejection as a model
+// problem. Also checks the hint cannot smuggle provider-echoed credentials
+// past Wrap's redaction.
+func TestProviderRequestContext_WrapBifrost_HintGatedOnSentinelNotStatus(t *testing.T) {
+	ctx := ChatRequestContext("openai", "https://zro.moonmath.ai")
+	for _, code := range []int{401, 402, 403, 404} {
+		status := code
+		be := &schemas.BifrostError{
+			StatusCode: &status,
+			Error:      &schemas.ErrorField{Message: "per-key rejection"},
+		}
+		msg := ctx.WrapBifrost("POST", be).Error()
+		assert.False(t, isCredentialExhaustion(be), "status %d is not the sentinel", code)
+		assert.NotContains(t, msg, "check that the configured model", "status %d grew the hint", code)
+		assert.Contains(t, msg, fmt.Sprintf("status %d", code))
+	}
+
+	sentinel := credentialExhaustionType
+	be := &schemas.BifrostError{
+		Type:  &sentinel,
+		Error: &schemas.ErrorField{Type: &sentinel, Message: "keys rejected: Bearer sk-judge-secret"},
+	}
+	msg := ctx.WrapBifrost("POST", be).Error()
+	assert.Contains(t, msg, "check that the configured model")
+	assert.NotContains(t, msg, "sk-judge-secret")
+}
+
+// TestProviderRequestContext_WrapBifrost_NilError covers the nil failure: it
+// must not panic and must not claim credential exhaustion.
+func TestProviderRequestContext_WrapBifrost_NilError(t *testing.T) {
+	ctx := ChatRequestContext("openai", "https://api.openai.com")
+	err := ctx.WrapBifrost("POST", nil)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "check that the configured model")
+	assert.False(t, isCredentialExhaustion(nil))
 }
 
 // TestChatRequestContext_UsesEnvConvention checks the env-var fallback path
