@@ -254,7 +254,8 @@ func (rg *RitualGuard) ritualRunningFor(edictID uint) bool {
 func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inputs map[string]string) {
 	go func() {
 		lock := rg.edictRitualLock(key.ID)
-		// Try to acquire the lock; if held, check for stale rituals and abort them
+		// Acquire the lock. If held, another ritual of this edict is live, so
+		// this one queues behind it — no stale sweep here (see below).
 		if !lock.TryLock() {
 			queueLen := int(rg.queuedCount.Add(1))
 			rg.notify(RitualStepMsg{
@@ -265,7 +266,13 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				Message:    fmt.Sprintf("Ritual %s queued — waiting for another ritual to finish", ritualName),
 				QueueLen:   queueLen,
 			})
-			rg.abortStaleRitualsIfLocked()
+			// Deliberately no stale sweep here. The per-edict lock is
+			// process-local, so a failed TryLock proves the holder is a live
+			// in-process goroutine — a sweep from the queue path could only
+			// ever abort a live ritual (this is the e1003 bug: a healthy,
+			// long-running `go test` was reaped at the 5m mark). Genuine
+			// staleness is covered by the ticker-path sweep in Run, which is
+			// gated on the same lock being free.
 			lock.Lock()
 			rg.queuedCount.Add(-1)
 		}
@@ -300,12 +307,26 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 	}()
 }
 
-// abortStaleRitualsIfLocked checks for running rituals older than flatlineAge
-// and aborts them directly in the database. This handles the case where a
-// previous ritual goroutine died or hung while holding its edict's lock: the
-// DB row is stale (no progress in flatlineAge) and is reaped, and its
-// streaming context is cancelled so any live goroutine unwinds and releases
-// the per-edict lock.
+// abortStaleRitualsIfLocked — "IfLocked" reads as the guard, not the trigger:
+// it aborts a stale row only if its edict's lock is free (no live holder). The
+// per-edict lock is held by startRitual for the whole of RitualRunner.Run —
+// given, act, then, fork items and any zhengming pause included — so a lock
+// that cannot be taken proves a live goroutine is working, regardless of how
+// stale its timestamp looks. Only edicts whose lock is free are candidates:
+// there the row is genuinely orphaned (the goroutine died mid-run) or hung.
+// That is the liveness guard which keeps the sweep from ever killing live work;
+// the heartbeat (touchExecution) covers the complementary case, a live holder
+// whose timestamp would otherwise age past the window.
+//
+// It is NOT called from the queue path in startRitual, where a failed TryLock
+// already proves the holder is alive and a sweep would be pure risk. The ticker
+// path (Run) is the right caller: it holds no lock, so the check is meaningful.
+//
+// Residual case: a goroutine wedged while still holding its lock is not
+// reapable from here, by design — DB surgery cannot tell it from a working
+// ritual, and aborting it would reprise the e1003 bug. Such a goroutine is
+// left to its streaming context's cancellation; the heartbeat, not this sweep,
+// is what keeps an actively-working ritual safe.
 func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 	if rg.db == nil {
 		return
@@ -320,6 +341,15 @@ func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 	}
 
 	for _, ritual := range staleRituals {
+		// Liveness guard: a held edict lock means a live goroutine owns this
+		// edict. Never reap it, however old its timestamp.
+		if !rg.edictLockFree(ritual.EdictID) {
+			rg.logger.Debug("skipping stale-ritual sweep: edict lock is held by a live ritual",
+				"execution_id", ritual.ID,
+				"ritual", ritual.RitualName,
+				"edict_id", ritual.EdictID)
+			continue
+		}
 		rg.logger.Info("aborting stale ritual",
 			"execution_id", ritual.ID,
 			"ritual", ritual.RitualName,
@@ -331,6 +361,18 @@ func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 				"error", err)
 		}
 	}
+}
+
+// edictLockFree reports whether no in-process goroutine currently holds
+// edictID's ritual lock. It takes and immediately releases a free lock, so a
+// true result is valid at the instant of the call only.
+func (rg *RitualGuard) edictLockFree(edictID uint) bool {
+	l := rg.edictRitualLock(edictID)
+	if !l.TryLock() {
+		return false
+	}
+	l.Unlock()
+	return true
 }
 
 // DispatchEvent dispatches an event to all subscribers and triggers event-driven rituals.
@@ -915,6 +957,11 @@ func (rg *RitualGuard) Run(ctx context.Context) {
 			rg.DispatchEvent(event)
 		case <-staleScanTicker.C:
 			rg.scanForStaleRituals(ctx)
+			// Orphan/hung-goroutine sweep: no lock is held here, so the
+			// per-edict liveness check inside is meaningful — a held lock
+			// spares the row, a free lock lets age decide. startRitual's queue
+			// path deliberately no longer sweeps.
+			rg.abortStaleRitualsIfLocked()
 			if rg.flatlineRunners != nil {
 				rg.flatlineRunners(ctx)
 			}

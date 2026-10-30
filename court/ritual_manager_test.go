@@ -587,49 +587,296 @@ func TestRitualGuard_EventNotification(t *testing.T) {
 	}
 }
 
-// TestAbortStaleRitualsOnStart verifies that startRitual aborts stale running
-// rituals before starting a new one.
-func TestAbortStaleRitualsOnStart(t *testing.T) {
+// TestStartRitualQueuedDoesNotReapLiveRitual verifies that taking the queued
+// path — a failed TryLock while another ritual holds the edict's lock — never
+// sweeps stale rituals. The lock is process-local, so a failed TryLock proves
+// the holder is a live in-process goroutine; the old sweep from that branch is
+// exactly the e1003 bug, where a healthy long-running step was aborted at the
+// 5m flatline mark. Even an old row must survive the queue path; genuine
+// staleness is the direct sweep's job (TestAbortStaleRituals_CancelsHoldingRitual).
+func TestStartRitualQueuedDoesNotReapLiveRitual(t *testing.T) {
 	db := setupEventTestDB(t)
-	logger := slog.Default()
 
-	// Create a stale running ritual (updated 10 minutes ago)
-	// Use raw SQL to bypass GORM's autoUpdateTime
-	staleTime := time.Now().Add(-10 * time.Minute)
 	staleExec := &RitualExecution{
-		ID:          "stale-ritual-123",
+		ID:          "old-but-alive",
 		RitualName:  "swift-strike",
 		EdictID:     100,
-		Username:    "test",
-		Project:     "test/project",
+		Username:    "testuser",
+		Project:     "testproject",
 		State:       RitualStateRunning,
 		CurrentStep: 1,
 	}
 	if err := db.Save(staleExec).Error; err != nil {
 		t.Fatalf("failed to create stale ritual: %v", err)
 	}
-	// Manually set updated_at to the past
-	if err := db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", staleTime, "stale-ritual-123").Error; err != nil {
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", staleTime, staleExec.ID).Error; err != nil {
 		t.Fatalf("failed to set stale updated_at: %v", err)
 	}
 
-	// Create RitualGuard with 5 minute flatlineAge and matching username/project
-	base := NewMinisterBase(db, nil, logger, "test", "test/project", nil)
+	ritual := &RitualDef{
+		Name:  "queued-no-reap",
+		Steps: []RitualStep{{Name: "work", Minister: "forge", Task: "do work"}},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		flatlineAge:    5 * time.Minute,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, &mockCallCountRunner{results: []runners.Output{{Output: "ok\n"}}},
+			slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return context.Background() },
+	}
+
+	queued := make(chan struct{}, 1)
+	rg.SetNotify(func(msg any) {
+		if stepMsg, ok := msg.(RitualStepMsg); ok && stepMsg.Status == "queued" {
+			select {
+			case queued <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	key := storage.EdictKey{ID: 200, Username: "testuser", Project: "testproject"}
+
+	// Hold edict 200's lock so startRitual must take the queued branch.
+	rg.edictRitualLock(200).Lock()
+	rg.startRitual("queued-no-reap", key, nil)
+
+	select {
+	case <-queued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the queued notification")
+	}
+
+	// Give any erroneous sweep a moment to act before asserting.
+	time.Sleep(50 * time.Millisecond)
+
+	var exec RitualExecution
+	if err := db.First(&exec, "id = ?", staleExec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if exec.State != RitualStateRunning {
+		t.Errorf("the queued path must not reap a live ritual: expected state %s, got %s",
+			RitualStateRunning, exec.State)
+	}
+
+	rg.edictRitualLock(200).Unlock()
+}
+
+// TestHeartbeatTouchProtectsFromSweep verifies that a heartbeat touch makes an
+// otherwise-stale running row young again, so the direct (ticker-path) stale
+// sweep leaves it alone. This is the safety property the heartbeat buys: age
+// stops being a proxy for a hung goroutine.
+func TestHeartbeatTouchProtectsFromSweep(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	exec := &RitualExecution{
+		ID:          "touched-ritual",
+		RitualName:  "swift-strike",
+		EdictID:     300,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	if err := db.Save(exec).Error; err != nil {
+		t.Fatalf("failed to create ritual: %v", err)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", staleTime, exec.ID).Error; err != nil {
+		t.Fatalf("failed to set stale updated_at: %v", err)
+	}
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner.touchExecution(exec.ID)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base, flatlineAge: 5 * time.Minute}
+	rg.abortStaleRitualsIfLocked()
+
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if got.State != RitualStateRunning {
+		t.Errorf("a heartbeat-touched execution must not be reaped: expected %s, got %s",
+			RitualStateRunning, got.State)
+	}
+}
+
+// TestTouchExecutionNilDB verifies that touchExecution is a no-op (not a panic)
+// when the runner has no database handle. The touch runs on a background
+// goroutine, so a nil dereference there would crash the process rather than
+// merely fail a step; the guard makes it consistent with the execID guard.
+func TestTouchExecutionNilDB(t *testing.T) {
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("touchExecution must not panic with a nil db, got: %v", r)
+		}
+	}()
+	runner.touchExecution("some-execution-id")
+	runner.touchExecution("")
+}
+
+// TestStaleSweepSparesEdictWithLiveLock is the A1/A2 regression guard: a
+// running execution whose updated_at is stale is NOT reaped while its edict's
+// ritual lock is held. The lock is held by startRitual for the whole of
+// RitualRunner.Run — the act phase, but equally a long given/then shell step or
+// a zhengming pause — so a held lock is proof of a live goroutine and age alone
+// must not condemn the row. Without the liveness guard this test fails.
+func TestStaleSweepSparesEdictWithLiveLock(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	staleExec := &RitualExecution{
+		ID:          "live-locked",
+		RitualName:  "swift-strike",
+		EdictID:     400,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	if err := db.Save(staleExec).Error; err != nil {
+		t.Fatalf("failed to create ritual: %v", err)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", staleTime, staleExec.ID).Error; err != nil {
+		t.Fatalf("failed to set stale updated_at: %v", err)
+	}
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
 	rg := &RitualGuard{
 		MinisterBase: base,
 		flatlineAge:  5 * time.Minute,
 	}
 
-	// Call abortStaleRitualsIfLocked
+	// Hold edict 400's lock: it stands in for a live goroutine inside a long
+	// given/then shell step or a zhengming pause, neither of which heartbeats.
+	rg.edictRitualLock(400).Lock()
+	defer rg.edictRitualLock(400).Unlock()
+
 	rg.abortStaleRitualsIfLocked()
 
-	// Verify the stale ritual was aborted
-	var exec RitualExecution
-	if err := db.First(&exec, "id = ?", "stale-ritual-123").Error; err != nil {
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", staleExec.ID).Error; err != nil {
 		t.Fatalf("failed to find ritual: %v", err)
 	}
-	if exec.State != RitualStateAborted {
-		t.Errorf("expected ritual state %s, got %s", RitualStateAborted, exec.State)
+	if got.State != RitualStateRunning {
+		t.Errorf("a stale row whose edict lock is held must survive the sweep: expected %s, got %s",
+			RitualStateRunning, got.State)
+	}
+}
+
+// TestSweepSparesLongGivenStepInFlight is the end-to-end A1 regression guard.
+// The ritual's given step is a shell command (swift-strike's `!just test`) that
+// can outlive flatlineAge without crossing any step boundary — no heartbeat
+// runs during it. The sweep must still spare the row, because startRitual holds
+// the edict lock across the whole Run, given phase included: a held lock is
+// proof of a live goroutine independent of the timestamp.
+func TestSweepSparesLongGivenStepInFlight(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name:       "long-given-test",
+		Background: []string{"!sleep 30"},
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	// blockingRunner parks inside the given step until the context is cancelled
+	// — standing in for a `go test` still running at the 5m mark.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		flatlineAge:    5 * time.Minute,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, &blockingRunner{}, slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return ctx },
+	}
+	rg.SetNotify(func(any) {})
+
+	key := storage.EdictKey{ID: 500, Username: "testuser", Project: "testproject"}
+	rg.startRitual("long-given-test", key, nil)
+
+	// Wait for the execution row, then age it past the flatline window while
+	// the given step is still in flight.
+	var exec RitualExecution
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := db.First(&exec, "edict_id = ?", 500).Error; err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ritual execution row never appeared")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", staleTime, exec.ID).Error; err != nil {
+		t.Fatalf("failed to age the row: %v", err)
+	}
+
+	// The given step is still parked with the edict lock held: the sweep must
+	// not touch the row.
+	rg.abortStaleRitualsIfLocked()
+
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if got.State != RitualStateRunning {
+		t.Fatalf("a stale row whose given step is in flight must survive the sweep: expected %s, got %s",
+			RitualStateRunning, got.State)
+	}
+
+	// Releasing the context ends the given step and the run, freeing the lock.
+	// A genuinely orphaned stale row is then fair game — proving the guard
+	// gates on liveness, not on disabling the sweep.
+	cancel()
+	releaseDeadline := time.Now().Add(5 * time.Second)
+	for {
+		l := rg.edictRitualLock(500)
+		if l.TryLock() {
+			l.Unlock()
+			break
+		}
+		if time.Now().After(releaseDeadline) {
+			t.Fatal("ritual goroutine did not release the edict lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := db.Exec("UPDATE ritual_executions SET state = ?, updated_at = ? WHERE id = ?",
+		RitualStateRunning, staleTime, exec.ID).Error; err != nil {
+		t.Fatalf("failed to reset row: %v", err)
+	}
+	rg.abortStaleRitualsIfLocked()
+	if err := db.First(&got, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if got.State != RitualStateAborted {
+		t.Errorf("with no live holder, a stale row must be reaped: expected %s, got %s",
+			RitualStateAborted, got.State)
 	}
 }
 

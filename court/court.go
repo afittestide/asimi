@@ -930,6 +930,21 @@ func (s *Court) ListModels(provider string) (*schemas.BifrostListModelsResponse,
 	if bifrostErr != nil {
 		return nil, bifrostErrorToGoError(bifrostErr)
 	}
+	// Bifrost prefixes every listed model ID with the queried provider key
+	// ("openai/deepseek-v4.1-flash"), while chat requests send Model verbatim.
+	// Strip exactly that prefix here so a model chosen from the list is stored
+	// in the form the provider accepts. A model whose own name starts with a
+	// provider key (OpenRouter-style "openai/gpt-4o" listed as
+	// "openai/openai/gpt-4o") keeps exactly one segment. Copy rather than
+	// mutate: the response may be shared, and re-stripping a cached
+	// double-prefixed ID would eat a second segment.
+	prefix := string(bifrostProvider) + "/"
+	models := make([]schemas.Model, len(resp.Data))
+	for i, m := range resp.Data {
+		m.ID = strings.TrimPrefix(m.ID, prefix)
+		models[i] = m
+	}
+	resp.Data = models
 	return resp, nil
 }
 

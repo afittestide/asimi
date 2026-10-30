@@ -456,6 +456,70 @@ func TestConfigureModel_DoesNotReloadRitualsWhenRegistryNotEmpty(t *testing.T) {
 	assert.NotContains(t, names, "dawn-audience", "embedded rituals should not be reloaded when registry is not empty")
 }
 
+// TestCourtListModels_StripsProviderPrefix guards the boundary that feeds the
+// model picker: bifrost's ListModels prefixes every ID with the queried
+// provider key ("openai/deepseek-v4.1-flash"), and persisting that form makes
+// the provider reject its own listing on the next chat (403 model access
+// denied, misreported as dead credentials). Exactly one prefix segment is
+// stripped, so OpenRouter-style model namespaces survive.
+func TestCourtListModels_StripsProviderPrefix(t *testing.T) {
+	tests := []struct {
+		name        string
+		asimiProv   string
+		bifrostProv schemas.ModelProvider
+		listed      []string
+		want        []string
+	}{
+		{
+			name:        "openai gateway",
+			asimiProv:   "openai",
+			bifrostProv: schemas.OpenAI,
+			listed:      []string{"openai/deepseek-v4.1-flash", "openai/zro/auto"},
+			want:        []string{"deepseek-v4.1-flash", "zro/auto"},
+		},
+		{
+			name:        "openrouter keeps the vendor namespace",
+			asimiProv:   "openrouter",
+			bifrostProv: schemas.OpenRouter,
+			listed:      []string{"openrouter/deepseek/deepseek-chat", "openrouter/openai/gpt-4o"},
+			want:        []string{"deepseek/deepseek-chat", "openai/gpt-4o"},
+		},
+		{
+			name:        "googleai maps to gemini",
+			asimiProv:   "googleai",
+			bifrostProv: schemas.Gemini,
+			listed:      []string{"gemini/gemini-2.0-flash"},
+			want:        []string{"gemini-2.0-flash"},
+		},
+		{
+			name:        "unprefixed ID is left alone",
+			asimiProv:   "openai",
+			bifrostProv: schemas.OpenAI,
+			listed:      []string{"deepseek-v4.1-flash"},
+			want:        []string{"deepseek-v4.1-flash"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := make([]schemas.Model, len(tt.listed))
+			for i, id := range tt.listed {
+				data[i] = schemas.Model{ID: id}
+			}
+			provider := &recordingProvider{listModelsResp: &schemas.BifrostListModelsResponse{Data: data}}
+			s := NewCourt(setupCourtTestDB(t), nil, nil, nil)
+			s.ConfigureModel(provider, &SessionConfig{}, repo.RepoInfo{})
+
+			resp, err := s.ListModels(tt.asimiProv)
+			require.NoError(t, err)
+			require.Len(t, resp.Data, len(tt.want))
+			for i, want := range tt.want {
+				assert.Equal(t, want, resp.Data[i].ID)
+			}
+			assert.Equal(t, tt.bifrostProv, provider.lastListProvider)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler clearing tests (merged from clear_scheduler_test.go)
 // ---------------------------------------------------------------------------
@@ -1375,6 +1439,93 @@ func TestCourt_StartRitual_UnknownRitual(t *testing.T) {
 	var events []storage.TianEvent
 	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
 	require.Empty(t, events, "unknown ritual must not emit a ritual_enacted event")
+}
+
+// TestCourt_StartRitual_DuplicateSameRitualRejected verifies that when a
+// running execution of the same ritual already exists for the edict,
+// StartRitual fails loudly and emits no ritual_enacted event — re-enacting the
+// same ritual would silently restart the work from step 0.
+func TestCourt_StartRitual_DuplicateSameRitualRejected(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "test-ritual"}))
+
+	key := storage.EdictKey{ID: 44, Username: cfg.Username, Project: cfg.Project}
+	running := &RitualExecution{
+		ID:         "already-running",
+		RitualName: "test-ritual",
+		EdictID:    key.ID,
+		Username:   key.Username,
+		Project:    key.Project,
+		State:      RitualStateRunning,
+	}
+	require.NoError(t, db.Save(running).Error)
+
+	err := s.StartRitual("test-ritual", key, map[string]string{"foo": "bar"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already has test-ritual running")
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
+	assert.Empty(t, events, "a duplicate same-ritual enactment must not emit a ritual_enacted event")
+}
+
+// TestCourt_StartRitual_DifferentRitualQueues verifies that a running execution
+// of a DIFFERENT ritual does not block enactment: the new ritual is published
+// as usual and queues behind the per-edict lock.
+func TestCourt_StartRitual_DifferentRitualQueues(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "swift-strike"}))
+	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "review"}))
+
+	key := storage.EdictKey{ID: 45, Username: cfg.Username, Project: cfg.Project}
+	running := &RitualExecution{
+		ID:         "other-running",
+		RitualName: "swift-strike",
+		EdictID:    key.ID,
+		Username:   key.Username,
+		Project:    key.Project,
+		State:      RitualStateRunning,
+	}
+	require.NoError(t, db.Save(running).Error)
+
+	require.NoError(t, s.StartRitual("review", key, nil))
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
+	assert.Len(t, events, 1, "a different ritual must still emit ritual_enacted")
+}
+
+// TestCourt_StartRitual_CompletedExecutionDoesNotBlock verifies that only a
+// RUNNING row blocks a same-ritual re-enactment; a finished execution does not.
+func TestCourt_StartRitual_CompletedExecutionDoesNotBlock(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "test-ritual"}))
+
+	key := storage.EdictKey{ID: 46, Username: cfg.Username, Project: cfg.Project}
+	done := &RitualExecution{
+		ID:         "finished",
+		RitualName: "test-ritual",
+		EdictID:    key.ID,
+		Username:   key.Username,
+		Project:    key.Project,
+		State:      RitualStateCompleted,
+	}
+	require.NoError(t, db.Save(done).Error)
+
+	require.NoError(t, s.StartRitual("test-ritual", key, nil))
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
+	assert.Len(t, events, 1, "a completed execution must not block re-enactment")
 }
 
 // TestCourt_CheckHostCommand_NoConfig verifies that CheckHostCommand returns
@@ -2894,8 +3045,10 @@ func TestExtractDetail_MirrorsProductionKeys(t *testing.T) {
 
 // recordingProvider is an LLMProvider that records the last user prompt seen.
 type recordingProvider struct {
-	mu      sync.Mutex
-	prompts []string
+	mu               sync.Mutex
+	prompts          []string
+	listModelsResp   *schemas.BifrostListModelsResponse
+	lastListProvider schemas.ModelProvider
 }
 
 func (p *recordingProvider) record(req *schemas.BifrostChatRequest) {
@@ -2941,6 +3094,12 @@ func (p *recordingProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostCont
 }
 
 func (p *recordingProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	p.mu.Lock()
+	p.lastListProvider = req.Provider
+	p.mu.Unlock()
+	if p.listModelsResp != nil {
+		return p.listModelsResp, nil
+	}
 	return &schemas.BifrostListModelsResponse{}, nil
 }
 

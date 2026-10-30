@@ -4323,6 +4323,8 @@ type idleTestMinister struct {
 	totalDuration  time.Duration // how long to work before completing
 	result         string
 	err            error
+	pauseOnTask    bool            // if true, raise zhengming (pausing the step) on task receipt
+	pausedCh       chan<- struct{} // signalled after the zhengming-raised callback fires
 }
 
 func (m *idleTestMinister) ID() string                  { return m.id }
@@ -4339,6 +4341,15 @@ func (m *idleTestMinister) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case t := <-m.tasksCh:
+			if m.pauseOnTask {
+				// Simulate the minister raising zhengming mid-step: fire the
+				// callback the runner wired to pause the step timer (and, per
+				// the heartbeat, to skip liveness touches).
+				m.fireZhengmingRaised()
+				if m.pausedCh != nil {
+					m.pausedCh <- struct{}{}
+				}
+			}
 			if m.notifyInterval > 0 && t.Notify != nil {
 				// Send periodic notifications while working
 				ticker := time.NewTicker(m.notifyInterval)
@@ -5489,6 +5500,182 @@ func TestRitualEffort_ExplicitOverridesUserDefault(t *testing.T) {
 	sess := runStepEffortSession(t, "low", "high")
 	assert.Equal(t, "low", sess.ReasoningEffort,
 		"explicit ritual step effort should take precedence over the user default")
+}
+
+// TestRitualStepHeartbeatAdvancesUpdatedAt verifies that a step running longer
+// than the flatline window keeps its execution's updated_at fresh. No step
+// boundary is crossed mid-step (saveExecution never runs), so the ticker-driven
+// touch is the only writer — and the DB timestamp must strictly increase across
+// the heartbeat interval.
+func TestRitualStepHeartbeatAdvancesUpdatedAt(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name:        "heartbeat-test",
+		Description: "Test that a long step keeps its execution alive",
+		Steps: []RitualStep{
+			{Name: "long", Minister: "forge", Task: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	// The minister acknowledges the task then stays silent for 800ms — no step
+	// boundary is crossed until it returns, so any updated_at movement in the
+	// window is the heartbeat's doing.
+	minister := &idleTestMinister{
+		MinisterBase:  MinisterBase{logger: slog.Default()},
+		id:            "forge",
+		tasksCh:       make(chan *Task, 1),
+		totalDuration: 800 * time.Millisecond,
+		result:        "done",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go minister.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{"forge": minister},
+		logger:    slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+	runner.heartbeatInterval = 50 * time.Millisecond
+	runner.idleTimeout = 5 * time.Second
+
+	stepStarted := make(chan struct{}, 1)
+	exec, err := runner.Start(ctx, "heartbeat-test", testEK(77), nil, func(msg any) {
+		if m, ok := msg.(RitualStepMsg); ok && m.Status == "started" && m.StepName == "long" {
+			select {
+			case stepStarted <- struct{}{}:
+			default:
+			}
+		}
+	})
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, exec) }()
+
+	select {
+	case <-stepStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("step never started")
+	}
+
+	updatedAt := func() time.Time {
+		var row RitualExecution
+		require.NoError(t, db.First(&row, "id = ?", exec.ID).Error)
+		return row.UpdatedAt
+	}
+
+	first := updatedAt()
+	time.Sleep(150 * time.Millisecond) // spans ~3 heartbeat ticks
+	second := updatedAt()
+	require.True(t, second.After(first),
+		"heartbeat must strictly advance updated_at mid-step: first=%v second=%v", first, second)
+
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ritual did not complete")
+	}
+}
+
+// TestRitualStepHeartbeatSkipsWhilePaused verifies that the step heartbeat does
+// NOT refresh updated_at while the step is paused waiting for zhengming. A wait
+// on the Ruler is not a hang, and the execution's liveness there is governed by
+// the (paused) idle timer, so a paused step must not be kept artificially young.
+// (The complementary property — that a running step IS heartbeated — is proven
+// by TestRitualStepHeartbeatAdvancesUpdatedAt.)
+func TestRitualStepHeartbeatSkipsWhilePaused(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name:        "heartbeat-pause-test",
+		Description: "Test that the heartbeat skips a paused step",
+		Steps: []RitualStep{
+			{Name: "waiting", Minister: "forge", Task: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	pausedCh := make(chan struct{}, 1)
+	minister := &idleTestMinister{
+		MinisterBase:  MinisterBase{logger: slog.Default()},
+		id:            "forge",
+		tasksCh:       make(chan *Task, 1),
+		totalDuration: 2 * time.Second, // stays in the step well past the pause
+		result:        "done",
+		pauseOnTask:   true,
+		pausedCh:      pausedCh,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go minister.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{"forge": minister},
+		logger:    slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+	runner.heartbeatInterval = 50 * time.Millisecond
+	runner.idleTimeout = 10 * time.Second
+
+	stepStarted := make(chan struct{}, 1)
+	exec, err := runner.Start(ctx, "heartbeat-pause-test", testEK(78), nil, func(msg any) {
+		if m, ok := msg.(RitualStepMsg); ok && m.Status == "started" && m.StepName == "waiting" {
+			select {
+			case stepStarted <- struct{}{}:
+			default:
+			}
+		}
+	})
+	require.NoError(t, err)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx, exec) }()
+
+	select {
+	case <-stepStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("step never started")
+	}
+
+	updatedAt := func() time.Time {
+		var row RitualExecution
+		require.NoError(t, db.First(&row, "id = ?", exec.ID).Error)
+		return row.UpdatedAt
+	}
+
+	// Before the pause fires, the heartbeat is live and must advance the timestamp.
+	select {
+	case <-pausedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("zhengming-raised callback never fired")
+	}
+
+	// The heartbeat goroutine may be mid-tick when the pause lands; let it
+	// settle so any in-flight touch completes before we take the baseline.
+	time.Sleep(100 * time.Millisecond)
+
+	baseline := updatedAt()
+	time.Sleep(250 * time.Millisecond) // spans ~5 heartbeat ticks, all paused
+	afterPause := updatedAt()
+
+	require.Equal(t, baseline, afterPause,
+		"a step paused for zhengming must not heartbeat: baseline=%v afterPause=%v", baseline, afterPause)
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ritual did not stop after cancel")
+	}
 }
 
 // TestRitualRun_StampsEdictRunnerOnCompletion verifies the terminal-state hook:

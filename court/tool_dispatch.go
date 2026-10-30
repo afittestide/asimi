@@ -309,6 +309,28 @@ func (s *Court) StartRitual(name string, key storage.EdictKey, inputs map[string
 		"ritual_name": name,
 		"inputs":      inputsPayload,
 	}
+
+	// Advisory check: a running execution of this edict with the same ritual
+	// means the work is already in flight, so re-enacting it would restart the
+	// ritual from step 0. Refuse loudly instead. This is NOT the concurrency
+	// guard — the per-edict lock remains the serialization point, and racing
+	// enactments that both pass this check resolve there (the second queues).
+	// A Court built without a DB (direct construction, tests) has nothing to
+	// check against and publishes as before.
+	if s.db != nil {
+		var running []RitualExecution
+		if err := s.db.Where("edict_id = ? AND username = ? AND project = ? AND state = ?",
+			key.ID, key.Username, key.Project, RitualStateRunning).Find(&running).Error; err != nil {
+			logger.Warn("failed to check for in-flight ritual", "ritual", name, "edict_id", key.ID, "error", err)
+		}
+		for _, exec := range running {
+			if exec.RitualName == name {
+				return fmt.Errorf("edict %d already has %s running (execution %s); the same ritual is not re-enacted",
+					key.ID, name, exec.ID)
+			}
+		}
+	}
+
 	s.PublishEvent(key, storage.EventRitualEnacted, payload)
 
 	logger.Info("ritual requested", "ritual", name, "edict_id", key.ID)

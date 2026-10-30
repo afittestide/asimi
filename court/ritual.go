@@ -33,6 +33,14 @@ import (
 // actively producing output will never hit this limit.
 const defaultStepIdleTimeout = 5 * time.Minute
 
+// defaultStepHeartbeat is how often a running step refreshes its execution's
+// liveness timestamp in the DB. A step boundary (saveExecution) is the only
+// other writer of updated_at, so a step that legitimately runs longer than
+// flatlineAge — a full `go test`, say — is otherwise indistinguishable from a
+// hung one. At 30s the reaper's 5m window tolerates ~10 missed beats, far
+// above scheduler jitter.
+const defaultStepHeartbeat = 30 * time.Second
+
 //go:embed dotagents/Justfile
 var dotagentsJustfile string
 
@@ -384,22 +392,23 @@ func LoadRitualsFromDir(dir string) (Rituals, error) {
 
 // RitualRunner executes rituals
 type RitualRunner struct {
-	registry        *RitualRegistry
-	stepDefs        *StepDefRegistry
-	getMinister     func(id string) Minister
-	publishEvent    func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
-	onRunnerUpgrade func(runners.Runner) // propagates runner changes back to court
-	db              *gorm.DB
-	runner          runners.Runner
-	logger          *slog.Logger
-	maxRetries      int
-	repoInfo        repo.RepoInfo
-	sandboxConfig   *config.SandboxConfig                                       // injected by ConfigureModel
-	projectSlug     string                                                      // injected by ConfigureModel
-	idleTimeout     time.Duration                                               // max silence before a step is aborted (0 = default)
-	waitZhengming   func(ctx context.Context, requestID string) (string, error) // injected by Court
-	isolatedHost    bool                                                        // skip sandbox steps when true
-	atifAgentName   string                                                      // ATIF agent name for ritual step sessions
+	registry          *RitualRegistry
+	stepDefs          *StepDefRegistry
+	getMinister       func(id string) Minister
+	publishEvent      func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
+	onRunnerUpgrade   func(runners.Runner) // propagates runner changes back to court
+	db                *gorm.DB
+	runner            runners.Runner
+	logger            *slog.Logger
+	maxRetries        int
+	repoInfo          repo.RepoInfo
+	sandboxConfig     *config.SandboxConfig                                       // injected by ConfigureModel
+	projectSlug       string                                                      // injected by ConfigureModel
+	idleTimeout       time.Duration                                               // max silence before a step is aborted (0 = default)
+	heartbeatInterval time.Duration                                               // liveness touch interval during a step (0 = default)
+	waitZhengming     func(ctx context.Context, requestID string) (string, error) // injected by Court
+	isolatedHost      bool                                                        // skip sandbox steps when true
+	atifAgentName     string                                                      // ATIF agent name for ritual step sessions
 	// getRunner resolves the per-edict runner for an execution. Injected by
 	// the Court; nil falls back to the Court-wide runner (r.runner).
 	getRunner func(edictID uint) (runners.Runner, error)
@@ -1775,6 +1784,32 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 		}
 	}()
 
+	// Heartbeat: refresh the execution's liveness while the step runs, so a
+	// step that crosses no boundary is not mistaken for a hung one. Skipped
+	// while paused for zhengming — a wait on the Ruler is not a hang, and the
+	// idle timer governing that case is paused too.
+	heartbeatInterval := r.heartbeatInterval
+	if heartbeatInterval == 0 {
+		heartbeatInterval = defaultStepHeartbeat
+	}
+	heartbeat := time.NewTicker(heartbeatInterval)
+	defer heartbeat.Stop()
+	go func() {
+		for {
+			select {
+			case <-stepCtx.Done():
+				return
+			case <-heartbeat.C:
+				timerMu.Lock()
+				isPaused := paused
+				timerMu.Unlock()
+				if !isPaused {
+					r.touchExecution(exec.ID)
+				}
+			}
+		}
+	}()
+
 	// Route act through Task pattern to enable minister processing.
 	// This ensures processTask runs, which handles failed verdicts and streams work through the LLM.
 	doneCh := make(chan Result, 1)
@@ -2360,6 +2395,21 @@ func (r *RitualRunner) saveExecution(exec *RitualExecution) {
 		if err := r.db.Save(&state).Error; err != nil {
 			r.logger.Warn("failed to save step state", "error", err)
 		}
+	}
+}
+
+// touchExecution refreshes only the execution's updated_at timestamp. A step
+// that runs long (a full `go test`) crosses no step boundary, so saveExecution
+// never runs; this narrow update is the step's heartbeat and keeps the row
+// younger than flatlineAge. Failure is logged, never fatal to the step.
+func (r *RitualRunner) touchExecution(execID string) {
+	if r.db == nil || execID == "" {
+		return
+	}
+	if err := r.db.Model(&RitualExecution{}).
+		Where("id = ?", execID).
+		Update("updated_at", time.Now()).Error; err != nil {
+		r.logger.Warn("failed to heartbeat ritual execution", "execution_id", execID, "error", err)
 	}
 }
 
