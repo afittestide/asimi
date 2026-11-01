@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,8 +103,7 @@ func newTestShared(t *testing.T) (*Shared, func()) {
 	gdb, sdb, cleanup := initTestDB(t)
 	cfg := &config.Config{
 		Court: config.CourtConfig{
-			Username: testUsername(),
-			Project:  "test-project",
+			Project: "test-project",
 		},
 	}
 	return &Shared{
@@ -441,6 +441,7 @@ func TestCreateCourtSetsRepoInfoBeforeStart(t *testing.T) {
 			Username:    testUsername(),
 			ProjectRoot: projectRoot,
 		},
+		testUsername(),
 		projectCfg,
 		repoInfo,
 		nil,
@@ -646,11 +647,15 @@ func TestDaemonTwoClientsIsolation(t *testing.T) {
 	}
 }
 
-// TestCreateCourtHonoursPinnedProject covers edict 968: the daemon path must
-// apply the pinned [court] project (and username) from .agents/asimi.conf, so
-// the same checkout cannot resolve to two different Court scopes — the TUI path
-// already honours it, and the daemon used to ignore it entirely.
-func TestCreateCourtHonoursPinnedProject(t *testing.T) {
+// TestCreateCourtIgnoresCommittedUsername covers edict 1006: a committed
+// [court] username in .agents/asimi.conf must have NO effect on the Court
+// scope. It is an attacker-authored, tracked file, so honouring it would let a
+// repository re-scope the session onto another user's ledger. The Court
+// username must be the socket-verified OS user, not the pinned value.
+//
+// Project pinning is intentionally left untouched here — dropping the
+// committed [court] project is the paired slug-precedence edict.
+func TestCreateCourtIgnoresCommittedUsername(t *testing.T) {
 	shared, cleanup := newTestShared(t)
 	defer cleanup()
 
@@ -688,6 +693,7 @@ func TestCreateCourtHonoursPinnedProject(t *testing.T) {
 			Username:    testUsername(),
 			ProjectRoot: projectRoot,
 		},
+		testUsername(),
 		projectCfg,
 		repoInfo,
 		nil,
@@ -702,7 +708,106 @@ func TestCreateCourtHonoursPinnedProject(t *testing.T) {
 	if key.Project != "oct7-io/data-poisoning-benchmark" {
 		t.Errorf("Court project = %q, want pinned %q", key.Project, "oct7-io/data-poisoning-benchmark")
 	}
-	if key.Username != "pinned-user" {
-		t.Errorf("Court username = %q, want pinned %q", key.Username, "pinned-user")
+	if key.Username != testUsername() {
+		t.Errorf("Court username = %q, want verified OS user %q (committed config must be ignored)", key.Username, testUsername())
+	}
+}
+
+// TestCreateCourtFailsClosedWithoutVerifiedUsername verifies edict 1006's
+// fail-closed rule: when the socket peer identity cannot be verified (empty),
+// createCourt refuses rather than falling back to a client- or config-supplied
+// username.
+func TestCreateCourtFailsClosedWithoutVerifiedUsername(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".agents"), 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	projectCfg, err := config.LoadProjectConfig(projectRoot, false)
+	if err != nil {
+		t.Fatalf("LoadProjectConfig: %v", err)
+	}
+
+	_, _, err = createCourt(
+		context.Background(),
+		shared,
+		1,
+		types.SetContextParams{
+			Project:     "test-project",
+			Username:    "attacker",
+			ProjectRoot: projectRoot,
+		},
+		"", // no verified peer identity
+		projectCfg,
+		repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test-project", Branch: "main"},
+		nil,
+		true,
+	)
+	if err == nil {
+		t.Fatal("createCourt with empty verified username = nil error, want refusal")
+	}
+}
+
+// TestDaemonRejectsHandshakeUsernameMismatch verifies that edict 1006's
+// preservation clause holds end to end: a client whose handshake Username
+// differs from its socket peer credential is rejected, so no process with
+// socket access can impersonate another user. This is the check the config
+// override used to bypass; the fix must keep it (intent acceptance #2).
+func TestDaemonRejectsHandshakeUsernameMismatch(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "d.sock")
+	if len(sockPath) >= 104 {
+		sockPath = filepath.Join("/tmp", "asimi-d-"+time.Now().Format("150405.000000")+".sock")
+		t.Cleanup(func() { _ = os.Remove(sockPath) })
+	}
+
+	listener, err := rpc.Listen(sockPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- serveClients(ctx, listener, shared) }()
+
+	netConn, err := rpc.Dial(sockPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	clientConn := rpc.New(netConn, rpc.Options{})
+	go func() { _ = clientConn.Serve() }()
+	defer clientConn.Close()
+
+	client := rpc.NewCourtClient(clientConn)
+	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer handshakeCancel()
+
+	// Claim a username that cannot be the socket peer.
+	err = client.SetContext(handshakeCtx, types.SetContextParams{
+		Project:     "test-project",
+		Username:    "not-the-socket-peer",
+		ProjectRoot: projectRoot,
+	})
+	if err == nil {
+		t.Fatal("SetContext with a username that differs from the socket peer = nil error, want rejection")
+	}
+	if !strings.Contains(err.Error(), "mismatch") {
+		t.Errorf("SetContext error = %q, want a username mismatch rejection", err)
+	}
+
+	cancel()
+	_ = listener.Close()
+	select {
+	case <-serveDone:
+	case <-time.After(3 * time.Second):
+		t.Log("serveClients didn't shut down in time")
 	}
 }

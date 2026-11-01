@@ -98,7 +98,7 @@ func TestCancelEdictCancelsEdictChannel(t *testing.T) {
 
 	s := &Court{
 		db:     db,
-		config: &config.CourtConfig{Username: "testuser", Project: "testproject"},
+		config: &config.CourtConfig{Project: "testproject"}, username: "testuser",
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	defer s.cancel()

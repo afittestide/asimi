@@ -385,8 +385,7 @@ func TestHeadlessSink_RitualStepStarted_NoFinish(t *testing.T) {
 func TestHeadlessContextParams(t *testing.T) {
 	cfg := &Config{
 		Court: config.CourtConfig{
-			Username: "testuser",
-			Project:  "testproject",
+			Project: "testproject",
 		},
 	}
 	ri := &repo.RepoInfo{
@@ -398,7 +397,8 @@ func TestHeadlessContextParams(t *testing.T) {
 	params := headlessContextParams(cfg, ri)
 
 	assert.Equal(t, "testproject", params.Project)
-	assert.Equal(t, "testuser", params.Username)
+	// The username always comes from the OS user, never config (edict 1006).
+	assert.Equal(t, config.OSUsername(), params.Username)
 	assert.Equal(t, "/path/to/project", params.ProjectRoot)
 	assert.Equal(t, "/path/to/worktree", params.WorktreePath)
 	assert.Equal(t, "main", params.Branch)
@@ -406,11 +406,7 @@ func TestHeadlessContextParams(t *testing.T) {
 
 // TestHeadlessContextParams_NilRepoInfo verifies fallback to CWD.
 func TestHeadlessContextParams_NilRepoInfo(t *testing.T) {
-	cfg := &Config{
-		Court: config.CourtConfig{
-			Username: "testuser",
-		},
-	}
+	cfg := &Config{}
 	params := headlessContextParams(cfg, nil)
 	assert.NotEmpty(t, params.ProjectRoot)
 }
@@ -659,7 +655,7 @@ func TestHeadlessSink_HandsoffZhengmingJoinsAnswers(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "headless-auto-1",
 		EdictID:    0,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "secretary",
 		Questions: storage.ZhengmingQuestions{
@@ -704,7 +700,7 @@ func TestHeadlessSink_HandsoffZhengmingSingleAnswer(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "headless-auto-single",
 		EdictID:    0,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "secretary",
 		Questions: storage.ZhengmingQuestions{

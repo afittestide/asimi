@@ -1,9 +1,23 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// TestCourtConfigHasNoUsernameField enforces edict 1006's Ruler ruling: the
+// config-file username key was to be removed entirely — "fail closed, no inert
+// knob survives to regress later". Court scope identity is resolved from the OS
+// (OSUsername), never from committed config, so CourtConfig must not carry a
+// username field at all: a surviving key is parseable from a tracked
+// .agents/asimi.conf and would re-open the cross-user forgery vector the moment
+// any code path read it again.
+func TestCourtConfigHasNoUsernameField(t *testing.T) {
+	if f, ok := reflect.TypeOf(CourtConfig{}).FieldByName("Username"); ok {
+		t.Errorf("CourtConfig still declares field %q (koanf tag %q): the config-file username key must be deleted entirely, not left as an inert knob (edict 1006)", f.Name, f.Tag.Get("koanf"))
+	}
+}
 
 func TestDefaultIgnoreCopyGlobs_IsSafeAllowlist(t *testing.T) {
 	globs := DefaultIgnoreCopyGlobs()

@@ -400,11 +400,11 @@ type CourtParams struct {
 // ProvideCourt creates the Court coordinator with lifecycle management
 func ProvideCourt(params CourtParams) *court.Court {
 
-	// Start with defaults, then overlay config file values
+	// Start with defaults, then overlay config file values. The Court
+	// username is never taken from config — it is resolved from the OS user
+	// inside NewCourt so a committed [court] username cannot re-scope the
+	// session onto another user's ledger (edict 1006).
 	cfg := config.DefaultCourtConfig()
-	if params.Config.Court.Username != "" {
-		cfg.Username = params.Config.Court.Username
-	}
 	if params.Config.Court.Project != "" {
 		cfg.Project = params.Config.Court.Project
 	} else if params.RepoInfo.Slug != "" {
@@ -419,7 +419,7 @@ func ProvideCourt(params CourtParams) *court.Court {
 	// Copy explicitly: RunnerFlatlineTimeout is resolved to the default by the
 	// loader when unset, so an explicit 0 disables the sweep.
 	cfg.RunnerFlatlineTimeout = params.Config.Court.RunnerFlatlineTimeout
-	params.Logger.Info("initializing Court", "user", cfg.Username, "project", cfg.Project)
+	params.Logger.Info("initializing Court", "project", cfg.Project)
 
 	s := court.NewCourt(params.GormDB, cfg, params.Runner, params.Logger)
 	// notify is set later via s.SetNotify(program.Send) once the TUI program is created

@@ -85,6 +85,14 @@ type Court struct {
 	config *config.CourtConfig
 	runner runners.Runner
 
+	// username is the Court's ledger-scope identity. It is resolved from the
+	// OS user at construction — never from committed or user config, which a
+	// repository could otherwise use to re-scope the session onto another
+	// user's ledger (edict 1006). On the daemon path the socket is per-uid
+	// (asimi-<uid>.sock, mode 0700), so the verified peer is necessarily this
+	// same OS user.
+	username string
+
 	ministers   map[string]Minister
 	ritualGuard *RitualGuard
 
@@ -186,6 +194,8 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		s.runnerFlatlineTimeout = cfg.RunnerFlatlineTimeout
 	}
 	s.ensureDefaults()
+	// Scope identity is resolved from the OS, never from config (edict 1006).
+	s.username = config.OSUsername()
 
 	// Reserve edict 1 for Court Infrastructure operations
 	s.ensureCourtInfrastructureEdict()
@@ -193,7 +203,7 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 	// Create all ministers — each needs its own base (channels/maps are reference types).
 	// publish uses a closure so it works even before ritualGuard is assigned.
 	newBase := func() *MinisterBase {
-		base := NewMinisterBase(db, runner, logger, s.config.Username, s.config.Project, &s.msgChan)
+		base := NewMinisterBase(db, runner, logger, s.username, s.config.Project, &s.msgChan)
 		base.publish = func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint {
 			return s.PublishEvent(key, eventType, payload)
 		}
@@ -363,7 +373,7 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 	repoInfo := &repo.RepoInfo{}
 	ctx := tools.ToolContext{
 		RepoInfo:    repoInfo,
-		Username:    s.config.Username,
+		Username:    s.username,
 		Project:     s.config.Project,
 		DB:          s.db,
 		OutputLimit: s.config.OutputLimit,
@@ -988,13 +998,13 @@ func (s *Court) Ministers() []Minister {
 
 // EdictKey returns the current context as an EdictKey with the given edict ID.
 func (s *Court) EdictKey(edictID uint) storage.EdictKey {
-	return storage.EdictKey{ID: edictID, Username: s.config.Username, Project: s.config.Project}
+	return storage.EdictKey{ID: edictID, Username: s.username, Project: s.config.Project}
 }
 
 // CourtEdictKey returns the Court Infrastructure edict key (edict 1).
 // This is used for system-level operations like startup events.
 func (s *Court) CourtEdictKey() storage.EdictKey {
-	return storage.EdictKey{ID: 0, Username: s.config.Username, Project: s.config.Project}
+	return storage.EdictKey{ID: 0, Username: s.username, Project: s.config.Project}
 }
 
 // nextEdictID returns the next available edict ID (MAX+1).
@@ -1030,7 +1040,7 @@ func (s *Court) CreateEdictSilent(issueRef, intent, sessionID string) (*storage.
 func (s *Court) createEdict(issueRef, intent, sessionID string) (*storage.Edict, error) {
 	edict := storage.Edict{
 		ID:        s.nextEdictID(),
-		Username:  s.config.Username,
+		Username:  s.username,
 		Project:   s.config.Project,
 		IssueRef:  issueRef,
 		Intent:    intent,
@@ -1083,7 +1093,7 @@ func (s *Court) PublishEvent(key storage.EdictKey, eventType storage.CourtEvent,
 func (s *Court) CancelEdict(edictID uint) error {
 	now := time.Now()
 	result := s.db.Model(&storage.Edict{}).
-		Where("id = ? AND username = ? AND project = ?", edictID, s.config.Username, s.config.Project).
+		Where("id = ? AND username = ? AND project = ?", edictID, s.username, s.config.Project).
 		Update("cancelled_at", now)
 	if result.Error != nil {
 		return fmt.Errorf("failed to cancel edict: %w", result.Error)
@@ -1149,6 +1159,9 @@ func (s *Court) ensureDefaults() {
 	if s.config == nil {
 		s.config = config.DefaultCourtConfig()
 	}
+	if s.username == "" {
+		s.username = config.OSUsername()
+	}
 }
 
 func (s *Court) ministerIDs() []string {
@@ -1164,13 +1177,13 @@ func (s *Court) ministerIDs() []string {
 // Edict 1 is reserved for Court Infrastructure operations (init, bootstrap, etc.)
 func (s *Court) ensureCourtInfrastructureEdict() {
 	var edict storage.Edict
-	if err := s.db.First(&edict, "id = ? AND username = ? AND project = ?", 1, s.config.Username, s.config.Project).Error; err == nil {
+	if err := s.db.First(&edict, "id = ? AND username = ? AND project = ?", 1, s.username, s.config.Project).Error; err == nil {
 		return
 	}
 
 	courtEdict := storage.Edict{
 		ID:       1,
-		Username: s.config.Username,
+		Username: s.username,
 		Project:  s.config.Project,
 		Intent:   "Court Infrastructure - reserved for system-level operations (init, bootstrap, etc.)",
 		Summary:  "Court Infrastructure",
@@ -1792,7 +1805,7 @@ func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) error {
 func (s *Court) edictCommitSummary(edictID uint) string {
 	var username, project string
 	if s.config != nil {
-		username, project = s.config.Username, s.config.Project
+		username, project = s.username, s.config.Project
 	}
 	return edictCommitSummary(s.db, username, project, edictID)
 }
@@ -1907,7 +1920,7 @@ func (s *Court) ListActiveEdicts() ([]storage.ActiveEdict, error) {
 	if sealer == nil {
 		return nil, fmt.Errorf("seal service not available")
 	}
-	return sealer.ListActiveEdicts(s.config.Username, s.config.Project)
+	return sealer.ListActiveEdicts(s.username, s.config.Project)
 }
 
 // AllowRunnerFallback toggles the host-fallback behaviour on the active runner.

@@ -3693,7 +3693,7 @@ func TestSetContextParams_ProjectEmptyWhenNeitherConfigNorRepoInfoProvides(t *te
 }
 
 func TestSetContextParams_UsernameFallbackToOSUser(t *testing.T) {
-	// mockConfig() has no Court.Username, so Username should fall back to OS user
+	// The handshake username is always the OS user — never config (edict 1006).
 	m := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, nil)
 	params := m.setContextParams()
 	expected, err := user.Current()
@@ -3701,17 +3701,7 @@ func TestSetContextParams_UsernameFallbackToOSUser(t *testing.T) {
 		t.Fatalf("user.Current() failed: %v", err)
 	}
 	assert.Equal(t, expected.Username, params.Username,
-		"Username should fall back to OS user when config.Court.Username is empty")
-}
-
-func TestSetContextParams_UsernameFromConfig(t *testing.T) {
-	// When config sets a username, it wins over OS user fallback
-	cfg := mockConfig()
-	cfg.Court.Username = "custom-user"
-	m := NewTUIModel(cfg, nil, nil, nil, nil, nil, nil, nil)
-	params := m.setContextParams()
-	assert.Equal(t, "custom-user", params.Username,
-		"config.Court.Username should take precedence over OS user fallback")
+		"Username should be the OS user")
 }
 
 // --- mockCourtClient records PublishEvent calls for test assertions ---

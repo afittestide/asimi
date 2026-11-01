@@ -23,16 +23,25 @@ type SessionStoreFactory func(sdb *storage.DB, repoInfo repo.RepoInfo, maxSessio
 // HostRunner depending on isolatedHost), creates the Court,
 // wires the session persister (using config.DefaultSessionConfig for
 // defaults), and starts it.
+//
+// verifiedUsername is the socket-verified peer identity from serveOne. It is
+// the only authoritative Court username; a committed [court] username or a
+// client-supplied handshake value must never override it (edict 1006).
 func createCourt(
 	ctx context.Context,
 	shared *Shared,
 	connID uint64,
 	hp types.SetContextParams,
+	verifiedUsername string,
 	projectCfg *config.Config,
 	repoInfo repo.RepoInfo,
 	newSessionStore SessionStoreFactory,
 	isolatedHost bool,
 ) (*court.Court, runners.Runner, error) {
+	if verifiedUsername == "" {
+		return nil, nil, fmt.Errorf("daemon: refusing connection: socket peer username could not be verified")
+	}
+
 	var runner runners.Runner
 	if isolatedHost {
 		hostRunner := runners.NewHostRunner(connID, repoInfo.ProjectRoot)
@@ -46,15 +55,14 @@ func createCourt(
 	}
 
 	courtCfg := config.DefaultCourtConfig()
-	// Pinned [court] username/project from .agents/asimi.conf take effect on the
-	// daemon path too — matching the TUI provider — so the same checkout cannot
-	// resolve to two different Court scopes. The pinned config wins over the
-	// handshake slug (which the client derived with the same shared resolver,
-	// edict 968); the handshake fills in what the config leaves unset.
-	if projectCfg.Court.Username != "" {
-		courtCfg.Username = projectCfg.Court.Username
-	} else if hp.Username != "" {
-		courtCfg.Username = hp.Username
+	// The Court username is the socket-verified peer identity — never the
+	// committed [court] username and never the client handshake slug. A
+	// repository carrying [court] username = "<victim>" must have no effect
+	// (edict 1006). The Court itself resolves the OS user, which on the
+	// per-uid daemon socket is exactly this verified peer; assert they agree
+	// so the invariant fails closed rather than silently diverging.
+	if osUser := config.OSUsername(); osUser != verifiedUsername {
+		return nil, nil, fmt.Errorf("daemon: refusing connection: socket peer %q does not match OS user %q", verifiedUsername, osUser)
 	}
 	if projectCfg.Court.Project != "" {
 		courtCfg.Project = projectCfg.Court.Project

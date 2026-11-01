@@ -156,9 +156,11 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 
 		// Verify the client-supplied Username against the peer credential
 		// from the Unix socket. This prevents any process with socket
-		// access from impersonating another user.
-		if verified := unixPeerUsername(conn); verified != "" && verified != p.Username {
-			msg := fmt.Sprintf("username mismatch: client claims %q, socket peer is %q", p.Username, verified)
+		// access from impersonating another user. The verified value is the
+		// only authoritative Court username — config can never override it.
+		verifiedUsername := unixPeerUsername(conn)
+		if verifiedUsername != "" && verifiedUsername != p.Username {
+			msg := fmt.Sprintf("username mismatch: client claims %q, socket peer is %q", p.Username, verifiedUsername)
 			slog.Info(msg)
 			return nil, wire.NewError(0, msg)
 		}
@@ -176,7 +178,7 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 				hasVCS = repo.GetRepoInfoForRoot(p.ProjectRoot).HasVCS
 			}
 			repoInfo := repo.RepoInfo{ProjectRoot: p.ProjectRoot, WorktreePath: p.WorktreePath, Branch: p.Branch, HasVCS: hasVCS, Slug: p.Project}
-			ct, runner, err = createCourt(ctx, shared, connID, p, projectCfg, repoInfo, shared.NewSessionStore, p.IsolatedHost)
+			ct, runner, err = createCourt(ctx, shared, connID, p, verifiedUsername, projectCfg, repoInfo, shared.NewSessionStore, p.IsolatedHost)
 			if err != nil {
 				return nil, wire.NewError(0, err.Error())
 			}

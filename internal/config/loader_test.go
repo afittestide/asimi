@@ -1627,7 +1627,6 @@ func TestLoadProjectConfig_ShogunateBackwardCompat(t *testing.T) {
 
 	// Old-format config with [shogunate] instead of [court]
 	projectConfig := `[shogunate]
-username = "legacy-user"
 project = "legacy-project"
 ritual_timeout = "10m"
 step_idle_timeout = "3m"
@@ -1638,7 +1637,6 @@ step_idle_timeout = "3m"
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 
-	assert.Equal(t, "legacy-user", cfg.Court.Username)
 	assert.Equal(t, "legacy-project", cfg.Court.Project)
 	assert.Equal(t, 10*time.Minute, cfg.Court.RitualTimeout)
 	assert.Equal(t, 3*time.Minute, cfg.Court.StepIdleTimeout)
@@ -1657,11 +1655,9 @@ func TestLoadProjectConfig_CourtOverridesShogunate(t *testing.T) {
 	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
 
 	projectConfig := `[shogunate]
-username = "old-user"
 project = "old-project"
 
 [court]
-username = "new-user"
 project = "new-project"
 `
 	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
@@ -1670,7 +1666,6 @@ project = "new-project"
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 
-	assert.Equal(t, "new-user", cfg.Court.Username)
 	assert.Equal(t, "new-project", cfg.Court.Project)
 }
 

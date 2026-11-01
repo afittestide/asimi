@@ -108,15 +108,14 @@ func buildSetContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParam
 		}
 	}
 	project := ""
-	username := ""
 	if cfg != nil {
 		project = cfg.Court.Project
-		username = cfg.Court.Username
 	}
-	if username == "" {
-		if u, err := user.Current(); err == nil {
-			username = u.Username
-		}
+	// The handshake username is resolved from the OS user, never from config:
+	// a committed [court] username must not choose scope (edict 1006).
+	username := ""
+	if u, err := user.Current(); err == nil {
+		username = u.Username
 	}
 	if username == "" {
 		username = "guest"

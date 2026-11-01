@@ -246,9 +246,6 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	// Backward-compat: old config files may have a [shogunate] section
 	// instead of [court]. If [court] wasn't explicitly set, copy values
 	// from [shogunate] so existing user configs keep working.
-	if !k.Exists("court.username") && k.Exists("shogunate.username") {
-		config.Court.Username = k.String("shogunate.username")
-	}
 	if !k.Exists("court.project") && k.Exists("shogunate.project") {
 		config.Court.Project = k.String("shogunate.project")
 	}

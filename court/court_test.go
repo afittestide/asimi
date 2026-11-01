@@ -912,7 +912,7 @@ func TestZhengmingAnswered_ChatDoesNotCreateEdict(t *testing.T) {
 	go s.ritualGuard.Run(ctx)
 
 	// Publish a zhengming_answered event with AnswerChat
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-chat-1",
 			"answer":     tools.AnswerChat,
@@ -941,7 +941,7 @@ func TestZhengmingAnswered_RejectDoesNotCreateEdict(t *testing.T) {
 
 	go s.ritualGuard.Run(ctx)
 
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-reject-1",
 			"answer":     tools.AnswerReject,
@@ -972,7 +972,7 @@ func TestZhengmingAnswered_ApproveEdictCreatesEdict(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "test-approve-1",
 		EdictID:    0,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "chancellor",
 		Questions: storage.ZhengmingQuestions{{
@@ -985,7 +985,7 @@ func TestZhengmingAnswered_ApproveEdictCreatesEdict(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&req).Error)
 
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-approve-1",
 			"answer":     tools.AnswerApproveEdict,
@@ -1037,7 +1037,7 @@ func TestZhengmingAnswered_ApproveEdictRefinesExistingEdict(t *testing.T) {
 	// Create an existing edict with the right user/project scoping
 	edict := storage.Edict{
 		ID:       42,
-		Username: cfg.Username,
+		Username: config.OSUsername(),
 		Project:  cfg.Project,
 		Intent:   "Original intent",
 	}
@@ -1047,7 +1047,7 @@ func TestZhengmingAnswered_ApproveEdictRefinesExistingEdict(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "test-refine-1",
 		EdictID:    42,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "chancellor",
 		Questions: storage.ZhengmingQuestions{{
@@ -1060,7 +1060,7 @@ func TestZhengmingAnswered_ApproveEdictRefinesExistingEdict(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&req).Error)
 
-	s.PublishEvent(storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-refine-1",
 			"answer":     tools.AnswerApproveEdict,
@@ -1098,7 +1098,7 @@ func TestZhengmingAnswered_NonSentinelAnswerWithEdictID0CreatesEdict(t *testing.
 	go s.ritualGuard.Run(ctx)
 
 	customAnswer := "Let's build a new feature"
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-custom-1",
 			"answer":     customAnswer,
@@ -1128,7 +1128,7 @@ func TestZhengmingAnswered_ChatAndNonSentinelIsolation(t *testing.T) {
 	go s.ritualGuard.Run(ctx)
 
 	// Publish Chat first
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "isolation-chat",
 			"answer":     tools.AnswerChat,
@@ -1137,7 +1137,7 @@ func TestZhengmingAnswered_ChatAndNonSentinelIsolation(t *testing.T) {
 
 	// Then publish a legitimate answer
 	legitAnswer := "Build the database migration tool"
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "isolation-legit",
 			"answer":     legitAnswer,
@@ -1179,7 +1179,7 @@ func TestZhengmingAnswered_EdictSuggestionWithEdictID0TypedAnswerDoesNotCreateEd
 	req := storage.Zhengming{
 		RequestID: "test-typed-suggestion",
 		EdictID:   0,
-		Username:  cfg.Username,
+		Username:  config.OSUsername(),
 		Project:   cfg.Project,
 		Questions: storage.ZhengmingQuestions{{
 			Text:    "Keep the Podman machine alive between sessions",
@@ -1192,7 +1192,7 @@ func TestZhengmingAnswered_EdictSuggestionWithEdictID0TypedAnswerDoesNotCreateEd
 	require.NoError(t, db.Create(&req).Error)
 
 	typed := "an edict needs to be more decisive about the podman machine"
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-typed-suggestion",
 			"answer":     typed,
@@ -1226,7 +1226,7 @@ func TestHandleZhengmingResponse_RoutesToRaisingMinister(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "route-to-raiser",
 		EdictID:    0,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "judge",
 		Questions: storage.ZhengmingQuestions{{
@@ -1269,7 +1269,7 @@ func TestHandleZhengmingResponse_NotFirstHandler(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "not-first-handler",
 		EdictID:    7,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "zzz_raiser",
 		Questions: storage.ZhengmingQuestions{{
@@ -1319,7 +1319,7 @@ func TestHandleZhengmingResponse_DeliversToWaitingRitual(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "ritual-wait",
 		EdictID:    42,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "secretary",
 		SessionID:  "ritual-session",
@@ -1414,7 +1414,7 @@ func TestCourt_StartRitual_EmitsEvent(t *testing.T) {
 	require.NotNil(t, s)
 	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "test-ritual"}))
 
-	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project}
 	err := s.StartRitual("test-ritual", key, map[string]string{"foo": "bar"})
 	require.NoError(t, err)
 
@@ -1432,7 +1432,7 @@ func TestCourt_StartRitual_UnknownRitual(t *testing.T) {
 	s := NewCourt(db, cfg, nil, nil)
 	require.NotNil(t, s)
 
-	key := storage.EdictKey{ID: 43, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 43, Username: config.OSUsername(), Project: cfg.Project}
 	err := s.StartRitual("no-such-ritual", key, map[string]string{"foo": "bar"})
 	require.Error(t, err)
 
@@ -1453,7 +1453,7 @@ func TestCourt_StartRitual_DuplicateSameRitualRejected(t *testing.T) {
 	require.NotNil(t, s)
 	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "test-ritual"}))
 
-	key := storage.EdictKey{ID: 44, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 44, Username: config.OSUsername(), Project: cfg.Project}
 	running := &RitualExecution{
 		ID:         "already-running",
 		RitualName: "test-ritual",
@@ -1484,7 +1484,7 @@ func TestCourt_StartRitual_DifferentRitualQueues(t *testing.T) {
 	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "swift-strike"}))
 	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "review"}))
 
-	key := storage.EdictKey{ID: 45, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 45, Username: config.OSUsername(), Project: cfg.Project}
 	running := &RitualExecution{
 		ID:         "other-running",
 		RitualName: "swift-strike",
@@ -1511,7 +1511,7 @@ func TestCourt_StartRitual_CompletedExecutionDoesNotBlock(t *testing.T) {
 	require.NotNil(t, s)
 	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "test-ritual"}))
 
-	key := storage.EdictKey{ID: 46, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 46, Username: config.OSUsername(), Project: cfg.Project}
 	done := &RitualExecution{
 		ID:         "finished",
 		RitualName: "test-ritual",
@@ -1562,16 +1562,15 @@ func TestCourt_CheckHostCommand_IsolatedHost(t *testing.T) {
 func TestCourt_AppendToIntent_InvalidatesSeals(t *testing.T) {
 	db := setupMinisterTestDB(t)
 	cfg := config.DefaultCourtConfig()
-	cfg.Username = "testuser"
 	cfg.Project = "testproject"
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
 	// Create an edict and grant judge + chancellor seals
-	edict := storage.Edict{Intent: "original intent", Username: "testuser", Project: "testproject"}
+	edict := storage.Edict{Intent: "original intent", Username: config.OSUsername(), Project: "testproject"}
 	require.NoError(t, db.Create(&edict).Error)
 
-	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
+	key := storage.EdictKey{ID: edict.ID, Username: config.OSUsername(), Project: "testproject"}
 	sealSvc := s.GetSealService()
 	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
 	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
@@ -1605,15 +1604,14 @@ func TestCourt_AppendToIntent_InvalidatesSeals(t *testing.T) {
 func TestCourt_GetEdictSealsExcludesStaleSeals(t *testing.T) {
 	db := setupMinisterTestDB(t)
 	cfg := config.DefaultCourtConfig()
-	cfg.Username = "testuser"
 	cfg.Project = "testproject"
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
-	edict := storage.Edict{Intent: "original intent", Username: "testuser", Project: "testproject"}
+	edict := storage.Edict{Intent: "original intent", Username: config.OSUsername(), Project: "testproject"}
 	require.NoError(t, db.Create(&edict).Error)
 
-	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
+	key := storage.EdictKey{ID: edict.ID, Username: config.OSUsername(), Project: "testproject"}
 	sealSvc := s.GetSealService()
 	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
 	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
@@ -1901,7 +1899,7 @@ func TestRequestZhengming_SetsSessionID(t *testing.T) {
 	// Call RequestZhengming via the Court (implements ZhengmingRequester)
 	var zr tools.ZhengmingRequester = s
 
-	key := storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Should we proceed?",
 		Summary: "proceed check",
@@ -1935,7 +1933,7 @@ func TestRequestZhengming_NilSessionLeavesSessionIDEmpty(t *testing.T) {
 
 	var zr tools.ZhengmingRequester = s
 
-	key := storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Should we proceed?",
 		Summary: "proceed check",
@@ -1993,7 +1991,7 @@ func TestRequestZhengming_UsesCallingMinisterSessionID(t *testing.T) {
 	// The chancellor calls RequestZhengming on behalf of "chancellor"
 	var zr tools.ZhengmingRequester = s
 
-	key := storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Should we proceed?",
 		Summary: "proceed check",
@@ -2039,7 +2037,7 @@ func TestRequestZhengming_EmptySessionIDWhenMinisterLookupNil(t *testing.T) {
 
 	var zr tools.ZhengmingRequester = s
 
-	key := storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Should we proceed?",
 		Summary: "proceed check",
@@ -2089,7 +2087,7 @@ func TestRequestZhengming_EmptySessionIDWhenMinisterNotFound(t *testing.T) {
 
 	var zr tools.ZhengmingRequester = s
 
-	key := storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Should we proceed?",
 		Summary: "proceed check",
@@ -2139,7 +2137,7 @@ func TestRequestZhengming_EmptySessionIDWhenMinisterHasNoSession(t *testing.T) {
 
 	var zr tools.ZhengmingRequester = s
 
-	key := storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Should we proceed?",
 		Summary: "proceed check",
@@ -2176,7 +2174,7 @@ func TestZhengmingAnswered_NonSentinelCreatesEdictWithSessionID(t *testing.T) {
 	req := storage.Zhengming{
 		RequestID:  "test-session-edict-1",
 		EdictID:    0,
-		Username:   cfg.Username,
+		Username:   config.OSUsername(),
 		Project:    cfg.Project,
 		MinisterID: "secretary",
 		SessionID:  sessionID,
@@ -2187,7 +2185,7 @@ func TestZhengmingAnswered_NonSentinelCreatesEdictWithSessionID(t *testing.T) {
 	require.NoError(t, db.Create(&req).Error)
 
 	customAnswer := "Build something new"
-	s.PublishEvent(storage.EdictKey{ID: 0, Username: cfg.Username, Project: cfg.Project},
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
 		storage.EventZhengmingAnswered, storage.JSON{
 			"request_id": "test-session-edict-1",
 			"answer":     customAnswer,
@@ -2342,7 +2340,7 @@ func TestCourt_RequestZhengming_CreatesDBRecord(t *testing.T) {
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
-	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Which approach?",
 		Summary: "approach check",
@@ -2356,7 +2354,7 @@ func TestCourt_RequestZhengming_CreatesDBRecord(t *testing.T) {
 	var req storage.Zhengming
 	require.NoError(t, db.First(&req, "request_id = ?", requestID).Error)
 	assert.Equal(t, uint(42), req.EdictID)
-	assert.Equal(t, cfg.Username, req.Username)
+	assert.Equal(t, config.OSUsername(), req.Username)
 	assert.Equal(t, cfg.Project, req.Project)
 	assert.Equal(t, "chancellor", req.MinisterID)
 	assert.Equal(t, storage.ZhengmingPending, req.Status)
@@ -2371,7 +2369,7 @@ func TestCourt_RequestZhengming_UrgentPrioritySetsShorterTimeout(t *testing.T) {
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
-	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Urgent question?",
 		Summary: "urgent",
@@ -2399,7 +2397,7 @@ func TestCourt_RequestZhengming_EmitsEvent(t *testing.T) {
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
-	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Which approach?",
 		Summary: "approach check",
@@ -2442,7 +2440,7 @@ func TestCourt_RequestZhengming_FiresCallbackOnCaller(t *testing.T) {
 		base.SetOnZhengmingRaised(func() { chancellorRaised = true })
 	}
 
-	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Which approach?",
 		Summary: "approach check",
@@ -2495,7 +2493,7 @@ func TestRequestZhengming_ContextSessionIDOverridesMinisterLookup(t *testing.T) 
 	ritualSessionID := "ritual-session-e717"
 	ctxWithSession := context.WithValue(ctx, tools.SessionIDKey{}, ritualSessionID)
 
-	key := storage.EdictKey{ID: 42, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 42, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{
 		Text:    "Approve?",
 		Summary: "approval check",
@@ -2547,7 +2545,7 @@ func TestRequestZhengming_ContextSessionIDWithMinisterSession(t *testing.T) {
 	ctxSessionID := "ctx-session-xyz"
 	ctxWithSession := context.WithValue(ctx, tools.SessionIDKey{}, ctxSessionID)
 
-	key := storage.EdictKey{ID: 1, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 1, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{Text: "OK?", Options: []string{"A", "B"}}}
 
 	requestID, err := s.RequestZhengming(ctxWithSession, key, questions, storage.PriorityNormal, "secretary")
@@ -2588,7 +2586,7 @@ func TestRequestZhengming_FallbackToMinisterSessionWhenNoContextSession(t *testi
 	}
 
 	// No session ID in context
-	key := storage.EdictKey{ID: 1, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 1, Username: config.OSUsername(), Project: cfg.Project}
 	questions := storage.ZhengmingQuestions{{Text: "OK?", Options: []string{"A", "B"}}}
 
 	requestID, err := s.RequestZhengming(context.Background(), key, questions, storage.PriorityNormal, "secretary")
@@ -2608,7 +2606,7 @@ func TestCourt_ConsultMinister_NotFound(t *testing.T) {
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
-	key := storage.EdictKey{ID: 1, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 1, Username: config.OSUsername(), Project: cfg.Project}
 	_, err := s.ConsultMinister(context.Background(), "secretary", "nonexistent", "secretary", key, "do something")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "minister not found")
@@ -2622,7 +2620,7 @@ func TestCourt_ConsultMinister_SelfConsultationRejected(t *testing.T) {
 	s := NewCourt(db, cfg, nil, slog.Default())
 	require.NotNil(t, s)
 
-	key := storage.EdictKey{ID: 1, Username: cfg.Username, Project: cfg.Project}
+	key := storage.EdictKey{ID: 1, Username: config.OSUsername(), Project: cfg.Project}
 	_, err := s.ConsultMinister(context.Background(), "forge", "forge", "forge", key, "do work")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot consult itself")
@@ -4350,7 +4348,7 @@ func TestMergeEdictWorktree_RunsOnHostMutationRunnerNotCourtRunner(t *testing.T)
 		logger:         slog.Default(),
 		runner:         courtRunner,
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
 
@@ -4380,7 +4378,7 @@ func TestEnsureEdictWorktree_UsesMutationRunner(t *testing.T) {
 		logger:         slog.Default(),
 		runner:         courtRunner,
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
 
@@ -4410,7 +4408,7 @@ func TestMergeEdictWorktree_RetriesTransientCorruptLooseObject(t *testing.T) {
 		logger:         slog.Default(),
 		runner:         &worktreeTestRunner{},
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{
 		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
@@ -4447,7 +4445,7 @@ func TestMergeEdictWorktree_PersistentCorruptionStillFails(t *testing.T) {
 		logger:         slog.Default(),
 		runner:         &worktreeTestRunner{},
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{
 		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
@@ -4595,7 +4593,7 @@ func TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject(t *testing.T
 		logger:         slog.Default(),
 		runner:         &worktreeTestRunner{},
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{
 		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
@@ -4642,7 +4640,7 @@ func TestMergeEdictWorktree_AbortsRebaseStateBeforeRetry(t *testing.T) {
 		logger:         slog.Default(),
 		runner:         &worktreeTestRunner{},
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{
 		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
@@ -4691,7 +4689,7 @@ func TestMergeEdictWorktree_AbortFailureDoesNotWedgeTheSeal(t *testing.T) {
 		logger:         slog.Default(),
 		runner:         &worktreeTestRunner{},
 		mutationRunner: mutation,
-		config:         &config.CourtConfig{Username: "u", Project: "p"},
+		config:         &config.CourtConfig{Project: "p"}, username: "u",
 	}
 	s.ritualGuard = &RitualGuard{
 		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},

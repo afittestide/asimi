@@ -178,7 +178,6 @@ const DefaultDiskMinFreeMiB = 4096
 type CourtConfig struct {
 	RitualTimeout   time.Duration `koanf:"ritual_timeout"`    // legacy, unused
 	StepIdleTimeout time.Duration `koanf:"step_idle_timeout"` // max silence before aborting a ritual step (default 5m)
-	Username        string        `koanf:"username"`          // OS username for edict scoping
 	Project         string        `koanf:"project"`           // project slug for edict scoping
 	IsolatedHost    bool          `koanf:"isolated_host"`     // skip sandbox, run commands on host without approval
 	OutputLimit     int           `koanf:"output_limit"`      // max chars of heavy output fields in summary mode (default 500)
@@ -210,16 +209,23 @@ const DefaultRunnerFlatlineTimeout = 15 * time.Minute
 
 // DefaultCourtConfig returns the default configuration.
 func DefaultCourtConfig() *CourtConfig {
-	username := "guest"
-	if u, err := user.Current(); err == nil {
-		username = u.Username
-	}
 	return &CourtConfig{
 		StepIdleTimeout:       5 * time.Minute,
-		Username:              username,
 		OutputLimit:           DefaultOutputLimit,
 		RunnerFlatlineTimeout: DefaultRunnerFlatlineTimeout,
 	}
+}
+
+// OSUsername returns the current OS user's username, the only identity the
+// Court can verify. It falls back to "guest" when the lookup fails so callers
+// always receive a non-empty scope, and is deliberately independent of any
+// config-file value: a committed [court] username must never choose scope
+// (edict 1006).
+func OSUsername() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return "guest"
 }
 
 // DefaultSessionConfig returns the default session configuration.
