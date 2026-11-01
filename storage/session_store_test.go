@@ -706,11 +706,11 @@ func TestMigrateV4toV5_ShogunateToCourtEventRename(t *testing.T) {
 		require.NotContains(t, et, "shogunate", "no DLQ event should contain 'shogunate' after migration")
 	}
 
-	// Verify schema version is now 7 (v4→v5, v5→v6, v6→v7 all run)
+	// Verify schema version is now the current version (v4→v5, v5→v6, v6→v7, … all run)
 	var version int
 	err = db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version)
 	require.NoError(t, err)
-	require.Equal(t, 7, version, "schema should be at version 7 after migration")
+	require.Equal(t, SchemaVersion, version, "schema should be at the current version after migration")
 }
 
 // TestMigrateV5toV6_SageToChancellorSealRename verifies that the v5→v6
@@ -778,17 +778,17 @@ func TestMigrateV5toV6_SageToChancellorSealRename(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, sageCount, "no seals should have minister_id='sage' after migration")
 
-	// Verify schema version is now 6
+	// Verify schema version is now the current version
 	var version int
 	err = db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version)
 	require.NoError(t, err)
-	require.Equal(t, 7, version, "schema should be at version 7 after migration")
+	require.Equal(t, SchemaVersion, version, "schema should be at the current version after migration")
 }
 
 // TestMigrateV5toV6_SealsTableNotExist verifies the migration handles
 // databases where the seals table doesn't exist yet (e.g., a DB created
 // by a tool that only ran raw SQL migrations without GORM AutoMigrate).
-// The migration should succeed without error and record version 7.
+// The migration should succeed without error and record the current version.
 func TestMigrateV5toV6_SealsTableNotExist(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "migration_v5v6_no_seals.db")
@@ -810,11 +810,11 @@ func TestMigrateV5toV6_SealsTableNotExist(t *testing.T) {
 	require.NoError(t, err, "migration should succeed when seals table does not exist")
 	defer db.Close()
 
-	// Verify schema version is now 6
+	// Verify schema version is now the current version
 	var version int
 	err = db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version)
 	require.NoError(t, err)
-	require.Equal(t, 7, version, "schema should be at version 7 after migration")
+	require.Equal(t, SchemaVersion, version, "schema should be at the current version after migration")
 
 	// Verify seals table still doesn't exist (migration shouldn't create it)
 	var tableExists bool
@@ -823,6 +823,139 @@ func TestMigrateV5toV6_SealsTableNotExist(t *testing.T) {
 	).Scan(&tableExists)
 	require.NoError(t, err)
 	require.False(t, tableExists, "migration should not create the seals table")
+}
+
+// TestMigrateV7toV8_AddsOwnerPID verifies that the v7→v8 migration adds the
+// owner_pid column to ritual_executions, idempotently, and that a DB already
+// carrying the column is left untouched.
+func TestMigrateV7toV8_AddsOwnerPID(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_v7v8_test.db")
+
+	// A v7 database with a ritual_executions table that predates owner_pid.
+	conn, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO schema_version (version, applied_at) VALUES (7, unixepoch())`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE ritual_executions (
+		id TEXT PRIMARY KEY,
+		ritual_name TEXT NOT NULL,
+		edict_id INTEGER NOT NULL,
+		username TEXT NOT NULL DEFAULT '',
+		project TEXT NOT NULL DEFAULT '',
+		session_id TEXT,
+		current_step INTEGER NOT NULL DEFAULT 0,
+		state TEXT NOT NULL DEFAULT 'pending',
+		data TEXT NOT NULL DEFAULT '{}',
+		created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+	)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO ritual_executions (id, ritual_name, edict_id, state) VALUES ('r1', 'swift-strike', 1, 'running')`)
+	require.NoError(t, err)
+	conn.Close()
+
+	db, err := InitDB(dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	var version int
+	require.NoError(t, db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version))
+	require.Equal(t, SchemaVersion, version, "schema should be at the current version after migration")
+
+	// The existing row must be readable and carry the default 0 (unknown owner).
+	var ownerPID int64
+	require.NoError(t, db.conn.QueryRow("SELECT owner_pid FROM ritual_executions WHERE id = 'r1'").Scan(&ownerPID))
+	require.Equal(t, int64(0), ownerPID, "legacy rows default to unknown owner (0), never reconciled")
+}
+
+// TestMigrateV7toV8_ColumnAlreadyPresentIsIdempotent verifies the migration's
+// idempotency arm: a v7 database whose ritual_executions table already carries
+// owner_pid (the raw-Schema shape, or a partially-applied migration) must
+// migrate cleanly instead of failing with a duplicate-column error. Without the
+// pragma_table_info guard the ALTER TABLE would abort the whole migration and
+// the Court would refuse to open the database.
+func TestMigrateV7toV8_ColumnAlreadyPresentIsIdempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_v7v8_column_present.db")
+
+	conn, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO schema_version (version, applied_at) VALUES (7, unixepoch())`)
+	require.NoError(t, err)
+	// The column is already there, as Schema (raw SQL) creates it on a fresh DB.
+	_, err = conn.Exec(`CREATE TABLE ritual_executions (
+		id TEXT PRIMARY KEY,
+		ritual_name TEXT NOT NULL,
+		edict_id INTEGER NOT NULL,
+		username TEXT NOT NULL DEFAULT '',
+		project TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL DEFAULT 'pending',
+		owner_pid INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+		updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+	)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO ritual_executions (id, ritual_name, edict_id, state) VALUES ('r1', 'swift-strike', 1, 'running')`)
+	require.NoError(t, err)
+	conn.Close()
+
+	db, err := InitDB(dbPath)
+	require.NoError(t, err, "a DB already carrying owner_pid must migrate cleanly, not fail on a duplicate column")
+	defer db.Close()
+
+	var version int
+	require.NoError(t, db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version))
+	require.Equal(t, SchemaVersion, version, "the version must still be recorded after the idempotent no-op")
+
+	// The column must exist exactly once, with the documented default.
+	var ownerPID int64
+	require.NoError(t, db.conn.QueryRow(
+		"SELECT owner_pid FROM ritual_executions LIMIT 1",
+	).Scan(&ownerPID))
+	require.Equal(t, int64(0), ownerPID)
+
+	var columnCount int
+	require.NoError(t, db.conn.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('ritual_executions') WHERE name = 'owner_pid'",
+	).Scan(&columnCount))
+	require.Equal(t, 1, columnCount, "owner_pid must exist exactly once")
+}
+
+// TestMigrateV7toV8_TableAbsentStillRecordsVersion verifies the migration when
+// ritual_executions does not exist at all (a DB created by a tool that ran only
+// part of the raw schema). The migration must still record the version rather
+// than fail, mirroring the v5→v6 no-seals precedent — otherwise such a database
+// can never advance past v7 and every startup re-runs the migration.
+func TestMigrateV7toV8_TableAbsentStillRecordsVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_v7v8_no_table.db")
+
+	conn, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO schema_version (version, applied_at) VALUES (7, unixepoch())`)
+	require.NoError(t, err)
+	conn.Close()
+
+	db, err := InitDB(dbPath)
+	require.NoError(t, err, "migration must succeed when ritual_executions does not exist")
+	defer db.Close()
+
+	var version int
+	require.NoError(t, db.conn.QueryRow("SELECT MAX(version) FROM schema_version").Scan(&version))
+	require.Equal(t, SchemaVersion, version)
+
+	var tableExists bool
+	require.NoError(t, db.conn.QueryRow(
+		"SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='ritual_executions'",
+	).Scan(&tableExists))
+	require.False(t, tableExists, "the migration must not create the ritual_executions table")
 }
 
 // TestPostGormMigrate_RenamesSageSeals verifies that PostGormMigrate

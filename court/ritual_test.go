@@ -5937,3 +5937,36 @@ func TestRitualRun_StampsEdictRunnerOnCompletion(t *testing.T) {
 	require.NoError(t, runner.Run(context.Background(), sysExec))
 	assert.Equal(t, []uint{42}, stamped, "system edicts must not stamp a per-edict runner")
 }
+
+// TestRitualStart_StampsOwnerPID verifies the explicit ownership stamp that the
+// startup reconciler depends on: an execution records this process as its owner
+// at start, and the stamp is persisted — not merely held in memory. Without it
+// every row reads owner_pid 0 (unknown), the reconciler can never prove an
+// orphan, and the e1012 invariant silently degrades to "never reconcile".
+func TestRitualStart_StampsOwnerPID(t *testing.T) {
+	db := setupRitualTestDB(t)
+	court := newRitualTestCourtWithDB(t, db, "hello\n", nil)
+
+	ritual := &RitualDef{
+		Name: "owner-stamp",
+		Steps: []RitualStep{
+			{Name: "echo", Minister: "forge", Task: "Echo hello"},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+
+	exec, err := runner.Start(context.Background(), "owner-stamp", testEK(77), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(os.Getpid()), exec.OwnerPID,
+		"a started execution must be stamped with the owning process")
+
+	// The stamp must reach the database, because that is where the reconciler
+	// reads it after a restart.
+	var row RitualExecution
+	require.NoError(t, db.First(&row, "id = ?", exec.ID).Error)
+	assert.Equal(t, int64(os.Getpid()), row.OwnerPID,
+		"the ownership stamp must be persisted, not only held in memory")
+}

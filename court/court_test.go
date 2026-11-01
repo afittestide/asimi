@@ -420,6 +420,79 @@ func TestConfigureModel_ReloadsRitualsWhenProjectRootBecomesAvailable(t *testing
 	assert.NotEmpty(t, reg.List(), "rituals should be loaded after ConfigureModel with project root")
 }
 
+// TestCourt_Start_ReconcilesOrphanedRituals verifies the e1012 startup
+// invariant is actually enforced from the Court lifecycle, not merely
+// implemented: Court.Start must move a `running` execution whose owner process
+// is gone out of `running` before the guard's recovery scanner runs. Without
+// this call the invariant is dead code and a restart still strands the edict.
+func TestCourt_Start_ReconcilesOrphanedRituals(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+
+	key := storage.EdictKey{ID: 480, Username: config.OSUsername(), Project: cfg.Project}
+	orphan := &RitualExecution{
+		ID:          "orphaned-at-start",
+		RitualName:  "swift-strike",
+		EdictID:     key.ID,
+		Username:    key.Username,
+		Project:     key.Project,
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+		// A pid that cannot exist on this host: its owner is provably dead.
+		OwnerPID: int64(1 << 30),
+	}
+	require.NoError(t, db.Save(orphan).Error)
+
+	require.NoError(t, s.Start(context.Background()))
+	t.Cleanup(func() { s.Stop() })
+
+	var got RitualExecution
+	require.NoError(t, db.First(&got, "id = ?", orphan.ID).Error)
+	assert.Equal(t, RitualStateFailed, got.State,
+		"Court.Start must reconcile an orphaned running execution out of `running`")
+
+	// A live-owned execution must survive the same startup path.
+	live := &RitualExecution{
+		ID:          "live-owned-at-start",
+		RitualName:  "swift-strike",
+		EdictID:     481,
+		Username:    config.OSUsername(),
+		Project:     cfg.Project,
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+		OwnerPID:    int64(os.Getpid()),
+	}
+	require.NoError(t, db.Save(live).Error)
+
+	s2 := NewCourt(db, cfg, nil, nil)
+	require.NoError(t, s2.Start(context.Background()))
+	t.Cleanup(func() { s2.Stop() })
+
+	var gotLive RitualExecution
+	require.NoError(t, db.First(&gotLive, "id = ?", live.ID).Error)
+	assert.Equal(t, RitualStateRunning, gotLive.State,
+		"Court.Start must never reconcile an execution owned by a live process")
+}
+
+// TestCourt_Start_ReconcileFailureIsNonFatal verifies the startup invariant is
+// enforced best-effort: a broken reconcile (here, the table is gone) must not
+// prevent the Court from starting. The acceptance criterion is explicit that a
+// reconciliation failure must not be fatal.
+func TestCourt_Start_ReconcileFailureIsNonFatal(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+
+	require.NoError(t, db.Exec("DROP TABLE ritual_executions").Error)
+
+	require.NoError(t, s.Start(context.Background()),
+		"a failing reconciliation must not prevent the Court from starting")
+	t.Cleanup(func() { s.Stop() })
+}
+
 func TestConfigureModel_DoesNotReloadRitualsWhenRegistryNotEmpty(t *testing.T) {
 	db := setupCourtTestDB(t)
 
@@ -1440,6 +1513,49 @@ func TestCourt_StartRitual_UnknownRitual(t *testing.T) {
 	var events []storage.TianEvent
 	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
 	require.Empty(t, events, "unknown ritual must not emit a ritual_enacted event")
+}
+
+// TestCourt_StartRitual_OrphanReconcileUnblocksReenactment verifies e1012
+// acceptance criterion 2: an edict whose ritual was orphaned by a restart can be
+// re-enacted without a human clearing a stale prompt. Before the reconcile the
+// duplicate-enactment guard refuses (the row is still `running`); after the
+// startup reconcile the guard releases and the enactment publishes.
+func TestCourt_StartRitual_OrphanReconcileUnblocksReenactment(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+	require.NoError(t, s.GetRitualRegistry().Register(&RitualDef{Name: "swift-strike"}))
+
+	key := storage.EdictKey{ID: 460, Username: config.OSUsername(), Project: cfg.Project}
+	orphan := &RitualExecution{
+		ID:          "orphaned-by-restart",
+		RitualName:  "swift-strike",
+		EdictID:     key.ID,
+		Username:    key.Username,
+		Project:     key.Project,
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+		// A pid that cannot exist: its owner is provably gone.
+		OwnerPID: int64(1 << 30),
+	}
+	require.NoError(t, db.Save(orphan).Error)
+
+	// While the orphan is still `running`, the duplicate-enactment guard blocks.
+	err := s.StartRitual("swift-strike", key, nil)
+	require.Error(t, err, "the orphan must block re-enactment before it is reconciled")
+	assert.Contains(t, err.Error(), "already has swift-strike running")
+
+	// Startup reconciliation moves the orphan out of `running`.
+	s.ritualGuard.reconcileOrphanedRituals()
+
+	// Now the edict can be re-enacted, and the enactment is published.
+	require.NoError(t, s.StartRitual("swift-strike", key, nil),
+		"a reconciled edict must be re-enactable without a human clearing a stale prompt")
+
+	var events []storage.TianEvent
+	require.NoError(t, db.Find(&events, "edict_id = ? AND event_type = ?", key.ID, storage.EventRitualEnacted).Error)
+	assert.Len(t, events, 1, "the re-enactment must publish exactly one ritual_enacted event")
 }
 
 // TestCourt_StartRitual_DuplicateSameRitualRejected verifies that when a

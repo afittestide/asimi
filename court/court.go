@@ -590,6 +590,14 @@ func (s *Court) Start(ctx context.Context) error {
 	// Discover and inject skills into all ministers.
 	s.injectSkills()
 
+	// Enforce the startup invariant before the guard's recovery scanner runs:
+	// no execution may remain `running` unless a live process owns it. A daemon
+	// that died mid-ritual leaves orphans that would otherwise block
+	// re-enactment and mint phantom abort prompts. This is best-effort and
+	// never fatal — a reconcile failure must not prevent the Court from
+	// starting.
+	s.ritualGuard.reconcileOrphanedRituals()
+
 	if s.ritualGuard != nil {
 		go s.ritualGuard.Run(s.ctx)
 	}

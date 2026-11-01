@@ -2448,3 +2448,187 @@ func TestPromptForAbortedRituals_SuppressesDuplicatePrompt(t *testing.T) {
 		t.Errorf("raised %d duplicate abort prompts, want 0", raised)
 	}
 }
+
+// TestReconcileThenRecoveryPromptOnce verifies the e1012 end-to-end flow: an
+// execution orphaned by a restart is reconciled to `failed` at startup and then
+// offered for recovery exactly once. A second startup scan — a second daemon
+// restart while the first prompt is still unanswered — must not mint a
+// duplicate prompt, because the pending one carries the execution's marker.
+func TestReconcileThenRecoveryPromptOnce(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+
+	edict := storage.Edict{Intent: "Orphaned by restart", Username: "testuser", Project: "testproject"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	// A daemon died mid-ritual: the row is `running` with a dead owner.
+	orphanID := "orphaned-by-restart"
+	orphan := &RitualExecution{
+		ID: orphanID, RitualName: "swift-strike", EdictID: edict.ID,
+		Username: "testuser", Project: "testproject", State: RitualStateRunning,
+		CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	if err := db.Save(orphan).Error; err != nil {
+		t.Fatalf("failed to create orphaned ritual: %v", err)
+	}
+
+	raised := 0
+	chancellor := newMockZhengmingMinister(
+		func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error) {
+			raised++
+			// Persist the pending prompt exactly as the Court does, so the
+			// dedup marker is discoverable by a later scan.
+			req := storage.Zhengming{
+				RequestID: "req-orphan", EdictID: key.ID, Username: key.Username,
+				Project: key.Project, MinisterID: "secretary",
+				Questions: questions, Status: storage.ZhengmingPending,
+				Priority: priority, TimeoutAt: time.Now().Add(time.Hour),
+			}
+			if err := db.Create(&req).Error; err != nil {
+				return "", err
+			}
+			return "req-orphan", nil
+		},
+		func(ctx context.Context, requestID string) (string, error) {
+			// The ruler has not answered yet — leave the prompt pending and
+			// the execution in `failed`.
+			return "", fmt.Errorf("zhengming not answered")
+		},
+	)
+	rg := newTestRitualGuard(t, db, func(id string) Minister {
+		if id == "secretary" {
+			return chancellor
+		}
+		return nil
+	}, chancellor)
+
+	// Startup reconciliation moves the orphan out of `running`.
+	rg.reconcileOrphanedRituals()
+
+	var reconciled RitualExecution
+	if err := db.First(&reconciled, "id = ?", orphanID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if reconciled.State != RitualStateFailed {
+		t.Fatalf("orphan must be reconciled to %s, got %s", RitualStateFailed, reconciled.State)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rg.promptForAbortedRituals(ctx)
+
+	if raised != 1 {
+		t.Fatalf("reconciled execution must be offered for recovery once, got %d prompts", raised)
+	}
+
+	// A second restart scans again while the prompt is still pending: the
+	// [exec:...] marker must suppress a duplicate.
+	rg.promptForAbortedRituals(ctx)
+	if raised != 1 {
+		t.Errorf("a second scan must not raise a duplicate prompt, got %d total", raised)
+	}
+}
+
+// TestDoubleRestart_MintsNoPhantomPromptForHealthyRitual is the e1012
+// acceptance test for criterion 4: restarting the daemon twice in a row must
+// mint NO abort-recovery prompt for a healthy ritual. The old failure was that a
+// healthy in-flight execution was left `running` across a restart, aged past the
+// flatline window, and reaped by the ticker into a phantom "was aborted"
+// prompt. With the ownership stamp and the startup reconciler, the restart is
+// survivable: the first restart reconciles the orphan exactly once and the
+// second restart — while the first prompt is still pending — adds nothing.
+//
+// The ritual is "healthy" in the sense that matters here: it was running
+// normally when the process died, so there is no failure to report beyond the
+// single recovery offer. A second offer is the phantom.
+func TestDoubleRestart_MintsNoPhantomPromptForHealthyRitual(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+
+	edict := storage.Edict{Intent: "Healthy ritual interrupted by a crash", Username: "testuser", Project: "testproject"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	// The healthy, in-flight execution at the moment of the crash.
+	orphan := &RitualExecution{
+		ID: "healthy-mid-flight", RitualName: "swift-strike", EdictID: edict.ID,
+		Username: "testuser", Project: "testproject", State: RitualStateRunning,
+		CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	if err := db.Save(orphan).Error; err != nil {
+		t.Fatalf("failed to create in-flight ritual: %v", err)
+	}
+
+	raised := 0
+	mock := newMockZhengmingMinister(
+		func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error) {
+			raised++
+			req := storage.Zhengming{
+				RequestID: fmt.Sprintf("req-%d", raised), EdictID: key.ID, Username: key.Username,
+				Project: key.Project, MinisterID: "secretary",
+				Questions: questions, Status: storage.ZhengmingPending,
+				Priority: priority, TimeoutAt: time.Now().Add(time.Hour),
+			}
+			if err := db.Create(&req).Error; err != nil {
+				return "", err
+			}
+			return req.RequestID, nil
+		},
+		func(ctx context.Context, requestID string) (string, error) {
+			// The ruler has not answered — the prompt stays pending, which is
+			// exactly the state a second restart must not duplicate.
+			return "", fmt.Errorf("zhengming not answered")
+		},
+	)
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return mock }, mock)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First restart: reconcile then offer recovery.
+	rg.reconcileOrphanedRituals()
+	rg.promptForAbortedRituals(ctx)
+	if raised != 1 {
+		t.Fatalf("the first restart must offer recovery exactly once, got %d", raised)
+	}
+
+	var afterFirst RitualExecution
+	if err := db.First(&afterFirst, "id = ?", orphan.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if afterFirst.State != RitualStateFailed {
+		t.Fatalf("the orphan must leave `running` on the first restart, got %s", afterFirst.State)
+	}
+
+	// Second restart: nothing left to reconcile, nothing new to prompt.
+	rg.reconcileOrphanedRituals()
+	rg.promptForAbortedRituals(ctx)
+	if raised != 1 {
+		t.Errorf("a second restart minted a phantom prompt: %d total, want 1", raised)
+	}
+
+	var pending int64
+	if err := db.Model(&storage.Zhengming{}).
+		Where("edict_id = ? AND username = ? AND project = ? AND status = ?",
+			edict.ID, "testuser", "testproject", storage.ZhengmingPending).
+		Count(&pending).Error; err != nil {
+		t.Fatalf("failed to count pending prompts: %v", err)
+	}
+	if pending != 1 {
+		t.Errorf("two restarts must leave exactly one pending prompt, got %d", pending)
+	}
+
+	// The invariant itself, asserted directly: no execution of this edict is
+	// left `running` after startup.
+	var stillRunning int64
+	if err := db.Model(&RitualExecution{}).
+		Where("edict_id = ? AND username = ? AND project = ? AND state = ?",
+			edict.ID, "testuser", "testproject", RitualStateRunning).
+		Count(&stillRunning).Error; err != nil {
+		t.Fatalf("failed to count running executions: %v", err)
+	}
+	if stillRunning != 0 {
+		t.Errorf("the startup invariant was violated: %d executions still `running`", stillRunning)
+	}
+}

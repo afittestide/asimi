@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2021,4 +2022,279 @@ func TestMergeWorktreeSuccessPublishesNoFailureEvent(t *testing.T) {
 	db.Model(&storage.TianEvent{}).
 		Where("edict_id = ? AND event_type = ?", 42, storage.EventWorktreeMergeFailed).Count(&n)
 	assert.Zero(t, n, "a clean landing must not publish a merge-failure event")
+}
+
+// TestReconcileOrphanedRituals_DeadOwnerFailed verifies the startup invariant:
+// a `running` execution whose owner process is gone is moved out of `running`
+// (to `failed`) so recovery can offer to resume it and the duplicate-enactment
+// guard stops blocking the edict.
+func TestReconcileOrphanedRituals_DeadOwnerFailed(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	// A very large pid cannot exist on this host, so its owner is provably
+	// dead (the signal-0 probe answers ESRCH / ErrProcessDone).
+	deadPID := int64(1 << 30)
+	exec := &RitualExecution{
+		ID:          "orphaned-ritual",
+		RitualName:  "swift-strike",
+		EdictID:     600,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+		OwnerPID:    deadPID,
+	}
+	if err := db.Save(exec).Error; err != nil {
+		t.Fatalf("failed to create ritual: %v", err)
+	}
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base}
+
+	rg.reconcileOrphanedRituals()
+
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if got.State != RitualStateFailed {
+		t.Errorf("an orphaned execution must be moved to %s, got %s", RitualStateFailed, got.State)
+	}
+}
+
+// TestReconcileOrphanedRituals_LiveOwnerUntouched verifies multi-process safety:
+// a `running` execution owned by a live process (here, this test process) is
+// never reconciled away.
+func TestReconcileOrphanedRituals_LiveOwnerUntouched(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	exec := &RitualExecution{
+		ID:          "live-owned-ritual",
+		RitualName:  "swift-strike",
+		EdictID:     601,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+		OwnerPID:    int64(os.Getpid()),
+	}
+	if err := db.Save(exec).Error; err != nil {
+		t.Fatalf("failed to create ritual: %v", err)
+	}
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base}
+
+	rg.reconcileOrphanedRituals()
+
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if got.State != RitualStateRunning {
+		t.Errorf("an execution owned by a live process must survive: expected %s, got %s",
+			RitualStateRunning, got.State)
+	}
+}
+
+// TestReconcileOrphanedRituals_UnknownOwnerUntouchedLogged verifies fail-safe
+// behaviour: a row whose ownership cannot be established (owner_pid 0) is left
+// alone and logged, never guessed at.
+func TestReconcileOrphanedRituals_UnknownOwnerUntouchedLogged(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	exec := &RitualExecution{
+		ID:          "unknown-owner-ritual",
+		RitualName:  "swift-strike",
+		EdictID:     602,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+		OwnerPID:    0,
+	}
+	if err := db.Save(exec).Error; err != nil {
+		t.Fatalf("failed to create ritual: %v", err)
+	}
+
+	var logMessages []string
+	testLogger := slog.New(slog.NewTextHandler(&testWriter{messages: &logMessages}, nil))
+	base := NewMinisterBase(db, nil, testLogger, "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base}
+
+	rg.reconcileOrphanedRituals()
+
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("failed to find ritual: %v", err)
+	}
+	if got.State != RitualStateRunning {
+		t.Errorf("an execution with unknown ownership must survive: expected %s, got %s",
+			RitualStateRunning, got.State)
+	}
+
+	logged := false
+	for _, msg := range logMessages {
+		if strings.Contains(msg, "ownership unknown") {
+			logged = true
+			break
+		}
+	}
+	if !logged {
+		t.Errorf("an unknown-ownership row must be logged; captured logs: %v", logMessages)
+	}
+}
+
+// TestReconcileOrphanedRituals_NilGuardsDoNotPanic verifies the reconcile
+// entry point is safe on every degenerate guard it can be reached with — a nil
+// guard, a guard without a DB, and a guard without a MinisterBase. The call is
+// unconditional in Court.Start (court/court.go), so a panic here would abort
+// startup rather than merely fail the reconcile.
+func TestReconcileOrphanedRituals_NilGuardsDoNotPanic(t *testing.T) {
+	var nilGuard *RitualGuard
+	nilGuard.reconcileOrphanedRituals()
+
+	noDB := &RitualGuard{MinisterBase: NewMinisterBase(nil, nil, slog.Default(), "testuser", "testproject", nil)}
+	noDB.reconcileOrphanedRituals()
+
+	noBase := &RitualGuard{}
+	noBase.reconcileOrphanedRituals()
+}
+
+// TestReconcileOrphanedRituals_QueryFailureIsNonFatal verifies the reconcile is
+// fail-safe when the DB read itself fails: it logs and returns without panicking,
+// so a broken database cannot take the startup path down with it.
+func TestReconcileOrphanedRituals_QueryFailureIsNonFatal(t *testing.T) {
+	db := setupEventTestDB(t)
+	if err := db.Exec("DROP TABLE ritual_executions").Error; err != nil {
+		t.Fatalf("failed to drop ritual_executions: %v", err)
+	}
+
+	var logMessages []string
+	testLogger := slog.New(slog.NewTextHandler(&testWriter{messages: &logMessages}, nil))
+	rg := &RitualGuard{MinisterBase: NewMinisterBase(db, nil, testLogger, "testuser", "testproject", nil)}
+
+	rg.reconcileOrphanedRituals()
+
+	logged := false
+	for _, msg := range logMessages {
+		if strings.Contains(msg, "failed to query running rituals") {
+			logged = true
+			break
+		}
+	}
+	if !logged {
+		t.Errorf("a failed running-rituals query must be logged; captured logs: %v", logMessages)
+	}
+}
+
+// TestReconcileOrphanedRituals_ReapWriteFailureIsNonFatal verifies that a
+// failure to write the reconciled state is logged and does not abort the sweep
+// over the remaining rows — the reconcile is best-effort by contract, and a
+// partial sweep must not lose the rows it can still fix.
+func TestReconcileOrphanedRituals_ReapWriteFailureIsNonFatal(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	// Two orphans: the first write is forced to fail, the second must still be
+	// reconciled. That distinguishes "log and continue" from "return early".
+	first := &RitualExecution{
+		ID: "reap-write-fails", RitualName: "swift-strike", EdictID: 610,
+		Username: "testuser", Project: "testproject",
+		State: RitualStateRunning, CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	second := &RitualExecution{
+		ID: "reap-write-succeeds", RitualName: "swift-strike", EdictID: 611,
+		Username: "testuser", Project: "testproject",
+		State: RitualStateRunning, CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	if err := db.Save(first).Error; err != nil {
+		t.Fatalf("failed to create first ritual: %v", err)
+	}
+	if err := db.Save(second).Error; err != nil {
+		t.Fatalf("failed to create second ritual: %v", err)
+	}
+
+	// Force every UPDATE targeting the first row to fail, leaving the second
+	// row's update untouched. A SQLite trigger is the seam: it fails the write
+	// at the database, exactly as a real constraint violation would, and it
+	// cannot be bypassed by GORM's statement rewriting.
+	if err := db.Exec(`CREATE TRIGGER judge_fail_first_reap
+		BEFORE UPDATE ON ritual_executions
+		WHEN OLD.id = '` + first.ID + `'
+		BEGIN SELECT RAISE(ABORT, 'forced reap write failure'); END`).Error; err != nil {
+		t.Fatalf("failed to create failure trigger: %v", err)
+	}
+
+	var logMessages []string
+	testLogger := slog.New(slog.NewTextHandler(&testWriter{messages: &logMessages}, nil))
+	rg := &RitualGuard{MinisterBase: NewMinisterBase(db, nil, testLogger, "testuser", "testproject", nil)}
+
+	rg.reconcileOrphanedRituals()
+
+	failedLogged := false
+	for _, msg := range logMessages {
+		if strings.Contains(msg, "failed to mark orphaned execution failed") {
+			failedLogged = true
+			break
+		}
+	}
+	if !failedLogged {
+		t.Errorf("a failed reap write must be logged; captured logs: %v", logMessages)
+	}
+
+	// The sweep must have continued past the failure and reconciled the other row.
+	var got RitualExecution
+	if err := db.First(&got, "id = ?", second.ID).Error; err != nil {
+		t.Fatalf("failed to find second ritual: %v", err)
+	}
+	if got.State != RitualStateFailed {
+		t.Errorf("a write failure on one row must not abort the sweep: %s stayed %s, want %s",
+			second.ID, got.State, RitualStateFailed)
+	}
+}
+
+// TestReconcileOrphanedRituals_OnlyThisScope verifies the reconcile is scoped to
+// this (username, project): another user's orphaned running execution is never
+// touched, because the reconciler has no authority over a tree it does not own.
+func TestReconcileOrphanedRituals_OnlyThisScope(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	mine := &RitualExecution{
+		ID: "mine", RitualName: "swift-strike", EdictID: 620,
+		Username: "testuser", Project: "testproject",
+		State: RitualStateRunning, CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	theirs := &RitualExecution{
+		ID: "theirs", RitualName: "swift-strike", EdictID: 620,
+		Username: "otheruser", Project: "testproject",
+		State: RitualStateRunning, CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	otherProject := &RitualExecution{
+		ID: "other-project", RitualName: "swift-strike", EdictID: 620,
+		Username: "testuser", Project: "otherproject",
+		State: RitualStateRunning, CurrentStep: 1, OwnerPID: int64(1 << 30),
+	}
+	for _, e := range []*RitualExecution{mine, theirs, otherProject} {
+		if err := db.Save(e).Error; err != nil {
+			t.Fatalf("failed to create ritual %s: %v", e.ID, err)
+		}
+	}
+
+	rg := &RitualGuard{MinisterBase: NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)}
+	rg.reconcileOrphanedRituals()
+
+	for _, e := range []*RitualExecution{mine, theirs, otherProject} {
+		var got RitualExecution
+		if err := db.First(&got, "id = ?", e.ID).Error; err != nil {
+			t.Fatalf("failed to find ritual %s: %v", e.ID, err)
+		}
+		want := RitualStateFailed
+		if e.ID != mine.ID {
+			want = RitualStateRunning
+		}
+		if got.State != want {
+			t.Errorf("%s (username=%s project=%s) state = %s, want %s",
+				e.ID, e.Username, e.Project, got.State, want)
+		}
+	}
 }

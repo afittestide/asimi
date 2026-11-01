@@ -8,7 +8,7 @@ import (
 )
 
 // Schema version
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // Type aliases - use types from internal/config as the single source of truth
 type (
@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS ritual_executions (
     current_step INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'pending',
     data TEXT NOT NULL DEFAULT '{}',
+    owner_pid INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );

@@ -200,6 +200,10 @@ func (db *DB) runMigrations(currentVersion int) error {
 			if err := db.migrateV6toV7(); err != nil {
 				return fmt.Errorf("migration v6→v7 failed: %w", err)
 			}
+		case 8:
+			if err := db.migrateV7toV8(); err != nil {
+				return fmt.Errorf("migration v7→v8 failed: %w", err)
+			}
 		default:
 			return fmt.Errorf("unknown migration version: %d", v)
 		}
@@ -391,6 +395,47 @@ func (db *DB) migrateV6toV7() error {
 		return fmt.Errorf("record version 7: %w", err)
 	}
 	slog.Debug("migrated schema v6→v7: added stale_at column to seals")
+	return nil
+}
+
+// migrateV7toV8 adds the owner_pid column to ritual_executions. The column
+// stamps the process that owns a running execution so a startup reconciler can
+// tell an orphan (owner gone) from work that another live process still owns.
+// It is a schema migration in the raw-Schema sense: ritual_executions is also
+// GORM-managed, so both paths add the column idempotently.
+func (db *DB) migrateV7toV8() error {
+	var tableExists bool
+	err := db.conn.QueryRow(
+		"SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='ritual_executions'",
+	).Scan(&tableExists)
+	if err != nil {
+		return fmt.Errorf("check ritual_executions existence: %w", err)
+	}
+
+	if tableExists {
+		// Check if the column already exists (idempotent)
+		var colExists bool
+		err := db.conn.QueryRow(
+			"SELECT COUNT(*) > 0 FROM pragma_table_info('ritual_executions') WHERE name = 'owner_pid'",
+		).Scan(&colExists)
+		if err != nil {
+			return fmt.Errorf("check owner_pid column existence: %w", err)
+		}
+		if !colExists {
+			_, err := db.conn.Exec(`ALTER TABLE ritual_executions ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0`)
+			if err != nil {
+				return fmt.Errorf("add owner_pid column: %w", err)
+			}
+		}
+	}
+
+	if _, err := db.conn.Exec(
+		"INSERT INTO schema_version (version, applied_at) VALUES (?, unixepoch())",
+		8,
+	); err != nil {
+		return fmt.Errorf("record version 8: %w", err)
+	}
+	slog.Debug("migrated schema v7→v8: added owner_pid column to ritual_executions")
 	return nil
 }
 

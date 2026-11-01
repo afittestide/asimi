@@ -603,8 +603,14 @@ type RitualExecution struct {
 	CurrentStep int          `gorm:"column:current_step"`
 	State       RitualState  `gorm:"column:state"`
 	Data        storage.JSON `gorm:"column:data;type:json"`
-	CreatedAt   time.Time    `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt   time.Time    `gorm:"column:updated_at;autoUpdateTime"`
+	// OwnerPID is the process that owns this execution (os.Getpid at start).
+	// It is the explicit ownership stamp the startup reconciler uses: a
+	// `running` row whose owner_pid is not a live process is an orphan left by
+	// a daemon restart. 0 means ownership is unknown (legacy row or a
+	// non-process owner), and such rows are never reconciled away.
+	OwnerPID  int64     `gorm:"column:owner_pid"`
+	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime"`
 
 	// Runtime (not persisted)
 	def        *RitualDef
@@ -742,6 +748,7 @@ func (r *RitualRunner) Start(ctx context.Context, ritualName string, key storage
 		CurrentStep: 0,
 		State:       RitualStatePending,
 		Data:        storage.JSON{"inputs": inputs},
+		OwnerPID:    int64(os.Getpid()),
 		def:         def,
 		notify:      notify,
 		repoInfo:    r.repoInfo,
