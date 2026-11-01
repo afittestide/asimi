@@ -139,7 +139,7 @@ Each minister is a specialized AI agent with a specific role:
 | Minister | Role | Core Tools | Specialized Tools |
 |----------|------|------------|-------------------|
 | **Secretary** | Manages court business and provides a bird's eye view of the Court | `read_file`, `glob`, `grep` | `suggest_edict`, `enact_ritual`, `consult_minister`, `asimisql` |
-| **Chancellor** | Coordinates all ministers, manages edict lifecycle, interfaces with the Ruler | — | `create_edict`, `cancel_edict`, `answer_zhengming`, `get_edict_status`, `list_edicts`, `list_rituals`, `enact_ritual`, `asimisql` |
+| **Chancellor** | Coordinates all ministers, manages edict lifecycle, interfaces with the Ruler | — | `create_edict`, `cancel_edict`, `answer_zhengming`, `get_edict_status`, `list_edicts`, `list_rituals`, `enact_ritual` |
 | **War** | Analyzes edicts, creates execution plans, decomposes work into Lings | `read_file`, `glob`, `grep` | `create_ling`, `update_ling`, `list_lings` |
 | **Forge** | Implements code changes according to plans | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `run_shell_command` | `create_manifest`, `update_manifest`, `commit_manifest` |
 | **Judge** | Writes tests and validates changes through test coverage | `read_file`, `write_file`, `edit_file`, `glob`, `run_shell_command` | `record_verdict`, `reject_manifest` |
@@ -571,9 +571,6 @@ When a step exhausts all `max_retries` attempts, the Court invokes the `report_f
 - `list_rituals()` — List available rituals from `.agents/rituals/`
 - `enact_ritual(ritual_name, edict_id)` — Start a ritual for an edict
 
-**Observability:**
-- `asimisql(query)` — Execute raw SQL for advanced queries
-
 > The Chancellor orchestrates ministers through rituals, not direct invocation. For ad-hoc minister work, use `enact_ritual` with a custom ritual.
 
 ### War Tools
@@ -923,7 +920,7 @@ Ministers are isolated by **tool catalogs** — each minister receives a differe
 
 | Minister | File Tools | Shell | DB Tables | Orchestration Tools |
 |----------|-----------|-------|-----------|-------------------|
-| **Chancellor** | read-only (list, read, read_many, grep) | no | edicts, zhengming, forge_manifests, ling | create_edict, enact_ritual, asimi_sql |
+| **Chancellor** | read-only (list, read, read_many, grep) | no | edicts, zhengming, forge_manifests, ling | create_edict, enact_ritual |
 | **War** | read-only | no | ling | create_ling, list_ling, update_ling |
 | **Forge** | read-write (read, write, replace, list, read_many, grep) | yes | forge_manifests | create_manifest, update_manifest, commit_manifest |
 | **Judge** | edit (read, write, replace, list, read_many, grep) | yes | verdicts, forge_manifests | record_verdict, reject_manifest |
@@ -1008,5 +1005,5 @@ Secretary: [Uses tian_ledger tool for edict issue-123]
   Events show: ritual_step_failed at step "build" - compilation error
 ```
 
-For advanced queries, use `asimisql` with raw SQL.
+For advanced queries, ask the Secretary to run `asimisql` with raw SQL.
 

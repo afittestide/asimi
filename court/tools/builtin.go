@@ -81,15 +81,10 @@ func registerEarthTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 // registerHeavenTools registers test/verification tools.
 func registerHeavenTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	heavenRead := Permissions{Heaven: Access{Read: true}}
-	heavenReadWrite := Permissions{Heaven: Access{Read: true, Write: true}}
 	heavenWrite := Permissions{Heaven: Access{Write: true}}
 
 	r.Register(ListPendingManifestsTool{Ctx: opts.Ctx}, heavenRead)
 	r.Register(GetManifestByCommitTool{Ctx: opts.Ctx}, heavenRead)
-
-	if opts.DBPath != "" {
-		r.Register(AsimiSQLTool{DB: opts.Ctx.DB, ProjectRoot: opts.Ctx.ProjectRoot()}, heavenReadWrite)
-	}
 
 	r.Register(CreateManifestTool{Ctx: opts.Ctx}, heavenWrite)
 	// The forge's constitution (internal/ministers/userconf/ministers.yaml)
@@ -156,6 +151,11 @@ func registerExtraTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 		r.RegisterExtra("enact_ritual", InvokeRitualTool{Ctx: opts.Ctx, Launcher: opts.RitualLauncher})
 	}
 	r.RegisterExtra("tian_ledger", TianLedgerTool{Ctx: opts.Ctx})
+	// Raw SQL is not ambient: only the minister whose def names asimisql in
+	// extra_tools receives it (today, the secretary). No DB handle, no tool.
+	if opts.DBPath != "" {
+		r.RegisterExtra("asimisql", AsimiSQLTool{DB: opts.Ctx.DB, ProjectRoot: opts.Ctx.ProjectRoot()})
+	}
 	if opts.ZhengmingRequester != nil {
 		r.RegisterExtraFactory("ask_ruler", func(mid string) Tool {
 			return AskRulerTool{

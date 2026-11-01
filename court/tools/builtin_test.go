@@ -143,7 +143,9 @@ func TestRegisterBuiltinToolsHeavenTools(t *testing.T) {
 
 	assertHas(t, names, "list_pending_manifests")
 	assertHas(t, names, "get_manifest_by_commit")
-	assertHas(t, names, "asimisql")
+	// asimisql is an extra tool now, not permission-matched — even the judge
+	// has no ambient raw SQL.
+	assertNotHas(t, names, "asimisql")
 	assertHas(t, names, "create_manifest")
 	assertHas(t, names, "record_verdict")
 	assertHas(t, names, "update_manifest_status")
@@ -164,8 +166,8 @@ func TestRegisterBuiltinToolsHeavenReadNoWrite(t *testing.T) {
 	// Heaven/Read tools should be visible (shared Read flag)
 	assertHas(t, names, "list_pending_manifests")
 	assertHas(t, names, "get_manifest_by_commit")
-	// Heaven/Read+Write tool should be visible (shared Read flag)
-	assertHas(t, names, "asimisql")
+	// asimisql is an extra tool, never permission-matched.
+	assertNotHas(t, names, "asimisql")
 	// create_manifest is visible through heaven Write AND intent Write.
 	// Sage (r--r--rwx) has intent Write, so it now sees create_manifest —
 	// the same visibility any intent-Write minister gets.
@@ -281,6 +283,27 @@ func TestRegisterBuiltinToolsExtraConditionalRitual(t *testing.T) {
 
 	assertHas(t, extraNames, "consult_minister")
 	assertNotHas(t, extraNames, "enact_ritual")
+}
+
+// TestRegisterBuiltinToolsAsimiSQLSecretaryOnly pins the new contract: raw SQL
+// is an extra tool, resolved only for the minister whose def names it, and it
+// never leaks into ForPermissions for any minister.
+func TestRegisterBuiltinToolsAsimiSQLSecretaryOnly(t *testing.T) {
+	r := NewToolRegistry()
+	RegisterBuiltinTools(r, ToolRegistrationOpts{
+		Ctx:    testCtx(),
+		DBPath: "/tmp/test.db",
+	})
+
+	// Only the secretary's def names asimisql in extra_tools.
+	assertHas(t, toolNames(r.ExtraTools("secretary", []string{"asimisql"})), "asimisql")
+	// A minister that doesn't list it gets nothing.
+	assertNotHas(t, toolNames(r.ExtraTools("judge", nil)), "asimisql")
+
+	for _, permStr := range []string{"rwxrwxr--", "r--r--rwx", "rwxr---w-", "rwxr--rwx"} {
+		perm, _ := ParsePermissions(permStr)
+		assertNotHas(t, toolNames(r.ForPermissions(perm)), "asimisql")
+	}
 }
 
 func TestRegisterBuiltinToolsAllMinisters(t *testing.T) {
@@ -427,28 +450,30 @@ func TestRegisterBuiltinToolsEmptyOpts(t *testing.T) {
 	r := NewToolRegistry()
 	RegisterBuiltinTools(r, ToolRegistrationOpts{})
 
-	allTools := r.Tools()
-	toolNames := make(map[string]bool)
-	for _, tp := range allTools {
-		toolNames[tp.Tool.Name()] = true
+	names := make(map[string]bool)
+	for _, tp := range r.Tools() {
+		names[tp.Tool.Name()] = true
 	}
 
 	// Earth tools with no dependencies
-	assertHas(t, toolNames, "read_file")
-	assertHas(t, toolNames, "read_many_files")
-	assertHas(t, toolNames, "glob")
-	assertHas(t, toolNames, "grep")
-	assertHas(t, toolNames, "write_file")
-	assertHas(t, toolNames, "replace_text")
+	assertHas(t, names, "read_file")
+	assertHas(t, names, "read_many_files")
+	assertHas(t, names, "glob")
+	assertHas(t, names, "grep")
+	assertHas(t, names, "write_file")
+	assertHas(t, names, "replace_text")
 
 	// No run_shell_command without runner
-	assertNotHas(t, toolNames, "run_shell_command")
+	assertNotHas(t, names, "run_shell_command")
 
-	// No asimisql without DBPath
-	assertNotHas(t, toolNames, "asimisql")
+	// No asimisql without DBPath. asimisql is an extra tool now, so the
+	// guard that matters lives on the ExtraTools path — assert there too,
+	// since the permission-matched map never carried it.
+	assertNotHas(t, names, "asimisql")
+	assertNotHas(t, toolNames(r.ExtraTools("secretary", []string{"asimisql"})), "asimisql")
 
 	// approve_doc is always registered (no dependencies)
-	assertHas(t, toolNames, "approve_doc")
+	assertHas(t, names, "approve_doc")
 }
 
 // TestConsultMinisterTool_FactoryProducesPerMinisterInstances verifies that

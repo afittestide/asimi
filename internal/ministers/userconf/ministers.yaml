@@ -17,7 +17,7 @@
 - id: secretary
   title: Secretary
   kanji: 中書令
-  extra_tools: [enact_ritual, consult_minister]
+  extra_tools: [enact_ritual, consult_minister, asimisql]
   greeting: |
     Greetings, Ruler and welcome to your Secretary. Here you can:
     - Chase bugs and formulate remedies
