@@ -474,6 +474,25 @@ func TestQueryPrecedents_ReturnsLegacyEdictLevelRow(t *testing.T) {
 	if !strings.Contains(result, "legacy-1") {
 		t.Errorf("query_precedents must return the legacy edict-level row, got: %s", result)
 	}
+
+	// The result is a table envelope (edict 988); the row must be present in
+	// both the rendered cells and the untruncated raw.
+	var env markdownTableEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a table envelope: %v\n%s", err, result)
+	}
+	if env.Format != markdownTableFormat {
+		t.Errorf("Format = %q, want %q", env.Format, markdownTableFormat)
+	}
+	found := false
+	for _, row := range env.Rows {
+		if len(row) > 0 && row[0] == "legacy-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("legacy-1 should appear in the envelope rows, got: %v", env.Rows)
+	}
 }
 
 // TestQueryPrecedents_RulingFilter verifies the optional ruling filter narrows
@@ -511,6 +530,21 @@ func TestQueryPrecedents_RulingFilter(t *testing.T) {
 	}
 	if !strings.Contains(both, "p-ap") || !strings.Contains(both, "p-rej") {
 		t.Errorf("empty ruling filter must return both rulings, got: %s", both)
+	}
+
+	// The rows carry the precedent ids (edict 988 envelope), not a raw JSON blob.
+	var env markdownTableEnvelope
+	if err := json.Unmarshal([]byte(both), &env); err != nil {
+		t.Fatalf("result is not a table envelope: %v\n%s", err, both)
+	}
+	ids := map[string]bool{}
+	for _, row := range env.Rows {
+		if len(row) > 0 {
+			ids[row[0]] = true
+		}
+	}
+	if !ids["p-ap"] || !ids["p-rej"] {
+		t.Errorf("expected p-ap and p-rej in envelope rows, got: %v", env.Rows)
 	}
 }
 
@@ -639,5 +673,104 @@ func TestListQuenchedManifestsTool_EmptyScopeReportsScope(t *testing.T) {
 	}
 	if report.Nearby[0].Project != "oct7-io/data-poisoning-benchmark" || report.Nearby[0].Count != 1 {
 		t.Errorf("nearby = %+v, want 1 quenched row for oct7-io/data-poisoning-benchmark", report.Nearby[0])
+	}
+}
+
+// TestListQuenchedManifestsTool_PopulatedReturnsTableEnvelope verifies a
+// populated list_quenched_manifests opts into the TUI markdown-table envelope
+// (edict 988) with raw carrying the full manifest slice.
+func TestListQuenchedManifestsTool_PopulatedReturnsTableEnvelope(t *testing.T) {
+	db := setupPrecedentTestDB(t)
+
+	if err := db.Create(&storage.ForgeManifest{
+		ManifestID: "m1", EdictID: 7, Username: "testuser", Project: "testproject",
+		LingID: "l1", FilePath: "a.go", Status: storage.ManifestQuenched,
+	}).Error; err != nil {
+		t.Fatalf("failed to create manifest: %v", err)
+	}
+
+	tool := ListQuenchedManifestsTool{Ctx: ToolContext{
+		DB: db, Username: "testuser", Project: "testproject",
+	}}
+	result, err := tool.Call(context.Background(), `{"edict_id":7}`)
+	if err != nil {
+		t.Fatalf("list_quenched_manifests failed: %v", err)
+	}
+
+	var env markdownTableEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a table envelope: %v\n%s", err, result)
+	}
+	if env.Format != markdownTableFormat {
+		t.Errorf("Format = %q, want %q", env.Format, markdownTableFormat)
+	}
+	wantCols := []string{"manifest_id", "edict_id", "ling_id", "file_path", "status"}
+	if len(env.Columns) != len(wantCols) {
+		t.Fatalf("Columns = %v, want %v", env.Columns, wantCols)
+	}
+	for i, c := range wantCols {
+		if env.Columns[i] != c {
+			t.Errorf("Columns[%d] = %q, want %q", i, env.Columns[i], c)
+		}
+	}
+	if len(env.Rows) != 1 || env.Rows[0][0] != "m1" {
+		t.Fatalf("Rows = %v, want one row starting m1", env.Rows)
+	}
+
+	raw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	var rawManifests []storage.ForgeManifest
+	if err := json.Unmarshal(raw, &rawManifests); err != nil {
+		t.Fatalf("raw is not a []storage.ForgeManifest: %v\n%s", err, raw)
+	}
+	if len(rawManifests) != 1 || rawManifests[0].ManifestID != "m1" {
+		t.Errorf("raw = %+v, want the manifest", rawManifests)
+	}
+}
+
+// TestListQuenchedManifestsTool_FormatCoversEnvelopeAndScopeReport covers the
+// Format fallback added in edict 988 (previously it dumped the raw result).
+func TestListQuenchedManifestsTool_FormatCoversEnvelopeAndScopeReport(t *testing.T) {
+	tool := ListQuenchedManifestsTool{}
+
+	env, err := newMarkdownTableEnvelope("Quenched Manifests", []string{"manifest_id"}, [][]string{{"m1"}}, nil)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+	if got := tool.Format("{}", env, nil); !strings.Contains(got, "List Quenched Manifests: 1 rows") {
+		t.Errorf("Format(envelope) = %q, want counted summary", got)
+	}
+
+	report := `{"rows":0,"message":"0 rows for username=\"u\" project=\"p\"; no rows exist for this key under any other scope"}`
+	got := tool.Format("{}", report, nil)
+	if !strings.Contains(got, `username="u"`) {
+		t.Errorf("Format(scope report) = %q, want the human message", got)
+	}
+	if strings.Contains(got, `"rows"`) {
+		t.Errorf("Format(scope report) = %q, must not leak the JSON blob", got)
+	}
+
+	if got := tool.Format("{}", "", assertError("boom")); !strings.Contains(got, "Error:") {
+		t.Errorf("Format(err) = %q, want error line", got)
+	}
+}
+
+// TestQueryPrecedentsTool_FormatCoversEnvelopeAndScopeReport covers the Format
+// fallback added in edict 988.
+func TestQueryPrecedentsTool_FormatCoversEnvelopeAndScopeReport(t *testing.T) {
+	tool := QueryPrecedentsTool{}
+
+	env, err := newMarkdownTableEnvelope("Precedents", []string{"precedent_id"}, [][]string{{"p1"}, {"p2"}}, nil)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+	if got := tool.Format("{}", env, nil); !strings.Contains(got, "Query Precedents: 2 rows") {
+		t.Errorf("Format(envelope) = %q, want counted summary", got)
+	}
+
+	if got := tool.Format("{}", "", assertError("boom")); !strings.Contains(got, "Error:") {
+		t.Errorf("Format(err) = %q, want error line", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/afittestide/asimi/storage"
@@ -315,11 +316,21 @@ func (t ListPendingManifestsTool) Call(ctx context.Context, input string) (strin
 			[]any{params.EdictID, storage.ManifestForged}, t.Ctx.Username, t.Ctx.Project), nil
 	}
 
-	result, err := json.MarshalIndent(manifests, "", "  ")
+	rows := make([][]string, len(manifests))
+	for i, m := range manifests {
+		rows[i] = []string{
+			m.ManifestID,
+			strconv.FormatUint(uint64(m.EdictID), 10),
+			m.LingID,
+			tableCell(m.FilePath, tableCellMaxLen),
+			string(m.Status),
+		}
+	}
+	env, err := newMarkdownTableEnvelope("Pending Manifests", []string{"manifest_id", "edict_id", "ling_id", "file_path", "status"}, rows, manifests)
 	if err != nil {
 		return "", fmt.Errorf("failed to format manifests: %w", err)
 	}
-	return string(result), nil
+	return env, nil
 }
 
 func (t ListPendingManifestsTool) ParameterSchema() map[string]any {
@@ -336,9 +347,16 @@ func (t ListPendingManifestsTool) Format(input, result string, err error) string
 	if err != nil {
 		return fmt.Sprintf("List Pending Manifests: Error: %v\n", err)
 	}
+	if env, ok := isMarkdownTableEnvelope(result); ok {
+		return fmt.Sprintf("Listed %d pending manifests\n", len(env.Rows))
+	}
 	var manifests []json.RawMessage
 	if json.Unmarshal([]byte(result), &manifests) == nil {
 		return fmt.Sprintf("Listed %d pending manifests\n", len(manifests))
+	}
+	if scopeMsg, ok := scopeReportMessage(result); ok {
+		// Fail-loud scope report: show the human message, not the JSON.
+		return fmt.Sprintf("List Pending Manifests: %s\n", scopeMsg)
 	}
 	return result + "\n"
 }

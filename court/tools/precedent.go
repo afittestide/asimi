@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/afittestide/asimi/storage"
@@ -166,11 +167,21 @@ func (t ListQuenchedManifestsTool) Call(ctx context.Context, input string) (stri
 			[]any{params.EdictID, storage.ManifestQuenched}, t.Ctx.Username, t.Ctx.Project), nil
 	}
 
-	result, err := json.MarshalIndent(manifests, "", "  ")
+	rows := make([][]string, len(manifests))
+	for i, m := range manifests {
+		rows[i] = []string{
+			m.ManifestID,
+			strconv.FormatUint(uint64(m.EdictID), 10),
+			m.LingID,
+			tableCell(m.FilePath, tableCellMaxLen),
+			string(m.Status),
+		}
+	}
+	env, err := newMarkdownTableEnvelope("Quenched Manifests", []string{"manifest_id", "edict_id", "ling_id", "file_path", "status"}, rows, manifests)
 	if err != nil {
 		return "", fmt.Errorf("failed to format manifests: %w", err)
 	}
-	return string(result), nil
+	return env, nil
 }
 
 func (t ListQuenchedManifestsTool) ParameterSchema() map[string]any {
@@ -187,7 +198,7 @@ func (t ListQuenchedManifestsTool) Format(input, result string, err error) strin
 	if err != nil {
 		return fmt.Sprintf("List Quenched Manifests: Error: %v\n", err)
 	}
-	return fmt.Sprintf("List Quenched Manifests: %s\n", result)
+	return formatTableList("List Quenched Manifests", result)
 }
 
 // QueryPrecedentsTool searches precedents by principle.
@@ -239,11 +250,21 @@ func (t QueryPrecedentsTool) Call(ctx context.Context, input string) (string, er
 		return "No precedents found for this principle", nil
 	}
 
-	result, err := json.MarshalIndent(precedents, "", "  ")
+	rows := make([][]string, len(precedents))
+	for i, p := range precedents {
+		rows[i] = []string{
+			p.PrecedentID,
+			strconv.FormatUint(uint64(p.EdictID), 10),
+			string(p.Ruling),
+			tableCell(p.Principle, tableCellMaxLen),
+			tableCell(p.Justification, tableCellMaxLen),
+		}
+	}
+	env, err := newMarkdownTableEnvelope("Precedents", []string{"precedent_id", "edict_id", "ruling", "principle", "justification"}, rows, precedents)
 	if err != nil {
 		return "", fmt.Errorf("failed to format precedents: %w", err)
 	}
-	return string(result), nil
+	return env, nil
 }
 
 func (t QueryPrecedentsTool) ParameterSchema() map[string]any {
@@ -262,7 +283,7 @@ func (t QueryPrecedentsTool) Format(input, result string, err error) string {
 	if err != nil {
 		return fmt.Sprintf("Query Precedents: Error: %v\n", err)
 	}
-	return fmt.Sprintf("Query Precedents: %s\n", result)
+	return formatTableList("Query Precedents", result)
 }
 
 // grantChancellorSeal records the Chancellor's seal on an edict (idempotent).

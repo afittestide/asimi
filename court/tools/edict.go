@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/afittestide/asimi/internal/utils"
@@ -153,6 +154,7 @@ func (t ListEdictsTool) Call(ctx context.Context, input string) (string, error) 
 	// Filter by status if specified (using derived status)
 	sealService := storage.NewSealService(t.DB)
 	var results []map[string]any
+	var rows [][]string
 	for _, e := range edicts {
 		status, err := sealService.GetEdictStatus(e.Key())
 		if err != nil {
@@ -167,7 +169,12 @@ func (t ListEdictsTool) Call(ctx context.Context, input string) (string, error) 
 		results = append(results, map[string]any{
 			"edict_id": e.ID,
 			"status":   string(status),
-			"intent":   utils.TruncateMiddle(e.Intent, 100),
+			"intent":   e.Intent,
+		})
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(e.ID), 10),
+			string(status),
+			tableCell(e.Intent, tableCellMaxLen),
 		})
 	}
 
@@ -187,8 +194,11 @@ func (t ListEdictsTool) Call(ctx context.Context, input string) (string, error) 
 		return string(resultJSON), nil
 	}
 
-	resultJSON, _ := json.Marshal(results)
-	return string(resultJSON), nil
+	env, err := newMarkdownTableEnvelope("Edicts", []string{"edict_id", "status", "intent"}, rows, results)
+	if err != nil {
+		return "", fmt.Errorf("format edicts: %w", err)
+	}
+	return env, nil
 }
 
 func (t ListEdictsTool) Format(input, result string, err error) string {
@@ -198,6 +208,10 @@ func (t ListEdictsTool) Format(input, result string, err error) string {
 	if err != nil {
 		msg.Writef("Error: %v", err)
 	} else {
+		if env, ok := isMarkdownTableEnvelope(result); ok {
+			msg.Writef("Found %d edicts", len(env.Rows))
+			return msg.String() + "\n"
+		}
 		var edicts []map[string]any
 		if json.Unmarshal([]byte(result), &edicts) == nil {
 			msg.Writef("Found %d edicts", len(edicts))

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/afittestide/asimi/storage"
@@ -198,11 +199,25 @@ func (t ListLingTool) Call(ctx context.Context, input string) (string, error) {
 		return emptyScopeReport(t.Ctx.DB, &storage.Ling{}, "edict_id = ?", []any{params.EdictID}, t.Ctx.Username, t.Ctx.Project), nil
 	}
 
-	result, err := json.MarshalIndent(lingList, "", "  ")
+	rows := make([][]string, len(lingList))
+	for i, l := range lingList {
+		deps := "-"
+		if len(l.Dependencies) > 0 {
+			deps = strings.Join(l.Dependencies, ",")
+		}
+		rows[i] = []string{
+			l.LingID,
+			string(l.Status),
+			l.Minister,
+			tableCell(l.Description, tableCellMaxLen),
+			deps,
+		}
+	}
+	env, err := newMarkdownTableEnvelope("Ling", []string{"id", "status", "minister", "description", "deps"}, rows, lingList)
 	if err != nil {
 		return "", fmt.Errorf("failed to format ling list: %w", err)
 	}
-	return string(result), nil
+	return env, nil
 }
 
 func (t ListLingTool) ParameterSchema() map[string]any {
@@ -222,7 +237,7 @@ func (t ListLingTool) Format(input, result string, err error) string {
 	if err != nil {
 		return fmt.Sprintf("List Ling: Error: %v\n", err)
 	}
-	return fmt.Sprintf("List Ling: %s\n", result)
+	return formatTableList("List Ling", result)
 }
 
 // --- UpdateLingStatusTool ---

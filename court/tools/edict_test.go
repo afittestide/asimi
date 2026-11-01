@@ -355,6 +355,56 @@ func TestGetEdictStatusTool_EmptyScopeReportsScope(t *testing.T) {
 	}
 }
 
+// TestListEdictsTool_PopulatedReturnsTableEnvelope verifies a populated
+// list_edicts opts into the TUI markdown-table envelope (edict 988) with raw
+// carrying the full row data.
+func TestListEdictsTool_PopulatedReturnsTableEnvelope(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	edict := storage.Edict{ID: 1, Username: "testuser", Project: "testproject", Intent: "Active edict"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "testuser", Project: "testproject"}
+	result, err := tool.Call(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("list_edicts failed: %v", err)
+	}
+
+	var env markdownTableEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a table envelope: %v\n%s", err, result)
+	}
+	if env.Format != markdownTableFormat {
+		t.Errorf("Format = %q, want %q", env.Format, markdownTableFormat)
+	}
+	wantCols := []string{"edict_id", "status", "intent"}
+	for i, c := range wantCols {
+		if i >= len(env.Columns) || env.Columns[i] != c {
+			t.Fatalf("Columns = %v, want %v", env.Columns, wantCols)
+		}
+	}
+	if len(env.Rows) != 1 {
+		t.Fatalf("Rows = %d, want 1", len(env.Rows))
+	}
+	if env.Rows[0][0] != "1" || env.Rows[0][1] != "active" || env.Rows[0][2] != "Active edict" {
+		t.Errorf("row = %v, want [1 active Active edict]", env.Rows[0])
+	}
+
+	raw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	var rawResults []map[string]any
+	if err := json.Unmarshal(raw, &rawResults); err != nil {
+		t.Fatalf("raw is not a list of edict results: %v\n%s", err, raw)
+	}
+	if len(rawResults) != 1 || rawResults[0]["intent"] != "Active edict" {
+		t.Errorf("raw = %+v, want the full edict result", rawResults)
+	}
+}
+
 // TestListEdictsTool_StatusFilterMissDoesNotLie covers the Chancellor-found
 // blocking defect in edict 968: when rows DO exist in scope but the optional
 // status filter excludes them all, list_edicts must NOT emit the "0 rows for
@@ -399,5 +449,19 @@ func TestListEdictsTool_StatusFilterMissDoesNotLie(t *testing.T) {
 	rendered := tool.Format(`{"status": "blocked"}`, result, nil)
 	if !containsSubstring(rendered, "in scope") {
 		t.Errorf("Format output %q should surface the filter-miss message", rendered)
+	}
+}
+
+// TestListEdictsTool_FormatCoversEnvelope covers the populated table-envelope
+// branch added to Format in edict 988 while the scope-report path stays intact.
+func TestListEdictsTool_FormatCoversEnvelope(t *testing.T) {
+	tool := ListEdictsTool{}
+
+	env, err := newMarkdownTableEnvelope("Edicts", []string{"edict_id"}, [][]string{{"1"}}, nil)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+	if got := tool.Format("{}", env, nil); !containsSubstring(got, "Found 1 edicts") {
+		t.Errorf("Format(envelope) = %q, want counted summary", got)
 	}
 }

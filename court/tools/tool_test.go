@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -320,4 +321,74 @@ func TestValidatePathWithinProject_NewFileCreation(t *testing.T) {
 			t.Errorf("expected no error for new file in new dir inside project, got: %v", err)
 		}
 	})
+}
+
+// TestMarkdownTableEnvelope covers the shared table-envelope helper (edict 988):
+// it emits the opt-in format with the given columns/rows and carries raw intact.
+func TestMarkdownTableEnvelope(t *testing.T) {
+	raw := []string{"one", "two"}
+	encoded, err := newMarkdownTableEnvelope("Title", []string{"a", "b"}, [][]string{{"1", "2"}}, raw)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+
+	env, ok := isMarkdownTableEnvelope(encoded)
+	if !ok {
+		t.Fatalf("encoded result is not a markdown table envelope: %s", encoded)
+	}
+	if env.Format != markdownTableFormat || env.Title != "Title" {
+		t.Errorf("env = %+v, want format %q title Title", env, markdownTableFormat)
+	}
+	if len(env.Rows) != 1 || env.Rows[0][0] != "1" {
+		t.Errorf("Rows = %v, want [[1 2]]", env.Rows)
+	}
+
+	gotRaw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	var got []string
+	if err := json.Unmarshal(gotRaw, &got); err != nil || len(got) != 2 || got[0] != "one" {
+		t.Errorf("raw = %s, want [one two]", gotRaw)
+	}
+
+	if _, ok := isMarkdownTableEnvelope(`[{"legacy":true}]`); ok {
+		t.Errorf("a legacy bare array must not be detected as a table envelope")
+	}
+}
+
+// TestTableCell covers cell collapsing and truncation.
+func TestTableCell(t *testing.T) {
+	if got := tableCell("  a\n b  ", 100); got != "a b" {
+		t.Errorf("tableCell collapse = %q, want %q", got, "a b")
+	}
+	if got := tableCell("hello world", 5); got != "hell…" {
+		t.Errorf("tableCell truncate = %q, want %q", got, "hell…")
+	}
+}
+
+// TestFormatTableList covers the shared list-tool Format helper (edict 988):
+// a table envelope reports its row count, a fail-loud scope report surfaces its
+// human message instead of the JSON, and anything else passes through.
+func TestFormatTableList(t *testing.T) {
+	env, err := newMarkdownTableEnvelope("Ling", []string{"id"}, [][]string{{"l1"}, {"l2"}}, nil)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+	if got := formatTableList("List Ling", env); !strings.Contains(got, "List Ling: 2 rows") {
+		t.Errorf("envelope Format = %q, want row count", got)
+	}
+
+	report := `{"rows":0,"username":"u","project":"p","message":"0 rows for username=\"u\" project=\"p\"; no rows exist for this key under any other scope"}`
+	got := formatTableList("List Ling", report)
+	if !strings.Contains(got, `username="u"`) {
+		t.Errorf("scope-report Format = %q, want the human message", got)
+	}
+	if strings.Contains(got, `"rows"`) {
+		t.Errorf("scope-report Format = %q, must not leak the JSON blob", got)
+	}
+
+	if got := formatTableList("List Ling", "plain text"); !strings.Contains(got, "List Ling: plain text") {
+		t.Errorf("fallback Format = %q, want the raw result", got)
+	}
 }

@@ -126,6 +126,67 @@ func TestListPendingManifestsTool_EmptyScopeReportsScope(t *testing.T) {
 	}
 }
 
+// TestListPendingManifestsTool_PopulatedReturnsTableEnvelope verifies a
+// populated list_pending_manifests opts into the TUI markdown-table envelope
+// (edict 988) with raw carrying the full manifest slice.
+func TestListPendingManifestsTool_PopulatedReturnsTableEnvelope(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	if err := db.AutoMigrate(&storage.ForgeManifest{}); err != nil {
+		t.Fatalf("failed to migrate: %v", err)
+	}
+
+	if err := db.Create(&storage.ForgeManifest{
+		ManifestID: "m1", EdictID: 7, Username: "testuser", Project: "testproject",
+		LingID: "l1", FilePath: "a.go", Status: storage.ManifestForged,
+	}).Error; err != nil {
+		t.Fatalf("failed to create manifest: %v", err)
+	}
+
+	tool := ListPendingManifestsTool{Ctx: ToolContext{DB: db, Username: "testuser", Project: "testproject"}}
+	result, err := tool.Call(context.Background(), `{"edict_id":7}`)
+	if err != nil {
+		t.Fatalf("list_pending_manifests failed: %v", err)
+	}
+
+	var env markdownTableEnvelope
+	if err := json.Unmarshal([]byte(result), &env); err != nil {
+		t.Fatalf("result is not a table envelope: %v\n%s", err, result)
+	}
+	if env.Format != markdownTableFormat {
+		t.Errorf("Format = %q, want %q", env.Format, markdownTableFormat)
+	}
+	wantCols := []string{"manifest_id", "edict_id", "ling_id", "file_path", "status"}
+	if len(env.Columns) != len(wantCols) {
+		t.Fatalf("Columns = %v, want %v", env.Columns, wantCols)
+	}
+	for i, c := range wantCols {
+		if env.Columns[i] != c {
+			t.Errorf("Columns[%d] = %q, want %q", i, env.Columns[i], c)
+		}
+	}
+	if len(env.Rows) != 1 {
+		t.Fatalf("Rows = %d, want 1", len(env.Rows))
+	}
+	if env.Rows[0][0] != "m1" || env.Rows[0][3] != "a.go" {
+		t.Errorf("row = %v, want m1 ... a.go ...", env.Rows[0])
+	}
+
+	raw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	var rawManifests []storage.ForgeManifest
+	if err := json.Unmarshal(raw, &rawManifests); err != nil {
+		t.Fatalf("raw is not a []storage.ForgeManifest: %v\n%s", err, raw)
+	}
+	if len(rawManifests) != 1 || rawManifests[0].ManifestID != "m1" {
+		t.Errorf("raw = %+v, want the manifest", rawManifests)
+	}
+}
+
 // TestGetManifestByCommitTool_EmptyScopeReportsScope covers edict 968 for the
 // single-row manifest reader: a wrong-scope lookup must not collapse into a bare
 // "manifest not found", while a commit that matches nowhere stays an error.
@@ -201,5 +262,24 @@ func TestEmptyScopeReport_LookupFailureDoesNotAssertAbsence(t *testing.T) {
 	}
 	if strings.Contains(report.Message, "no rows exist for this key under any other scope") {
 		t.Errorf("message %q must not assert the key matches nowhere when the lookup failed", report.Message)
+	}
+}
+
+// TestListPendingManifestsTool_FormatCoversEnvelope covers the envelope branch
+// added to Format in edict 988 (it previously only understood a bare array).
+func TestListPendingManifestsTool_FormatCoversEnvelope(t *testing.T) {
+	tool := ListPendingManifestsTool{}
+
+	env, err := newMarkdownTableEnvelope("Pending Manifests", []string{"manifest_id"}, [][]string{{"m1"}, {"m2"}}, nil)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+	if got := tool.Format("{}", env, nil); !strings.Contains(got, "Listed 2 pending manifests") {
+		t.Errorf("Format(envelope) = %q, want counted summary", got)
+	}
+
+	legacy := `[{"manifest_id":"m1"}]`
+	if got := tool.Format("{}", legacy, nil); !strings.Contains(got, "Listed 1 pending manifests") {
+		t.Errorf("Format(legacy array) = %q, want counted summary", got)
 	}
 }

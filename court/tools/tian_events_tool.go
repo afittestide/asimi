@@ -13,10 +13,9 @@ import (
 	"github.com/afittestide/asimi/storage"
 )
 
-// tianMarkdownTableFormat is the generic TUI opt-in format. Any daemon-side
-// tool may emit an envelope carrying this value to have the TUI lay its
-// result out as a width-aware markdown table.
-const tianMarkdownTableFormat = "markdown_table"
+// tianMarkdownTableFormat names the shared TUI markdown-table opt-in for the
+// ledger's own envelope (see markdownTableFormat in table_envelope.go).
+const tianMarkdownTableFormat = markdownTableFormat
 
 // tianLedgerEnvelope is the human-facing result shape. Columns and rows are
 // plain strings so the TUI owns all layout; the raw summaries ride along under
