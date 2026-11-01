@@ -3059,6 +3059,63 @@ func TestRunGivenStep_BashFailure_TruncatesOutput(t *testing.T) {
 		"exec.Data[\"test\"] (via storeGivenResult) should contain the full output, not truncated")
 }
 
+// TestRunThenStepFailurePopulatesAndClearsError verifies Change 3b: a failing
+// then-step populates exec.Data["error"] so a later conditional act can render
+// {{ .error }}, and a subsequent successful attempt clears it so a stale error
+// can never leak.
+func TestRunThenStepFailurePopulatesAndClearsError(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "then-error-test",
+		Steps: []RitualStep{
+			{Name: "landing", Then: []string{"!exit 1"}, OnFailure: "retry", MaxRetries: 1},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	// First command fails, second succeeds: the retry lands, and .error must be
+	// cleared once the step completes.
+	runner := NewRitualRunner(registry, nil, nil, db, &mockCallCountRunner{results: []runners.Output{
+		{Output: "CONFLICT\n", ExitCode: "1"},
+		{Output: "ok\n", ExitCode: "0"},
+	}}, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(context.Background(), "then-error-test", testEK(9), nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(context.Background(), exec))
+
+	_, stale := exec.Data["error"]
+	assert.False(t, stale, "a successful attempt must clear a stale .error")
+	assert.Equal(t, "completed", exec.stepStates[0].Status)
+}
+
+// TestRunThenStepTerminalFailureKeepsError verifies .error is present at the
+// point the ritual fails terminally, so the failure message carries the cause.
+func TestRunThenStepTerminalFailureKeepsError(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "then-error-terminal",
+		Steps: []RitualStep{
+			{Name: "landing", Then: []string{"!exit 1"}, OnFailure: "abort"},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	runner := NewRitualRunner(registry, nil, nil, db, &mockCmdRunner{output: "CONFLICT\n", exitCode: "1"}, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(context.Background(), "then-error-terminal", testEK(9), nil, nil)
+	require.NoError(t, err)
+	require.Error(t, runner.Run(context.Background(), exec))
+
+	got, ok := exec.Data["error"].(string)
+	require.True(t, ok, "a failing then-step must populate .error")
+	assert.Contains(t, got, "CONFLICT", ".error carries the step's captured output")
+}
+
 func TestRunThenStep_BashFailure_TruncatesOutput(t *testing.T) {
 	db := setupRitualTestDB(t)
 	registry := NewRitualRegistry()
@@ -3249,29 +3306,30 @@ func TestPrepareWorktree_IdempotentReuse(t *testing.T) {
 	assert.Empty(t, mock.commands, "existing worktree is reused without commands")
 }
 
-// TestMergeEdictWorktree_OnRulerSealEvent asserts that a ruler seal fires the
-// rebase → squash-commit → remove sequence for the edict's worktree.
-func TestMergeEdictWorktree_OnRulerSealEvent(t *testing.T) {
+// mergeStepTestRunner wires a RitualRunner the way the Court does for the
+// merge-worktree ritual: mutations run through the injected host mutation
+// runner (never the Court-wide/podman runner), and no worktree routing is
+// declared, so the merge runs on root by construction.
+func mergeStepTestRunner(mutation runners.Runner) *RitualRunner {
+	r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	r.mutationRunner = func(string) runners.Runner { return mutation }
+	return r
+}
+
+// TestMergeEdictWorktree_StepDefLandsAndRemoves asserts the step-def performs
+// the rebase → squash-commit → remove sequence for the edict's worktree.
+func TestMergeEdictWorktree_StepDefLandsAndRemoves(t *testing.T) {
 	root := t.TempDir()
-	abs := filepath.Join(root, ".agents", "worktrees", "e531")
-	require.NoError(t, os.MkdirAll(abs, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
 
 	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
 		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
 	}}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         mock,
-		mutationRunner: mock,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+	r := mergeStepTestRunner(mock)
 
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "ruler"},
-	})
+	err := r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"})
+	require.NoError(t, err)
 
 	joined := mock.joined()
 	assert.Contains(t, joined, "rebase main", "worktree branch is rebased onto default")
@@ -3281,46 +3339,41 @@ func TestMergeEdictWorktree_OnRulerSealEvent(t *testing.T) {
 	assert.NotContains(t, joined, "--force", "removal must not use the forbidden flag")
 }
 
-// TestMergeEdictWorktree_NonRulerSealIgnored verifies judge/chancellor seals do
-// not touch the worktree.
-func TestMergeEdictWorktree_NonRulerSealIgnored(t *testing.T) {
-	root := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
-
-	mock := &worktreeTestRunner{}
-	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Project: "p"}, username: "u"}
-	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
-
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "judge"},
-	})
-
-	assert.Empty(t, mock.commands, "non-ruler seals must not merge/remove the worktree")
-}
-
-// TestMergeEdictWorktree_NoWorktreeNoOp verifies an edict that never opted in is
-// a no-op (and does not, e.g., remove an unrelated directory).
+// TestMergeEdictWorktree_NoWorktreeNoOp verifies an edict that never opted in
+// is a no-op (and does not, e.g., remove an unrelated directory) so the ritual
+// still ascends.
 func TestMergeEdictWorktree_NoWorktreeNoOp(t *testing.T) {
 	root := t.TempDir()
 	mock := &worktreeTestRunner{}
-	s := &Court{logger: slog.Default(), runner: mock, config: &config.CourtConfig{Project: "p"}, username: "u"}
-	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+	r := mergeStepTestRunner(mock)
 
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 999, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "ruler"},
-	})
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 999),
+		storage.EdictKey{ID: 999, Username: "u", Project: "p"}))
 
 	assert.Empty(t, mock.commands, "no worktree means nothing to merge")
 }
 
-// TestMergeEdictWorktree_ConflictLeavesWorktreeIntact verifies that a rebase
-// conflict stops the merge and does not remove the worktree — the forge (工部)
-// resolves it before the ruler reviews.
-func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
+// TestMergeEdictWorktree_GitlessNoOp: on gitless ground there is nothing to
+// land, so the step must be a no-op rather than shelling out to git.
+func TestMergeEdictWorktree_GitlessNoOp(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mock := &worktreeTestRunner{}
+	r := mergeStepTestRunner(mock)
+
+	exec := mergeExec(root, 531)
+	exec.repoInfo.HasVCS = false // Gitless()
+
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), exec,
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
+	assert.Empty(t, mock.commands, "gitless ground has no worktree to land")
+}
+
+// TestMergeEdictWorktree_ConflictReturnsError verifies that a rebase conflict
+// fails the step — so on_failure: retry re-invokes it (routing the forge in) —
+// and leaves the worktree intact for resolution.
+func TestMergeEdictWorktree_ConflictReturnsError(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
 
@@ -3328,115 +3381,90 @@ func TestMergeEdictWorktree_ConflictLeavesWorktreeIntact(t *testing.T) {
 		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
 		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
 	}}
-	s := &Court{logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Project: "p"}, username: "u"}
-	// The guard has a buffered channel to capture the published failure and,
-	// deliberately, a nil logger: publishing must degrade safely, never panic
-	// on an unwired dependency.
-	s.ritualGuard = &RitualGuard{
-		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
-		eventCh:      make(chan Event, 4),
-	}
+	r := mergeStepTestRunner(mock)
 
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "ruler"},
-	})
+	err := r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"})
+	require.Error(t, err, "a conflict must fail the step so the ritual retries")
 
 	joined := mock.joined()
 	assert.NotContains(t, joined, "merge --squash", "no squash-merge after a failed rebase")
 	assert.NotContains(t, joined, "worktree remove", "worktree must survive a conflict")
-
-	// The seal is already recorded, so the only user-visible signal of the
-	// unlanded work is the event. It must carry a non-empty reason.
-	select {
-	case ev := <-s.ritualGuard.eventCh:
-		assert.Equal(t, storage.EventWorktreeMergeFailed, ev.Type, "merge failure is published")
-		reason, _ := ev.Payload["reason"].(string)
-		assert.NotEmpty(t, reason, "merge failure reason must be non-empty")
-	default:
-		t.Fatal("expected EventWorktreeMergeFailed to be published on a failed rebase")
-	}
+	_, statErr := os.Stat(filepath.Join(root, ".agents", "worktrees", "e531"))
+	assert.NoError(t, statErr, "worktree is left intact for the forge")
 }
 
-// TestMergeEdictWorktree_FailurePublishesEvent is the "stop lying" guard: the
-// ruler's seal is recorded before this handler runs, so a merge failure must
-// publish an event the TUI surfaces as "sealed but work NOT merged" rather than
-// letting the seal toast imply success.
-func TestMergeEdictWorktree_FailurePublishesEvent(t *testing.T) {
+// TestMergeEdictWorktree_SubsumedSquashIsSuccess pins e974: a fully-subsumed
+// branch (git reports the squash as a no-op) is a landed merge, not a failure.
+// The step returns nil and proceeds to removal.
+func TestMergeEdictWorktree_SubsumedSquashIsSuccess(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
 
+	// An empty staged index models the "Already up to date" no-op.
 	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
-		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
-		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "", ExitCode: "0"},
 	}}
-	db := setupCourtTestDB(t)
-	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p"}).Error)
+	r := mergeStepTestRunner(mock)
 
-	s := &Court{db: db, logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Project: "p"}, username: "u"}
-	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
-		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root}},
-	})
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}),
+		"a fully-subsumed squash is a successful landing")
 
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "ruler"},
-	})
-
-	var ev storage.TianEvent
-	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 531, storage.EventWorktreeMergeFailed).First(&ev).Error)
-	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "rebase", "reason carries the failure")
+	assert.NotContains(t, mock.joined(), "commit -m", "no commit is made when nothing is staged")
+	assert.Contains(t, mock.joined(), "worktree remove", "the worktree is still retired")
 }
 
-// TestMergeEdictWorktree_RemovalFailurePublishesMergedEvent covers the other
-// half of change #4/#2: when the squash-merge lands but the worktree cannot be
-// removed (dirty tree, no --force allowed), the work IS merged, so the ruler must
-// see a distinct cleanup-failure notification — not the same "NOT merged" alarm,
-// and never a plain success. The event carries merged=true to make that
-// distinction; the worktree is left for inspection.
-func TestMergeEdictWorktree_RemovalFailurePublishesMergedEvent(t *testing.T) {
+// TestMergeEdictWorktree_RemovalFailureReturnsError covers the other half: when
+// the squash-merge lands but the worktree cannot be removed (dirty tree, no
+// --force allowed), the work IS merged, so the step returns an error but marks
+// the execution so the terminal event reports the landed state.
+func TestMergeEdictWorktree_RemovalFailureReturnsError(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
 
 	mock := &worktreeTestRunner{outputs: map[string]runners.Output{
 		"symbolic-ref":    {Output: "origin/main\n", ExitCode: "0"},
-		"rev-list":        {Output: "1\n", ExitCode: "0"},
 		"worktree remove": {Output: "contains modified or untracked files", ExitCode: "1"},
 	}}
+	r := mergeStepTestRunner(mock)
+	exec := mergeExec(root, 531)
+
+	err := r.mergeEdictWorktree(context.Background(), exec,
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removal failed")
+	assert.Contains(t, mock.joined(), "merge --squash asimi/e531", "the work still lands on the default branch")
+	assert.NotContains(t, mock.joined(), "--force", "cleanup must not force-remove")
+	assert.Equal(t, true, exec.Data["merge_landed"], "the execution records that the merge itself succeeded")
+	_, statErr := os.Stat(filepath.Join(root, ".agents", "worktrees", "e531"))
+	assert.NoError(t, statErr, "worktree stays intact when cleanup fails")
+}
+
+// TestAscendEdict_PublishesEdictSealed verifies the ritual-level then-step
+// revives the dead EventEdictSealed so the ruler gets a durable line.
+func TestAscendEdict_PublishesEdictSealed(t *testing.T) {
 	db := setupCourtTestDB(t)
-	require.NoError(t, db.Create(&storage.Edict{ID: 531, Username: "u", Project: "p"}).Error)
+	registry := NewRitualRegistry()
+	var published []storage.CourtEvent
+	r := NewRitualRunner(registry, nil, func(key storage.EdictKey, et storage.CourtEvent, payload storage.JSON) uint {
+		published = append(published, et)
+		return key.ID
+	}, db, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
 
-	s := &Court{db: db, logger: slog.Default(), runner: mock, mutationRunner: mock, config: &config.CourtConfig{Project: "p"}, username: "u"}
-	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
-		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root}},
-	})
+	exec := &RitualExecution{ID: "x", RitualName: mergeWorktreeRitual, EdictID: 531, Username: "u", Project: "p"}
+	require.NoError(t, r.runThen(context.Background(), exec, "ascend_edict"))
 
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "ruler"},
-	})
-
-	// The merge itself happened; the worktree survived for inspection.
-	joined := mock.joined()
-	assert.Contains(t, joined, "merge --squash asimi/e531", "the work still lands on the default branch")
-	assert.NotContains(t, joined, "--force", "cleanup must not force-remove")
-
-	var ev storage.TianEvent
-	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 531, storage.EventWorktreeMergeFailed).First(&ev).Error)
-	assert.Equal(t, true, ev.Payload["merged"], "merged=true distinguishes cleanup failure from 'work not merged'")
-	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "removal failed")
-	_, err := os.Stat(filepath.Join(root, ".agents", "worktrees", "e531"))
-	assert.NoError(t, err, "worktree stays intact when cleanup fails")
+	require.Len(t, published, 1)
+	assert.Equal(t, storage.EventEdictSealed, published[0])
 }
 
 // TestMergeEdictWorktree_EndToEndSealsStagedWork is the real acceptance gate for
 // the bug: an edict whose worktree holds unreviewed-but-staged work (never
 // committed by the forge) must, on the ruler's seal, land on the default branch
 // as exactly one commit, and the worktree and edict branch must be gone. This
-// exercises the Court handler against a real repository, not a mock, so the
+// exercises the step-def against a real repository, not a mock, so the
 // rebase → squash-merge → remove chain is proven end to end.
 func TestMergeEdictWorktree_EndToEndSealsStagedWork(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
@@ -3481,28 +3509,26 @@ func TestMergeEdictWorktree_EndToEndSealsStagedWork(t *testing.T) {
 	}).Error)
 
 	// The seal-chain runner executes inside the worktree, where the staged work
-	// lives (`git add` with no -C); the Court-wide runner that performs the
-	// merge/removal is rooted at the project root.
+	// lives (`git add` with no -C); the merge step-def performs the
+	// merge/removal on the project root through a host mutation runner.
 	worktreeRunner := runners.NewHostRunner(0, abs)
-	courtRunner := runners.NewHostRunner(0, root)
-	s := &Court{db: db, logger: slog.Default(), runner: courtRunner, config: &config.CourtConfig{Project: "p"}, username: "u"}
-	s.ritualGuard = NewRitualGuard(RitualGuardOpts{
-		Base: &MinisterBase{db: db, logger: slog.Default(), repoInfo: repo.RepoInfo{ProjectRoot: root, HasVCS: true}},
-	})
+	hostMutation := runners.NewHostRunner(0, root)
 
-	// The seal-chain staging step commits the work before the ruler's seal
-	// reaches this handler; both are part of the same invariant.
-	ritualRunner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, worktreeRunner, nil,
+	ritualRunner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, worktreeRunner, slog.Default(),
 		repo.RepoInfo{ProjectRoot: root, WorktreePath: rel, HasVCS: true})
+	ritualRunner.mutationRunner = func(string) runners.Runner { return hostMutation }
 	require.NoError(t, ritualRunner.runThen(context.Background(), &RitualExecution{
 		ID: "e2e", RitualName: "swift-strike", EdictID: 531, Username: "u", Project: "p",
 	}, "await_ruler_seal"))
 
-	s.handleSealGranted(Event{
-		Type:     storage.EventSealGranted,
-		EdictKey: storage.EdictKey{ID: 531, Username: "u", Project: "p"},
-		Payload:  map[string]interface{}{"minister_id": "ruler"},
-	})
+	// The merge-worktree step-def runs on root (no worktree routing), exactly as
+	// the ritual declares.
+	require.NoError(t, ritualRunner.mergeEdictWorktree(context.Background(),
+		&RitualExecution{
+			ID: "e2e-merge", RitualName: mergeWorktreeRitual, EdictID: 531, Username: "u", Project: "p",
+			repoInfo: repo.RepoInfo{ProjectRoot: root, HasVCS: true},
+		},
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
 
 	// The work landed on main as exactly one commit carrying the edict suffix.
 	subject := strings.TrimSpace(gitOutput(t, root, "log", "-1", "--format=%s"))
@@ -3604,11 +3630,11 @@ func TestEdictCommitSummary_UsesRecordedSummary(t *testing.T) {
 	assert.Equal(t, "chore: merge edict worktree e531", (&Court{}).edictCommitSummary(531))
 }
 
-// TestSealEdict_FailedMergeIsReportedNotSilent covers the transition_edict
-// path: sealing records the ruler's seal AND lands the worktree, but a merge
-// failure is surfaced to the caller and published as EventWorktreeMergeFailed
-// rather than swallowed by the seal's success.
-func TestSealEdict_FailedMergeIsReportedNotSilent(t *testing.T) {
+// TestSealEdict_HandsLandingToRitual covers the transition_edict path: sealing
+// records the ruler's seal and publishes EventSealGranted{minister_id: ruler}
+// (which triggers the merge-worktree ritual) rather than merging inline. The
+// ruler still gets a durable failure signal from the ritual's terminal path.
+func TestSealEdict_HandsLandingToRitual(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
 
@@ -3625,37 +3651,35 @@ func TestSealEdict_FailedMergeIsReportedNotSilent(t *testing.T) {
 	rg.repoInfo = repo.RepoInfo{ProjectRoot: root}
 	s.ritualGuard = rg
 
-	mergeFailure, err := s.SealEdict(531, "notes")
-	require.NoError(t, err)
-	assert.NotEmpty(t, mergeFailure, "a failed merge must be surfaced to the caller")
+	require.NoError(t, s.SealEdict(531, "notes"), "sealing must not fail on a landing it does not perform")
 
-	// The seal is still recorded — the failure is reported alongside it, not
-	// instead of it.
+	// Sealing performs no inline merge: nothing lands or is removed here.
+	assert.Empty(t, mock.commands, "sealing must not merge inline — the ritual lands the worktree")
+
+	// The seal is recorded and the trigger event is published (no merge_handled
+	// flag — the ritual is the single path).
 	seals, err := s.GetEdictSeals(s.EdictKey(531))
 	require.NoError(t, err)
 	require.Len(t, seals, 1)
 	assert.Equal(t, "ruler", seals[0].MinisterID)
 
-	// And the merge failure is announced on the bus.
-	var published []Event
+	var granted *Event
 	for {
 		select {
 		case ev := <-rg.eventCh:
-			published = append(published, ev)
+			if ev.Type == storage.EventSealGranted {
+				e := ev
+				granted = &e
+			}
 			continue
 		default:
 		}
 		break
 	}
-	var failed *Event
-	for i := range published {
-		if published[i].Type == storage.EventWorktreeMergeFailed {
-			failed = &published[i]
-		}
-	}
-	require.NotNil(t, failed, "expected EventWorktreeMergeFailed to be published")
-	reason, _ := failed.Payload["reason"].(string)
-	assert.NotEmpty(t, reason, "merge failure reason must be non-empty")
+	require.NotNil(t, granted, "expected EventSealGranted to be published")
+	assert.Equal(t, "ruler", granted.Payload["minister_id"])
+	_, hasFlag := granted.Payload["merge_handled"]
+	assert.False(t, hasFlag, "the merge_handled flag is gone; the ritual is the single path")
 }
 
 // TestBuildToolRegistry_WiresEdictSealer covers the production wiring site: the
@@ -3692,9 +3716,10 @@ func TestBuildToolRegistry_WiresEdictSealer(t *testing.T) {
 
 	out, err := transition.Call(context.Background(), `{"edict_id":531,"status":"sealed"}`)
 	require.NoError(t, err)
-	assert.Contains(t, out, "merge_failure", "a failed merge must surface in the tool result: %s", out)
+	assert.Contains(t, out, "merge-worktree ritual", "the tool result reports landing handed to the ritual: %s", out)
+	assert.NotContains(t, out, "merge_failure", "no inline merge_failure is reported: %s", out)
 
-	// The seal is still recorded; the failure is reported alongside it.
+	// The seal is still recorded; the landing is the ritual's job.
 	seals, err := s.GetEdictSeals(s.EdictKey(531))
 	require.NoError(t, err)
 	require.Len(t, seals, 1)

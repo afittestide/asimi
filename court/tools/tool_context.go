@@ -122,11 +122,12 @@ type MinisterConsultant interface {
 	ConsultMinister(ctx context.Context, callerMinisterID, ministerID, channelID string, key storage.EdictKey, work string) (string, error)
 }
 
-// EdictSealer grants the ruler's seal AND lands the edict's worktree so a seal
-// stopped being a silent no-op: sealing without the merge records the seal but
-// leaves the work unmerged. SealEdict returns a non-empty mergeFailure string
-// (already reported via EventWorktreeMergeFailed) when the work could not land.
+// EdictSealer grants the ruler's seal and hands the edict's worktree landing to
+// the merge-worktree ritual (triggered by seal_granted{minister_id: ruler}), so
+// sealing is never a silent no-op and un-merge worktrees can be left dangling.
+// A terminal landing failure is reported
+// durably via EventWorktreeMergeFailed by the ritual's failure path.
 // Implemented by the Court.
 type EdictSealer interface {
-	SealEdict(edictID uint, notes string) (mergeFailure string, err error)
+	SealEdict(edictID uint, notes string) error
 }

@@ -4334,29 +4334,147 @@ func mergeTestRunnerOutputs() map[string]runners.Output {
 	}
 }
 
+// newMergeStepRunner builds a RitualRunner wired the way the Court wires it
+// for the merge-worktree ritual: repository mutations run through the injected
+// host mutation runner, the legacy ling-worktree sweep is a no-op unless
+// supplied, and a landed merge tears the edict runner down.
+func newMergeStepRunner(t *testing.T, mutation runners.Runner, sweep func(context.Context, uint)) *RitualRunner {
+	t.Helper()
+	r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
+	r.mutationRunner = func(string) runners.Runner { return mutation }
+	if sweep != nil {
+		r.sweepLingWorktrees = sweep
+	}
+	return r
+}
+
+// mergeExec builds the execution context the merge step-def reads: the edict's
+// identity and the project root. No worktree routing — the ritual declares no
+// `given: an edict's worktree`, so the merge runs on root by construction.
+func mergeExec(root string, edictID uint) *RitualExecution {
+	return &RitualExecution{
+		ID:         "merge-test",
+		RitualName: mergeWorktreeRitual,
+		EdictID:    edictID,
+		Username:   "u",
+		Project:    "p",
+		repoInfo:   repo.RepoInfo{ProjectRoot: root, HasVCS: true},
+	}
+}
+
 // TestMergeEdictWorktree_RunsOnHostMutationRunnerNotCourtRunner is the
 // consistency repair of incident 9f8b980c998a6c32: EnsureEdictWorktree already
 // mutates the repo through a host runner, and the seal-time merge must do the
-// same. The Court-wide (podman) runner is asserted to receive nothing.
+// same. The step-def's own runner (the Court-wide/podman one) is asserted to
+// receive nothing.
 func TestMergeEdictWorktree_RunsOnHostMutationRunnerNotCourtRunner(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
 
 	courtRunner := &worktreeTestRunner{}
 	mutation := &worktreeTestRunner{outputs: mergeTestRunnerOutputs()}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         courtRunner,
-		mutationRunner: mutation,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}}}
+	r := newMergeStepRunner(t, mutation, nil)
+	r.runner = courtRunner
 
-	s.mergeEdictWorktree(context.Background(), 531)
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
 
 	assert.Contains(t, mutation.joined(), "rebase", "the mutation goes through the host mutation runner")
 	assert.Contains(t, mutation.joined(), "worktree remove", "the post-merge removal uses the same runner")
 	assert.Empty(t, courtRunner.commands, "no repo mutation may go through the Court-wide runner")
+}
+
+// TestMergeEdictWorktree_RunsOnRootNotWorktreeRunner pins the structural
+// invariant that lets the ritual omit `given: an edict's worktree`: the handler
+// resolves the merge target from exec.repoInfo.ProjectRoot (not the worktree's
+// effective root), so merge/commit/remove act on root. Only the rebase runs
+// inside the worktree, by design.
+func TestMergeEdictWorktree_RunsOnRootNotWorktreeRunner(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e531")
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	mutation := &worktreeTestRunner{outputs: mergeTestRunnerOutputs()}
+	r := newMergeStepRunner(t, mutation, nil)
+
+	// Simulate a worktree-routed execution (prepare_worktree having run): the
+	// handler must still merge on root, not the effective worktree root.
+	exec := mergeExec(root, 531)
+	exec.repoInfo.WorktreePath = filepath.Join(".agents", "worktrees", "e531")
+	exec.repoInfo.IsWorktree = true
+
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), exec,
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
+
+	joined := mutation.joined()
+	assert.Contains(t, joined, "git -C "+root+" -c core.fsync=loose-object merge --squash",
+		"the squash-merge runs against the project root")
+	assert.Contains(t, joined, "git -C "+root+" -c core.fsync=loose-object worktree remove "+abs,
+		"the removal runs against the project root")
+}
+
+// TestMergeEdictWorktree_SweepsLingWorktreesBeforeRemoval pins e984's
+// invariant: legacy per-ling worktrees nested under the edict's worktree
+// cannot be removed with their parent, so the sweep must run before the merge
+// — and only for an edict that actually has a worktree to land.
+func TestMergeEdictWorktree_SweepsLingWorktreesBeforeRemoval(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	var swept []uint
+	mutation := &worktreeTestRunner{outputs: mergeTestRunnerOutputs()}
+	r := newMergeStepRunner(t, mutation, func(_ context.Context, edictID uint) { swept = append(swept, edictID) })
+
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
+	assert.Equal(t, []uint{531}, swept, "the edict's nested ling worktrees are swept before removal")
+
+	// No worktree → nothing to land, so no sweep is attempted (it must not,
+	// e.g., delete an unrelated edict's nested worktrees).
+	swept = nil
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 999),
+		storage.EdictKey{ID: 999, Username: "u", Project: "p"}))
+	assert.Empty(t, swept, "a no-worktree landing must not sweep")
+}
+
+// TestMergeEdictWorktree_ClosesEdictRunnerOnSuccess pins the teardown half of a
+// landed merge: the worktree is gone, so the edict's container is retired too.
+// A missing hook (a directly-constructed runner) must not fail the landing.
+func TestMergeEdictWorktree_ClosesEdictRunnerOnSuccess(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	mutation := &worktreeTestRunner{outputs: mergeTestRunnerOutputs()}
+	r := newMergeStepRunner(t, mutation, nil)
+
+	var closed []uint
+	r.closeEdictRunner = func(_ context.Context, edictID uint) { closed = append(closed, edictID) }
+
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
+	assert.Equal(t, []uint{531}, closed, "a landed merge retires the edict's runner")
+
+	// A failed landing must NOT retire the runner — the worktree survives for
+	// the forge to resolve the conflict.
+	root2 := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root2, ".agents", "worktrees", "e532"), 0o755))
+	conflict := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref": {Output: "origin/main\n", ExitCode: "0"},
+		"rebase":       {Output: "CONFLICT", ExitCode: "1"},
+	}}
+	r2 := newMergeStepRunner(t, conflict, nil)
+	closed = nil
+	r2.closeEdictRunner = func(_ context.Context, edictID uint) { closed = append(closed, edictID) }
+
+	require.Error(t, r2.mergeEdictWorktree(context.Background(), mergeExec(root2, 532),
+		storage.EdictKey{ID: 532, Username: "u", Project: "p"}))
+	assert.Empty(t, closed, "a conflicted landing keeps the edict runner for the forge")
+
+	// A nil hook is a safe no-op: it must not turn a landed merge into a failure.
+	r3 := newMergeStepRunner(t, &worktreeTestRunner{outputs: mergeTestRunnerOutputs()}, nil)
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e533"), 0o755))
+	require.NoError(t, r3.mergeEdictWorktree(context.Background(), mergeExec(root, 533),
+		storage.EdictKey{ID: 533, Username: "u", Project: "p"}))
 }
 
 // TestRepoMutationRunner_IsHost guards the production default: with no runner
@@ -4391,8 +4509,8 @@ func TestEnsureEdictWorktree_UsesMutationRunner(t *testing.T) {
 
 // TestMergeEdictWorktree_RetriesTransientCorruptLooseObject: a rebase that
 // fails once with "loose object … is corrupt" is a torn read, not disk rot, so
-// the seal retries the whole operation once and lands the work — without
-// publishing a failure the ruler would read as "sealed but not merged".
+// the step retries the whole operation once and lands the work — returning nil
+// so the ritual ascends rather than routing the forge in.
 func TestMergeEdictWorktree_RetriesTransientCorruptLooseObject(t *testing.T) {
 	root := t.TempDir()
 	abs := filepath.Join(root, ".agents", "worktrees", "e531")
@@ -4404,32 +4522,21 @@ func TestMergeEdictWorktree_RetriesTransientCorruptLooseObject(t *testing.T) {
 		fails:              1,
 		output:             "fatal: loose object 585ccf60a5ba79b40f0b63e0f0f0d0e6b1f2c3d4 is corrupt",
 	}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         &worktreeTestRunner{},
-		mutationRunner: mutation,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{
-		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
-		eventCh:      make(chan Event, 4),
-	}
+	r := newMergeStepRunner(t, mutation, nil)
 
-	s.mergeEdictWorktree(context.Background(), 531)
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}),
+		"a transient corruption must not fail the step")
 
 	assert.Contains(t, mutation.joined(), "merge --squash asimi/e531", "the retry lands the work")
 	assert.Contains(t, mutation.joined(), "worktree remove", "the retry proceeds to retire the worktree")
-	select {
-	case ev := <-s.ritualGuard.eventCh:
-		t.Fatalf("a transient corruption must not publish a failure, got %s", ev.Type)
-	default:
-	}
 }
 
 // TestMergeEdictWorktree_PersistentCorruptionStillFails: when the object is
-// genuinely unreadable the retry is exhausted, the failure is published, and
-// the worktree stays intact — exactly today's failure-and-leave-intact
-// behaviour, with no retry loop.
+// genuinely unreadable the retry is exhausted, the step returns an error (so
+// the ritual routes the forge in), and the worktree stays intact — exactly the
+// failure-and-leave-intact behaviour, with no retry loop. The terminal failure
+// event is published by the ritual manager, not here.
 func TestMergeEdictWorktree_PersistentCorruptionStillFails(t *testing.T) {
 	root := t.TempDir()
 	abs := filepath.Join(root, ".agents", "worktrees", "e531")
@@ -4441,18 +4548,12 @@ func TestMergeEdictWorktree_PersistentCorruptionStillFails(t *testing.T) {
 		fails:              2,
 		output:             "fatal: loose object 585ccf60a5ba79b40f0b63e0f0f0d0e6b1f2c3d4 is corrupt",
 	}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         &worktreeTestRunner{},
-		mutationRunner: mutation,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{
-		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
-		eventCh:      make(chan Event, 4),
-	}
+	r := newMergeStepRunner(t, mutation, nil)
 
-	s.mergeEdictWorktree(context.Background(), 531)
+	err := r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"})
+	require.Error(t, err, "persistent corruption must fail the step so the forge is routed in")
+	assert.Contains(t, err.Error(), "is corrupt", "the error carries the git message")
 
 	rebaseAttempts := 0
 	for _, cmd := range mutation.commands {
@@ -4463,17 +4564,8 @@ func TestMergeEdictWorktree_PersistentCorruptionStillFails(t *testing.T) {
 	assert.Equal(t, 2, rebaseAttempts, "the operation is retried exactly once, never looped")
 	assert.NotContains(t, mutation.joined(), "merge --squash", "no merge after a failed retry")
 	assert.NotContains(t, mutation.joined(), "worktree remove", "worktree is left intact on failure")
-	_, err := os.Stat(abs)
-	assert.NoError(t, err, "persistent corruption leaves the worktree for the forge")
-
-	select {
-	case ev := <-s.ritualGuard.eventCh:
-		assert.Equal(t, storage.EventWorktreeMergeFailed, ev.Type, "a second failure is announced")
-		reason, _ := ev.Payload["reason"].(string)
-		assert.Contains(t, reason, "is corrupt", "the reason carries the git error")
-	default:
-		t.Fatal("expected EventWorktreeMergeFailed after a failed retry")
-	}
+	_, statErr := os.Stat(abs)
+	assert.NoError(t, statErr, "persistent corruption leaves the worktree for the forge")
 }
 
 // healingRunner runs real git through a host runner and, the first time a
@@ -4589,25 +4681,11 @@ func TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject(t *testing.T
 		Runner: runners.NewHostRunner(0, root),
 		heal:   func() { writeLooseObject(t, objPath, good) },
 	}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         &worktreeTestRunner{},
-		mutationRunner: mutation,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{
-		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
-		eventCh:      make(chan Event, 4),
-	}
+	r := newMergeStepRunner(t, mutation, nil)
 
-	require.NoError(t, s.mergeEdictWorktree(context.Background(), 531),
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}),
 		"a transient torn read must not abort the seal")
-
-	select {
-	case ev := <-s.ritualGuard.eventCh:
-		t.Fatalf("a transient torn read must not publish %s: %v", ev.Type, ev.Payload)
-	default:
-	}
 
 	// The branch's work landed on main and the worktree was retired.
 	for _, name := range []string{"a", "b", "c"} {
@@ -4636,18 +4714,10 @@ func TestMergeEdictWorktree_AbortsRebaseStateBeforeRetry(t *testing.T) {
 		fails:              1,
 		output:             "fatal: loose object 585ccf60 is corrupt",
 	}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         &worktreeTestRunner{},
-		mutationRunner: mutation,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{
-		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
-		eventCh:      make(chan Event, 4),
-	}
+	r := newMergeStepRunner(t, mutation, nil)
 
-	s.mergeEdictWorktree(context.Background(), 531)
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}))
 
 	abortIdx, rebaseIdxs := -1, []int{}
 	for i, cmd := range mutation.commands {
@@ -4685,18 +4755,11 @@ func TestMergeEdictWorktree_AbortFailureDoesNotWedgeTheSeal(t *testing.T) {
 		fails:  1,
 		output: "fatal: loose object 585ccf60 is corrupt",
 	}
-	s := &Court{
-		logger:         slog.Default(),
-		runner:         &worktreeTestRunner{},
-		mutationRunner: mutation,
-		config:         &config.CourtConfig{Project: "p"}, username: "u",
-	}
-	s.ritualGuard = &RitualGuard{
-		MinisterBase: &MinisterBase{repoInfo: repo.RepoInfo{ProjectRoot: root}},
-		eventCh:      make(chan Event, 4),
-	}
+	r := newMergeStepRunner(t, mutation, nil)
 
-	s.mergeEdictWorktree(context.Background(), 531)
+	err := r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"})
+	require.Error(t, err, "a failed abort must fail the step so the forge is routed in")
 
 	rebaseIdxs := 0
 	for _, cmd := range mutation.commands {
@@ -4706,14 +4769,8 @@ func TestMergeEdictWorktree_AbortFailureDoesNotWedgeTheSeal(t *testing.T) {
 	}
 	assert.Equal(t, 1, rebaseIdxs, "a failed abort must not attempt the rebase again")
 
-	select {
-	case ev := <-s.ritualGuard.eventCh:
-		assert.Equal(t, storage.EventWorktreeMergeFailed, ev.Type)
-	default:
-		t.Fatal("expected EventWorktreeMergeFailed when the stale state cannot be cleared")
-	}
-	_, err := os.Stat(abs)
-	assert.NoError(t, err, "worktree stays intact for the forge")
+	_, statErr := os.Stat(abs)
+	assert.NoError(t, statErr, "worktree stays intact for the forge")
 }
 
 // sandboxReconcileRunner is a Runner that also exposes the janitor backends, so

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -244,17 +243,24 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		DeliverZhengming: s.DeliverZhengmingAnswer,
 		FlatlineRunners:  s.flatlineIdleRunners,
 	})
+	// TODO - move the next block to NewRitualGuard
 	s.ritualGuard.ritualRunner.isolatedHost = s.isolatedHost
 	// Rituals resolve their own per-edict runner and stamp last-used on
 	// completion so an idle container is never flatlined mid-ritual.
 	s.ritualGuard.ritualRunner.SetRunnerResolver(s.RunnerForEdict, s.TouchEdictRunner)
+	// The merge-worktree ritual lands a sealed edict's worktree. Its git
+	// mutations must run on the host (never the sandbox), it must sweep
+	// legacy per-ling worktrees before removing the parent, and it tears the
+	// edict's runner down once the worktree is gone. Inject those Court
+	// seams so the step-def never reaches back into Court internals.
+	s.ritualGuard.ritualRunner.mutationRunner = s.repoMutationRunner
+	s.ritualGuard.ritualRunner.sweepLingWorktrees = s.sweepLingWorktrees
+	s.ritualGuard.ritualRunner.closeEdictRunner = s.CloseEdictRunner
 
-	// Handle the Ruler's seal: squash-merge and remove the edict's worktree
-	// (if any) so an edict's isolated work ascends to the default branch as a
-	// single commit and the worktree does not outlive the edict. The handler
-	// runs off the ritual goroutine; it must not call SetRepoInfo (which locks
-	// and fans out).
-	s.ritualGuard.Subscribe(storage.EventSealGranted, s.handleSealGranted)
+	// The ruler's seal is landed by the merge-worktree ritual, which is
+	// triggered by the seal_granted{minister_id: ruler} event (see
+	// builtin_rituals.yaml and the payload filter in RitualTrigger). There is
+	// no imperative merge handler: the ritual is the single path.
 
 	// Handle zhengming_answered events: merged handler for ritual delivery, edict creation, and legacy path
 	s.ritualGuard.Subscribe(storage.EventZhengmingAnswered, func(e Event) {
@@ -1691,21 +1697,6 @@ func (s *Court) ignoreCopyGlobs() []string {
 	return config.DefaultIgnoreCopyGlobs()
 }
 
-// handleSealGranted reacts to a granted seal. Only the ruler's seal triggers the
-// worktree merge-and-remove; other seals are ignored. A payload flag
-// ("merge_handled") lets a synchronous caller (transition_edict) perform the
-// merge itself and report the outcome, so the handler must not merge again.
-func (s *Court) handleSealGranted(e Event) {
-	minister, _ := e.Payload["minister_id"].(string)
-	if minister != "ruler" {
-		return
-	}
-	if handled, _ := e.Payload["merge_handled"].(bool); handled {
-		return
-	}
-	s.mergeEdictWorktree(context.Background(), e.EdictKey.ID)
-}
-
 // repoMutationRunner returns the runner that performs repository mutations
 // (worktree creation, seal-time rebase/merge/remove). Mutations always run on
 // the host, matching EnsureEdictWorktree: the sandbox bind-mounts a single
@@ -1718,86 +1709,6 @@ func (s *Court) repoMutationRunner(root string) runners.Runner {
 	r := runners.NewHostRunner(0, root)
 	r.SetTimeouts(s.hostTimeouts())
 	return r
-}
-
-// mergeEdictWorktree squash-merges the edict's worktree into the merge target
-// and removes it. It is a no-op (nil) when the edict has no worktree (i.e. its
-// rituals never opted in). On a merge or cleanup failure it publishes
-// EventWorktreeMergeFailed and returns the failure so a synchronous caller
-// (transition_edict) can surface it; the worktree is left intact so the forge
-// (工部) can resolve conflicts before the ruler reviews.
-func (s *Court) mergeEdictWorktree(ctx context.Context, edictID uint) error {
-	if s == nil {
-		return nil
-	}
-	root := ""
-	if s.ritualGuard != nil {
-		root = s.ritualGuard.repoInfo.ProjectRoot
-	}
-	if root == "" {
-		return nil
-	}
-	rel := worktree.RelPath(edictID) // exact: e531 is not e5310
-	abs := filepath.Join(root, rel)
-	if _, err := os.Stat(abs); err != nil {
-		return nil // no worktree → nothing to do
-	}
-	branch := worktree.Branch(edictID)
-	summary := s.edictCommitSummary(edictID)
-	runner := s.repoMutationRunner(root)
-	// Nested per-ling worktrees (legacy shape, superseded by e923) under a live
-	// edict worktree cannot be removed with their parent, so sweep them first.
-	s.sweepLingWorktrees(ctx, edictID)
-	err := worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, summary)
-	if worktree.LooseObjectCorrupt(err) {
-		// A torn read of a just-written loose object, not disk rot. Retry the
-		// whole operation once; git wrote the object already, and fsync=loose-object
-		// makes the second attempt durable. A second failure keeps the
-		// failure-and-leave-intact behaviour below.
-		s.logger.Warn("retrying worktree merge after a corrupt loose object",
-			"edict", edictID, "err", err)
-		// A rebase writes a tree per replayed commit, so the torn read may have
-		// struck mid-replay and left .git/rebase-merge behind. git refuses a
-		// fresh rebase while that state exists, so the retry would be a refused
-		// no-op that wedges the worktree. Clear it first; --abort is a no-op when
-		// no rebase is in progress.
-		if abortErr := worktree.AbortRebase(ctx, runner, abs); abortErr != nil {
-			s.logger.Error("could not clear stale rebase state before retry",
-				"edict", edictID, "err", abortErr)
-		} else {
-			err = worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, summary)
-		}
-	}
-	if err != nil {
-		s.logger.Error("worktree merge failed; left intact for inspection/rollback",
-			"edict", edictID, "err", err)
-		// The ruler's seal is already recorded, so the TUI would otherwise
-		// report an unqualified success (🥂 sealed). Publish a dedicated event
-		// so the failure is visible: edict sealed, work NOT merged.
-		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
-			"minister_id": "ruler",
-			"reason":      err.Error(),
-			"worktree":    rel,
-			"branch":      branch,
-		})
-		return err // forge resolves conflicts; do NOT remove on failure
-	}
-	if err := worktree.Remove(ctx, runner, root, abs, branch); err != nil {
-		s.logger.Error("worktree removal failed after successful merge", "edict", edictID, "err", err)
-		cleanupErr := fmt.Errorf("work merged but worktree removal failed: %w", err)
-		s.PublishEvent(s.EdictKey(edictID), storage.EventWorktreeMergeFailed, storage.JSON{
-			"minister_id": "ruler",
-			"reason":      cleanupErr.Error(),
-			"worktree":    rel,
-			"branch":      branch,
-			"merged":      true,
-		})
-		return cleanupErr // keep the edict runner so the worktree can be inspected
-	}
-	// The worktree is gone; tear down the edict's container too. The next
-	// ritual for the edict lazily recreates a runner.
-	s.CloseEdictRunner(ctx, edictID)
-	return nil
 }
 
 // edictCommitSummary builds the squash-merge commit message for an edict from
@@ -1864,20 +1775,19 @@ func (s *Court) GrantRulerSeal(edictID uint, notes string) error {
 	return nil
 }
 
-// SealEdict stamps the ruler's seal, lands the edict's worktree, and reports
-// the merge outcome to the caller. It is the synchronous counterpart of the
-// seal→merge event path used by `:edict seal`: the seal is still announced via
-// EventSealGranted (so the TUI's seal toast is unchanged), but the event carries
-// merge_handled=true so the async handler does not merge a second time. A
-// non-empty mergeFailure (also published as EventWorktreeMergeFailed) tells a
-// calling minister the edict is sealed while its work did NOT land.
-func (s *Court) SealEdict(edictID uint, notes string) (string, error) {
+// SealEdict stamps the ruler's seal and publishes EventSealGranted, which the
+// merge-worktree ritual picks up to land the edict's worktree. Landing is no
+// longer inline: the ritual is the single path, and it retries through the
+// forge when a rebase conflicts. A terminal landing failure surfaces durably
+// as EventWorktreeMergeFailed (published by the ritual's failure path), so the
+// ruler is never left with a silent no-op.
+func (s *Court) SealEdict(edictID uint, notes string) error {
 	if s == nil {
-		return "", fmt.Errorf("court not initialized")
+		return fmt.Errorf("court not initialized")
 	}
 	sealer := s.GetSealService()
 	if sealer == nil {
-		return "", fmt.Errorf("seal service not available")
+		return fmt.Errorf("seal service not available")
 	}
 	key := s.EdictKey(edictID)
 	timestamp := time.Now().Format(time.RFC3339)
@@ -1885,18 +1795,14 @@ func (s *Court) SealEdict(edictID uint, notes string) (string, error) {
 		"notes":     notes,
 		"timestamp": timestamp,
 	}); err != nil {
-		return "", err
+		return err
 	}
 	s.PublishEvent(key, storage.EventSealGranted, storage.JSON{
-		"minister_id":   "ruler",
-		"notes":         notes,
-		"timestamp":     timestamp,
-		"merge_handled": true,
+		"minister_id": "ruler",
+		"notes":       notes,
+		"timestamp":   timestamp,
 	})
-	if err := s.mergeEdictWorktree(context.Background(), edictID); err != nil {
-		return err.Error(), nil
-	}
-	return "", nil
+	return nil
 }
 
 // GetEdictSeals returns the live seal chain (invalidated/stale seals excluded).

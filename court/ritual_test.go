@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -326,6 +327,118 @@ func TestRitualRegistry(t *testing.T) {
 	if err := registry.Register(&RitualDef{}); err == nil {
 		t.Error("expected error for ritual without name")
 	}
+}
+
+func TestRitualRegistry_GetByEventAndPayload(t *testing.T) {
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: "merge-worktree",
+		Triggers: []RitualTrigger{
+			{Event: "seal_granted", Filter: map[string]string{"minister_id": "ruler"}},
+		},
+	}))
+	require.NoError(t, registry.Register(&RitualDef{
+		Name:     "unfiltered",
+		Triggers: []RitualTrigger{{Event: "seal_granted"}},
+	}))
+
+	names := func(rituals []*RitualDef) []string {
+		var out []string
+		for _, r := range rituals {
+			out = append(out, r.Name)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	// The ruler's seal matches the filter and the wildcard.
+	assert.Equal(t, []string{"merge-worktree", "unfiltered"},
+		names(registry.GetByEventAndPayload("seal_granted", storage.JSON{"minister_id": "ruler"})))
+
+	// A judge's seal matches only the wildcard — the payload filter excludes
+	// the filtered ritual.
+	assert.Equal(t, []string{"unfiltered"},
+		names(registry.GetByEventAndPayload("seal_granted", storage.JSON{"minister_id": "judge"})))
+
+	// A missing key stringifies to "<nil>" and does not match.
+	assert.Equal(t, []string{"unfiltered"},
+		names(registry.GetByEventAndPayload("seal_granted", storage.JSON{})))
+
+	// An unrelated event matches nothing.
+	assert.Empty(t, registry.GetByEventAndPayload("other_event", storage.JSON{"minister_id": "ruler"}))
+}
+
+// TestRitualRegistry_GetByEventAndPayload_Regex verifies filter values are
+// anchored regular expressions: "ruler|judge" matches both, and an anchored
+// "ruler" does not match a prefix like "rulership".
+func TestRitualRegistry_GetByEventAndPayload_Regex(t *testing.T) {
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: "either",
+		Triggers: []RitualTrigger{
+			{Event: "seal_granted", Filter: map[string]string{"minister_id": "ruler|judge"}},
+		},
+	}))
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: "exact",
+		Triggers: []RitualTrigger{
+			{Event: "seal_granted", Filter: map[string]string{"minister_id": "ruler"}},
+		},
+	}))
+
+	matched := func(payload string) map[string]bool {
+		out := map[string]bool{}
+		for _, r := range registry.GetByEventAndPayload("seal_granted", storage.JSON{"minister_id": payload}) {
+			out[r.Name] = true
+		}
+		return out
+	}
+
+	assert.Equal(t, map[string]bool{"either": true, "exact": true}, matched("ruler"))
+	assert.Equal(t, map[string]bool{"either": true}, matched("judge"),
+		"the anchored 'ruler' filter must not match 'judge'")
+	assert.Empty(t, matched("rulership"),
+		"the anchored 'ruler' filter must not match a prefix")
+}
+
+// TestValidateRitual_RejectsInvalidFilterRegex: an uncompilable filter must be
+// a load-time error, not a silent never-match.
+func TestValidateRitual_RejectsInvalidFilterRegex(t *testing.T) {
+	def := &RitualDef{
+		Name: "bad",
+		Triggers: []RitualTrigger{
+			{Event: "seal_granted", Filter: map[string]string{"minister_id": "("}},
+		},
+		Steps: []RitualStep{{Name: "s"}},
+	}
+	err := ValidateRitual(def)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid regex")
+}
+
+// TestMergeWorktreeRitual_LoadsWithTriggerAndOneStep is the structural
+// regression guard for the forward-goto defect: merge-worktree must load with
+// its ruler-only trigger and exactly ONE step, so nothing can run after a
+// successful landing.
+func TestMergeWorktreeRitual_LoadsWithTriggerAndOneStep(t *testing.T) {
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+
+	var def *RitualDef
+	for _, r := range rituals {
+		if r.Name == mergeWorktreeRitual {
+			def = r
+		}
+	}
+	require.NotNil(t, def, "merge-worktree must load")
+
+	require.Len(t, def.Steps, 1, "merge-worktree must have exactly one step (landing)")
+	assert.Equal(t, "landing", def.Steps[0].Name)
+	assert.Equal(t, "retry", def.Steps[0].OnFailure)
+
+	require.Len(t, def.Triggers, 1)
+	assert.Equal(t, "seal_granted", def.Triggers[0].Event)
+	assert.Equal(t, map[string]string{"minister_id": "ruler"}, def.Triggers[0].Filter)
 }
 
 func TestRitualRegistry_Summaries(t *testing.T) {
@@ -1029,6 +1142,119 @@ func TestRitualStepPreservesOutputOnFailure(t *testing.T) {
 	if !strings.Contains(exec.stepStates[0].Message, "something went wrong") {
 		t.Errorf("Expected step message to contain error, got %q", exec.stepStates[0].Message)
 	}
+}
+
+// TestRitualStepWhitespaceOnlyActIsNoOp verifies the engine treats a
+// whitespace-only rendered act as a no-op: a `|` literal block whose sole
+// content is a newline must not dispatch a spurious minister turn, while its
+// then steps still run.
+func TestRitualStepWhitespaceOnlyActIsNoOp(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "ws-act-test",
+		Steps: []RitualStep{
+			{Name: "landing", Minister: "forge", Act: "\n", Then: []string{"!true"}},
+		},
+	}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(ritual))
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 1),
+		result:       "unexpected turn",
+	}
+	ctx := context.Background()
+	go forgeM.Run(ctx)
+	court := &Court{ministers: map[string]Minister{"forge": forgeM}, logger: slog.Default()}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, &mockCmdRunner{output: "ok\n", exitCode: "0"}, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(ctx, "ws-act-test", testEK(7), nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(ctx, exec))
+
+	assert.Zero(t, forgeM.callCount, "a whitespace-only act must not dispatch the minister")
+	assert.Equal(t, "completed", exec.stepStates[0].Status, "the then step still runs")
+}
+
+// TestMergeWorktreeRitual_ActRendersEmptyOnCleanPath pins the load-bearing
+// shape of the merge-worktree act: the builtin must use a folded-strip block
+// (`>-`) so the clean path renders exactly the empty string (the no-op the
+// engine relies on), while a retry after a failed landing renders a non-empty
+// instruction carrying .error. A `|` literal block would render "\n" on the
+// clean path — the whitespace-only no-op guard covers that, but this test
+// keeps the cleaner shape from silently regressing.
+func TestMergeWorktreeRitual_ActRendersEmptyOnCleanPath(t *testing.T) {
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+
+	var def *RitualDef
+	for _, r := range rituals {
+		if r.Name == mergeWorktreeRitual {
+			def = r
+		}
+	}
+	require.NotNil(t, def, "merge-worktree must load")
+	require.Len(t, def.Steps, 1)
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
+	exec := &RitualExecution{ID: "act", RitualName: mergeWorktreeRitual, EdictID: 5}
+
+	assert.Equal(t, "", runner.expandTemplate(def.Steps[0].Act, exec),
+		"the clean path must render an empty act, so no minister turn is spent landing cleanly")
+
+	exec.Data = storage.JSON{"error": "CONFLICT (content): Merge conflict in a.go"}
+	retryAct := runner.expandTemplate(def.Steps[0].Act, exec)
+	assert.NotEmpty(t, retryAct, "a retry must carry an instruction")
+	assert.Contains(t, retryAct, "CONFLICT (content): Merge conflict in a.go",
+		"the retry instruction must carry the failing merge's error")
+}
+
+// TestRitualRun_MergeWorktreeExemptFromSealedEdictGate pins the engine
+// exception at the top of Run: a sealed edict aborts a normal ritual before it
+// does any work, but merge-worktree runs *because* the edict was just sealed,
+// so it must not be aborted by its own precondition.
+func TestRitualRun_MergeWorktreeExemptFromSealedEdictGate(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}))
+
+	key := testEK(961)
+	require.NoError(t, db.Create(&storage.Edict{
+		ID: key.ID, Username: key.Username, Project: key.Project, Intent: "sealed already",
+	}).Error)
+	require.NoError(t, storage.NewSealService(db).GrantSeal(key, "ruler", storage.JSON{}))
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name:  mergeWorktreeRitual,
+		Steps: []RitualStep{{Name: "landing", Then: []string{"!true"}}},
+	}))
+	require.NoError(t, registry.Register(&RitualDef{
+		Name:  "ordinary",
+		Steps: []RitualStep{{Name: "work", Then: []string{"!true"}}},
+	}))
+
+	runner := NewRitualRunner(registry, nil, nil, db, &mockCmdRunner{output: "ok\n", exitCode: "0"}, slog.Default(), repo.RepoInfo{})
+
+	ctx := context.Background()
+	mergeExec, err := runner.Start(ctx, mergeWorktreeRitual, key, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, runner.Run(ctx, mergeExec), "merge-worktree must run on an already-sealed edict")
+	assert.Equal(t, RitualStateCompleted, mergeExec.State)
+	assert.Equal(t, "completed", mergeExec.stepStates[0].Status)
+
+	// The gate still protects every other ritual: a sealed edict aborts it
+	// before any step (or background given) executes.
+	ordinaryExec, err := runner.Start(ctx, "ordinary", key, nil, nil)
+	require.NoError(t, err)
+	err = runner.Run(ctx, ordinaryExec)
+	require.Error(t, err, "a sealed edict must abort an ordinary ritual")
+	assert.Contains(t, err.Error(), "ritual aborted: edict 961 is sealed")
+	assert.Equal(t, RitualStateAborted, ordinaryExec.State)
+	assert.Equal(t, "pending", ordinaryExec.stepStates[0].Status, "no step runs on an aborted ritual")
 }
 
 func TestLoadBuiltinRituals(t *testing.T) {

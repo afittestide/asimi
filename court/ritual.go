@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +33,15 @@ import (
 // minister (stream chunks, tool calls, etc.), so a minister that is
 // actively producing output will never hit this limit.
 const defaultStepIdleTimeout = 5 * time.Minute
+
+// mergeWorktreeRitual is the name of the ritual that lands a sealed edict's
+// worktree. It is special-cased in two engine places: the edict-status gate
+// (a sealed edict is its precondition, not a reason to abort) and the terminal
+// failure path (which publishes EventWorktreeMergeFailed). The name is a
+// stable, load-bearing identifier — the ritual is a builtin defined in
+// builtin_rituals.yaml — so a string comparison is acceptable here; a rename
+// must be accompanied by these two references.
+const mergeWorktreeRitual = "merge-worktree"
 
 // defaultStepHeartbeat is how often a running step refreshes its execution's
 // liveness timestamp in the DB. A step boundary (saveExecution) is the only
@@ -140,7 +150,8 @@ type Rituals []*RitualDef
 
 // RitualTrigger defines when a ritual can be invoked
 type RitualTrigger struct {
-	Event string `yaml:"event,omitempty"` // Event type that triggers this ritual
+	Event  string            `yaml:"event,omitempty"` // Event type that triggers this ritual
+	Filter map[string]string `yaml:"match,omitempty"` // payload matching; empty = no filtering
 }
 
 // InputDef defines an input parameter for a ritual
@@ -229,6 +240,48 @@ func (r *RitualRegistry) GetByEvent(event string) []*RitualDef {
 	return r.byEvent[event]
 }
 
+// GetByEventAndPayload retrieves the rituals triggered by an event whose
+// trigger also matches the event payload. A trigger matches iff its Event
+// equals event and every Filter[k] matches fmt.Sprint(payload[k]) as an
+// anchored regular expression. A trigger with an empty/nil Filter matches
+// every payload (today's behaviour for unfiltered triggers). This lets one
+// event (e.g. seal_granted) drive different rituals depending on who emitted
+// it.
+func (r *RitualRegistry) GetByEventAndPayload(event string, payload storage.JSON) []*RitualDef {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var matched []*RitualDef
+	for _, ritual := range r.byEvent[event] {
+		for _, trigger := range ritual.Triggers {
+			if trigger.Event == event && trigger.matchesPayload(payload) {
+				matched = append(matched, ritual)
+				break
+			}
+		}
+	}
+	return matched
+}
+
+// matchesPayload reports whether every declared Filter key matches the
+// payload's value. A missing key stringifies to "<nil>"; an empty Filter is a
+// wildcard. Filter values are Go regular expressions, anchored so that
+// "ruler" matches exactly "ruler" (not "rulership") and "ruler|judge" matches
+// either. Validation rejects uncompilable patterns at load time, so a compile
+// error here can only mean a programmatically-registered trigger; treat it as
+// a non-match rather than a panic.
+func (t RitualTrigger) matchesPayload(payload storage.JSON) bool {
+	for k, pattern := range t.Filter {
+		re, err := regexp.Compile("^(?:" + pattern + ")$")
+		if err != nil {
+			return false
+		}
+		if !re.MatchString(fmt.Sprint(payload[k])) {
+			return false
+		}
+	}
+	return true
+}
+
 // Clear removes all registered rituals.
 func (r *RitualRegistry) Clear() {
 	r.mu.Lock()
@@ -305,6 +358,17 @@ func ValidateRitual(def *RitualDef) error {
 			return fmt.Errorf("ritual %q: duplicate step name %q", def.Name, step.Name)
 		}
 		stepNames[step.Name] = true
+	}
+
+	// Validate trigger payload filters: an uncompilable regex must be a
+	// load-time error, not a silent never-match.
+	for _, trigger := range def.Triggers {
+		for key, pattern := range trigger.Filter {
+			if _, err := regexp.Compile("^(?:" + pattern + ")$"); err != nil {
+				return fmt.Errorf("ritual %q: trigger filter %q has invalid regex %q: %w",
+					def.Name, key, pattern, err)
+			}
+		}
 	}
 
 	// Validate step references
@@ -416,6 +480,22 @@ type RitualRunner struct {
 	// Court can stamp the edict runner's last-used time (never flatline a
 	// just-finished ritual).
 	onRitualDone func(edictID uint)
+
+	// mutationRunner resolves the runner used for repository mutations
+	// (worktree rebase/squash-merge/remove). Injected by the Court so
+	// mutations run on the host, never the sandbox: the container
+	// bind-mounts a single worktree, so a sandboxed shell cannot mutate the
+	// shared repo safely (incident 9f8b980c998a6c32, edict 984). nil falls
+	// back to r.runner for directly-constructed runners (tests).
+	mutationRunner func(root string) runners.Runner
+	// sweepLingWorktrees removes legacy per-ling worktrees nested under an
+	// edict's worktree before the parent is removed. Injected by the Court;
+	// nil is a no-op.
+	sweepLingWorktrees func(ctx context.Context, edictID uint)
+	// closeEdictRunner tears down an edict's runner after its worktree has
+	// been landed and removed. Injected by the Court; nil is a safe no-op so
+	// a directly-constructed runner never fails a landed merge.
+	closeEdictRunner func(ctx context.Context, edictID uint)
 
 	// Pause/resume for ruler interjection. When the ruler prompts on a ritual
 	// tab, the ritual pauses: the step context is cancelled (stopping the
@@ -763,6 +843,28 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 		"execution_id": exec.ID,
 	})
 
+	// Abort up front if the edict is already sealed or cancelled: background
+	// given steps and every step below would only waste work on a dead edict.
+	// This runs before background handling (it used to run per-step, after
+	// background steps had already fired).
+	//
+	// The merge-worktree ritual is the one exception: it runs *because* the
+	// edict was just sealed, so a sealed status is its normal precondition.
+	if exec.EdictID != 0 && exec.RitualName != mergeWorktreeRitual {
+		sealService := storage.NewSealService(r.db)
+		if status, err := sealService.GetEdictStatus(execKey); err == nil {
+			if status == storage.EdictSealed || status == storage.EdictCancelled {
+				r.logger.Info("aborting ritual: edict state changed",
+					"ritual", exec.RitualName,
+					"edict_id", exec.EdictID,
+					"edict_status", status)
+				exec.State = RitualStateAborted
+				r.saveExecution(exec)
+				return fmt.Errorf("ritual aborted: edict %d is %s", exec.EdictID, status)
+			}
+		}
+	}
+
 	// === BACKGROUND ===
 	for _, raw := range exec.def.Background {
 		entry, err := r.resolveStepDef(raw)
@@ -867,6 +969,19 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 			exec.stepStates[exec.CurrentStep].Message = err.Error()
 			exec.stepStates[exec.CurrentStep].Output = result
 
+			// Publish the failure into template data so a conditional act (the
+			// merge-worktree `resolving` step) can render {{ .error }}. Prefer
+			// the step's captured output, which carries git's message; fall
+			// back to the error itself.
+			if exec.Data == nil {
+				exec.Data = storage.JSON{}
+			}
+			if result != "" {
+				exec.Data["error"] = result
+			} else {
+				exec.Data["error"] = err.Error()
+			}
+
 			// Context cancelled (user interrupt) — the session layer already
 			// sent StreamInterruptedMsg which surfaces as 🛑 ABORTED in the
 			// TUI.
@@ -945,6 +1060,12 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 		// Update step state
 		exec.stepStates[exec.CurrentStep].Status = "completed"
 		exec.stepStates[exec.CurrentStep].Message = result
+
+		// A successful attempt clears any stale failure so a later conditional
+		// act cannot render a previous attempt's error.
+		if exec.Data != nil {
+			delete(exec.Data, "error")
+		}
 
 		// Move to next step (considering dependencies)
 		exec.CurrentStep++
@@ -1104,22 +1225,10 @@ func (r *RitualRunner) executeStep(ctx context.Context, exec *RitualExecution, s
 		return r.executeForkStep(ctx, exec, step)
 	}
 
-	// Check edict status before executing step - abort if sealed or cancelled
-	// TODO: move to the top of the ritual, before background handling
-	if exec.EdictID != 0 {
-		sealService := storage.NewSealService(r.db)
-		status, err := sealService.GetEdictStatus(execKey)
-		if err == nil {
-			if status == storage.EdictSealed || status == storage.EdictCancelled {
-				r.logger.Info("aborting ritual step due to edict state change",
-					"ritual", exec.RitualName,
-					"step", step.Name,
-					"edict_id", exec.EdictID,
-					"edict_status", status)
-				return "", fmt.Errorf("ritual aborted: edict %d is %s", exec.EdictID, status)
-			}
-		}
-	}
+	// Edict status is checked once, at the top of the ritual (before
+	// background handling), so a mid-run seal/cancel is caught there rather
+	// than re-queried on every step. The ticker-path stale-ritual sweep covers
+	// an edict that changes state while a long ritual is in flight.
 
 	r.saveExecution(exec)
 
@@ -1613,8 +1722,10 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 	}
 	act := r.expandTemplate(actTemplate, exec)
 
-	// Skip minister call when act is empty
-	if act == "" {
+	// Skip minister call when act is empty. Trim first: a template block that
+	// renders only whitespace (e.g. a `|` literal block whose sole content is a
+	// newline) must be a no-op, not a spurious minister turn.
+	if strings.TrimSpace(act) == "" {
 		return "", nil
 	}
 

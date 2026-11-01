@@ -55,6 +55,31 @@
   then:
     - the edict awaits ruler's seal
 
+- name: merge-worktree
+  description: "Land a sealed edict's worktree as one squash commit; the forge resolves conflicts"
+  triggers:
+    - event: seal_granted
+      match:
+        minister_id: ruler
+  inputs:
+    edict_id:
+      type: string
+      required: true
+  max_retries: 3
+  steps:
+    - name: landing
+      minister: forge
+      act: >-
+        {{- if .error }}
+          Automatic merge failed. Fix the issue without recording manifests:
+          {{ .error }}
+        {{- end}}
+      then:
+        - the edict is merged
+      on_failure: retry
+  then:
+    - the edict ascended to heaven
+
 - name: castle-siege
   description: "A medium complexity 地 change with planning"
   inputs:

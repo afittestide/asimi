@@ -83,6 +83,8 @@ func NewStepDefRegistry() *StepDefRegistry {
 		{"the sandbox is healthy", "verify_sandbox_up", "sandbox_healthy"},
 		{"the project metadata", "get_project_metadata", "project_metadata"},
 		{"the edict awaits ruler's seal", "await_ruler_seal", "awaiting_seal"},
+		{"the edict is merged", "merge_edict_worktree", ""},
+		{"the edict ascended to heaven", "ascend_edict", ""},
 		{"the infrastructure is staged", "stage_infrastructure", "infrastructure_staged"},
 		{"record the judge's seal", "record_judge_seal", ""},
 		{"record the chancellor's seal", "record_chancellor_seal", ""},
@@ -299,6 +301,94 @@ func (r *RitualRunner) prepareWorktree(ctx context.Context, exec *RitualExecutio
 	}
 	r.logger.Info("worktree prepared", "path", abs, "edict", exec.EdictID, "branch", branch)
 	return map[string]string{"path": abs, "branch": branch}, nil
+}
+
+// mergeEdictWorktree lands the edict's worktree on the default branch as one
+// squash commit and retires it. It is the step-def behind the merge-worktree
+// ritual's "the edict is merged" then-step.
+//
+// It always operates on the project ROOT (exec.repoInfo.ProjectRoot), never
+// the worktree-routed runner: the ritual deliberately declares no `given: an
+// edict's worktree`, so prepare_worktree never runs and exec.runner stays the
+// root runner. The git commands run through the Court-injected mutation
+// runner, which is a host runner — the container bind-mounts a single
+// worktree, so a sandboxed shell cannot mutate the shared repo (e984).
+//
+// Returns nil (a landed, ascending no-op) when there is no repository, no
+// worktree, or the squash is fully subsumed (e974: the branch's patch is
+// already on the target). Returns an error on a real failure — a rebase
+// conflict — so the ritual's on_failure: retry re-invokes it after the forge
+// resolves the conflict; the worktree is left intact for that resolution.
+func (r *RitualRunner) mergeEdictWorktree(ctx context.Context, exec *RitualExecution, key storage.EdictKey) error {
+	root := exec.repoInfo.ProjectRoot
+	if root == "" {
+		return nil // system/no-git ritual — nothing to land
+	}
+	if exec.repoInfo.Gitless() {
+		return nil // no heaven to ascend to
+	}
+	rel := worktree.RelPath(exec.EdictID)
+	abs := filepath.Join(root, rel)
+	if _, err := os.Stat(abs); err != nil {
+		return nil // no worktree → nothing to land; the ritual still ascends
+	}
+	branch := worktree.Branch(exec.EdictID)
+	msg := edictCommitSummary(r.db, key.Username, key.Project, exec.EdictID)
+	runner := r.mutationRunnerFor(root)
+
+	// Nested per-ling worktrees under a live edict worktree cannot be removed
+	// with their parent, so sweep them first (e984).
+	if r.sweepLingWorktrees != nil {
+		r.sweepLingWorktrees(ctx, exec.EdictID)
+	}
+
+	err := worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, msg)
+	if worktree.LooseObjectCorrupt(err) {
+		// A torn read of a just-written loose object, not disk rot. Clear any
+		// stale rebase state first — git refuses a fresh rebase while a
+		// half-finished one exists — then retry the whole operation exactly
+		// once. No loop (e984).
+		r.logger.Warn("retrying worktree merge after a corrupt loose object",
+			"edict", exec.EdictID, "err", err)
+		if abortErr := worktree.AbortRebase(ctx, runner, abs); abortErr != nil {
+			r.logger.Error("could not clear stale rebase state before retry",
+				"edict", exec.EdictID, "err", abortErr)
+		} else {
+			err = worktree.SquashMergeToDefault(ctx, runner, root, abs, branch, msg)
+		}
+	}
+	if err != nil {
+		// A conflict is the forge's to resolve; the ritual retries this step
+		// after the `resolving` turn. Do NOT remove the worktree.
+		return fmt.Errorf("land worktree: %w", err)
+	}
+	if err := worktree.Remove(ctx, runner, root, abs, branch); err != nil {
+		// The work landed; only cleanup failed. The worktree is left intact
+		// for inspection. Record that the merge itself succeeded so the
+		// terminal failure event is explicit about which case this is — a
+		// reader must never see "not merged" for a merge that succeeded.
+		if exec.Data == nil {
+			exec.Data = storage.JSON{}
+		}
+		exec.Data["merge_landed"] = true
+		return fmt.Errorf("worktree landed but removal failed (left intact): %w", err)
+	}
+	// The worktree is gone; tear down the edict's container too. A missing
+	// hook must not fail an already-landed merge.
+	if r.closeEdictRunner != nil {
+		r.closeEdictRunner(ctx, exec.EdictID)
+	}
+	return nil
+}
+
+// mutationRunnerFor resolves the runner used for repository mutations. It
+// prefers the Court-injected host mutation runner (e984); a directly
+// constructed runner without the hook falls back to its own runner.
+func (r *RitualRunner) mutationRunnerFor(root string) runners.Runner {
+	if r.mutationRunner != nil {
+		return r.mutationRunner(root)
+	}
+	return r.runner
 }
 
 // ignoreCopyGlobs returns the configured allowlist of gitignored files to
@@ -1256,10 +1346,10 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 	switch fn {
 	case "seal_edict":
 		// Sealing goes through the same path as `:edict seal`: grant the ruler
-		// seal, then publish EventSealGranted so the Court's handler
-		// squash-merges and removes the edict's worktree. Granting the seal
-		// without the event would seal the edict but silently leave its work
-		// unmerged on the edict branch.
+		// seal, then publish EventSealGranted so the merge-worktree ritual
+		// lands and removes the edict's worktree. Granting the seal without
+		// the event would seal the edict but silently leave its work unmerged
+		// on the edict branch.
 		sealService := storage.NewSealService(r.db)
 		if err := sealService.GrantSeal(thenKey, "ruler", storage.JSON{"ritual": exec.RitualName}); err != nil {
 			return err
@@ -1380,6 +1470,15 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		}
 
 		// TODO: Raise event - awaiting ruler's seat
+		return nil
+	case "merge_edict_worktree":
+		return r.mergeEdictWorktree(ctx, exec, thenKey)
+	case "ascend_edict":
+		// Revive the dead EventEdictSealed: publish it so the ruler gets the
+		// durable "✅ Edict N sealed and ascended to Heaven" chat line.
+		r.emitEvent(thenKey, storage.EventEdictSealed, storage.JSON{
+			"ritual": exec.RitualName,
+		})
 		return nil
 	case "record_judge_seal":
 		// Record the judge's seal on the edict

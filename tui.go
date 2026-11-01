@@ -2700,6 +2700,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case storage.EventEdictSealed:
 			text := fmt.Sprintf("✅ Edict %d sealed and ascended to Heaven", msg.EdictKey.ID)
 			chat.AddToRawHistory("CONTEXT", text)
+			chat.AddMessage(text)
 			m.commandLine.AddToast(text, "success", 3*time.Second)
 		case storage.EventSealGranted:
 			minister, _ := msg.Payload["minister_id"].(string)

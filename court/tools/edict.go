@@ -320,24 +320,22 @@ func (t TransitionEdictTool) Call(ctx context.Context, input string) (string, er
 		}
 	case "sealed":
 		if t.Sealer != nil {
-			// Seal through the Court so the ruler's seal also lands the
-			// edict's worktree; a merge failure is surfaced in the result
-			// (and recorded as EventWorktreeMergeFailed) rather than masked
-			// by the seal's success.
-			mergeFailure, err := t.Sealer.SealEdict(params.EdictID, "transitioned_by: transition_edict")
-			if err != nil {
+			// Seal through the Court; landing the edict's worktree is handed
+			// to the merge-worktree ritual (triggered by the ruler seal), so
+			// this call returns as soon as the seal is stamped and the event
+			// published. A terminal landing failure surfaces durably via
+			// EventWorktreeMergeFailed.
+			if err := t.Sealer.SealEdict(params.EdictID, "transitioned_by: transition_edict"); err != nil {
 				return "", fmt.Errorf("seal edict: %w", err)
 			}
 			result := map[string]any{
 				"edict_id":        params.EdictID,
 				"previous_status": string(currentStatus),
 				"new_status":      params.Status,
+				"landing":         "handed to merge-worktree ritual",
 			}
 			if params.Reason != "" {
 				result["reason"] = params.Reason
-			}
-			if mergeFailure != "" {
-				result["merge_failure"] = mergeFailure
 			}
 			resultJSON, _ := json.Marshal(result)
 			return string(resultJSON), nil

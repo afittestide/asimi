@@ -11,6 +11,7 @@ import (
 
 	"github.com/afittestide/asimi/internal"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 )
 
@@ -293,6 +294,23 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				return
 			}
 			rg.logger.Warn("ritual failed", "ritual", ritualName, "error", err)
+			// A merge-worktree ritual that exhausts the forge's retries leaves
+			// the edict sealed while its work never landed (or landed but its
+			// worktree could not be cleaned up). Publish the failure only here
+			// — on terminal failure — so an eventually-resolved conflict inside
+			// the ritual does not flash a scary warning. `merged` distinguishes
+			// the two cases so a reader never sees "not merged" for a merge
+			// that succeeded.
+			if ritualName == mergeWorktreeRitual {
+				merged, _ := exec.Data["merge_landed"].(bool)
+				rg.PublishEvent(key, storage.EventWorktreeMergeFailed, storage.JSON{
+					"minister_id": "ruler",
+					"reason":      getRulersError(err),
+					"worktree":    worktree.RelPath(key.ID),
+					"branch":      worktree.Branch(key.ID),
+					"merged":      merged,
+				})
+			}
 			// Run is the single owner of terminal Tian events; emit only the
 			// notification here to avoid a duplicate ritual_failed event.
 			rg.notify(RitualStepMsg{
@@ -399,18 +417,19 @@ func (rg *RitualGuard) DispatchEvent(event Event) {
 		return
 	}
 	// Trigger event-driven rituals (skip if recovery prompts are in progress)
+	eventPayload := storage.JSON(event.Payload)
 	rg.recoveryMu.RLock()
 	recoveryComplete := rg.recoveryComplete
 	rg.recoveryMu.RUnlock()
 	if !recoveryComplete {
-		rituals := rg.ritualRegistry.GetByEvent(string(event.Type))
+		rituals := rg.ritualRegistry.GetByEventAndPayload(string(event.Type), eventPayload)
 		if len(rituals) > 0 {
 			rg.logger.Debug("skipping event-driven rituals during recovery prompts", "event", event.Type)
 		}
 		return
 	}
 	if rg.ritualRegistry != nil && rg.ritualRunner != nil {
-		rituals := rg.ritualRegistry.GetByEvent(string(event.Type))
+		rituals := rg.ritualRegistry.GetByEventAndPayload(string(event.Type), eventPayload)
 		sourceRitual, _ := event.Payload["ritual"].(string)
 		for _, ritual := range rituals {
 			if ritual.Name == sourceRitual {
@@ -882,8 +901,13 @@ func (rg *RitualGuard) scanForStaleRituals(ctx context.Context) {
 		return
 	}
 
-	// Abort rituals on stale edicts
+	// Abort rituals on stale edicts. merge-worktree is exempt: it is triggered
+	// *by* the ruler's seal and therefore runs on an already-sealed edict, so
+	// the sealed status is its normal precondition, not staleness.
 	for _, ritual := range runningRituals {
+		if ritual.RitualName == mergeWorktreeRitual {
+			continue
+		}
 		if staleEdictSet[ritual.EdictID] {
 			status := staleStatuses[ritual.EdictID]
 			if err := rg.abortRitual(ctx, &ritual, fmt.Sprintf("edict %d is %s", ritual.EdictID, status)); err != nil {

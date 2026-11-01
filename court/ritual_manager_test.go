@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
@@ -12,7 +14,10 @@ import (
 
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -1101,6 +1106,45 @@ func TestScanForStaleRituals_OtherProjectExcluded(t *testing.T) {
 	}
 }
 
+// TestScanForStaleRituals_MergeWorktreeExempt: merge-worktree runs *because*
+// the edict was sealed, so a sealed status is its normal precondition. The
+// sweep must spare it (and any other ritual of that edict) while still aborting
+// a genuinely stale sibling ritual.
+func TestScanForStaleRituals_MergeWorktreeExempt(t *testing.T) {
+	db := setupEventTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}, &storage.Seal{}))
+
+	sealed := storage.Edict{Intent: "sealed edict", Username: "test", Project: "test/project"}
+	require.NoError(t, db.Create(&sealed).Error)
+	require.NoError(t, db.Create(&storage.Seal{
+		EdictID: sealed.ID, Username: "test", Project: "test/project", MinisterID: "ruler",
+	}).Error)
+
+	require.NoError(t, db.Save(&RitualExecution{
+		ID: "running-merge", RitualName: mergeWorktreeRitual, EdictID: sealed.ID,
+		Username: "test", Project: "test/project", State: RitualStateRunning, CurrentStep: 0,
+	}).Error)
+	require.NoError(t, db.Save(&RitualExecution{
+		ID: "running-ordinary", RitualName: "swift-strike", EdictID: sealed.ID,
+		Username: "test", Project: "test/project", State: RitualStateRunning, CurrentStep: 1,
+	}).Error)
+
+	rg := &RitualGuard{
+		MinisterBase: NewMinisterBase(db, nil, slog.Default(), "test", "test/project", nil),
+		ritualRunner: NewRitualRunner(NewRitualRegistry(),
+			func(id string) Minister { return nil }, nil, db, nil, slog.Default(), repo.RepoInfo{}),
+	}
+	rg.scanForStaleRituals(context.Background())
+
+	var mergeResult, ordinaryResult RitualExecution
+	require.NoError(t, db.First(&mergeResult, "id = ?", "running-merge").Error)
+	require.NoError(t, db.First(&ordinaryResult, "id = ?", "running-ordinary").Error)
+	assert.Equal(t, RitualStateRunning, mergeResult.State,
+		"merge-worktree's sealed precondition must not read as staleness")
+	assert.Equal(t, RitualStateAborted, ordinaryResult.State,
+		"the exemption must not spare genuinely stale rituals")
+}
+
 // TestRecoveryZhengmingHasPassOption verifies that recovery zhengming includes "Pass" option.
 func TestRecoveryZhengmingHasPassOption(t *testing.T) {
 	db := setupEventTestDB(t)
@@ -1766,4 +1810,215 @@ func TestBuildEventNotification_WorktreeMergeFailed(t *testing.T) {
 	if cleanup.Message != "Edict 7 sealed; work merged but worktree cleanup failed: work merged but worktree removal failed" {
 		t.Errorf("unexpected message: %q", cleanup.Message)
 	}
+}
+
+// mergeWorktreeGuard builds a RitualGuard whose registry carries a
+// merge-worktree ritual with the real ruler-only trigger, plus a plain
+// "observer" ritual (no trigger) to prove the filter is what gates the start.
+func mergeWorktreeGuard(t *testing.T, db *gorm.DB) *RitualGuard {
+	t.Helper()
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: mergeWorktreeRitual,
+		Triggers: []RitualTrigger{
+			{Event: "seal_granted", Filter: map[string]string{"minister_id": "ruler"}},
+		},
+		Steps: []RitualStep{{Name: "landing"}},
+	}))
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := NewRitualGuard(RitualGuardOpts{Base: base})
+	rg.ritualRegistry = registry
+	rg.ritualRunner = NewRitualRunner(registry, func(string) Minister { return nil }, nil,
+		db, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	rg.streamingCtx = func(string) context.Context { return context.Background() }
+	rg.recoveryMu.Lock()
+	rg.recoveryComplete = true
+	rg.recoveryMu.Unlock()
+	rg.SetNotify(func(any) {})
+	return rg
+}
+
+// TestDispatchEvent_RulerSealStartsMergeWorktree: a seal_granted from the ruler
+// starts the merge-worktree ritual.
+func TestDispatchEvent_RulerSealStartsMergeWorktree(t *testing.T) {
+	db := setupEventTestDB(t)
+	rg := mergeWorktreeGuard(t, db)
+
+	rg.DispatchEvent(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 42, Username: "testuser", Project: "testproject"},
+		Payload:  map[string]interface{}{"minister_id": "ruler"},
+	})
+
+	require.Eventually(t, func() bool {
+		var n int64
+		db.Model(&RitualExecution{}).Where("ritual_name = ?", mergeWorktreeRitual).Count(&n)
+		return n > 0
+	}, 3*time.Second, 10*time.Millisecond, "the ruler's seal must start merge-worktree")
+}
+
+// TestDispatchEvent_JudgeSealDoesNotStartMergeWorktree: a mid-run judge seal
+// carries the same event type but a different payload, so the filter must keep
+// merge-worktree from firing.
+func TestDispatchEvent_JudgeSealDoesNotStartMergeWorktree(t *testing.T) {
+	db := setupEventTestDB(t)
+	rg := mergeWorktreeGuard(t, db)
+
+	rg.DispatchEvent(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 42, Username: "testuser", Project: "testproject"},
+		Payload:  map[string]interface{}{"minister_id": "judge"},
+	})
+
+	// Give the dispatch path time to (not) start anything.
+	time.Sleep(200 * time.Millisecond)
+	var n int64
+	db.Model(&RitualExecution{}).Where("ritual_name = ?", mergeWorktreeRitual).Count(&n)
+	assert.Zero(t, n, "a judge's seal must not start merge-worktree")
+}
+
+// TestMergeWorktreeTerminalFailurePublishesEvent: when the merge-worktree
+// ritual exhausts its retries, the terminal failure path publishes
+// EventWorktreeMergeFailed carrying the failure reason.
+func TestMergeWorktreeTerminalFailurePublishesEvent(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: mergeWorktreeRitual,
+		Steps: []RitualStep{
+			{Name: "landing", Then: []string{"!false"}, OnFailure: "retry", MaxRetries: 1},
+		},
+	}))
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := NewRitualGuard(RitualGuardOpts{Base: base})
+	rg.ritualRegistry = registry
+	rg.streamingCtx = func(string) context.Context { return context.Background() }
+	rg.SetNotify(func(any) {})
+	// A runner whose every command fails, so the then-step errors and the
+	// retries are exhausted.
+	rg.ritualRunner = NewRitualRunner(registry, func(string) Minister { return nil }, nil,
+		db, &mockCallCountRunner{results: []runners.Output{
+			{Output: "CONFLICT\n", ExitCode: "1"},
+			{Output: "CONFLICT\n", ExitCode: "1"},
+			{Output: "CONFLICT\n", ExitCode: "1"},
+		}}, slog.Default(), repo.RepoInfo{})
+
+	key := storage.EdictKey{ID: 42, Username: "testuser", Project: "testproject"}
+	rg.startRitual(mergeWorktreeRitual, key, map[string]string{"edict_id": "42"})
+
+	require.Eventually(t, func() bool {
+		var n int64
+		db.Model(&storage.TianEvent{}).
+			Where("edict_id = ? AND event_type = ?", 42, storage.EventWorktreeMergeFailed).Count(&n)
+		return n == 1
+	}, 5*time.Second, 20*time.Millisecond, "a terminal merge-worktree failure must publish exactly one event")
+
+	var ev storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 42, storage.EventWorktreeMergeFailed).First(&ev).Error)
+	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "CONFLICT")
+	assert.Equal(t, false, ev.Payload["merged"], "the work never landed, so merged must be explicit false")
+	assert.Equal(t, "asimi/e42", ev.Payload["branch"])
+}
+
+// TestMergeWorktreeTerminalFailureReportsMergedCleanup: when the squash-merge
+// landed but the worktree could not be cleaned up, the terminal failure event
+// must say merged=true — a reader must never see "work NOT merged" for a merge
+// that succeeded (the unreachable-variant defect).
+func TestMergeWorktreeTerminalFailureReportsMergedCleanup(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	root := t.TempDir()
+	abs := filepath.Join(root, worktree.RelPath(42))
+	require.NoError(t, os.MkdirAll(abs, 0o755))
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: mergeWorktreeRitual,
+		Steps: []RitualStep{
+			{Name: "landing", Then: []string{"the edict is merged"}, OnFailure: "abort"},
+		},
+	}))
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := NewRitualGuard(RitualGuardOpts{Base: base})
+	rg.ritualRegistry = registry
+	rg.streamingCtx = func(string) context.Context { return context.Background() }
+	rg.SetNotify(func(any) {})
+
+	// The rebase and squash-merge succeed (a non-empty staged index) but the
+	// removal is refused — the landed-but-dirty case.
+	mutation := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "feature.txt\n", ExitCode: "0"},
+		"worktree remove":           {Output: "contains modified or untracked files", ExitCode: "1"},
+	}}
+	rr := NewRitualRunner(registry, func(string) Minister { return nil }, rg.PublishEvent,
+		db, mutation, slog.Default(), repo.RepoInfo{ProjectRoot: root, HasVCS: true})
+	rr.mutationRunner = func(string) runners.Runner { return mutation }
+	rg.ritualRunner = rr
+
+	key := storage.EdictKey{ID: 42, Username: "testuser", Project: "testproject"}
+	rg.startRitual(mergeWorktreeRitual, key, map[string]string{"edict_id": "42"})
+
+	require.Eventually(t, func() bool {
+		var n int64
+		db.Model(&storage.TianEvent{}).
+			Where("edict_id = ? AND event_type = ?", 42, storage.EventWorktreeMergeFailed).Count(&n)
+		return n == 1
+	}, 5*time.Second, 20*time.Millisecond, "a terminal cleanup failure must publish exactly one event")
+
+	var ev storage.TianEvent
+	require.NoError(t, db.Where("edict_id = ? AND event_type = ?", 42, storage.EventWorktreeMergeFailed).First(&ev).Error)
+	assert.Equal(t, true, ev.Payload["merged"],
+		"the work landed; the event must not read as 'not merged'")
+	assert.Contains(t, fmt.Sprint(ev.Payload["reason"]), "removal failed")
+}
+
+// TestMergeWorktreeSuccessPublishesNoFailureEvent: a clean landing must ascend
+// without ever flashing the terminal failure warning.
+func TestMergeWorktreeSuccessPublishesNoFailureEvent(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, worktree.RelPath(42)), 0o755))
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: mergeWorktreeRitual,
+		Steps: []RitualStep{
+			{Name: "landing", Then: []string{"the edict is merged"}, OnFailure: "retry"},
+		},
+		Then: []string{"the edict ascended to heaven"},
+	}))
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := NewRitualGuard(RitualGuardOpts{Base: base})
+	rg.ritualRegistry = registry
+	rg.streamingCtx = func(string) context.Context { return context.Background() }
+	rg.SetNotify(func(any) {})
+
+	mutation := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"symbolic-ref":              {Output: "origin/main\n", ExitCode: "0"},
+		"diff --cached --name-only": {Output: "feature.txt\n", ExitCode: "0"},
+	}}
+	rr := NewRitualRunner(registry, func(string) Minister { return nil }, rg.PublishEvent,
+		db, mutation, slog.Default(), repo.RepoInfo{ProjectRoot: root, HasVCS: true})
+	rr.mutationRunner = func(string) runners.Runner { return mutation }
+	rg.ritualRunner = rr
+
+	key := storage.EdictKey{ID: 42, Username: "testuser", Project: "testproject"}
+	rg.startRitual(mergeWorktreeRitual, key, map[string]string{"edict_id": "42"})
+
+	// The happy path publishes the ascended event...
+	require.Eventually(t, func() bool {
+		var n int64
+		db.Model(&storage.TianEvent{}).
+			Where("edict_id = ? AND event_type = ?", 42, storage.EventEdictSealed).Count(&n)
+		return n == 1
+	}, 5*time.Second, 20*time.Millisecond, "a clean landing must ascend the edict")
+
+	// ...and never the failure warning.
+	var n int64
+	db.Model(&storage.TianEvent{}).
+		Where("edict_id = ? AND event_type = ?", 42, storage.EventWorktreeMergeFailed).Count(&n)
+	assert.Zero(t, n, "a clean landing must not publish a merge-failure event")
 }

@@ -7838,6 +7838,38 @@ func TestEventWorktreeMergeFailed_WarnsNotSuccess(t *testing.T) {
 	assert.True(t, found, "expected a persistent chat line for the merge failure")
 }
 
+// TestEventEdictSealed_ShowsPersistentChatLine verifies the revived
+// EventEdictSealed gives the ruler a durable chat line on the happy path — not
+// only a transient toast.
+func TestEventEdictSealed_ShowsPersistentChatLine(t *testing.T) {
+	mock := &mockCourtClient{}
+	model := newTestModel(t)
+	model.court = mock
+
+	eventMsg := court.EventNotificationMsg{
+		ChannelID: "secretary",
+		EventType: storage.EventEdictSealed,
+		EdictKey:  storage.EdictKey{ID: 42, Username: "test", Project: "test"},
+		Payload:   map[string]interface{}{"ritual": "merge-worktree"},
+	}
+
+	newModel, _ := model.handleCustomMessages(eventMsg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	chat := updated.tabs.ChatByTab("secretary")
+	found := false
+	for _, m := range chat.Messages {
+		if strings.Contains(m.Content, "Edict 42 sealed and ascended to Heaven") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a persistent chat line for the ascended edict")
+
+	require.NotEmpty(t, updated.commandLine.toasts, "the toast is kept alongside the chat line")
+	assert.Equal(t, "success", updated.commandLine.toasts[0].Type)
+}
+
 // TestEventWorktreeMergeFailed_MergedCleanupVariant verifies the merged-but-
 // cleanup-failed variant renders distinctly from the not-merged case.
 func TestEventWorktreeMergeFailed_MergedCleanupVariant(t *testing.T) {
