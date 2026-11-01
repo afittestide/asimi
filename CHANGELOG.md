@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Edict details as a markdown block** — the swift-strike `given: "the edict details"` step now prints the edict's full, untruncated Intent as a rendered markdown block instead of the bare step name, so the Ruler can see what a ritual is about (e975)
 - **`~` in mount sources** — a `[[sandbox.additional_mounts]]` `source` may now begin with `~/` (or be exactly `~`) and is expanded to the user's home directory at config load, so consumers only ever see absolute host paths; a leading tilde that cannot be resolved is a hard config error. `destination` is a container path and is deliberately left untouched (e992)
 - **`gh` runs in the sandbox** — the sandbox image now installs the GitHub CLI (fixing the install to run as root and adding `wget`), and `gh` is no longer carved out to the host by default, so GitHub commands execute inside the sandbox; this repo's `.agents/asimi.conf` mounts `~/.config/gh` so auth travels with the worktree (303fb78ad, 0911315a2)
+- **Warm-start sandboxes via cache volumes** — a new `[[sandbox.cache_volumes]]` config persists absolute in-container cache paths in named volumes keyed by the project slug (the runner expands a `<slug>` placeholder at container-create time, so all edicts of one project share a cache while different projects stay separate); it defaults to Go's module cache at `/go/pkg/mod`, so a recreated sandbox starts warm instead of re-downloading the world. `GOCACHE` is deliberately absent — it is already pinned to the project-root `.gocache` shared across worktrees (e977)
+- **`disk_min_free_mib`** — a new `[sandbox]` free-space floor (default 4096 MiB; `0` disables): below it, reclaimable build artifacts (dangling images, builder cache) are pruned before a sandbox container is created, so a full podman store cannot wedge `podman build` (e985)
 
 ### Changed
 
@@ -26,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tab-close messaging** — closing a tab now toasts "Tab closed; `:qa` to close all" instead of the ambiguous bare "Tab closed" (59753408f)
 - **Toolchain security floors** — bumped to Go 1.26.10 and podman v6.1.3 (with a vendor refresh) to remediate the 2026-10-22 govulncheck findings (e986)
 - **Empty `run_on_host` defaults** — the default `run_on_host` and `safe_run_on_host` pattern lists are now empty, so no command is silently diverted to the host by default; projects whose toolchains cannot run in the sandbox opt in explicitly via `[run_shell_command]` (0911315a2)
+- **Court list tools render as markdown tables** — `list_edicts`, `list_ling`, `list_pending_manifests`, `list_quenched_manifests`, and `query_precedents` now return a width-aware markdown table instead of raw JSON, through the same generic envelope `tian_ledger` uses; the untruncated rows still ride along so the model keeps full structured fidelity, and each tool's one-line summary counts rows without re-parsing (e988)
+- **`CI` is the only podman test lane** — the podman integration lane is selected solely by the `CI` env var (no second flag), and it now runs against the public `golang:1.26.10-bookworm` image with podman installed on the runner instead of requiring a locally built sandbox image; `just test` again runs the blocking `test-race` gate (e1004, e995)
+- **`asimisql` schema hint is project-agnostic** — the tool's schema reference no longer points at this repo's source files (`storage/court_schema.go`, `storage/schema.go`), which do not exist in other projects; it now teaches introspection against the live DB (`sqlite_master`, `PRAGMA table_info`) and uses `<user>` / `<owner/repo>` placeholders in its example (e937)
 
 ### Fixed
 
@@ -39,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`approve_doc` with a nil Notify** — the tool is no longer registered with a zero-value struct and a permanently-nil callback; it uses a lazy `NotifyFn` getter, fixing "approve_doc requires TUI notify to open editor" (e970)
 - **OOM from duplicated git/Go caches** — added a `.dockerignore` and bounded the builder context (pruning before build) so edict worktrees, `vendor/`, `.git/`, and build logs are no longer shipped into the podman VM, fixing "no space left on device" (b1bde5b4c)
 - **`:init` project-slug regression** — `:init` again trusts `repoInfo.Slug` (already resolved through the tracked-remote → origin → basename precedence) and only falls back to the shared resolver when it is empty, restoring the gitless `:init` flow that the e968 resolver change had broken (e996)
+- **False flatline reaped healthy rituals** — a long-running step (a full `go test`, say) crossed no step boundary, so its execution row aged past the flatline window and was aborted as hung; a running step now heartbeats its row every 30s, the stale sweep only considers edicts whose ritual lock is free (a held lock proves a live goroutine, so live work is never reaped), and the queue path no longer sweeps at all. Re-enacting a ritual already running for the same edict is now rejected with the running execution id instead of restarting it (e1003)
+- **Model-access denials misreported as key failures** — when every configured key returned a permanent per-key error, bifrost collapsed them into its synthetic `upstream_credentials_exhausted` 502 and the message blamed the keys; the error now appends a hint that the configured model may be the rejected party, since gateways also return 403 for model-access denials (e1008)
+- **Orphaned sandbox containers wedged the podman VM** — containers left behind by dead processes accumulated until the store filled and `podman build` failed; sandbox containers now carry project/owner/edict labels, the Court reaps unowned orphans at startup (off the startup path, and only when the owner PID is provably gone), and the disk-pressure guard prunes reclaimable artifacts (e985)
+- **Integration image was never pulled** — the preflight ran only `podman image exists` and rejected an absent image before any pull was attempted, so a cold CI machine failed five integration tests; an absent pullable remote reference is now pulled once and re-checked, while a `localhost/...` build local to the machine still reports `SandboxMissingError` (e1011)
+- **Loose-object retry was git-version-specific** — the torn-read predicate required both `loose object` and `is corrupt`, which git 2.55 does not emit when the fault strikes mid-replay, so the seal aborted instead of retrying; the predicate now recognizes the `unable to unpack … header` / `inflate: data stream error` shape too, staying false for ordinary merge conflicts and absent branches and keeping the retry to exactly one attempt (e1011)
 
 ### Developer tooling
 
@@ -46,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`heaven/` evidence archiving** — `just vuln` now writes each govulncheck report to `heaven/security/` and `just test` writes its output to `heaven/tests/` (write-only, timestamped, gitignored), so a release's evidence outlives the terminal (505db5e61)
 - **`gh-issue-sync` skill** — a new minister skill that syncs GitHub issues to local Markdown under `intent/issues/`, for triaging, editing, and creating issues without leaving the editor (dd2b48a56)
 - **三界 cosmology doc** — added `docs/the_three_realms.md` and sharpened the Judge/Chancellor role definitions in the minister config (e971)
+- **`write-rituals` skill** — a new minister skill covering how to author Asimi rituals: step shape, `given:`/`then:` expressions, gates, and failure routing (e995)
 
 ## [0.14.5] - 2026-10-11
 
