@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Orphaned sandbox containers wedged the podman VM** — containers left behind by dead processes accumulated until the store filled and `podman build` failed; sandbox containers now carry project/owner/edict labels, the Court reaps unowned orphans at startup (off the startup path, and only when the owner PID is provably gone), and the disk-pressure guard prunes reclaimable artifacts (e985)
 - **Integration image was never pulled** — the preflight ran only `podman image exists` and rejected an absent image before any pull was attempted, so a cold CI machine failed five integration tests; an absent pullable remote reference is now pulled once and re-checked, while a `localhost/...` build local to the machine still reports `SandboxMissingError` (e1011)
 - **Loose-object retry was git-version-specific** — the torn-read predicate required both `loose object` and `is corrupt`, which git 2.55 does not emit when the fault strikes mid-replay, so the seal aborted instead of retrying; the predicate now recognizes the `unable to unpack … header` / `inflate: data stream error` shape too, staying false for ordinary merge conflicts and absent branches and keeping the retry to exactly one attempt (e1011)
+- **Tool-call results could beat their own notification** — a tool call's result channel was signalled *before* its terminal `success`/`error` message was dispatched, so a consumer that received the result could still be missing the complete terminal message sequence; the terminal notification now goes out first, and `ClearQueue` likewise delivers every aborted call's abort notification before its result channel yields (e982)
+
+### Security
+
+- **Court scope identity is no longer configurable** — a committed `[court] username` in a repository's `.agents/asimi.conf` could re-scope a session onto another user's ledger; the username is now resolved solely from the OS user (the per-uid socket's verified peer), the daemon refuses any connection whose socket-verified peer disagrees with the OS user, and the `[court] username` option — including its `[shogunate] username` backward-compat path — is removed (e1006)
 
 ### Developer tooling
 
