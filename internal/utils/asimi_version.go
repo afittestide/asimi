@@ -20,7 +20,7 @@ const (
 )
 
 // Update this before each release
-var AsimiVersion = "0.15.0-rc2"
+var AsimiVersion = "0.15.0"
 
 // ReleaseInfo holds information about a GitHub release.
 type ReleaseInfo struct {
