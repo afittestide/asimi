@@ -4814,6 +4814,51 @@ func TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject(t *testing.T
 	}
 }
 
+// TestMergeEdictWorktree_RetriesWhenAbortReportsGit256Wording is the CI-runner
+// regression for the red main this edict fixes. The retry path clears stale
+// rebase state with `git rebase --abort` before re-running the rebase. The CI
+// runner's git 2.56 answers "fatal: no rebase in progress" where the dev
+// station's git 2.39 says "fatal: No rebase in progress?". AbortRebase matched
+// the 2.39 wording case-sensitively, so on the runner it reported a failure,
+// mergeEdictWorktree skipped the retry, and a transient torn loose object
+// surfaced as a hard seal failure — the test passed locally and failed only on
+// CI. The abort's version-specific "nothing to abort" answer must be treated as
+// success so the single retry still fires.
+func TestMergeEdictWorktree_RetriesWhenAbortReportsGit256Wording(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", "e531"), 0o755))
+
+	outputs := mergeTestRunnerOutputs()
+	// git 2.56's lowercase "nothing to abort" answer (exit 128). The retry must
+	// survive it; a case-sensitive match on git 2.39's form would not.
+	outputs["rebase --abort"] = runners.Output{
+		Output:   "fatal: no rebase in progress\n",
+		ExitCode: "128",
+	}
+	mutation := &flakyMergeRunner{
+		worktreeTestRunner: worktreeTestRunner{outputs: outputs},
+		failOn:             "rebase",
+		fails:              1,
+		output: "error: inflate: data stream error (incorrect header check)\n" +
+			"error: unable to unpack 6ac66c5e0dbaedc985115ed3b13afe6d4c3b01a5 header\n" +
+			"fatal: loose object 6ac66c5e0dbaedc985115ed3b13afe6d4c3b01a5 (stored in .git/objects/6a/c66c5e…) is corrupt",
+	}
+	r := newMergeStepRunner(t, mutation, nil)
+
+	require.NoError(t, r.mergeEdictWorktree(context.Background(), mergeExec(root, 531),
+		storage.EdictKey{ID: 531, Username: "u", Project: "p"}),
+		"git 2.56's abort wording must not suppress the retry")
+
+	rebaseAttempts := 0
+	for _, cmd := range mutation.commands {
+		if strings.Contains(cmd, " rebase ") && !strings.Contains(cmd, "rebase --abort") {
+			rebaseAttempts++
+		}
+	}
+	assert.Equal(t, 2, rebaseAttempts,
+		"the rebase must be retried exactly once when the abort reports git 2.56's wording")
+}
+
 // TestMergeEdictWorktree_AbortsRebaseStateBeforeRetry pins the ordering the
 // mid-replay regression depends on: a rebase that dies on a torn loose object
 // may have left .git/rebase-merge behind (git writes a tree per replayed

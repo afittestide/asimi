@@ -350,12 +350,52 @@ func TestAbortRebase_ClearsStateAndToleratesNone(t *testing.T) {
 		t.Errorf("no rebase in progress must be a successful no-op, got: %v", err)
 	}
 
+	// git 2.56 (the CI runner's version) lowercases the same message: "fatal:
+	// no rebase in progress". A case-sensitive match on the 2.39 form made the
+	// abort "fail", the caller skipped its retry, and a transient torn loose
+	// object surfaced as a hard seal failure (the red main this edict fixes).
+	newer := &recordingRunner{outputs: map[string]runners.Output{
+		"rebase --abort": {Output: "fatal: no rebase in progress\n", ExitCode: "128"},
+	}}
+	if err := AbortRebase(context.Background(), newer, abs); err != nil {
+		t.Errorf("git 2.56's lowercase no-rebase answer must also be a successful no-op, got: %v", err)
+	}
+
 	// A genuine abort failure is surfaced so the caller does not retry on stale state.
 	broken := &recordingRunner{outputs: map[string]runners.Output{
 		"rebase --abort": {Output: "error: could not remove state", ExitCode: "1"},
 	}}
 	if err := AbortRebase(context.Background(), broken, abs); err == nil {
 		t.Error("a real abort failure must be returned")
+	}
+}
+
+// TestNoRebaseInProgress pins git's "nothing to abort" wording across versions.
+// git 2.39 (the dev station) says "fatal: No rebase in progress?"; git 2.56
+// (the CI runner) says "fatal: no rebase in progress". Matching only the 2.39
+// form made AbortRebase report a failure on the CI runner, which short-circuits
+// the loose-object retry in mergeEdictWorktree — so a transient torn object
+// became a hard seal failure on main while passing locally. Every version's
+// wording must be recognised, and an ordinary git error must not be.
+func TestNoRebaseInProgress(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"git 2.39 no-rebase", "fatal: No rebase in progress?", true},
+		{"git 2.56 no-rebase", "fatal: no rebase in progress", true},
+		{"uppercase variant", "FATAL: NO REBASE IN PROGRESS", true},
+		{"real abort failure", "error: could not remove state", false},
+		{"rebase conflict", "CONFLICT (content): merge conflict in a.go", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NoRebaseInProgress(tc.msg); got != tc.want {
+				t.Errorf("NoRebaseInProgress(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
 	}
 }
 

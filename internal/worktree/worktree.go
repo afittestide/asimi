@@ -179,14 +179,25 @@ func AbortRebase(ctx context.Context, r runners.Runner, abs string) error {
 		return fmt.Errorf("%s: %w", description, err)
 	}
 	if out.ExitCode != "" && out.ExitCode != "0" {
-		// git exits 128 with "No rebase in progress?" when there is nothing to
-		// abort; that is the clean case, not a failure.
-		if strings.Contains(out.Output, "No rebase in progress") {
+		// git exits 128 when there is nothing to abort; that is the clean
+		// case, not a failure.
+		if NoRebaseInProgress(out.Output) {
 			return nil
 		}
 		return fmt.Errorf("%s: exit %s: %s", description, out.ExitCode, strings.TrimSpace(out.Output))
 	}
 	return nil
+}
+
+// NoRebaseInProgress reports whether msg is git's "nothing to abort" answer,
+// which AbortRebase treats as success. The wording is git-version-specific and
+// differs only in case: git 2.39 says "fatal: No rebase in progress?" and git
+// 2.56 says "fatal: no rebase in progress". A case-sensitive match on the 2.39
+// form misses the CI runner's 2.56, so the abort "fails", the caller skips its
+// retry, and a transient torn loose object surfaces as a hard seal failure.
+// Matching case-insensitively keeps the abort a clean no-op on every git.
+func NoRebaseInProgress(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "no rebase in progress")
 }
 
 // SquashMergeToDefault rebases the branch at abs onto the repository's default

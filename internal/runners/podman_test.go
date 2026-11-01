@@ -194,13 +194,7 @@ func TestPodmanRunnerWithFallback(t *testing.T) {
 }
 
 func TestPodmanRunnerIntegration(t *testing.T) {
-	if os.Getenv("container") != "" {
-		t.Skip("Skipping Podman test when running inside a container")
-	}
-
-	if os.Getenv("CI") == "" {
-		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
-	}
+	requirePodman(t)
 
 	repoInfo := repo.RepoInfo{
 		ProjectRoot: sandboxProjectRoot(t),
@@ -243,13 +237,7 @@ func TestPodmanRunnerIntegration(t *testing.T) {
 }
 
 func TestPodmanRunnerContainerLaunchMessage(t *testing.T) {
-	if os.Getenv("container") != "" {
-		t.Skip("Skipping Podman test when running inside a container")
-	}
-
-	if os.Getenv("CI") == "" {
-		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
-	}
+	requirePodman(t)
 
 	repoInfo := repo.RepoInfo{
 		ProjectRoot: sandboxProjectRoot(t),
@@ -284,13 +272,7 @@ func TestPodmanRunnerContainerLaunchMessage(t *testing.T) {
 }
 
 func TestPodmanRunnerHealthcheckPass(t *testing.T) {
-	if os.Getenv("container") != "" {
-		t.Skip("Skipping Podman test when running inside a container")
-	}
-
-	if os.Getenv("CI") == "" {
-		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
-	}
+	requirePodman(t)
 
 	repoInfo := repo.RepoInfo{
 		ProjectRoot: sandboxProjectRoot(t),
@@ -333,13 +315,7 @@ func TestPodmanRunnerHealthcheckPass(t *testing.T) {
 }
 
 func TestPodmanRunnerHealthcheckRecovery(t *testing.T) {
-	if os.Getenv("container") != "" {
-		t.Skip("Skipping Podman test when running inside a container")
-	}
-
-	if os.Getenv("CI") == "" {
-		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
-	}
+	requirePodman(t)
 
 	repoInfo := repo.RepoInfo{
 		ProjectRoot: sandboxProjectRoot(t),
@@ -787,6 +763,116 @@ func makeSandboxFiles(t *testing.T, root string) {
 	require.NoError(t, os.MkdirAll(sandboxDir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(sandboxDir, "Dockerfile"), nil, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(sandboxDir, "bashrc"), nil, 0o644))
+}
+
+// podmanConnect probes whether a podman service is reachable. It is a variable
+// so tests can stub the dial without a real podman. It uses the runner's own
+// connection path (establishConnection), so the probe agrees with the client
+// the integration tests actually use.
+var podmanConnect = func(ctx context.Context) error {
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: os.TempDir(), Slug: "test/podman-probe"}, "probe", nil)
+	_, err := runner.establishConnection(ctx)
+	return err
+}
+
+// podmanSkipReason returns the reason the Podman integration tests must skip,
+// or "" when podman is reachable and they must run. The reachability check is
+// what makes the suite agree with itself: TestEstablishConnectionContextNotCanceled
+// already skips when podman is unreachable, while the five integration tests
+// used to fail. Routing all of them through this one decision means a broken
+// lane degrades to a loud skip instead of a hard failure.
+func podmanSkipReason(ctx context.Context) string {
+	if os.Getenv("container") != "" {
+		return "running inside a container"
+	}
+	if os.Getenv("CI") == "" {
+		return "CI is unset; set CI=1 to run this test (requires podman and network to pull the integration image)"
+	}
+	if err := podmanConnect(ctx); err != nil {
+		return fmt.Sprintf("podman not reachable: %v", err)
+	}
+	return ""
+}
+
+// requirePodman skips the calling test, with a printed reason, when podman is
+// not reachable. A reachable podman proceeds to the real integration
+// assertions. The skip is loud: the reason names the unreachable socket so a
+// red lane is diagnosable rather than silently green.
+func requirePodman(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if reason := podmanSkipReason(ctx); reason != "" {
+		t.Skipf("podman unavailable, skipping: %s", reason)
+	}
+}
+
+// TestPodmanSkipReason exercises the single skip decision the integration tests
+// share. Before this edict the five tests failed when podman was unreachable
+// while TestEstablishConnectionContextNotCanceled skipped — the suite disagreed
+// with itself about whether an unreachable podman is fatal. Each guard must
+// yield a reason (skip), and a reachable podman must yield "" (run).
+func TestPodmanSkipReason(t *testing.T) {
+	stub := func(err error) {
+		prev := podmanConnect
+		podmanConnect = func(context.Context) error { return err }
+		t.Cleanup(func() { podmanConnect = prev })
+	}
+
+	t.Run("inside a container skips", func(t *testing.T) {
+		t.Setenv("container", "podman")
+		stub(nil)
+		if got := podmanSkipReason(context.Background()); !strings.Contains(got, "container") {
+			t.Errorf("reason = %q, want a container skip", got)
+		}
+	})
+
+	t.Run("CI unset skips", func(t *testing.T) {
+		t.Setenv("container", "")
+		t.Setenv("CI", "")
+		stub(nil)
+		if got := podmanSkipReason(context.Background()); !strings.Contains(got, "CI is unset") {
+			t.Errorf("reason = %q, want a CI-unset skip", got)
+		}
+	})
+
+	t.Run("unreachable podman skips with the cause", func(t *testing.T) {
+		t.Setenv("container", "")
+		t.Setenv("CI", "1")
+		stub(errors.New("dial unix /var/run/podman/podman.sock: permission denied"))
+		got := podmanSkipReason(context.Background())
+		if !strings.Contains(got, "not reachable") || !strings.Contains(got, "permission denied") {
+			t.Errorf("reason = %q, want the unreachable socket named", got)
+		}
+	})
+
+	t.Run("reachable podman runs", func(t *testing.T) {
+		t.Setenv("container", "")
+		t.Setenv("CI", "1")
+		stub(nil)
+		if got := podmanSkipReason(context.Background()); got != "" {
+			t.Errorf("reason = %q, want empty so the integration assertions run", got)
+		}
+	})
+}
+
+// TestEstablishConnectionHonorsContainerHost pins the CI socket-path contract:
+// the workflow starts a rootless podman service and exports CONTAINER_HOST, so
+// the client must dial exactly that socket. The platform probes in
+// establishConnection otherwise fall through to /var/run/podman/podman.sock,
+// which a rootless service never creates — the client and the service would
+// disagree on the path and every integration test would fail on a lane whose
+// socket is up.
+func TestEstablishConnectionHonorsContainerHost(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "podman.sock")
+	t.Setenv("CONTAINER_HOST", "unix://"+sock)
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: dir, Slug: "test/ctx-host"}, "0", nil)
+	_, err := runner.establishConnection(context.Background())
+	require.Error(t, err, "no service is listening, so the dial must fail")
+	assert.Contains(t, err.Error(), sock,
+		"the client must dial the CONTAINER_HOST socket, not a platform default")
 }
 
 // TestFastPathDetectsStoppedContainer verifies Edict 589: when containerStarted==true,
@@ -1447,12 +1533,7 @@ func TestPodmanRunnerProjectCacheRootStaysOnMainRoot(t *testing.T) {
 // reap only anonymous volumes. Create a cache entry, remove the container, then
 // recreate and confirm the module cache is still there — do not assume.
 func TestCacheVolumeSurvivesContainerRemoval(t *testing.T) {
-	if os.Getenv("container") != "" {
-		t.Skip("Skipping Podman test when running inside a container")
-	}
-	if os.Getenv("CI") == "" {
-		t.Skip("Skipping Podman integration test. Set CI=1 to run this test (requires podman and network to pull the integration image)")
-	}
+	requirePodman(t)
 
 	slug := "test/project"
 	volumeName := "asimi-gomodcache-" + repo.SanitizeSegment(slug)

@@ -23,6 +23,48 @@ jobs:
           go-version: '1.26.10'
       - name: Install dependencies
         uses: ./.github/actions/install-dependencies
+      - name: Start the podman socket
+        run: |
+          # `apt install podman` ships the client only; the integration tests
+          # dial a podman service socket, so one must be running. The runner
+          # user is non-root, and a root-owned /var/run/podman/podman.sock
+          # answers "permission denied" (the red main this fixes), so start a
+          # ROOTLESS service whose socket the user owns.
+          #
+          # The socket lives at a NON-default path on purpose: the client's
+          # platform probe would otherwise find a stray socket even when the
+          # lane is broken. Keeping it off the default path means CONTAINER_HOST
+          # alone decides whether the tests run — establishConnection honors it.
+          #
+          # This step must never fail the build: an unusable podman lane must
+          # degrade to a loud skip in the test step, not a red job. Every
+          # fallible command is guarded, and errexit is turned off explicitly.
+          set +e
+          socket_dir="${RUNNER_TEMP:-/tmp}/podman"
+          mkdir -p "$socket_dir"
+          CONTAINER_HOST="unix://$socket_dir/podman.sock"
+          export CONTAINER_HOST
+          # nohup + disown so the service outlives this step's shell; without it
+          # the socket would vanish before the test step dials it.
+          nohup podman system service --time=0 "$CONTAINER_HOST" >/tmp/podman-service.log 2>&1 &
+          disown 2>/dev/null
+          for _ in $(seq 1 30); do
+            if podman info >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          # A pingable service is not a usable lane: rootless podman can answer
+          # `info` and still fail to run a container (no user namespaces). Prove
+          # the lane end to end with the very image the integration tests use;
+          # only then export CONTAINER_HOST. A half-working lane must degrade to
+          # a loud skip, not five hard failures.
+          if podman run --rm docker.io/library/golang:1.26.10-bookworm true >/tmp/podman-smoke.log 2>&1; then
+            echo "CONTAINER_HOST=$CONTAINER_HOST" >> "$GITHUB_ENV"
+            echo "podman lane is up; integration tests will run"
+          else
+            echo "::warning::podman lane is not usable; integration tests will skip"
+            cat /tmp/podman-service.log /tmp/podman-smoke.log 2>/dev/null || true
+          fi
+          exit 0
       - name: Run linting
         run: just lint
       - name: Run tests

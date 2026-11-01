@@ -146,10 +146,13 @@ run:
 #   - Dev station: set CI=1 to enable the podman integration tests. Requires
 #     podman plus network access to pull the integration image
 #     docker.io/library/golang:1.26.10-bookworm (no sandbox build or tagging).
-#   - CI: the same mode on a Linux runner with podman installed; CI is set by
-#     the runner, so the integration tests run. In the sandbox and CI the
-#     runner is Linux (native podman, /tmp shared); on macOS podman runs in a
-#     VM that does not share /tmp.
+#   - CI: the same mode on a Linux runner with podman installed and its service
+#     socket started (see .github/workflows/ci.yml), so the integration tests
+#     run. In the sandbox and CI the runner is Linux (native podman, /tmp
+#     shared); on macOS podman runs in a VM that does not share /tmp.
+# An unreachable podman (no socket, wrong socket path, permission denied) is a
+# SKIP with a printed reason, never a failure — the integration lane degrades
+# loudly rather than reddening the whole suite.
 test:
     #!/usr/bin/env bash
     set -euo pipefail

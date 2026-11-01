@@ -391,6 +391,25 @@ func (r *PodmanRunner) healthcheck(ctx context.Context) error {
 func (r *PodmanRunner) establishConnection(ctx context.Context) (context.Context, error) {
 	slog.Debug("attempting to establish podman connection")
 
+	// An explicit CONTAINER_HOST wins: it is the podman-standard way to name
+	// the service socket, and it is how CI points the client at the rootless
+	// socket it started ($XDG_RUNTIME_DIR/podman/podman.sock). The platform
+	// probes below would otherwise dial /var/run/podman/podman.sock, which a
+	// rootless `podman system service` never creates — the client and the
+	// socket would disagree on the path. Honoring it here (rather than only
+	// inside bindings, which the explicit URIs below bypass) is what makes the
+	// exported variable meaningful.
+	if host := os.Getenv("CONTAINER_HOST"); host != "" {
+		slog.Debug("connecting via CONTAINER_HOST", "host", host)
+		conn, err := bindings.NewConnection(context.Background(), host)
+		if err == nil {
+			slog.Debug("successfully connected via CONTAINER_HOST")
+			return conn, nil
+		}
+		slog.Debug("failed to connect via CONTAINER_HOST", "host", host, "error", err)
+		return nil, err
+	}
+
 	currentUser, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current user: %w", err)
