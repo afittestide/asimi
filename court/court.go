@@ -256,6 +256,10 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 	s.ritualGuard.ritualRunner.mutationRunner = s.repoMutationRunner
 	s.ritualGuard.ritualRunner.sweepLingWorktrees = s.sweepLingWorktrees
 	s.ritualGuard.ritualRunner.closeEdictRunner = s.CloseEdictRunner
+	// The blessed-branch lease serializes rituals that mutate the repository
+	// root. It lives on the guard so it is process-wide and repo-scoped.
+	s.ritualGuard.ritualRunner.blessedBranchLock = s.ritualGuard.blessedBranchLock
+	s.ritualGuard.ritualRunner.blessedWaiters = &s.ritualGuard.blessedWaiters
 
 	// The ruler's seal is landed by the merge-worktree ritual, which is
 	// triggered by the seal_granted{minister_id: ruler} event (see

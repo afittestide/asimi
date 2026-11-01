@@ -1831,6 +1831,8 @@ func mergeWorktreeGuard(t *testing.T, db *gorm.DB) *RitualGuard {
 	rg.ritualRegistry = registry
 	rg.ritualRunner = NewRitualRunner(registry, func(string) Minister { return nil }, nil,
 		db, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	rg.ritualRunner.blessedBranchLock = rg.blessedBranchLock
+	rg.ritualRunner.blessedWaiters = &rg.blessedWaiters
 	rg.streamingCtx = func(string) context.Context { return context.Background() }
 	rg.recoveryMu.Lock()
 	rg.recoveryComplete = true
@@ -2297,4 +2299,72 @@ func TestReconcileOrphanedRituals_OnlyThisScope(t *testing.T) {
 				e.ID, e.Username, e.Project, got.State, want)
 		}
 	}
+}
+
+// --- blessed-branch lease (e1013) ---
+
+// TestBlessedBranchLock_RepoScoped: the lease is keyed by ProjectRoot, so two
+// different repos never block each other while the same root does.
+func TestBlessedBranchLock_RepoScoped(t *testing.T) {
+	rg := &RitualGuard{}
+
+	a := rg.blessedBranchLock("/repo/a")
+	b := rg.blessedBranchLock("/repo/b")
+	sameA := rg.blessedBranchLock("/repo/a")
+
+	assert.Same(t, a, sameA, "the same root yields the same lease")
+	assert.NotSame(t, a, b, "different roots get independent leases")
+
+	a.Lock()
+	ok := b.TryLock()
+	if ok {
+		b.Unlock()
+	}
+	assert.True(t, ok, "a lease on another repo must not block this one")
+	a.Unlock()
+}
+
+// TestBlessedBranchLock_SameRootBlocks: two edicts merging into one repo share
+// an index and a HEAD, so the same root must serialize.
+func TestBlessedBranchLock_SameRootBlocks(t *testing.T) {
+	rg := &RitualGuard{}
+
+	l1 := rg.blessedBranchLock("/repo/a")
+	l2 := rg.blessedBranchLock("/repo/a")
+	require.Same(t, l1, l2)
+
+	l1.Lock()
+	assert.False(t, l2.TryLock(), "a held lease on the same root must block")
+	l1.Unlock()
+	assert.True(t, l2.TryLock(), "a released lease frees the root")
+	l2.Unlock()
+}
+
+// TestBlessedBranchLock_EmptyRootSentinel: an empty root must not create a
+// shared entry that a real repo could contend with.
+func TestBlessedBranchLock_EmptyRootSentinel(t *testing.T) {
+	rg := &RitualGuard{}
+
+	empty := rg.blessedBranchLock("")
+	real := rg.blessedBranchLock("/repo/a")
+	assert.NotSame(t, empty, real, "the system sentinel must not alias a real repo's lease")
+
+	empty2 := rg.blessedBranchLock("")
+	assert.Same(t, empty, empty2, "empty roots share the sentinel entry")
+}
+
+// TestBlessedWaiters_IndependentOfQueuedCount: the two counters must not be
+// conflated — a repo wait is not a per-edict queue wait.
+func TestBlessedWaiters_IndependentOfQueuedCount(t *testing.T) {
+	rg := &RitualGuard{}
+
+	rg.queuedCount.Add(1)
+	assert.Equal(t, int32(1), rg.queuedCount.Load())
+	assert.Equal(t, int32(0), rg.blessedWaiters.Load(),
+		"a per-edict queue wait must not move the blessed-branch counter")
+
+	rg.blessedWaiters.Add(1)
+	assert.Equal(t, int32(1), rg.queuedCount.Load(),
+		"a blessed-branch wait must not move the per-edict counter")
+	assert.Equal(t, int32(1), rg.blessedWaiters.Load())
 }

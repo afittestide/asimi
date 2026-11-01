@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -77,7 +78,16 @@ type RitualStepMsg struct {
 	Status      string `msgpack:"status,omitempty"`
 	Message     string `msgpack:"message,omitempty"`
 	QueueLen    int    `msgpack:"queue_len,omitempty"` // number of rituals waiting (including this one), when Status=="queued"
+	// WaitOn names what a queued ritual is waiting for: "" (another ritual of
+	// the same edict) or "the blessed branch". It keeps the blessed-branch
+	// wait from rendering as "waiting for another ritual to finish", which
+	// would be untrue.
+	WaitOn string `msgpack:"wait_on,omitempty"`
 }
+
+// BlessedBranchWaitOn is the WaitOn value marking a wait for the repo-scoped
+// blessed-branch lease (as opposed to a same-edict queue wait).
+const BlessedBranchWaitOn = "the blessed branch"
 
 // RitualState represents the current state of a ritual execution
 type RitualState string
@@ -496,6 +506,13 @@ type RitualRunner struct {
 	// been landed and removed. Injected by the Court; nil is a safe no-op so
 	// a directly-constructed runner never fails a landed merge.
 	closeEdictRunner func(ctx context.Context, edictID uint)
+	// blessedBranchLock resolves the repo-scoped lease that serializes
+	// rituals mutating the repository root (see RitualGuard.blessedBranchLock).
+	// Injected by the Court; nil means no lease is available.
+	blessedBranchLock func(root string) *sync.Mutex
+	// blessedWaiters counts rituals waiting for a blessed-branch lease,
+	// independent of the guard's per-edict queuedCount.
+	blessedWaiters *atomic.Int32
 
 	// Pause/resume for ruler interjection. When the ruler prompts on a ritual
 	// tab, the ritual pauses: the step context is cancelled (stopping the
@@ -632,6 +649,36 @@ type RitualExecution struct {
 	forkWorkIndex int    // index of current work step within the fork
 	forkWorkTotal int    // total work steps in the fork
 	forkItem      bool   // true for a per-item fork context; owns its state and never persists
+
+	// repoLease is this run's blessed-branch lease, stamped by the
+	// acquire_blessed_branch_lock background given and released when Run
+	// unwinds. It is a POINTER deliberately: saveExecution copies the
+	// execution (`snapshot := *exec`), so storing a sync.Mutex by value here
+	// would copy a mutex (go vet copylocks). The mutex stays owned by the
+	// guard's map; the execution holds only this pointer plus the key.
+	// Runtime-only: not persisted, not a DB column.
+	repoLease *repoLease `gorm:"-"`
+}
+
+// repoLease is one ritual run's hold on the repository root (the blessed
+// branch). Release is idempotent so a double release cannot Unlock an
+// unlocked mutex; it is called exactly once by Run's unwind defer.
+type repoLease struct {
+	lock *sync.Mutex
+	root string
+	once sync.Once
+}
+
+// Release frees the lease. Safe to call more than once.
+func (l *repoLease) Release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		if l.lock != nil {
+			l.lock.Unlock()
+		}
+	})
 }
 
 // forkStepStates returns a private copy of the parent's step states for a
@@ -842,6 +889,24 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 	if r.onRitualDone != nil && exec.EdictID > 1 {
 		defer r.onRitualDone(exec.EdictID)
 	}
+
+	// The blessed-branch lease is released when the run unwinds, whatever the
+	// outcome. Registered before background handling: the acquire step runs
+	// inside that loop, and an early return from a later background given must
+	// not leak the lease. Reads exec.repoLease at unwind time, so it is correct
+	// whether the lease is stamped before or after this defer is registered.
+	//
+	// Deliberately NOT gated on exec.EdictID > 1 the way onRitualDone is:
+	// release unconditionally when a lease exists — a leaked lease wedges every
+	// subsequent merge. A PAUSED ritual keeps the lease (the ruling is
+	// whole-run): the forge is mid-resolution and its worktree must not be
+	// rebased under it.
+	defer func() {
+		if exec.repoLease != nil {
+			exec.repoLease.Release()
+			exec.repoLease = nil
+		}
+	}()
 
 	// Emit ritual_started Tian event
 	execKey := exec.EdictKey()

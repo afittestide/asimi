@@ -67,6 +67,7 @@ func NewStepDefRegistry() *StepDefRegistry {
 	}{
 		{"the edict details", "get_edict", "edict"},
 		{"an edict's worktree", "prepare_worktree", "worktree"},
+		{"a lock on the blessed branch", "acquire_blessed_branch_lock", ""},
 		{"the court status", "get_court_status", "court_status"},
 		{"the manifests", "get_manifests", "manifests"},
 		{"the verdicts", "get_verdicts", "verdicts"},
@@ -238,6 +239,8 @@ func (r *RitualRunner) runGiven(ctx context.Context, exec *RitualExecution, fn s
 		return r.getEdict(givenKey)
 	case "prepare_worktree":
 		return r.prepareWorktree(ctx, exec)
+	case "acquire_blessed_branch_lock":
+		return r.acquireBlessedBranchLock(exec)
 	case "get_court_status":
 		return r.getCourtStatus(givenKey)
 	case "get_manifests":
@@ -301,6 +304,60 @@ func (r *RitualRunner) prepareWorktree(ctx context.Context, exec *RitualExecutio
 	}
 	r.logger.Info("worktree prepared", "path", abs, "edict", exec.EdictID, "branch", branch)
 	return map[string]string{"path": abs, "branch": branch}, nil
+}
+
+// acquireBlessedBranchLock takes the repo-scoped lease that serializes rituals
+// mutating the repository root (the blessed branch: its index, HEAD and
+// worktree registry) and stamps it on the execution. It is a background given
+// for merge-worktree, so the lease spans the whole run — the forge's conflict
+// retries included — and a queued merge rebases onto the already-landed first
+// merge. Run's unwind defer releases it.
+//
+// A non-blocking probe comes first so the uncontended case emits no "queued"
+// chatter: a merge that never waits must not flash a queue toast.
+func (r *RitualRunner) acquireBlessedBranchLock(exec *RitualExecution) (interface{}, error) {
+	root := exec.repoInfo.ProjectRoot
+	if root == "" {
+		return nil, nil // system/no-git — nothing to protect
+	}
+	if exec.repoInfo.Gitless() {
+		// No heaven to ascend to: mergeEdictWorktree is a no-op here, so the
+		// lease would guard nothing.
+		return nil, nil
+	}
+	if r.blessedBranchLock == nil {
+		// No guard to lease from: a wiring error, not a runtime condition.
+		// Fail loudly rather than silently running the merge unserialized —
+		// a silent unserialized merge is exactly the corruption this lease
+		// exists to prevent. In production the Court always injects it.
+		return nil, fmt.Errorf("acquire_blessed_branch_lock: no lease configured")
+	}
+	lock := r.blessedBranchLock(root)
+
+	if !lock.TryLock() {
+		// Contended: count the wait and tell the ruler what we are waiting
+		// for. WaitOn distinguishes this from a same-edict queue wait, which
+		// would otherwise render as "waiting for another ritual to finish" —
+		// untrue here.
+		var n int32
+		if r.blessedWaiters != nil {
+			n = r.blessedWaiters.Add(1)
+		}
+		exec.Notify(RitualStepMsg{
+			Status:   "queued",
+			WaitOn:   BlessedBranchWaitOn,
+			QueueLen: int(n),
+			Message:  "merge queued — waiting for another merge to finish",
+		})
+		lock.Lock()
+		if r.blessedWaiters != nil {
+			r.blessedWaiters.Add(-1)
+		}
+	}
+
+	exec.repoLease = &repoLease{lock: lock, root: root}
+	r.logger.Info("blessed-branch lease acquired", "root", root, "edict", exec.EdictID)
+	return nil, nil
 }
 
 // mergeEdictWorktree lands the edict's worktree on the default branch as one

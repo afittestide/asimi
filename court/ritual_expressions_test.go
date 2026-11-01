@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -3742,3 +3743,275 @@ func TestRitualRunner_ignoreCopyGlobs_FallbackAndConfigured(t *testing.T) {
 	r.sandboxConfig = &config.SandboxConfig{IgnoreCopyGlobs: []string{}}
 	assert.Empty(t, r.ignoreCopyGlobs(), "explicit empty allowlist means copy nothing")
 }
+
+// --- blessed-branch lease (e1013) ---
+
+// leaseTestRunner wires a runner with a real guard-backed lease, the way the
+// Court does for merge-worktree: the lease resolves through the guard, keyed
+// by ProjectRoot.
+func leaseTestRunner(mutation runners.Runner, rg *RitualGuard) *RitualRunner {
+	r := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	r.mutationRunner = func(string) runners.Runner { return mutation }
+	if rg != nil {
+		r.blessedBranchLock = rg.blessedBranchLock
+		r.blessedWaiters = &rg.blessedWaiters
+	}
+	return r
+}
+
+// TestAcquireBlessedBranchLock_StampsLease: the given takes the repo lease and
+// stamps it as a POINTER on the execution (never a by-value mutex, which
+// saveExecution's `snapshot := *exec` would copy).
+func TestAcquireBlessedBranchLock_StampsLease(t *testing.T) {
+	rg := &RitualGuard{}
+	r := leaseTestRunner(&worktreeTestRunner{}, rg)
+	exec := mergeExec(t.TempDir(), 42)
+
+	_, err := r.acquireBlessedBranchLock(exec)
+	require.NoError(t, err)
+	require.NotNil(t, exec.repoLease, "the lease must be stamped on the execution")
+	require.NotNil(t, exec.repoLease.lock)
+	assert.Equal(t, exec.repoInfo.ProjectRoot, exec.repoLease.root)
+
+	// The lease is a pointer field: the execution can be copied (as
+	// saveExecution does) without copying a sync.Mutex.
+	_ = *exec
+
+	exec.repoLease.Release()
+}
+
+// TestAcquireBlessedBranchLock_UncontendedEmitsNoQueuedMessage: a merge that
+// never waits must not flash a queue toast.
+func TestAcquireBlessedBranchLock_UncontendedEmitsNoQueuedMessage(t *testing.T) {
+	rg := &RitualGuard{}
+	r := leaseTestRunner(&worktreeTestRunner{}, rg)
+
+	var msgs []RitualStepMsg
+	exec := mergeExec(t.TempDir(), 42)
+	exec.notify = func(m any) {
+		if step, ok := m.(RitualStepMsg); ok {
+			msgs = append(msgs, step)
+		}
+	}
+
+	_, err := r.acquireBlessedBranchLock(exec)
+	require.NoError(t, err)
+	assert.Empty(t, msgs, "the uncontended path must emit no queued message")
+	exec.repoLease.Release()
+}
+
+// TestAcquireBlessedBranchLock_ContendedEmitsWaitOn: when another ritual holds
+// the repo lease, the waiter emits one queued message naming the blessed
+// branch, and only after the holder releases does it acquire.
+func TestAcquireBlessedBranchLock_ContendedEmitsWaitOn(t *testing.T) {
+	rg := &RitualGuard{}
+	root := t.TempDir()
+
+	holder := leaseTestRunner(&worktreeTestRunner{}, rg)
+	held := mergeExec(root, 1)
+	_, err := holder.acquireBlessedBranchLock(held)
+	require.NoError(t, err)
+
+	waiter := leaseTestRunner(&worktreeTestRunner{}, rg)
+	exec := mergeExec(root, 2)
+	var mu sync.Mutex
+	var msgs []RitualStepMsg
+	exec.notify = func(m any) {
+		if step, ok := m.(RitualStepMsg); ok {
+			mu.Lock()
+			msgs = append(msgs, step)
+			mu.Unlock()
+		}
+	}
+
+	acquired := make(chan struct{})
+	go func() {
+		_, _ = waiter.acquireBlessedBranchLock(exec)
+		close(acquired)
+	}()
+
+	// The waiter must block while the holder keeps the lease.
+	select {
+	case <-acquired:
+		t.Fatal("waiter acquired the lease while it was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	mu.Lock()
+	got := append([]RitualStepMsg(nil), msgs...)
+	mu.Unlock()
+	require.Len(t, got, 1, "the contended path emits exactly one queued message")
+	assert.Equal(t, "queued", got[0].Status)
+	assert.Equal(t, BlessedBranchWaitOn, got[0].WaitOn, "the wait must name the blessed branch")
+	assert.Equal(t, 1, got[0].QueueLen)
+
+	held.repoLease.Release()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire after the holder released")
+	}
+	exec.repoLease.Release()
+}
+
+// TestAcquireBlessedBranchLock_EmptyRootNoOp: a system/no-git ritual has
+// nothing to protect and must not take a lease.
+func TestAcquireBlessedBranchLock_EmptyRootNoOp(t *testing.T) {
+	rg := &RitualGuard{}
+	r := leaseTestRunner(&worktreeTestRunner{}, rg)
+	exec := &RitualExecution{ID: "sys", RitualName: mergeWorktreeRitual, EdictID: 1}
+
+	_, err := r.acquireBlessedBranchLock(exec)
+	require.NoError(t, err)
+	assert.Nil(t, exec.repoLease, "empty ProjectRoot takes no lease")
+}
+
+// TestAcquireBlessedBranchLock_GitlessNoOp: with no VCS there is nothing to
+// protect — mergeEdictWorktree is itself a no-op on gitless ground.
+func TestAcquireBlessedBranchLock_GitlessNoOp(t *testing.T) {
+	rg := &RitualGuard{}
+	r := leaseTestRunner(&worktreeTestRunner{}, rg)
+	exec := mergeExec(t.TempDir(), 42)
+	exec.repoInfo.HasVCS = false // Gitless()
+
+	_, err := r.acquireBlessedBranchLock(exec)
+	require.NoError(t, err)
+	assert.Nil(t, exec.repoLease, "gitless ground takes no lease")
+}
+
+// TestRepoLease_ReleaseIdempotent: a double release must not Unlock an
+// unlocked mutex.
+func TestRepoLease_ReleaseIdempotent(t *testing.T) {
+	var mu sync.Mutex
+	lease := &repoLease{lock: &mu, root: "/repo"}
+
+	mu.Lock()
+	lease.Release()
+	lease.Release() // must not panic
+
+	assert.True(t, mu.TryLock(), "the mutex is free after release")
+	mu.Unlock()
+}
+
+// TestMergeEdictWorktree_ConcurrentRunsDoNotInterleave is the load-bearing
+// concurrency regression: two merge runs against ONE root must not interleave
+// their root git commands. Interleaving is the silent mis-attribution bug — A
+// stages and B stages on top of A's staged content, A commits BOTH edicts'
+// work under A's message, then B's diff finds an empty index, returns nil, and
+// B ascends having landed nothing of its own.
+func TestMergeEdictWorktree_ConcurrentRunsDoNotInterleave(t *testing.T) {
+	rg := &RitualGuard{}
+	root := t.TempDir()
+	for _, id := range []uint{11, 12} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, ".agents", "worktrees", fmt.Sprintf("e%d", id)), 0o755))
+	}
+
+	// One shared recorder: each run's runner tags its commands with its own
+	// edict, so the global sequence shows whether the two runs interleaved.
+	rec := &mergeSequenceRecorder{
+		entered: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+
+	run := func(id uint) {
+		mutation := &taggedMergeRunner{edict: fmt.Sprintf("e%d", id), rec: rec}
+		r := leaseTestRunner(mutation, rg)
+		exec := mergeExec(root, id)
+		exec.notify = func(any) {}
+		_, _ = r.acquireBlessedBranchLock(exec)
+		if exec.repoLease == nil {
+			return
+		}
+		defer func() {
+			exec.repoLease.Release()
+			exec.repoLease = nil
+		}()
+		_ = r.mergeEdictWorktree(context.Background(), exec,
+			storage.EdictKey{ID: id, Username: "u", Project: "p"})
+	}
+
+	var wg sync.WaitGroup
+	for _, id := range []uint{11, 12} {
+		wg.Add(1)
+		go func(id uint) {
+			defer wg.Done()
+			run(id)
+		}(id)
+	}
+
+	// The first run to reach root blocks there. If the lease failed to
+	// serialize, the second run enters root too and we see two entries.
+	first := <-rec.entered
+	select {
+	case second := <-rec.entered:
+		t.Fatalf("both runs (%s, %s) entered root concurrently — the lease did not serialize them", first, second)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(rec.release)
+	wg.Wait()
+
+	// Contiguity: the recorded sequence, collapsed to runs of equal labels,
+	// must have exactly two blocks — one per run.
+	rec.mu.Lock()
+	sequence := append([]string(nil), rec.sequence...)
+	rec.mu.Unlock()
+
+	var blocks []string
+	for _, label := range sequence {
+		if len(blocks) == 0 || blocks[len(blocks)-1] != label {
+			blocks = append(blocks, label)
+		}
+	}
+	assert.Len(t, blocks, 2,
+		"each run's root commands must be contiguous (no interleave); got sequence %v", sequence)
+}
+
+// mergeSequenceRecorder records the global root-command sequence and gates the
+// first run that reaches root, so an unserialized second run is observable.
+type mergeSequenceRecorder struct {
+	mu       sync.Mutex
+	sequence []string
+	entered  chan string
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (r *mergeSequenceRecorder) record(label string) {
+	r.mu.Lock()
+	r.sequence = append(r.sequence, label)
+	r.mu.Unlock()
+}
+
+// gate blocks the first rebase of the first run until release is closed.
+func (r *mergeSequenceRecorder) gate(label string) {
+	r.once.Do(func() {
+		r.entered <- label
+		<-r.release
+	})
+}
+
+// taggedMergeRunner tags every command with its run's edict label and gates the
+// first rebase, so two runs racing on one root are distinguishable.
+type taggedMergeRunner struct {
+	edict string
+	rec   *mergeSequenceRecorder
+}
+
+func (m *taggedMergeRunner) Run(_ context.Context, input runners.Input) (runners.Output, error) {
+	m.rec.record(m.edict)
+	if strings.Contains(input.Command, "rebase") {
+		m.rec.gate(m.edict)
+	}
+	if strings.Contains(input.Command, "symbolic-ref") {
+		return runners.Output{Output: "origin/main\n", ExitCode: "0"}, nil
+	}
+	return runners.Output{ExitCode: "0"}, nil
+}
+
+func (m *taggedMergeRunner) Restart(context.Context) error        { return nil }
+func (m *taggedMergeRunner) Close(context.Context) error          { return nil }
+func (m *taggedMergeRunner) AllowFallback(bool)                   {}
+func (m *taggedMergeRunner) RunnerType() string                   { return "tagged-merge" }
+func (m *taggedMergeRunner) GetOS() string                        { return runtime.GOOS }
+func (m *taggedMergeRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (m *taggedMergeRunner) HealthCheck(context.Context) error    { return nil }

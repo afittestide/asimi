@@ -7896,3 +7896,92 @@ func TestEventWorktreeMergeFailed_MergedCleanupVariant(t *testing.T) {
 	assert.NotEqual(t, "success", toast.Type, "a cleanup failure must not be reported as plain success")
 	assert.Contains(t, toast.Message, "cleanup failed")
 }
+
+// TestRitualStepMsg_QueuedBlessedBranchNamesMerge verifies that a wait on the
+// repo-scoped blessed-branch lease renders "another merge" — not "another
+// ritual", which would be untrue (the blocker is another edict's merge).
+func TestRitualStepMsg_QueuedBlessedBranchNamesMerge(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e1013", "ritual", "e1013")
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e1013",
+		RitualName: "merge-worktree",
+		EdictID:    1013,
+		Status:     "queued",
+		WaitOn:     court.BlessedBranchWaitOn,
+		QueueLen:   2,
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	chat := updatedModel.tabs.ChatByTab("e1013")
+	require.NotNil(t, chat)
+	require.NotEmpty(t, chat.Messages)
+
+	last := chat.Messages[len(chat.Messages)-1]
+	assert.Contains(t, last.Content, "Merge for edict 1013")
+	assert.Contains(t, last.Content, "position 2 in queue")
+	assert.NotContains(t, last.Content, "waiting for active ritual to finish")
+
+	// The toast names the merge too.
+	require.NotEmpty(t, updatedModel.commandLine.toasts, "a toast is still shown")
+	assert.Contains(t, updatedModel.commandLine.toasts[0].Message, "another merge")
+}
+
+// TestRitualStepMsg_QueuedBlessedBranchSingleWaiter verifies the sole-waiter
+// wording names the merge rather than a generic ritual.
+func TestRitualStepMsg_QueuedBlessedBranchSingleWaiter(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e1015", "ritual", "e1015")
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e1015",
+		RitualName: "merge-worktree",
+		EdictID:    1015,
+		Status:     "queued",
+		WaitOn:     court.BlessedBranchWaitOn,
+		QueueLen:   1,
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	chat := updatedModel.tabs.ChatByTab("e1015")
+	require.NotNil(t, chat)
+	require.NotEmpty(t, chat.Messages)
+
+	last := chat.Messages[len(chat.Messages)-1]
+	assert.Contains(t, last.Content, "another merge")
+	assert.NotContains(t, last.Content, "position")
+}
+
+// TestRitualStepMsg_QueuedEdictWaitUnchanged verifies the same-edict queue
+// wording is untouched by the blessed-branch branch.
+func TestRitualStepMsg_QueuedEdictWaitUnchanged(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e1014", "ritual", "e1014")
+
+	msg := court.RitualStepMsg{
+		ChannelID:  "e1014",
+		RitualName: "swift-strike",
+		EdictID:    1014,
+		Status:     "queued",
+		QueueLen:   1,
+	}
+	newModel, _ := model.handleCustomMessages(msg)
+	updatedModel := newModel.(TUIModel)
+
+	chat := updatedModel.tabs.ChatByTab("e1014")
+	require.NotNil(t, chat)
+	require.NotEmpty(t, chat.Messages)
+
+	last := chat.Messages[len(chat.Messages)-1]
+	assert.Contains(t, last.Content, "waiting for active ritual to finish")
+	assert.NotContains(t, last.Content, "another merge")
+}

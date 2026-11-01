@@ -66,6 +66,8 @@
       type: string
       required: true
   max_retries: 3
+  background:
+    - a lock on the blessed branch
   steps:
     - name: landing
       minister: forge

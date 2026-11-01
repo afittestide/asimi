@@ -2571,6 +2571,21 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "info":
 			chat.AddMessage(fmt.Sprintf("  %s", msg.Message))
 		case "queued":
+			if msg.WaitOn == court.BlessedBranchWaitOn {
+				// A repo-scoped wait: name the blessed branch, not "another
+				// ritual" — the blocker is another edict's merge, not this
+				// edict's own ritual.
+				text := fmt.Sprintf("⏳ Merge for edict %d queued — waiting for another merge to finish", msg.EdictID)
+				m.commandLine.AddToast(text, "warning", 3*time.Second)
+				queueMsg := fmt.Sprintf("⏳ Merge for edict %d queued at %s", msg.EdictID, time.Now().Format("15:04:05"))
+				if msg.QueueLen > 1 {
+					queueMsg += fmt.Sprintf(" — position %d in queue", msg.QueueLen)
+				} else {
+					queueMsg += " — waiting for another merge to finish"
+				}
+				chat.AddMessage(queueMsg)
+				break
+			}
 			text := fmt.Sprintf("⏳ Ritual %s queued for edict %d — waiting for another ritual to finish",
 				msg.RitualName, msg.EdictID)
 			m.commandLine.AddToast(text, "warning", 3*time.Second)

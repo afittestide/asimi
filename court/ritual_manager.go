@@ -50,9 +50,14 @@ type RitualGuard struct {
 	ritualMu    sync.Mutex
 	ritualLocks map[uint]*sync.Mutex
 	queuedCount atomic.Int32 // number of rituals waiting for any per-edict lock
-	maxRetries  int
-	batchSize   int
-	flatlineAge time.Duration
+	// blessedMu guards blessedLocks, the repo-scoped leases that serialize
+	// rituals mutating the repository root (see blessedBranchLock).
+	blessedMu      sync.Mutex
+	blessedLocks   map[string]*sync.Mutex
+	blessedWaiters atomic.Int32 // number of rituals waiting for a blessed-branch lease
+	maxRetries     int
+	batchSize      int
+	flatlineAge    time.Duration
 	// Dependency injection (replaces *Court back-reference)
 	getMinister  func(id string) Minister
 	streamingCtx func(string) context.Context
@@ -103,6 +108,7 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 		eventRegistry:    eventRegistry,
 		eventCh:          eventCh,
 		ritualLocks:      make(map[uint]*sync.Mutex),
+		blessedLocks:     make(map[string]*sync.Mutex),
 		maxRetries:       3,
 		batchSize:        100,
 		flatlineAge:      5 * time.Minute,
@@ -211,6 +217,12 @@ func isRitualChannelID(channelID string) bool {
 // Different edicts get different locks, so their rituals run concurrently while
 // rituals of the same edict stay ordered. System rituals (edict 1) keep their
 // own key, like every other edict.
+//
+// Lock ordering (durable rule): a ritual takes its edict lock FIRST and the
+// blessed-branch lock (blessedBranchLock) SECOND — never the reverse. Today
+// only merge-worktree takes the blessed-branch lock, so no cycle exists;
+// recording the order keeps a future opt-in ritual from creating one.
+// sync.Mutex is not reentrant, so a ritual acquires each exactly once per run.
 func (rg *RitualGuard) edictRitualLock(edictID uint) *sync.Mutex {
 	rg.ritualMu.Lock()
 	defer rg.ritualMu.Unlock()
@@ -221,6 +233,41 @@ func (rg *RitualGuard) edictRitualLock(edictID uint) *sync.Mutex {
 	if !ok {
 		l = &sync.Mutex{}
 		rg.ritualLocks[edictID] = l
+	}
+	return l
+}
+
+// systemRootSentinel keys the blessed-branch lock for an empty ProjectRoot. It
+// is not a valid absolute path, so a system/no-git ritual can never contend
+// with a real repository's lease.
+const systemRootSentinel = "<system>"
+
+// blessedBranchLock returns the lease that serializes rituals mutating the
+// repository root (the blessed branch: its index, HEAD and worktree registry).
+// Keyed by ProjectRoot, because that is the resource that actually races — two
+// edicts merging into one repo share an index and a HEAD. Process-local, like
+// edictRitualLock: a process-local lock cannot go stale, and the
+// cross-restart ownership gap is e1012's, not this lease's.
+//
+// An empty root does not create a shared entry: it gets a sentinel key so a
+// system/no-git ritual never contends with a real repo.
+//
+// Lock ordering (durable rule): see edictRitualLock — edict lock first,
+// blessed-branch lock second, never the reverse.
+func (rg *RitualGuard) blessedBranchLock(root string) *sync.Mutex {
+	key := root
+	if key == "" {
+		key = systemRootSentinel
+	}
+	rg.blessedMu.Lock()
+	defer rg.blessedMu.Unlock()
+	if rg.blessedLocks == nil {
+		rg.blessedLocks = make(map[string]*sync.Mutex)
+	}
+	l, ok := rg.blessedLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		rg.blessedLocks[key] = l
 	}
 	return l
 }

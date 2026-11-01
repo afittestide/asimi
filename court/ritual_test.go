@@ -5970,3 +5970,140 @@ func TestRitualStart_StampsOwnerPID(t *testing.T) {
 	assert.Equal(t, int64(os.Getpid()), row.OwnerPID,
 		"the ownership stamp must be persisted, not only held in memory")
 }
+
+// --- blessed-branch lease (e1013) ---
+
+// TestMergeWorktreeRitual_DeclaresBlessedBranchLock: the ritual carries the
+// background given, and it resolves to a registered step-def. The existing
+// TestBuiltinRituals_BackgroundGivensResolve sweeps every background given, so
+// this pins that merge-worktree now carries this one.
+func TestMergeWorktreeRitual_DeclaresBlessedBranchLock(t *testing.T) {
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+
+	var def *RitualDef
+	for _, r := range rituals {
+		if r.Name == mergeWorktreeRitual {
+			def = r
+		}
+	}
+	require.NotNil(t, def, "merge-worktree must load")
+
+	require.Contains(t, def.Background, "a lock on the blessed branch",
+		"merge-worktree must opt into the repo-scoped lease")
+	require.Len(t, def.Steps, 1, "the lease must not add a step: exactly one step (landing)")
+
+	entry, err := NewStepDefRegistry().Match("a lock on the blessed branch")
+	require.NoError(t, err)
+	require.NotNil(t, entry, "the background given must resolve to a registered step-def")
+	assert.Equal(t, "acquire_blessed_branch_lock", entry.HandlerKey)
+	assert.Empty(t, entry.OutputKey, "a lease is not a serializable context value")
+}
+
+// TestRitualRun_ReleasesLeaseOnAbort: a lease stamped on the execution must be
+// released when Run unwinds via abort, or every later merge wedges.
+func TestRitualRun_ReleasesLeaseOnAbort(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name:  "lease-abort",
+		Steps: []RitualStep{{Name: "work", Then: []string{"!true"}}},
+	}))
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	exec, err := runner.Start(ctx, "lease-abort", testEK(1013), nil, func(any) {})
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	mu.Lock() // the lease owns a held mutex
+	exec.repoLease = &repoLease{lock: &mu, root: "/repo"}
+
+	cancel() // abort before the step runs
+	_ = runner.Run(ctx, exec)
+
+	assert.Nil(t, exec.repoLease, "the unwind defer must clear the lease")
+	assert.True(t, mu.TryLock(), "the lease must be released on abort")
+	mu.Unlock()
+}
+
+// TestRitualRun_ReleasesLeaseWhenLaterBackgroundGivenFails: an early return
+// from a LATER background given must not leak the lease already taken by the
+// first. The first given is the ritual's real declared pattern, so it actually
+// dispatches and stamps the lease; the second fails to resolve, unwinding the
+// run before the step loop.
+func TestRitualRun_ReleasesLeaseWhenLaterBackgroundGivenFails(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: "lease-bg-fail",
+		// The first is the real declared pattern (it dispatches and takes the
+		// lease); the second cannot resolve, so Run returns early.
+		Background: []string{"a lock on the blessed branch", "no such given step"},
+		Steps:      []RitualStep{{Name: "work", Then: []string{"!true"}}},
+	}))
+
+	rg := &RitualGuard{}
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{})
+	runner.blessedBranchLock = rg.blessedBranchLock
+	runner.blessedWaiters = &rg.blessedWaiters
+
+	root := t.TempDir()
+	exec, err := runner.Start(context.Background(), "lease-bg-fail", testEK(1013), nil, func(any) {})
+	require.NoError(t, err)
+	exec.repoInfo = repo.RepoInfo{ProjectRoot: root, HasVCS: true}
+
+	err = runner.Run(context.Background(), exec)
+	require.Error(t, err, "the unresolvable later background given must fail the run")
+
+	// The lease must have been taken (proving the first given dispatched) and
+	// then released on the early return.
+	assert.Nil(t, exec.repoLease, "the unwind defer must clear the lease")
+
+	lock := rg.blessedBranchLock(root)
+	require.True(t, lock.TryLock(), "a failed later background given must not leak the lease")
+	lock.Unlock()
+}
+
+// TestMergeWorktreeRitual_BackgroundGivenTakesTheLease is the end-to-end guard
+// for the whole feature: the ritual's declared background given must actually
+// take the repo lease when Run executes it, through the real dispatch path
+// (registry → resolveStepDef → runGivenStep → runGiven).
+//
+// This is the test the other lease tests miss. They call
+// acquireBlessedBranchLock directly, so they all pass even when the given is
+// registered but never dispatched by runGiven — in which case the merge runs
+// completely unserialized in production. Driving Run with the real ritual
+// definition is the only way to observe the wiring.
+func TestMergeWorktreeRitual_BackgroundGivenTakesTheLease(t *testing.T) {
+	db := setupRitualTestDB(t)
+	root := t.TempDir()
+
+	rg := &RitualGuard{}
+	registry := NewRitualRegistry()
+	require.NoError(t, registry.Register(&RitualDef{
+		Name: mergeWorktreeRitual,
+		// Exactly what court/builtin_rituals.yaml declares.
+		Background: []string{"a lock on the blessed branch"},
+		Steps:      []RitualStep{{Name: "landing", Then: []string{"!true"}}},
+	}))
+
+	runner := NewRitualRunner(registry, nil, nil, db, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	runner.blessedBranchLock = rg.blessedBranchLock
+	runner.blessedWaiters = &rg.blessedWaiters
+
+	exec, err := runner.Start(context.Background(), mergeWorktreeRitual, testEK(1013), nil, func(any) {})
+	require.NoError(t, err)
+	exec.repoInfo = repo.RepoInfo{ProjectRoot: root, HasVCS: true}
+
+	require.NoError(t, runner.Run(context.Background(), exec),
+		"the declared background given must resolve AND dispatch")
+
+	// Run's unwind defer must have released it, so the lease is free again.
+	lock := rg.blessedBranchLock(root)
+	require.True(t, lock.TryLock(),
+		"the background given must have taken the repo lease and Run must have released it")
+	lock.Unlock()
+}
