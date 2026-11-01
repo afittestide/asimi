@@ -43,10 +43,14 @@ func (t *mockTool) ParameterSchema() map[string]any {
 func TestCoreToolScheduler(t *testing.T) {
 	var msgs []any
 	var msgMu sync.Mutex
+	var terminalNotified atomic.Bool
 	scheduler := NewCoreToolScheduler(func(msg any) {
 		msgMu.Lock()
 		msgs = append(msgs, msg)
 		msgMu.Unlock()
+		if _, ok := msg.(ToolCallSuccessMsg); ok {
+			terminalNotified.Store(true)
+		}
 	})
 
 	tool := &mockTool{
@@ -62,6 +66,11 @@ func TestCoreToolScheduler(t *testing.T) {
 
 	result := <-resultChan
 
+	// Ordering invariant: the terminal success notification must have been
+	// dispatched before the result channel signalled.
+	assert.True(t, terminalNotified.Load(),
+		"ToolCallSuccessMsg must be dispatched before the result channel yields")
+
 	assert.NoError(t, result.Error)
 	assert.Equal(t, "output for test-input", result.Output)
 
@@ -74,6 +83,88 @@ func TestCoreToolScheduler(t *testing.T) {
 	assert.True(t, ok)
 	_, ok = msgs[2].(ToolCallSuccessMsg)
 	assert.True(t, ok)
+}
+
+// TestCoreToolScheduler_ErrorOrdering verifies the same ordering invariant for
+// the error arm: ToolCallErrorMsg is dispatched before the result channel yields.
+func TestCoreToolScheduler_ErrorOrdering(t *testing.T) {
+	var msgMu sync.Mutex
+	var msgs []any
+	var terminalNotified atomic.Bool
+	scheduler := NewCoreToolScheduler(func(msg any) {
+		msgMu.Lock()
+		msgs = append(msgs, msg)
+		msgMu.Unlock()
+		if _, ok := msg.(ToolCallErrorMsg); ok {
+			terminalNotified.Store(true)
+		}
+	})
+
+	failingTool := &mockTool{
+		name:        "error-tool",
+		description: "A tool that fails",
+		callFunc: func(ctx context.Context, input string) (string, error) {
+			time.Sleep(10 * time.Millisecond)
+			return "", assert.AnError
+		},
+	}
+
+	resultChan := scheduler.Schedule(context.Background(), failingTool, "bad-input")
+
+	result := <-resultChan
+
+	assert.True(t, terminalNotified.Load(),
+		"ToolCallErrorMsg must be dispatched before the result channel yields")
+
+	assert.Error(t, result.Error)
+	assert.ErrorIs(t, result.Error, assert.AnError)
+
+	msgMu.Lock()
+	defer msgMu.Unlock()
+	require.GreaterOrEqual(t, len(msgs), 3)
+	_, ok := msgs[0].(ToolCallScheduledMsg)
+	assert.True(t, ok)
+	_, ok = msgs[1].(ToolCallExecutingMsg)
+	assert.True(t, ok)
+	_, ok = msgs[2].(ToolCallErrorMsg)
+	assert.True(t, ok)
+}
+
+// TestCoreToolScheduler_ClearQueueOrdering verifies that aborted calls deliver
+// their notifications before the result channel yields.
+func TestCoreToolScheduler_ClearQueueOrdering(t *testing.T) {
+	var msgMu sync.Mutex
+	aborted := make(map[string]bool)
+	scheduler := NewCoreToolScheduler(func(msg any) {
+		msgMu.Lock()
+		if m, ok := msg.(ToolCallAbortedMsg); ok {
+			aborted[m.CallID] = true
+		}
+		msgMu.Unlock()
+	})
+
+	slowTool := &mockTool{
+		name: "slow-tool",
+		callFunc: func(ctx context.Context, input string) (string, error) {
+			time.Sleep(500 * time.Millisecond)
+			return "done", nil
+		},
+	}
+
+	r1 := scheduler.Schedule(context.Background(), slowTool, "a")
+	time.Sleep(20 * time.Millisecond)
+	r2 := scheduler.Schedule(context.Background(), slowTool, "b")
+
+	scheduler.ClearQueue()
+
+	for _, ch := range []<-chan ToolCallResult{r1, r2} {
+		res := <-ch
+		_, ok := res.Error.(SandboxRestartedError)
+		assert.True(t, ok)
+		msgMu.Lock()
+		assert.NotEmpty(t, aborted, "aborted notification must be dispatched before the result channel yields")
+		msgMu.Unlock()
+	}
 }
 
 func TestCoreToolScheduler_ClearQueue(t *testing.T) {

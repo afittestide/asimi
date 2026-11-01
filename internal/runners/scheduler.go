@@ -185,9 +185,6 @@ func (s *CoreToolScheduler) executeCall(call *ToolCall) {
 				Formatted: call.Tool.Format(call.Input, "", err),
 			})
 		}
-		if resultChan != nil {
-			resultChan <- ToolCallResult{Error: err}
-		}
 	} else {
 		call.Status = StatusSuccess
 		call.Result = output
@@ -202,12 +199,8 @@ func (s *CoreToolScheduler) executeCall(call *ToolCall) {
 				Formatted: call.Tool.Format(call.Input, output, nil),
 			})
 		}
-		if resultChan != nil {
-			resultChan <- ToolCallResult{Output: output}
-		}
 	}
 	if resultChan != nil {
-		close(resultChan)
 		delete(s.resultChans, call.ID)
 	}
 
@@ -216,7 +209,16 @@ func (s *CoreToolScheduler) executeCall(call *ToolCall) {
 	notifications = append(notifications, s.processQueue()...)
 	s.mu.Unlock()
 
+	// Dispatch the terminal notification before signalling the result channel so
+	// that a consumer which receives the result is guaranteed the complete
+	// terminal message sequence (scheduled, executing, success/error) is already
+	// visible. sendNotifications stays outside the mutex.
 	s.sendNotifications(notifications)
+
+	if resultChan != nil {
+		resultChan <- ToolCallResult{Output: output, Error: err}
+		close(resultChan)
+	}
 }
 
 // SandboxRestartedError is returned when a tool call is aborted due to sandbox restart
@@ -243,6 +245,10 @@ func (s *CoreToolScheduler) ClearQueue() int {
 
 	abortErr := SandboxRestartedError{}
 	var notifications []any
+	// Result channels are signalled only after the abort notifications have been
+	// dispatched (below the mutex), so consumers observe the complete terminal
+	// message sequence before the result channel yields.
+	var resultChans []chan ToolCallResult
 
 	// Abort all active (in-flight) calls via context cancellation
 	for _, call := range s.activeCalls {
@@ -265,8 +271,7 @@ func (s *CoreToolScheduler) ClearQueue() int {
 		}
 
 		if resultChan, exists := s.resultChans[call.ID]; exists {
-			resultChan <- ToolCallResult{Error: abortErr}
-			close(resultChan)
+			resultChans = append(resultChans, resultChan)
 			delete(s.resultChans, call.ID)
 		}
 		delete(s.toolCalls, call.ID)
@@ -291,8 +296,7 @@ func (s *CoreToolScheduler) ClearQueue() int {
 		}
 
 		if resultChan, exists := s.resultChans[call.ID]; exists {
-			resultChan <- ToolCallResult{Error: abortErr}
-			close(resultChan)
+			resultChans = append(resultChans, resultChan)
 			delete(s.resultChans, call.ID)
 		}
 		delete(s.toolCalls, call.ID)
@@ -303,6 +307,11 @@ func (s *CoreToolScheduler) ClearQueue() int {
 	s.mu.Unlock()
 
 	s.sendNotifications(notifications)
+
+	for _, resultChan := range resultChans {
+		resultChan <- ToolCallResult{Error: abortErr}
+		close(resultChan)
+	}
 	return abortedCount
 }
 
