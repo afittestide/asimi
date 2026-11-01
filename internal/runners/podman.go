@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,9 @@ import (
 type PodmanRunner struct {
 	imageName        string
 	containerName    string
+	projectSlug      string
+	ownerPID         int
+	edictID          uint
 	allowFallback    bool
 	noCleanup        bool
 	config           *Config
@@ -47,7 +51,8 @@ const healthcheckTimeout = 5 * time.Second
 // NewPodmanRunner creates a new PodmanRunner. identifier is used verbatim as
 // the container name suffix: connections pass the connection ID (numeric), and
 // per-edict runners pass "e{ID}" so each edict gets its own container
-// (asimi-shell-{slug}-{identifier}).
+// (asimi-shell-{slug}-{identifier}). The "e{ID}" form also yields the edict
+// label; the connection runner carries no edict label.
 func NewPodmanRunner(cfg *Config, repoInfo repo.RepoInfo, identifier string, fallback Runner) *PodmanRunner {
 	imageName := cfg.ImageName
 	if imageName == "" {
@@ -60,6 +65,9 @@ func NewPodmanRunner(cfg *Config, repoInfo repo.RepoInfo, identifier string, fal
 	r := &PodmanRunner{
 		imageName:     imageName,
 		containerName: containerName,
+		projectSlug:   repoInfo.Slug,
+		ownerPID:      os.Getpid(),
+		edictID:       edictIDFromIdentifier(identifier),
 		allowFallback: cfg.AllowHostFallback,
 		noCleanup:     cfg.NoCleanup,
 		config:        cfg,
@@ -69,6 +77,20 @@ func NewPodmanRunner(cfg *Config, repoInfo repo.RepoInfo, identifier string, fal
 	r.establishConn = r.establishConnection
 	r.checkImage = r.defaultCheckImage
 	return r
+}
+
+// edictIDFromIdentifier parses the "e{ID}" per-edict identifier form. The
+// connection runner's numeric identifier returns 0 (no edict).
+func edictIDFromIdentifier(identifier string) uint {
+	rest, ok := strings.CutPrefix(identifier, "e")
+	if !ok || rest == "" {
+		return 0
+	}
+	id, err := strconv.ParseUint(rest, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return uint(id)
 }
 
 func (r *PodmanRunner) SetMessageChannel(msgChan chan<- Msg) {
@@ -428,6 +450,10 @@ func (r *PodmanRunner) establishConnection(ctx context.Context) (context.Context
 func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	slog.Debug("creating new container", "image", r.imageName, "containerName", r.containerName, "noCleanup", r.noCleanup)
 
+	// Reclaim build artifacts first when the podman store is tight; a full VM
+	// makes `podman build`/create fail with ENOSPC.
+	r.ensureSandboxDiskHeadroom(ctx)
+
 	s := specgen.NewSpecGenerator(r.imageName, false)
 	s.Name = r.containerName
 	autoRemove := !r.noCleanup
@@ -439,6 +465,7 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	terminal := false
 	s.Terminal = &terminal
 	s.Env = map[string]string{"TERM": "dumb"}
+	s.Labels = SandboxLabels(r.projectSlug, r.ownerPID, r.edictID)
 	for _, kv := range NonInteractiveGitEnv() {
 		name, val, _ := strings.Cut(kv, "=")
 		s.Env[name] = val

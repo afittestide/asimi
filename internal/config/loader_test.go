@@ -1842,3 +1842,13 @@ func TestLoadProjectConfig_RunnerFlatlineTimeoutDefault(t *testing.T) {
 		assert.Equal(t, time.Duration(0), cfg.Court.RunnerFlatlineTimeout)
 	})
 }
+
+// TestDefaultConf_DiskMinFreeMiB ensures the [sandbox] template surfaces the
+// disk-pressure guard: a config field with no template entry is a
+// bad-boy-scout violation (edict 966 prior-rejection finding).
+func TestDefaultConf_DiskMinFreeMiB(t *testing.T) {
+	content := DefaultConfContent()
+	if !strings.Contains(content, "disk_min_free_mib") {
+		t.Fatal("default.conf must surface sandbox.disk_min_free_mib so the field is discoverable")
+	}
+}

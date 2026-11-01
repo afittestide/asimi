@@ -537,6 +537,11 @@ func (s *Court) Start(ctx context.Context) error {
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
+	// Reap sandbox containers left by dead processes before this process
+	// starts handing out runners. Runs off the startup path so a slow or
+	// unavailable podman daemon cannot delay the Court.
+	go s.reconcileSandboxOrphans(s.ctx)
+
 	// Load rituals
 	if err := s.ritualGuard.LoadRituals(); err != nil {
 		s.logger.Warn("failed to load rituals", "error", err)

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -4695,4 +4696,91 @@ func TestMergeEdictWorktree_AbortFailureDoesNotWedgeTheSeal(t *testing.T) {
 	}
 	_, err := os.Stat(abs)
 	assert.NoError(t, err, "worktree stays intact for the forge")
+}
+
+// sandboxReconcileRunner is a Runner that also exposes the janitor backends, so
+// Court startup reconciliation can be exercised without a podman daemon.
+type sandboxReconcileRunner struct {
+	trackingRunner
+	mu         sync.Mutex
+	containers []runners.SandboxContainer
+	removed    []string
+	freeMiB    int64
+	pruneRuns  int
+	alive      map[int]bool
+}
+
+func (r *sandboxReconcileRunner) ListSandboxes(context.Context) ([]runners.SandboxContainer, error) {
+	return r.containers, nil
+}
+
+func (r *sandboxReconcileRunner) RemoveSandbox(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.removed = append(r.removed, id)
+	return nil
+}
+
+// removedIDs returns a snapshot of the reaped container IDs. Reconciliation
+// runs on its own goroutine, so the test must never read the slice directly.
+func (r *sandboxReconcileRunner) removedIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.removed...)
+}
+
+func (r *sandboxReconcileRunner) SandboxFreeMiB(context.Context) (int64, error) {
+	return r.freeMiB, nil
+}
+
+func (r *sandboxReconcileRunner) PruneSandboxArtifacts(context.Context) (int, error) {
+	r.pruneRuns++
+	return 1, nil
+}
+
+// TestCourt_Start_ReconcilesOrphanSandboxes verifies edict 985 acceptance 1 and
+// 2: startup reaps a container whose owning process is dead and preserves one
+// whose owner may still be live.
+func TestCourt_Start_ReconcilesOrphanSandboxes(t *testing.T) {
+	db := setupCourtTestDB(t)
+	runner := &sandboxReconcileRunner{
+		trackingRunner: trackingRunner{label: "reconcile"},
+		containers: []runners.SandboxContainer{
+			{ID: "orphan", Name: "asimi-shell-e985-e1", Labels: map[string]string{runners.SandboxLabelOwnerPID: "999999"}},
+			{ID: "live", Name: "asimi-shell-e985-e2", Labels: map[string]string{runners.SandboxLabelOwnerPID: strconv.Itoa(os.Getpid())}},
+		},
+	}
+	s := NewCourt(db, config.DefaultCourtConfig(), runner, slog.Default())
+
+	require.NoError(t, s.Start(context.Background()))
+	t.Cleanup(func() { s.Stop() })
+
+	require.Eventually(t, func() bool { return len(runner.removedIDs()) > 0 }, 2*time.Second, 10*time.Millisecond,
+		"startup reconciliation must run")
+	assert.Equal(t, []string{"orphan"}, runner.removedIDs(),
+		"the dead owner's container is reaped; the live owner's is preserved")
+}
+
+// TestCourt_reconcileSandboxOrphans_PreservesLiveOwner is the invariance test
+// for acceptance 2 without the goroutine timing of Start: a single container
+// with a live owner PID must never be removed.
+func TestCourt_reconcileSandboxOrphans_PreservesLiveOwner(t *testing.T) {
+	db := setupCourtTestDB(t)
+	runner := &sandboxReconcileRunner{
+		containers: []runners.SandboxContainer{
+			{ID: "live", Name: "asimi-shell-e985-e1", Labels: map[string]string{runners.SandboxLabelOwnerPID: strconv.Itoa(os.Getpid())}},
+		},
+	}
+	s := NewCourt(db, config.DefaultCourtConfig(), runner, slog.Default())
+
+	s.reconcileSandboxOrphans(context.Background())
+	assert.Empty(t, runner.removedIDs(), "a container whose owner is live must be preserved")
+}
+
+// TestCourt_reconcileSandboxOrphans_NoJanitorIsSafe proves reconciliation is a
+// no-op for a runner with no podman backends (e.g. the host runner).
+func TestCourt_reconcileSandboxOrphans_NoJanitorIsSafe(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), &trackingRunner{label: "plain"}, slog.Default())
+	s.reconcileSandboxOrphans(context.Background())
 }

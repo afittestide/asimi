@@ -496,7 +496,14 @@ type mockPodmanServer struct {
 	execCount           int
 	lastCreateBody      []byte
 	lastRemoveQuery     string
-	mu                  sync.Mutex
+	lastCreateSpec      string
+	// containersJSON is served for GET /containers/json (janitor listing);
+	// infoJSON for GET /info (free-space); pruneCount counts POST
+	// /images/prune (artifact reclamation).
+	containersJSON string
+	infoJSON       string
+	pruneCount     int
+	mu             sync.Mutex
 }
 
 // mockInspectJSON returns a complete inspect JSON response with the given
@@ -525,6 +532,42 @@ func newMockPodmanServer(inspectResp string, inspectCode int) *mockPodmanServer 
 			return
 		}
 
+		// GET /containers/json — the janitor's sandbox listing.
+		if strings.HasSuffix(path, "/containers/json") {
+			m.mu.Lock()
+			body := m.containersJSON
+			m.mu.Unlock()
+			if body == "" {
+				body = "[]"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, body)
+			return
+		}
+
+		// GET /info — the disk guard's free-space query.
+		if strings.HasSuffix(path, "/info") {
+			m.mu.Lock()
+			body := m.infoJSON
+			m.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, body)
+			return
+		}
+
+		// POST /images/prune — the disk guard's artifact reclamation.
+		if strings.HasSuffix(path, "/images/prune") {
+			m.mu.Lock()
+			m.pruneCount++
+			m.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `[{"Id":"deadbeef","Size":1024}]`)
+			return
+		}
+
 		parts := strings.Split(path, "/")
 		if len(parts) < 5 || parts[3] != "containers" {
 			// Check if this is an /exec/{id}/... path
@@ -543,6 +586,7 @@ func newMockPodmanServer(inspectResp string, inspectCode int) *mockPodmanServer 
 			m.mu.Lock()
 			m.createCount++
 			m.lastCreateBody = body
+			m.lastCreateSpec = string(body)
 			if m.containerCreated || m.createConflictCount > 0 {
 				if m.createConflictCount > 0 {
 					m.createConflictCount--
@@ -1322,4 +1366,375 @@ func TestCloseRemovesContainerWithVolumesFlag(t *testing.T) {
 	assert.Equal(t, "true", params.Get("volumes"),
 		"Close must pass volumes=true; otherwise podman reaps the project-keyed cache volume and the warm start is lost")
 	assert.Equal(t, "true", params.Get("force"), "Close must force-remove")
+}
+
+// TestCreateContainerStampsOwnerLabels verifies edict 985: every sandbox
+// container is created with asimi.project/asimi.owner_pid labels (plus
+// asimi.edict for a per-edict container) so a later process can tell an
+// orphan from a live owner without relying on in-memory state.
+func TestCreateContainerStampsOwnerLabels(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/labels"}, "e42", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	err := runner.initialize(context.Background())
+	require.NoError(t, err)
+
+	mock.mu.Lock()
+	spec := mock.lastCreateSpec
+	mock.mu.Unlock()
+	require.NotEmpty(t, spec, "the mock server must have captured the create spec")
+
+	labels := SandboxLabels("test/labels", os.Getpid(), 42)
+	for key, want := range labels {
+		assert.Contains(t, spec, key, "the create spec must label the container with %s", key)
+		assert.Contains(t, spec, want, "label %s must carry value %q", key, want)
+	}
+}
+
+// TestSandboxLabels_ConnectionRunnerHasNoEdictLabel proves the connection
+// runner is stamped with project/owner only: it serves no single edict.
+func TestSandboxLabels_ConnectionRunnerHasNoEdictLabel(t *testing.T) {
+	labels := SandboxLabels("Test/Project", 1234, 0)
+	assert.Equal(t, "test-project", labels[SandboxLabelProject], "slug must be sanitized like the container name")
+	assert.Equal(t, "1234", labels[SandboxLabelOwnerPID])
+	_, hasEdict := labels[SandboxLabelEdict]
+	assert.False(t, hasEdict, "the connection runner must not carry an edict label")
+
+	withEdict := SandboxLabels("test/project", 1234, 985)
+	assert.Equal(t, "985", withEdict[SandboxLabelEdict], "a per-edict container must record its edict")
+}
+
+// TestEdictIDFromIdentifier pins the runner-name-to-edict mapping the labels
+// depend on: "e42" is edict 42, a connection's numeric identifier is not.
+func TestEdictIDFromIdentifier(t *testing.T) {
+	assert.Equal(t, uint(42), edictIDFromIdentifier("e42"))
+	assert.Equal(t, uint(0), edictIDFromIdentifier("1"), "connection identifiers carry no edict")
+	assert.Equal(t, uint(0), edictIDFromIdentifier("e"), "a bare prefix is not an edict")
+	assert.Equal(t, uint(0), edictIDFromIdentifier("ex"), "a non-numeric suffix is not an edict")
+}
+
+// fakeContainerBackend records removals so the janitor's decisions can be
+// asserted without a podman daemon.
+type fakeContainerBackend struct {
+	containers []SandboxContainer
+	listErr    error
+	removeErr  error
+	removed    []string
+}
+
+func (f *fakeContainerBackend) ListSandboxes(context.Context) ([]SandboxContainer, error) {
+	return f.containers, f.listErr
+}
+
+func (f *fakeContainerBackend) RemoveSandbox(_ context.Context, id string) error {
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	f.removed = append(f.removed, id)
+	return nil
+}
+
+// fakeDiskBackend reports a fixed free space and counts prunes.
+type fakeDiskBackend struct {
+	freeMiB   int64
+	freeErr   error
+	pruneErr  error
+	pruneRuns int
+}
+
+func (f *fakeDiskBackend) SandboxFreeMiB(context.Context) (int64, error) {
+	return f.freeMiB, f.freeErr
+}
+
+func (f *fakeDiskBackend) PruneSandboxArtifacts(context.Context) (int, error) {
+	f.pruneRuns++
+	if f.pruneErr != nil {
+		return 0, f.pruneErr
+	}
+	return 3, nil
+}
+
+func newTestJanitor(containers SandboxContainerBackend, disk SandboxDiskBackend, alive map[int]bool) *SandboxJanitor {
+	return &SandboxJanitor{
+		Containers:   containers,
+		Disk:         disk,
+		OrphanMaxAge: time.Hour,
+		ProcessAlive: func(pid int) bool { return alive[pid] },
+		Now:          func() time.Time { return time.Now() },
+	}
+}
+
+// TestJanitorReconcile_RemovesDeadOwnerPreservesLiveOwner is the edict 985
+// invariant: a container whose owning process is dead is reaped; one whose
+// owner may still be live is preserved.
+func TestJanitorReconcile_RemovesDeadOwnerPreservesLiveOwner(t *testing.T) {
+	backend := &fakeContainerBackend{containers: []SandboxContainer{
+		{ID: "orphan", Name: "asimi-shell-proj-e1", Labels: map[string]string{SandboxLabelOwnerPID: "4242"}},
+		{ID: "live", Name: "asimi-shell-proj-e2", Labels: map[string]string{SandboxLabelOwnerPID: "5252"}},
+	}}
+	j := newTestJanitor(backend, nil, map[int]bool{5252: true})
+
+	removed, err := j.ReconcileOrphans(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, removed)
+	assert.Equal(t, []string{"orphan"}, backend.removed,
+		"the dead owner's container must be reaped and the live owner's preserved")
+}
+
+// TestJanitorReconcile_LegacyContainerByAge proves unlabeled containers (created
+// before labels landed) are only reaped once old enough — an owner may still be
+// live, so age is the only safe signal.
+func TestJanitorReconcile_LegacyContainerByAge(t *testing.T) {
+	now := time.Now()
+	backend := &fakeContainerBackend{containers: []SandboxContainer{
+		{ID: "old", Name: "asimi-shell-proj-7", Created: now.Add(-2 * time.Hour)},
+		{ID: "new", Name: "asimi-shell-proj-8", Created: now.Add(-time.Minute)},
+		{ID: "unknown-age", Name: "asimi-shell-proj-9"},
+	}}
+	j := newTestJanitor(backend, nil, nil)
+	j.Now = func() time.Time { return now }
+
+	removed, err := j.ReconcileOrphans(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, removed)
+	assert.Equal(t, []string{"old"}, backend.removed,
+		"only the aged unlabeled container is safe to reap")
+}
+
+// TestJanitorReconcile_ZeroMaxAgeDisablesLegacyReaping preserves every unlabeled
+// container when the age fallback is disabled.
+func TestJanitorReconcile_ZeroMaxAgeDisablesLegacyReaping(t *testing.T) {
+	backend := &fakeContainerBackend{containers: []SandboxContainer{
+		{ID: "old", Name: "asimi-shell-proj-7", Created: time.Now().Add(-1000 * time.Hour)},
+	}}
+	j := newTestJanitor(backend, nil, nil)
+	j.OrphanMaxAge = 0
+
+	removed, err := j.ReconcileOrphans(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, removed)
+	assert.Empty(t, backend.removed, "a zero max age disables the legacy fallback")
+}
+
+// TestJanitorReconcile_ListErrorIsReturned proves a listing failure is reported,
+// not silently treated as "nothing to do".
+func TestJanitorReconcile_ListErrorIsReturned(t *testing.T) {
+	backend := &fakeContainerBackend{listErr: errors.New("podman down")}
+	j := newTestJanitor(backend, nil, nil)
+
+	_, err := j.ReconcileOrphans(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "podman down")
+}
+
+// TestJanitorReconcile_RemoveFailureContinues proves one failed removal does not
+// abort the sweep; the remaining orphans are still reaped.
+func TestJanitorReconcile_RemoveFailureContinues(t *testing.T) {
+	backend := &fakeContainerBackend{
+		containers: []SandboxContainer{
+			{ID: "a", Labels: map[string]string{SandboxLabelOwnerPID: "1"}},
+			{ID: "b", Labels: map[string]string{SandboxLabelOwnerPID: "2"}},
+		},
+		removeErr: errors.New("already gone"),
+	}
+	j := newTestJanitor(backend, nil, nil)
+
+	removed, err := j.ReconcileOrphans(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, removed, "a failed removal is not counted as reaped")
+}
+
+// TestNewSandboxJanitor_HostRunnerIsNil proves a runner that cannot speak to
+// podman yields no janitor, so callers never attempt reconciliation through it.
+func TestNewSandboxJanitor_HostRunnerIsNil(t *testing.T) {
+	host := NewHostRunner(1, t.TempDir())
+	assert.Nil(t, NewSandboxJanitor(host, nil), "a host runner has no podman state to reconcile")
+}
+
+// TestDiskGuard_PrunesBelowThresholdAndNoOpsAtZero covers the edict 985 disk
+// guard: prune only under pressure, and 0 disables entirely.
+func TestDiskGuard_PrunesBelowThresholdAndNoOpsAtZero(t *testing.T) {
+	t.Run("below threshold prunes", func(t *testing.T) {
+		disk := &fakeDiskBackend{freeMiB: 100}
+		j := newTestJanitor(nil, disk, nil)
+
+		pruned, err := j.EnsureDiskHeadroom(context.Background(), 4096)
+		require.NoError(t, err)
+		assert.True(t, pruned, "free space below the floor must trigger a prune")
+		assert.Equal(t, 1, disk.pruneRuns)
+	})
+
+	t.Run("above threshold no-ops", func(t *testing.T) {
+		disk := &fakeDiskBackend{freeMiB: 8192}
+		j := newTestJanitor(nil, disk, nil)
+
+		pruned, err := j.EnsureDiskHeadroom(context.Background(), 4096)
+		require.NoError(t, err)
+		assert.False(t, pruned)
+		assert.Zero(t, disk.pruneRuns, "a healthy store must never be pruned")
+	})
+
+	t.Run("zero disables", func(t *testing.T) {
+		disk := &fakeDiskBackend{freeMiB: 1}
+		j := newTestJanitor(nil, disk, nil)
+
+		pruned, err := j.EnsureDiskHeadroom(context.Background(), 0)
+		require.NoError(t, err)
+		assert.False(t, pruned)
+		assert.Zero(t, disk.pruneRuns, "0 disables the guard")
+	})
+}
+
+// TestDiskGuard_UnavailableFreeSpaceIsNoOp proves the guard never blocks on a
+// failed free-space query: it is a safety net, not a gate.
+func TestDiskGuard_UnavailableFreeSpaceIsNoOp(t *testing.T) {
+	disk := &fakeDiskBackend{freeErr: errors.New("no store info")}
+	j := newTestJanitor(nil, disk, nil)
+
+	pruned, err := j.EnsureDiskHeadroom(context.Background(), 4096)
+	require.NoError(t, err)
+	assert.False(t, pruned)
+	assert.Zero(t, disk.pruneRuns, "an unreadable free space must not trigger pruning")
+}
+
+// TestProcessAlive pins the real liveness signal the janitor depends on. The
+// unit tests inject a fake ProcessAlive, so without this the one function that
+// actually distinguishes an orphan from a live owner is never exercised.
+func TestProcessAlive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot verify process liveness; processAlive reports alive by design")
+	}
+	assert.True(t, processAlive(os.Getpid()), "the test process itself is alive")
+	assert.False(t, processAlive(0), "pid 0 is never a live process")
+
+	// A reaped child is provably dead: signal 0 must report ESRCH.
+	cmd := exec.Command("true")
+	require.NoError(t, cmd.Start())
+	pid := cmd.Process.Pid
+	require.NoError(t, cmd.Wait())
+	assert.False(t, processAlive(pid), "a reaped child must not be reported alive")
+}
+
+// TestSandboxContainerPrefix proves the legacy-container prefix is built from
+// the sanitized slug, exactly as the container name is.
+func TestSandboxContainerPrefix(t *testing.T) {
+	assert.Equal(t, "asimi-shell-test-project-", sandboxContainerPrefix("Test/Project"))
+}
+
+// TestHasNamePrefix covers the fallback matcher: it must tolerate the leading
+// slash some podman endpoints include, or legacy containers become invisible and
+// are never reaped.
+func TestHasNamePrefix(t *testing.T) {
+	prefix := "asimi-shell-proj-"
+	assert.True(t, hasNamePrefix([]string{"/asimi-shell-proj-e1"}, prefix), "a leading slash must be tolerated")
+	assert.True(t, hasNamePrefix([]string{"asimi-shell-proj-e1"}, prefix))
+	assert.False(t, hasNamePrefix([]string{"asimi-shell-other-e1"}, prefix))
+	assert.False(t, hasNamePrefix([]string{"asimi-shell-proj"}, prefix), "a name shorter than the prefix cannot match")
+	assert.False(t, hasNamePrefix(nil, prefix))
+}
+
+// TestContainerDisplayName proves the log helper falls back to the ID.
+func TestContainerDisplayName(t *testing.T) {
+	assert.Equal(t, "asimi-shell-proj-e1", containerDisplayName([]string{"asimi-shell-proj-e1"}, "id123"))
+	assert.Equal(t, "id123", containerDisplayName(nil, "id123"))
+}
+
+// TestListSandboxes_SelectsThisProjectsContainers is the coverage for the
+// client-side selection that keeps legacy (unlabeled) containers visible: the
+// project's labeled and name-prefixed containers are returned, an unrelated
+// container is not.
+func TestListSandboxes_SelectsThisProjectsContainers(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	mock.mu.Lock()
+	mock.containersJSON = `[
+		{"Id":"c1","Names":["/asimi-shell-test-list-e1"],"Labels":{"asimi.project":"test-list","asimi.owner_pid":"111"}},
+		{"Id":"c2","Names":["/asimi-shell-test-list-legacy"],"Labels":{}},
+		{"Id":"c3","Names":["/other-container"],"Labels":{"asimi.project":"somebody-else"}}
+	]`
+	mock.mu.Unlock()
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/list"}, "e1", nil)
+	runner.conn = connCtx
+
+	got, err := runner.ListSandboxes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 2, "only this project's labeled and name-prefixed containers are listed")
+	ids := []string{got[0].ID, got[1].ID}
+	assert.ElementsMatch(t, []string{"c1", "c2"}, ids)
+}
+
+// TestRemoveSandbox_HitsPodman proves the janitor's removal reaches the podman
+// API rather than being a silent no-op.
+func TestRemoveSandbox_HitsPodman(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/rm"}, "e1", nil)
+	runner.conn = connCtx
+
+	require.NoError(t, runner.RemoveSandbox(context.Background(), "orphan"))
+
+	mock.mu.Lock()
+	count := mock.removeCount
+	mock.mu.Unlock()
+	assert.Equal(t, 1, count, "removal must issue a podman DELETE")
+}
+
+// TestSandboxFreeMiB_ComputesFromStore proves the disk guard reads real store
+// usage: free = allocated - used, in MiB.
+func TestSandboxFreeMiB_ComputesFromStore(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	mock.mu.Lock()
+	// 4 GiB allocated, 1 GiB used → 3072 MiB free.
+	mock.infoJSON = `{"store":{"graphRootAllocated":4294967296,"graphRootUsed":1073741824}}`
+	mock.mu.Unlock()
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/free"}, "e1", nil)
+	runner.conn = connCtx
+
+	free, err := runner.SandboxFreeMiB(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(3072), free)
+}
+
+// TestPruneSandboxArtifacts_HitsPodman proves the reap actually calls prune with
+// the builder cache included.
+func TestPruneSandboxArtifacts_HitsPodman(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/prune"}, "e1", nil)
+	runner.conn = connCtx
+
+	pruned, err := runner.PruneSandboxArtifacts(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, pruned)
+
+	mock.mu.Lock()
+	count := mock.pruneCount
+	mock.mu.Unlock()
+	assert.Equal(t, 1, count, "artifact reclamation must issue a podman prune")
 }

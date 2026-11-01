@@ -112,3 +112,17 @@ func TestDefaultSessionConfig_Table(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultConfig_DiskMinFreeMiB verifies edict 985: the disk-pressure guard
+// ships enabled with a sensible floor (so a full podman VM prunes before it
+// wedges) and a positive default is what a field left unset would lack.
+func TestDefaultConfig_DiskMinFreeMiB(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Sandbox.DiskMinFreeMiB != DefaultDiskMinFreeMiB {
+		t.Fatalf("DefaultConfig Sandbox.DiskMinFreeMiB = %d, want %d",
+			cfg.Sandbox.DiskMinFreeMiB, DefaultDiskMinFreeMiB)
+	}
+	if DefaultDiskMinFreeMiB <= 0 {
+		t.Fatalf("DefaultDiskMinFreeMiB must be positive to guard the store, got %d", DefaultDiskMinFreeMiB)
+	}
+}

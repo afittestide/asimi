@@ -140,6 +140,10 @@ type SandboxConfig struct {
 	// former unbounded `--ignored` copy did, multiplying secrets exposure and
 	// duplicating gigabytes per edict. Empty means copy nothing.
 	IgnoreCopyGlobs []string `koanf:"ignore_copy_globs"`
+	// DiskMinFreeMiB is the free-space floor, in MiB, on the podman store. When
+	// free space drops below it, reclaimable build artifacts (dangling images,
+	// builder cache) are pruned before a container is created. 0 disables.
+	DiskMinFreeMiB int `koanf:"disk_min_free_mib"`
 }
 
 // DefaultIgnoreCopyGlobs is the built-in safe allowlist for
@@ -164,6 +168,11 @@ func DefaultCacheVolumes() []Mount {
 		{Source: "asimi-gomodcache-<slug>", Destination: "/go/pkg/mod"},
 	}
 }
+
+// DefaultDiskMinFreeMiB is the default free-space floor (4 GiB) for the podman
+// store. It is generous enough not to prune on a healthy machine but fires
+// before the VM wedges; 0 disables the guard.
+const DefaultDiskMinFreeMiB = 4096
 
 // CourtConfig holds configuration for the Court.
 type CourtConfig struct {

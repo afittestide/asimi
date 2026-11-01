@@ -92,6 +92,7 @@ func DefaultConfig() Config {
 			ApprovalTimeout: 120 * time.Second,
 			IgnoreCopyGlobs: DefaultIgnoreCopyGlobs(),
 			CacheVolumes:    DefaultCacheVolumes(),
+			DiskMinFreeMiB:  DefaultDiskMinFreeMiB,
 		},
 	}
 }
