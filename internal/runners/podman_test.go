@@ -1182,6 +1182,242 @@ func TestPodmanImageExistsErrorPodmanMissing(t *testing.T) {
 	}
 }
 
+// withExecPodman stubs the podman exec seam for the duration of a test and
+// restores it afterwards. It returns a pointer to the recorded call log so a
+// test can assert which podman subcommands ran (and in what order).
+func withExecPodman(t *testing.T, fn func(ctx context.Context, args ...string) ([]byte, error)) *[][]string {
+	t.Helper()
+	orig := execPodman
+	calls := &[][]string{}
+	execPodman = func(ctx context.Context, args ...string) ([]byte, error) {
+		*calls = append(*calls, append([]string(nil), args...))
+		return fn(ctx, args...)
+	}
+	t.Cleanup(func() { execPodman = orig })
+	return calls
+}
+
+// TestIsPullableImage: only a fully-qualified remote reference is pullable. A
+// localhost/... image is a local build and must not be pulled, and a bare name
+// with neither a registry nor a tag is not a remote reference.
+func TestIsPullableImage(t *testing.T) {
+	pullable := []string{
+		"docker.io/library/golang:1.26.10-bookworm",
+		"ghcr.io/owner/image:tag",
+		"quay.io/owner/image:tag",
+		"registry.example.com/owner/image:tag",
+		"registry.example.com/owner/image", // a registry, no tag
+		"owner/image:v1",                   // an explicit :tag
+		"docker.io/library/golang@sha256:2b8c9f0e1a3d4c5b6a7980123456789abcdef0123456789abcdef0123456789", // digest-pinned
+	}
+	for _, name := range pullable {
+		assert.True(t, isPullableImage(name), "%q is a pullable remote reference", name)
+	}
+
+	notPullable := []string{
+		"localhost/asimi/sandbox/project:latest",
+		"localhost/foo",
+		"",
+		"myimage", // no registry, no tag → treated as local
+	}
+	for _, name := range notPullable {
+		assert.False(t, isPullableImage(name), "%q must not be pulled", name)
+	}
+}
+
+// TestCheckSandboxImageAvailablePullsOnMiss is the load-bearing proof for the
+// pull-on-miss preflight: when the image is absent and the reference is
+// pullable, the check must pull once and re-check — no env flag, no manual
+// `podman pull`.
+func TestCheckSandboxImageAvailablePullsOnMiss(t *testing.T) {
+	existsCalls, pullCalls := 0, 0
+	calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+		switch {
+		case len(args) >= 2 && args[0] == "image" && args[1] == "exists":
+			existsCalls++
+			if existsCalls == 1 {
+				return []byte(""), errors.New("exit status 1") // absent
+			}
+			return []byte(""), nil // present after pull
+		case len(args) >= 1 && args[0] == "pull":
+			pullCalls++
+			return []byte(""), nil
+		}
+		return nil, errors.New("unexpected podman invocation")
+	})
+
+	require.NoError(t, CheckSandboxImageAvailable(context.Background(), integrationImage, "/tmp/test"))
+	assert.Equal(t, 1, pullCalls, "a missing pullable image must be pulled exactly once")
+	assert.Equal(t, 2, existsCalls, "the image must be re-checked after the pull")
+
+	var sawPull bool
+	for _, c := range *calls {
+		if len(c) >= 2 && c[0] == "pull" && c[1] == integrationImage {
+			sawPull = true
+		}
+	}
+	assert.True(t, sawPull, "the pull must name the configured image: %v", *calls)
+}
+
+// TestCheckSandboxImageAvailableNoPullForLocalBuild: a localhost/... image is a
+// local build; a miss must surface SandboxMissingError (the build-sandbox
+// guidance), not attempt a pull.
+func TestCheckSandboxImageAvailableNoPullForLocalBuild(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.Mkdir(dir+"/.agents", 0o755))
+	image := "localhost/asimi/sandbox/test/project:latest"
+
+	calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) >= 1 && args[0] == "pull" {
+			return nil, errors.New("pull must not be attempted for a local build")
+		}
+		return []byte(""), errors.New("exit status 1")
+	})
+
+	err := CheckSandboxImageAvailable(context.Background(), image, dir)
+	require.Error(t, err)
+	missing, ok := err.(SandboxMissingError)
+	require.True(t, ok, "error = %T, want SandboxMissingError", err)
+	assert.Contains(t, missing.Error(), "just build-sandbox")
+	for _, c := range *calls {
+		assert.NotEqual(t, "pull", c[0], "a local build must not be pulled: %v", c)
+	}
+}
+
+// TestCheckSandboxImageAvailablePullFailureSurfacesMissing: a failed pull must
+// still surface SandboxMissingError so the user gets the actionable guidance,
+// not a silent success.
+func TestCheckSandboxImageAvailablePullFailureSurfacesMissing(t *testing.T) {
+	calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) >= 1 && args[0] == "pull" {
+			return []byte("Error: unable to pull image"), errors.New("exit status 125")
+		}
+		return []byte(""), errors.New("exit status 1")
+	})
+
+	err := CheckSandboxImageAvailable(context.Background(), integrationImage, t.TempDir())
+	require.Error(t, err)
+	_, ok := err.(SandboxMissingError)
+	assert.True(t, ok, "error = %T, want SandboxMissingError after a failed pull", err)
+	// Exactly one pull, one initial check, and no re-check after the failure.
+	assert.Len(t, *calls, 2, "a failed pull must not loop: %v", *calls)
+}
+
+// TestCheckSandboxImageAvailablePodmanDownIsNotAPullProblem: when podman is
+// down, a pull would be meaningless — the check must surface
+// PodmanUnavailableError without attempting to pull.
+func TestCheckSandboxImageAvailablePodmanDownIsNotAPullProblem(t *testing.T) {
+	calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) >= 1 && args[0] == "pull" {
+			return nil, errors.New("pull must not be attempted when podman is down")
+		}
+		return []byte("Cannot connect to Podman. try `podman machine start`"), errors.New("exit status 125")
+	})
+
+	err := CheckSandboxImageAvailable(context.Background(), integrationImage, "/tmp/test")
+	require.Error(t, err)
+	_, ok := err.(PodmanUnavailableError)
+	assert.True(t, ok, "error = %T, want PodmanUnavailableError", err)
+	for _, c := range *calls {
+		assert.NotEqual(t, "pull", c[0], "podman down must not trigger a pull: %v", c)
+	}
+}
+
+// TestIsPodmanAvailableIsALocalProbe: IsPodmanAvailable gates whether the runner
+// is wired up at all (InitShellRunner, RitualGuard's sandbox health check), so
+// it must be a pure local probe: it reports true only when the image is already
+// present, and it must NEVER pull. Pulling there would turn a cheap availability
+// check into an unbounded network fetch on every startup and could report a
+// sandbox as available before the pull-on-miss preflight ever runs.
+func TestIsPodmanAvailableIsALocalProbe(t *testing.T) {
+	t.Run("present image is available and never pulls", func(t *testing.T) {
+		calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+			if len(args) >= 1 && args[0] == "pull" {
+				return nil, errors.New("IsPodmanAvailable must not pull")
+			}
+			return []byte(""), nil
+		})
+		assert.True(t, IsPodmanAvailable(integrationImage))
+		for _, c := range *calls {
+			assert.NotEqual(t, "pull", c[0], "a local probe must not pull: %v", c)
+		}
+	})
+
+	t.Run("missing pullable image stays unavailable", func(t *testing.T) {
+		calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+			if len(args) >= 1 && args[0] == "pull" {
+				return nil, errors.New("IsPodmanAvailable must not pull")
+			}
+			return []byte(""), errors.New("exit status 1")
+		})
+		assert.False(t, IsPodmanAvailable(integrationImage),
+			"a missing image must not be reported available before the preflight pulls it")
+		for _, c := range *calls {
+			assert.NotEqual(t, "pull", c[0], "a local probe must not pull: %v", c)
+		}
+	})
+}
+
+// TestCheckSandboxImageAvailablePresentImageSkipsPull: when the image is already
+// present the check must return at once — no pull, no second probe. This is the
+// hot path (every runner initialization on a warm machine), and it is the branch
+// that guarantees pull-on-miss never becomes a network fetch when the sandbox is
+// ready. The pull decision must live strictly behind the absent-image branch.
+func TestCheckSandboxImageAvailablePresentImageSkipsPull(t *testing.T) {
+	calls := withExecPodman(t, func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) >= 1 && args[0] == "pull" {
+			return nil, errors.New("a present image must never be pulled")
+		}
+		return []byte(""), nil // the image exists
+	})
+
+	require.NoError(t, CheckSandboxImageAvailable(context.Background(), integrationImage, "/tmp/test"))
+	require.Len(t, *calls, 1, "a present image needs exactly one probe: %v", *calls)
+	assert.Equal(t, []string{"image", "exists", integrationImage}, (*calls)[0])
+}
+
+// TestPreflightSandboxBudgetAllowsAPull pins the widened outer budget. The local
+// `podman image exists` probe stays bounded at imageExistsTimeout (5s), but the
+// preflight must hand the image check a deadline long enough for a cold-machine
+// `podman pull` — before e1011 that budget was 5s, which silently killed the
+// pull leg and left CI red. A regression to a 5s outer budget fails this test.
+func TestPreflightSandboxBudgetAllowsAPull(t *testing.T) {
+	t.Run("missing sandbox files short-circuit before any image check", func(t *testing.T) {
+		called := false
+		runner := NewPodmanRunner(&Config{},
+			repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/preflight-files"}, "0", nil)
+		runner.checkImage = func(context.Context) error { called = true; return nil }
+
+		err := runner.preflightSandbox(context.Background())
+		var setupErr SandboxSetupMissingError
+		require.ErrorAs(t, err, &setupErr)
+		assert.False(t, called, "a missing sandbox must be reported before any image check")
+	})
+
+	t.Run("the image check gets a pull-sized budget", func(t *testing.T) {
+		projectRoot := t.TempDir()
+		makeSandboxFiles(t, projectRoot)
+		runner := NewPodmanRunner(&Config{},
+			repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/preflight-budget"}, "0", nil)
+
+		var probeCtx context.Context
+		runner.checkImage = func(ctx context.Context) error { probeCtx = ctx; return nil }
+
+		require.NoError(t, runner.preflightSandbox(context.Background()))
+		require.NotNil(t, probeCtx)
+
+		deadline, ok := probeCtx.Deadline()
+		require.True(t, ok, "the image check must be bounded, not unbounded")
+		budget := time.Until(deadline)
+		assert.Greater(t, budget, time.Minute,
+			"budget %v is too small for a pull (a 5s budget silently kills the pull leg, the pre-e1011 behaviour)", budget)
+		assert.LessOrEqual(t, budget, preflightTimeout,
+			"budget %v must not exceed preflightTimeout", budget)
+		assert.ErrorIs(t, probeCtx.Err(), context.Canceled,
+			"the preflight must cancel its probe context on return")
+	})
+}
+
 // projectCacheRoot must always return the main project root — never the
 // worktree — so GOCACHE is shared across edicts. This is the anchor that keeps
 // a worktree's `go build`/`go test` reusing the main build cache once the

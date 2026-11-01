@@ -4490,11 +4490,31 @@ type healingRunner struct {
 
 func (h *healingRunner) Run(ctx context.Context, in runners.Input) (runners.Output, error) {
 	out, err := h.Runner.Run(ctx, in)
-	if !h.healed && strings.Contains(out.Output, "is corrupt") {
+	if !h.healed && worktree.LooseObjectCorruptMessage(out.Output) {
 		h.healed = true
 		h.heal()
 	}
 	return out, err
+}
+
+// TestHealingRunnerHealsOnGit255Message pins the heal hook to the shared
+// worktree.LooseObjectCorrupt predicate: it must fire on the git 2.55 mid-replay
+// wording, not only the 2.39 "is corrupt" summary, or the real-git regression
+// below silently stops healing on the CI runner's newer git.
+func TestHealingRunnerHealsOnGit255Message(t *testing.T) {
+	inner := &worktreeTestRunner{outputs: map[string]runners.Output{
+		"rebase": {Output: "error: inflate: data stream error (incorrect header check)\n" +
+			"error: unable to unpack 6ac66c5e0dbaedc985115ed3b13afe6d4c3b01a5 header\n" +
+			"fatal: loose object 6ac66c5e0dbaedc985115ed3b13afe6d4c3b01a5 (stored in .git/objects/6a/c66c5e…) is corrupt",
+			ExitCode: "1"},
+	}}
+	healed := false
+	h := &healingRunner{Runner: inner, heal: func() { healed = true }}
+
+	_, _ = h.Run(context.Background(), runners.Input{Command: "git rebase origin/main"})
+
+	assert.True(t, healed, "the heal hook must fire on the git 2.55 mid-replay message")
+	assert.True(t, h.healed, "the heal must be recorded so it happens at most once")
 }
 
 // TestMergeEdictWorktree_RetriesAfterMidReplayCorruptLooseObject is the real-git

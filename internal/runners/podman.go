@@ -260,12 +260,17 @@ func (r *PodmanRunner) initialize(ctx context.Context) error {
 	return nil
 }
 
+// preflightTimeout bounds the whole image check. The local `podman image
+// exists` probe is bounded separately (imageExistsTimeout); this outer budget
+// exists so a pull-on-miss — not a 5s operation — is not silently timed out.
+const preflightTimeout = 5 * time.Minute
+
 func (r *PodmanRunner) preflightSandbox(ctx context.Context) error {
 	if err := r.checkSandboxFiles(); err != nil {
 		return err
 	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, preflightTimeout)
 	defer cancel()
 	return r.checkImage(probeCtx)
 }

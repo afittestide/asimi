@@ -116,15 +116,38 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, copyGl
 // tree it had itself just written, the object later proving byte-valid).
 const fsyncLooseObjects = "-c core.fsync=loose-object"
 
-// LooseObjectCorrupt reports whether err is git's "loose object … is corrupt".
-// That failure is a transient torn read of a freshly written object rather than
-// disk rot, so the caller may retry the operation once before giving up.
+// LooseObjectCorrupt reports whether err is git's torn read of a freshly
+// written loose object. That failure is transient rather than disk rot, so the
+// caller may retry the operation once before giving up.
+//
+// The wording is git-version-specific. git 2.39 reports
+// "fatal: loose object … is corrupt"; git 2.55 reports the same torn read on
+// "error: unable to unpack … header" and "error: inflate: data stream error"
+// lines (the "is corrupt" line may not reach the caller). The predicate matches
+// any of those shapes so the single retry fires on both. It stays false for
+// ordinary merge conflicts and for a genuinely absent branch, which carry none
+// of these markers.
 func LooseObjectCorrupt(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "loose object") && strings.Contains(msg, "is corrupt")
+	return LooseObjectCorruptMessage(err.Error())
+}
+
+// LooseObjectCorruptMessage reports whether msg (git's output, whether or not it
+// was wrapped into an error) describes a torn loose-object read. Callers that
+// see git's output as text — the retry heal hook, for instance — use it so they
+// cannot drift from the production condition.
+func LooseObjectCorruptMessage(msg string) bool {
+	if strings.Contains(msg, "loose object") && strings.Contains(msg, "is corrupt") {
+		return true
+	}
+	// git 2.55's mid-replay wording: the torn object surfaces as an unpack or
+	// inflate failure rather than the "is corrupt" summary line.
+	if strings.Contains(msg, "unable to unpack") && strings.Contains(msg, "header") {
+		return true
+	}
+	return strings.Contains(msg, "inflate: data stream error")
 }
 
 // AbortRebase clears leftover rebase state in the worktree at abs so a retry can

@@ -242,14 +242,36 @@ func TestSquashMerge_ConflictLeavesWorktreeIntact(t *testing.T) {
 }
 
 // TestLooseObjectCorrupt: the predicate gates the seal's single retry, so it
-// must match git's torn-read wording ("loose object … is corrupt") and nothing
-// else. A bare corruption error without the loose-object shape must not retry.
+// must match git's torn-read wording across git versions and nothing else.
+// git 2.39 reports "loose object … is corrupt"; git 2.55 surfaces the same torn
+// read mid-replay as "unable to unpack … header" / "inflate: data stream
+// error". A conflict or a missing ref must not retry.
 func TestLooseObjectCorrupt(t *testing.T) {
+	// git 2.39's wording.
 	if !LooseObjectCorrupt(errors.New("fatal: loose object 585ccf60 is corrupt")) {
-		t.Error("the torn-read wording must be recognised")
+		t.Error("the git 2.39 torn-read wording must be recognised")
+	}
+	// git 2.55's mid-replay wording: the fault surfaces on the unpack line, and
+	// the "is corrupt" summary may not be present.
+	git255 := "error: inflate: data stream error (incorrect header check)\n" +
+		"error: unable to unpack 6ac66c5e0dbaedc985115ed3b13afe6d4c3b01a5 header\n" +
+		"fatal: loose object 6ac66c5e0dbaedc985115ed3b13afe6d4c3b01a5 (stored in .git/objects/6a/c66c5e…) is corrupt"
+	if !LooseObjectCorrupt(errors.New(git255)) {
+		t.Error("the git 2.55 mid-replay wording must be recognised")
+	}
+	// The unpack/inflate lines alone (no "is corrupt" summary) are the same
+	// torn-read condition and must still be recognised.
+	if !LooseObjectCorruptMessage("error: unable to unpack abc123 header") {
+		t.Error("an unable-to-unpack header line is a torn read")
+	}
+	if !LooseObjectCorruptMessage("error: inflate: data stream error (incorrect header check)") {
+		t.Error("an inflate data-stream error is a torn read")
 	}
 	if LooseObjectCorrupt(errors.New("CONFLICT (content): merge conflict")) {
 		t.Error("a conflict is not a corrupt loose object")
+	}
+	if LooseObjectCorrupt(errors.New("fatal: invalid reference: missing-branch")) {
+		t.Error("a genuinely absent branch is not a corrupt loose object")
 	}
 	if LooseObjectCorrupt(nil) {
 		t.Error("nil is not a corruption")
