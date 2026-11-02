@@ -134,19 +134,17 @@ run:
 # test-race` (a non-final command in the CI branch) would be swallowed and the
 # recipe would still exit 0.
 #
-# The build throttle mirrors the sandbox image defaults (edict 948): cold
-# parallel compilation of the full ./... tree (modernc.org/sqlite/lib,
-# aws-sdk-go-v2/service/s3) OOM-kills the compiler in the ~2GiB sandbox, which
-# surfaces as `compile: signal: killed` → `[build failed]` and makes the
-# swift-strike judge gate misread a resource failure as a test failure. These
-# only serialize compilation; no test is skipped or weakened.
+# The Go build throttle (GOFLAGS/GOMAXPROCS/GOMEMLIMIT, edict 948) bounds
+# compilation of the full ./... tree (modernc.org/sqlite/lib,
+# aws-sdk-go-v2/service/s3) so it cannot OOM-kill the compiler on a ~2GiB host,
+# which surfaces as `compile: signal: killed` → `[build failed]` and makes the
+# swift-strike judge gate misread a resource failure as a test failure. It is a
+# host limit, not a project one, so it is not set here: on a dev station the
+# repo-root .envrc exports it via direnv, and the sandbox image carries its own
+# defaults (.agents/sandbox/Dockerfile). Nothing is skipped or weakened.
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    export GOTOOLCHAIN=auto
-    export GOFLAGS="-p=1"
-    export GOMAXPROCS=2
-    export GOMEMLIMIT=1500MiB
     mkdir -p heaven/tests
     go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test_$(date +%Y%m%dT%H%M%S).out"
     if [ -n "${CI:-}" ]; then
@@ -156,15 +154,13 @@ test:
 # Run tests under the race detector. Data races are invisible to the plain
 # `test` recipe and must be caught before a release. Scoped by default to the
 # court package — where the ritual/fork concurrency lives — because -race needs
-# CGO and the full ./... tree OOM-kills the compiler in the 2GiB sandbox.
+# CGO and the full ./... tree OOM-kills the compiler in the 2GiB sandbox. The Go
+# build throttle is a host limit and comes from .envrc / the sandbox image, not
+# from this recipe (edict 948).
 # Override with: just test-race ./court/ ./internal/runners/
 test-race *packages="./court/":
     #!/usr/bin/env bash
     set -o pipefail
-    export GOTOOLCHAIN=auto
-    export GOFLAGS="-p=1"
-    export GOMAXPROCS=2
-    export GOMEMLIMIT=1500MiB
     go test -race -parallel 1 -tags containers_image_openpgp -timeout 10m {{packages}}
 
 # Run performance benchmarks and guardrail tests
