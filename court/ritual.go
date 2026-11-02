@@ -1570,6 +1570,11 @@ func (r *RitualRunner) toInterfaceSlice(val interface{}) ([]interface{}, error) 
 		r.logger.Debug("converted work units from []map[string]interface{}",
 			"count", len(result))
 		return result, nil
+	case string:
+		// A bash given step returns its stdout as a string, and a minister
+		// act returns Result.Output (also a string). Forking over one of
+		// these is the `!find ... | fork` idiom, so strings must decompose.
+		return r.stringToWorkUnits(v)
 	default:
 		r.logger.Debug("converting work units via JSON",
 			"type", fmt.Sprintf("%T", val))
@@ -1586,6 +1591,86 @@ func (r *RitualRunner) toInterfaceSlice(val interface{}) ([]interface{}, error) 
 			"count", len(result))
 		return result, nil
 	}
+}
+
+// stringToWorkUnits decomposes a string work-unit set. JSON arrays are tried
+// first so that minister output shaped like fix-lint's
+// [{"file": ..., "errors": [...]}] keeps its keys; anything else falls back to
+// xargs-style tokenization. Newline-separated input (from `find`) is the
+// documented, space-safe feeding convention, and whitespace splitting matches
+// POSIX xargs — the loose split is intentional.
+func (r *RitualRunner) stringToWorkUnits(s string) ([]interface{}, error) {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "[") {
+		var decoded []interface{}
+		if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+			r.logger.Debug("converted work units from JSON-array string",
+				"count", len(decoded))
+			return decoded, nil
+		}
+	}
+	tokens := splitXargsArgs(s)
+	result := make([]interface{}, len(tokens))
+	for i, tok := range tokens {
+		result[i] = tok
+	}
+	r.logger.Debug("converted work units from xargs-style string",
+		"count", len(result))
+	return result, nil
+}
+
+// splitXargsArgs tokenizes s the way POSIX xargs does by default: items are
+// separated by blanks (space, tab, newline); single and double quotes group
+// runs of characters including blanks; a backslash escapes the next character
+// (including a newline, giving line continuation); consecutive blanks collapse
+// and leading/trailing blanks are skipped. Empty input yields no tokens.
+func splitXargsArgs(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inToken := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && i+1 < len(s):
+			i++
+			// A backslash-newline is a line continuation: the newline is
+			// consumed, joining the two runs into one token.
+			if s[i] != '\n' {
+				cur.WriteByte(s[i])
+			}
+			inToken = true
+		case c == '\'':
+			inToken = true
+			i++
+			for i < len(s) && s[i] != '\'' {
+				cur.WriteByte(s[i])
+				i++
+			}
+		case c == '"':
+			inToken = true
+			i++
+			for i < len(s) && s[i] != '"' {
+				if s[i] == '\\' && i+1 < len(s) {
+					i++
+				}
+				cur.WriteByte(s[i])
+				i++
+			}
+		case c == ' ' || c == '\t' || c == '\n':
+			if inToken {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteByte(c)
+			inToken = true
+		}
+	}
+	if inToken {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
 }
 
 // executeForkDAG executes work units respecting dependency ordering by driving

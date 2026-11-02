@@ -352,6 +352,48 @@ func TestToInterfaceSlice(t *testing.T) {
 			wantLen: 4,
 			wantErr: false,
 		},
+		{
+			name:    "newline separated string",
+			input:   "tests/A/a.py\ntests/A/b.py\ntests/A/c.py\n",
+			wantLen: 3,
+			wantErr: false,
+		},
+		{
+			name:    "space separated string",
+			input:   "a.py b.py c.py",
+			wantLen: 3,
+			wantErr: false,
+		},
+		{
+			name:    "quoted path with space",
+			input:   "'a b.py'",
+			wantLen: 1,
+			wantErr: false,
+		},
+		{
+			name:    "json array of objects",
+			input:   `[{"file":"a.go","errors":["e1"]},{"file":"b.go","errors":[]}]`,
+			wantLen: 2,
+			wantErr: false,
+		},
+		{
+			name:    "empty string",
+			input:   "",
+			wantLen: 0,
+			wantErr: false,
+		},
+		{
+			name:    "whitespace only string",
+			input:   "   \n\t ",
+			wantLen: 0,
+			wantErr: false,
+		},
+		{
+			name:    "non-array json string falls back to xargs",
+			input:   "{}",
+			wantLen: 1,
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -363,6 +405,78 @@ func TestToInterfaceSlice(t *testing.T) {
 			}
 			if len(result) != tt.wantLen {
 				t.Errorf("expected %d items, got %d", tt.wantLen, len(result))
+			}
+		})
+	}
+}
+
+// TestToInterfaceSlice_StringValues pins the exact decomposition of string work
+// units — order, quoting and JSON object shape — not just the item count.
+func TestToInterfaceSlice_StringValues(t *testing.T) {
+	db := setupRitualTestDB(t)
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, nil, repo.RepoInfo{})
+
+	got, err := runner.toInterfaceSlice("tests/A/a.py\ntests/A/b.py\n")
+	if err != nil {
+		t.Fatalf("toInterfaceSlice() error = %v", err)
+	}
+	if len(got) != 2 || got[0] != "tests/A/a.py" || got[1] != "tests/A/b.py" {
+		t.Errorf("newline split = %v, want [tests/A/a.py tests/A/b.py]", got)
+	}
+
+	got, err = runner.toInterfaceSlice("'a b.py'")
+	if err != nil {
+		t.Fatalf("toInterfaceSlice() error = %v", err)
+	}
+	if len(got) != 1 || got[0] != "a b.py" {
+		t.Errorf("quoted split = %v, want [a b.py]", got)
+	}
+
+	got, err = runner.toInterfaceSlice(`[{"file":"a.go","errors":["e1"]}]`)
+	if err != nil {
+		t.Fatalf("toInterfaceSlice() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("json split len = %d, want 1", len(got))
+	}
+	m, ok := got[0].(map[string]interface{})
+	if !ok || m["file"] != "a.go" {
+		t.Errorf("json split = %#v, want map with file=a.go", got[0])
+	}
+}
+
+// TestSplitXargsArgs covers the POSIX xargs tokenization rules directly.
+func TestSplitXargsArgs(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"blanks collapse", "a   b\t\tc", []string{"a", "b", "c"}},
+		{"leading trailing blanks", "  a b  ", []string{"a", "b"}},
+		{"single quotes group blanks", "'a b' c", []string{"a b", "c"}},
+		{"double quotes group blanks", `"a b" c`, []string{"a b", "c"}},
+		{"backslash escapes space", `a\ b c`, []string{"a b", "c"}},
+		{"backslash newline continues", "a\\\nb", []string{"ab"}},
+		// Inside double quotes a backslash escapes the next character, so an
+		// escaped quote does not close the run and the backslash is dropped.
+		{"double quoted escaped quote", `"a\"b" c`, []string{`a"b`, "c"}},
+		{"double quoted escaped backslash", `"a\\b" c`, []string{`a\b`, "c"}},
+		{"empty input", "", nil},
+		{"whitespace only", " \n\t", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitXargsArgs(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitXargsArgs(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitXargsArgs(%q)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
+				}
 			}
 		})
 	}
@@ -1054,6 +1168,153 @@ func recipeBody(justfile, header string) string {
 		body = append(body, line)
 	}
 	return strings.Join(body, "\n")
+}
+
+// TestExecuteForkStep_BashGivenString is the end-to-end regression for edict
+// 1000: a bash `given:` stores its stdout as a string, and `fork: {over: ...}`
+// must iterate that string. Two newline-separated paths must produce two fork
+// results.
+func TestExecuteForkStep_BashGivenString(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "fork-bash-string-test",
+		Steps: []RitualStep{
+			{
+				Name: "process-all",
+				Given: []string{
+					"!printf 'a\\nb\\n'  # units",
+				},
+				Fork: &ForkDef{
+					Over:      "units",
+					BatchSize: 1,
+				},
+				Work: []RitualStep{
+					{Name: "process", Minister: "forge", Act: "process {{ .item }}"},
+				},
+			},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 10),
+		result:       "done",
+	}
+	go forgeM.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{"forge": forgeM},
+		logger:    slog.Default(),
+	}
+
+	mockRunner := &mockCmdRunner{output: "a\nb\n", exitCode: "0"}
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, mockRunner, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(ctx, "fork-bash-string-test", ek(9), nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to start ritual: %v", err)
+	}
+
+	if err := runner.Run(ctx, exec); err != nil {
+		t.Fatalf("Ritual run failed: %v", err)
+	}
+
+	forkData, ok := exec.Data["fork"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected fork data in exec.Data")
+	}
+	out, ok := forkData["out"].([]ForkResult)
+	if !ok {
+		t.Fatal("expected fork out results")
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 fork results from bash string, got %d", len(out))
+	}
+	items := map[string]bool{}
+	for _, res := range out {
+		items[fmt.Sprintf("%v", res.Item)] = true
+	}
+	if !items["a"] || !items["b"] {
+		t.Errorf("expected items a and b, got %v", items)
+	}
+}
+
+// TestExecuteForkStep_EmptyBashGivenString covers acceptance criterion 1's
+// empty case end-to-end: a bash `given:` that prints nothing yields a string
+// that decomposes to zero work units, so the fork must complete successfully
+// with zero results rather than erroring. This exercises the zero-work-unit
+// branch of executeForkDAG (court/ritual.go).
+func TestExecuteForkStep_EmptyBashGivenString(t *testing.T) {
+	db := setupRitualTestDB(t)
+
+	ritual := &RitualDef{
+		Name: "fork-empty-string-test",
+		Steps: []RitualStep{
+			{
+				Name:  "process-all",
+				Given: []string{"!true  # units"},
+				Fork: &ForkDef{
+					Over:      "units",
+					BatchSize: 1,
+				},
+				Work: []RitualStep{
+					{Name: "process", Minister: "forge", Act: "process {{ .item }}"},
+				},
+			},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	forgeM := &ritualTestMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 10),
+		result:       "done",
+	}
+	go forgeM.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{"forge": forgeM},
+		logger:    slog.Default(),
+	}
+
+	// The given step succeeds but emits no output, so the string is empty.
+	mockRunner := &mockCmdRunner{output: "", exitCode: "0"}
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, mockRunner, nil, repo.RepoInfo{})
+
+	exec, err := runner.Start(ctx, "fork-empty-string-test", ek(9), nil, nil)
+	if err != nil {
+		t.Fatalf("Failed to start ritual: %v", err)
+	}
+
+	if err := runner.Run(ctx, exec); err != nil {
+		t.Fatalf("Ritual run with zero work units must not fail: %v", err)
+	}
+
+	forkData, ok := exec.Data["fork"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected fork data in exec.Data")
+	}
+	out, ok := forkData["out"].([]ForkResult)
+	if !ok {
+		t.Fatal("expected fork out results")
+	}
+	if len(out) != 0 {
+		t.Fatalf("expected 0 fork results from an empty string, got %d", len(out))
+	}
 }
 
 // mockCallCountRunner implements runners.Runner for fork tests

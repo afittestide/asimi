@@ -2930,6 +2930,31 @@ func TestFixLintRitual(t *testing.T) {
 	if forkStep.Fork.BatchSize != 5 {
 		t.Fatalf("fix-lint: expected batch_size 5, got %d", forkStep.Fork.BatchSize)
 	}
+
+	// The structural check above never proves the mechanism works. The lint
+	// step is a forge act whose result is a string; forking over it must decode
+	// the JSON array (edict 1000).
+	db := setupRitualTestDB(t)
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, nil, repo.RepoInfo{})
+	exec := &RitualExecution{
+		ID:         "fix-lint-exec",
+		RitualName: "fix-lint",
+		Data: storage.JSON{
+			"lint": `[{"file":"a.go","errors":["unused"]},{"file":"b.go","errors":[]}]`,
+		},
+	}
+
+	units, err := runner.getForkWorkUnits(exec, "lint")
+	if err != nil {
+		t.Fatalf("getForkWorkUnits(lint) error = %v", err)
+	}
+	if len(units) != 2 {
+		t.Fatalf("expected 2 fork items decoded from lint string, got %d", len(units))
+	}
+	first, ok := units[0].(map[string]interface{})
+	if !ok || first["file"] != "a.go" {
+		t.Errorf("expected first item to be map with file=a.go, got %#v", units[0])
+	}
 }
 
 // TestRitualSessionIDTracking verifies that session_id is captured during ritual execution
