@@ -122,12 +122,17 @@ run:
     go build -tags containers_image_openpgp .
     ./asimi --debug
 
-# Run all tests (CI mode when CI env var is set).
-# The suite also runs under the race detector — a data race is not visible to
-# the plain `go test` run, so the `test-race` recipe is the permanent gate.
-# `set -e` is load-bearing: `just test-race` is not the final command, so
-# without it a failing race step would be silently swallowed and the recipe
-# would still exit 0.
+# Run the test suite. The CI env var forks the two modes (the only such flag):
+#   - Dev station (CI unset): the plain suite, cached by Go. The fast inner loop.
+#   - CI / sandbox (CI=1): the same plain suite, then the -race gate on ./court/.
+# Both modes tee the full output to heaven/tests/test_<datetime>.out (each run
+# appends a new file, none is overwritten; heaven/ is gitignored) and CI uploads
+# heaven/ as the build artifact, so a red run's evidence outlives the job.
+#
+# `set -euo pipefail` is load-bearing twice: without pipefail the `tee` exit
+# status would mask a failing `go test`, and without -e a failing `just
+# test-race` (a non-final command in the CI branch) would be swallowed and the
+# recipe would still exit 0.
 #
 # The build throttle mirrors the sandbox image defaults (edict 948): cold
 # parallel compilation of the full ./... tree (modernc.org/sqlite/lib,
@@ -135,24 +140,6 @@ run:
 # surfaces as `compile: signal: killed` → `[build failed]` and makes the
 # swift-strike judge gate misread a resource failure as a test failure. These
 # only serialize compilation; no test is skipped or weakened.
-#
-# The run's output is archived under heaven/tests as test_<datetime>.out
-# (e.g. test_20260522T143000.out), mirroring the `vuln` report precedent: each
-# run appends a new file, none is overwritten, and heaven/ is gitignored. The
-# `set -o pipefail` is load-bearing: without it the `tee` exit status would
-# mask a failing `go test` and the gate would never fail.
-#
-# Two test modes, separated by the CI env var (the only such flag):
-#   - Dev station: set CI=1 to enable the podman integration tests. Requires
-#     podman plus network access to pull the integration image
-#     docker.io/library/golang:1.26.10-bookworm (no sandbox build or tagging).
-#   - CI: the same mode on a Linux runner with podman installed and its service
-#     socket started (see .github/workflows/ci.yml), so the integration tests
-#     run. In the sandbox and CI the runner is Linux (native podman, /tmp
-#     shared); on macOS podman runs in a VM that does not share /tmp.
-# An unreachable podman (no socket, wrong socket path, permission denied) is a
-# SKIP with a printed reason, never a failure — the integration lane degrades
-# loudly rather than reddening the whole suite.
 test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -161,8 +148,10 @@ test:
     export GOMAXPROCS=2
     export GOMEMLIMIT=1500MiB
     mkdir -p heaven/tests
-    go test -tags containers_image_openpgp -timeout 5m -v ./... | tee "heaven/tests/test_$(date +%Y%m%dT%H%M%S).out"
-    just test-race
+    go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test_$(date +%Y%m%dT%H%M%S).out"
+    if [ -n "${CI:-}" ]; then
+        just test-race
+    fi
 
 # Run tests under the race detector. Data races are invisible to the plain
 # `test` recipe and must be caught before a release. Scoped by default to the

@@ -1282,12 +1282,12 @@ func TestLoadBuiltinRituals(t *testing.T) {
 			if len(r.Steps[0].Given) != 0 {
 				t.Errorf("swift-strike forge: expected no step-level given, got %v", r.Steps[0].Given)
 			}
-			// Judge step should have Given with !just test
+			// Judge step should have Given with !CI=1 just test
 			if len(r.Steps[1].Given) == 0 {
 				t.Error("swift-strike judge step: expected given entries")
 			}
-			if r.Steps[1].Given[0] != "!just test" {
-				t.Errorf("swift-strike judge given: expected '!just test', got %q", r.Steps[1].Given[0])
+			if r.Steps[1].Given[0] != "!CI=1 just test" {
+				t.Errorf("swift-strike judge given: expected '!CI=1 just test', got %q", r.Steps[1].Given[0])
 			}
 		}
 	}
@@ -5248,7 +5248,7 @@ func TestExecuteMinisterStep_SetsRitualScriptScratchpad(t *testing.T) {
 			{
 				Name:            "judging",
 				Minister:        "judge",
-				Given:           []string{"!just test"},
+				Given:           []string{"!CI=1 just test"},
 				Act:             "Verify tests were not weakened. When judgement is done, call record_verdict",
 				Then:            []string{"the verdicts are passed"},
 				OnFailure:       "goto",
@@ -5301,8 +5301,8 @@ func TestExecuteMinisterStep_SetsRitualScriptScratchpad(t *testing.T) {
 	require.Contains(t, script, "1. **forging** — minister: forge")
 	require.Contains(t, script, "2. **judging** — minister: judge")
 
-	// Given commands verbatim — the forge must see "!just test".
-	require.Contains(t, script, `given: ["!just test"]`)
+	// Given commands verbatim — the forge must see "!CI=1 just test".
+	require.Contains(t, script, `given: ["!CI=1 just test"]`)
 
 	// Failure routing of the judging step itself.
 	require.Contains(t, script, "on_failure: goto → forging")
@@ -5383,7 +5383,7 @@ func TestRenderRitualScript(t *testing.T) {
 			{
 				Name:            "judging",
 				Minister:        "judge",
-				Given:           []string{"!just test"},
+				Given:           []string{"!CI=1 just test"},
 				Act:             "Verify tests were not weakened. When judgement is done, call record_verdict",
 				Then:            []string{"the verdicts are passed", "record the judge's seal"},
 				OnFailure:       "goto",
@@ -5408,9 +5408,9 @@ func TestRenderRitualScript(t *testing.T) {
 	require.Contains(t, script, "2. **judging** — minister: judge")
 	require.Contains(t, script, "3. **reviewing** — minister: chancellor")
 
-	// Given commands are shown verbatim (the judge's "!just test" is what
+	// Given commands are shown verbatim (the judge's "!CI=1 just test" is what
 	// the forge needs to know to make tests runnable)
-	require.Contains(t, script, `given: ["!just test"]`)
+	require.Contains(t, script, `given: ["!CI=1 just test"]`)
 
 	// Act summaries are collapsed to a single line
 	require.Contains(t, script, "act: Implement the changes for the edict: {{ .edict }}")

@@ -25,7 +25,7 @@
     - name: judging
       minister: judge
       given:
-        - "!just test"
+        - "!CI=1 just test"
       act: |
         If any tests were changed, you need to verify that were not weakened
         and that non trivial changes are justified by the edict.

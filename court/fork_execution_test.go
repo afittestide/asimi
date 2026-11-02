@@ -915,6 +915,12 @@ func TestSaveExecution_SnapshotsLiveState(t *testing.T) {
 // justfile wiring is such that `just test` propagates a `just test-race`
 // failure. Without `set -e`, test-race is a non-final command and its non-zero
 // exit would be swallowed — the exact silent regression this edict prevents.
+//
+// Per edict 1014 the gate is now the CI branch of the `test:` recipe: the dev
+// path deliberately skips `-race` to stay the fast inner loop, so the guard
+// asserts the race invocation sits inside a branch on CI. Asserting over the
+// whole file would be vacuous now — the string survives even if the dev path
+// never reaches it.
 func TestRaceGate_FailsClosed(t *testing.T) {
 	root, err := filepath.Abs("..")
 	if err != nil {
@@ -926,9 +932,16 @@ func TestRaceGate_FailsClosed(t *testing.T) {
 	}
 	content := string(data)
 
-	// The test recipe must invoke the race recipe...
-	if !strings.Contains(content, "just test-race") {
-		t.Fatal("Justfile `test` recipe does not invoke `just test-race`")
+	// The race gate must live in the `test` recipe's CI branch...
+	testRecipe := recipeBody(content, "test:")
+	if testRecipe == "" {
+		t.Fatal("could not extract `test` recipe body from Justfile")
+	}
+	if !strings.Contains(testRecipe, "${CI") {
+		t.Fatal("`test` recipe does not branch on the CI env var")
+	}
+	if !strings.Contains(testRecipe, "just test-race") {
+		t.Fatal("`test` recipe CI branch does not invoke `just test-race`")
 	}
 
 	// The race recipe must actually enable the race detector.
