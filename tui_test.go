@@ -7248,7 +7248,7 @@ func TestZhengmingPendingMsg_RoutesToMinisterTab(t *testing.T) {
 	// The judge tab's prompt should now be in answering mode
 	judgeTab := updated.tabs.TabByTarget("judge")
 	require.NotNil(t, judgeTab)
-	judgePrompt, ok := updated.prompts[judgeTab.Label]
+	judgePrompt, ok := updated.prompts[judgeTab.Target]
 	require.True(t, ok, "judge tab should have a prompt")
 	require.NotNil(t, judgePrompt.answering, "judge tab's prompt should be in answering mode after ZhengmingPendingMsg")
 	assert.Equal(t, "zhengming-test-1", judgePrompt.answering.RequestID)
@@ -7257,9 +7257,9 @@ func TestZhengmingPendingMsg_RoutesToMinisterTab(t *testing.T) {
 	// The secretary tab's prompt should NOT be in answering mode
 	secTab := updated.tabs.TabByTarget("secretary")
 	require.NotNil(t, secTab)
-	if secPrompt, ok := updated.prompts[secTab.Label]; ok {
-		assert.Nil(t, secPrompt.answering, "secretary tab's prompt should not be in answering mode")
-	}
+	secPrompt, ok := updated.prompts[secTab.Target]
+	require.True(t, ok, "secretary tab should have a prompt")
+	assert.Nil(t, secPrompt.answering, "secretary tab's prompt should not be in answering mode")
 }
 
 // TestZhengmingPendingMsg_FallbackToActiveTab verifies that when the
@@ -7984,4 +7984,68 @@ func TestRitualStepMsg_QueuedEdictWaitUnchanged(t *testing.T) {
 	last := chat.Messages[len(chat.Messages)-1]
 	assert.Contains(t, last.Content, "waiting for active ritual to finish")
 	assert.NotContains(t, last.Content, "another merge")
+}
+
+// TestHandleTabNewCommand_DuplicateMinisterTabsHaveIndependentPrompts verifies
+// that opening a second tab for a minister that already has one yields a tab
+// with a unique Target and Label, and that each tab owns a distinct
+// PromptComponent — typing into one leaves the other empty.
+func TestHandleTabNewCommand_DuplicateMinisterTabsHaveIndependentPrompts(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	// Default tabs already include a Secretary tab ("secretary"/"Secretary").
+	handleTabNewCommand(model, []string{ministers.Secretary})
+
+	newTab := model.tabs.TabByTarget("secretary-2")
+	require.NotNil(t, newTab, "second Secretary tab should have target secretary-2")
+	assert.Equal(t, "Secretary 2", newTab.Label)
+	assert.Equal(t, "Secretary", model.tabs.TabByTarget("secretary").Label)
+
+	// Each Secretary tab resolves to its own prompt component.
+	require.True(t, model.tabs.SwitchToTarget("secretary"))
+	firstPrompt := model.prompt()
+	require.True(t, model.tabs.SwitchToTarget("secretary-2"))
+	secondPrompt := model.prompt()
+	require.NotSame(t, firstPrompt, secondPrompt,
+		"duplicate minister tabs must not share a PromptComponent")
+
+	// Typing into one must not leak into the other.
+	secondPrompt.SetValue("second tab text")
+	require.True(t, model.tabs.SwitchToTarget("secretary"))
+	assert.Empty(t, model.prompt().Value(), "first tab's prompt should be untouched")
+	assert.Equal(t, "second tab text", secondPrompt.Value())
+}
+
+// TestPrompt_KeyedByTargetNotLabel pins the actual root-cause fix of e1018:
+// prompt() must resolve the active tab's PromptComponent by Target. Two live
+// tabs that share a Label but not a Target must never share a prompt. This is
+// the only guarantee that survives a future label collision (a renamed tab, a
+// def whose Title equals another's); keying by Label passes every other test in
+// this file because UniqueLabel happens to keep the labels distinct.
+func TestPrompt_KeyedByTargetNotLabel(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	require.True(t, model.tabs.SwitchToTarget("secretary"))
+	first := model.prompt()
+	first.SetValue("first tab text")
+
+	// A second tab whose Label collides with the first, but whose Target does not.
+	second := model.tabs.Add("Secretary", TabType(ministers.Secretary), "secretary-2")
+	require.Equal(t, "secretary-2", second.Target)
+	second.Label = "Secretary"
+	require.Equal(t, model.tabs.TabByTarget("secretary").Label, second.Label,
+		"precondition: both live tabs are labelled Secretary")
+
+	require.True(t, model.tabs.SwitchToTarget("secretary-2"))
+	secondPrompt := model.prompt()
+	require.NotSame(t, first, secondPrompt,
+		"tabs with equal Labels but distinct Targets must not share a PromptComponent")
+	assert.Empty(t, secondPrompt.Value(), "second tab must not read the first tab's text")
+
+	secondPrompt.SetValue("second tab text")
+	require.True(t, model.tabs.SwitchToTarget("secretary"))
+	assert.Equal(t, "first tab text", model.prompt().Value(),
+		"first tab's prompt must survive the other tab's edit")
 }

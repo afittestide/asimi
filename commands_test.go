@@ -870,3 +870,33 @@ func TestHandleSwitchCommand_ResetsTabs(t *testing.T) {
 	assert.Equal(t, len(ministers.DefaultTabIDs), model.tabs.TabCount(), "tabs must reset to defaults")
 	assert.Nil(t, model.tabs.TabByTarget("target2"), "extra tabs must be discarded")
 }
+
+// TestAddMinisterTab_ToastReportsFinalLabel covers the commands.go half of
+// e1018: addMinisterTab must toast the tab's *final* (uniquified) label — the
+// one the ruler actually sees in the tab bar — not the pre-suffix label it was
+// constructed with. Before the fix the toast always read "Opened Secretary tab"
+// even when the created tab was labelled "Secretary 2".
+func TestAddMinisterTab_ToastReportsFinalLabel(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+	model.commandLine.ClearToasts()
+	defs, err := ministers.LoadMinisters()
+	require.NoError(t, err)
+	defsByID := ministers.LookupMap(defs)
+
+	// Secretary already has a default tab, so the new one is suffixed.
+	addMinisterTab(model, defsByID, ministers.Secretary)
+
+	toasts := model.commandLine.ActiveToasts()
+	require.Len(t, toasts, 1)
+	assert.Equal(t, "Opened Secretary 2 tab", toasts[0].Message,
+		"toast must report the tab's final label, not the pre-suffix one")
+	assert.Equal(t, "success", toasts[0].Type)
+	require.NotNil(t, model.tabs.TabByTarget("secretary-2"))
+
+	// A second duplicate advances the suffix, and the toast follows it.
+	addMinisterTab(model, defsByID, ministers.Secretary)
+	toasts = model.commandLine.ActiveToasts()
+	require.Len(t, toasts, 2)
+	assert.Equal(t, "Opened Secretary 3 tab", toasts[1].Message)
+}

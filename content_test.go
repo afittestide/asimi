@@ -299,6 +299,50 @@ func TestHandleTabNewCommand_ChancellorArgOpensChancellorTab(t *testing.T) {
 	assert.Contains(t, newTab.Label, chancellorDef.Title)
 }
 
+// TestUniqueLabel_GeneratesUniqueLabels pins the label half of e1018: no two
+// tabs may share a Label, and the suffix form is space-separated ("Secretary 2")
+// — deliberately distinct from UniqueTarget's hyphen form ("secretary-2").
+func TestUniqueLabel_GeneratesUniqueLabels(t *testing.T) {
+	tm := newTestTabManager()
+
+	// Default tabs already carry the bare labels.
+	assert.Equal(t, "Secretary 2", tm.UniqueLabel("Secretary"))
+	assert.Equal(t, "Chancellor 2", tm.UniqueLabel("Chancellor"))
+	// An unused label is returned untouched.
+	assert.Equal(t, "Sage", tm.UniqueLabel("Sage"))
+
+	// Add applies the invariant: the stored label is the uniquified one.
+	first := tm.Add("Secretary", TabType(ministers.Secretary), "secretary-2")
+	assert.Equal(t, "Secretary 2", first.Label)
+	second := tm.Add("Secretary", TabType(ministers.Secretary), "secretary-3")
+	assert.Equal(t, "Secretary 3", second.Label)
+	assert.Equal(t, "Secretary 4", tm.UniqueLabel("Secretary"))
+
+	// The invariant holds across every live tab.
+	seen := map[string]bool{}
+	for i := range tm.tabs {
+		require.False(t, seen[tm.tabs[i].Label], "duplicate tab label %q", tm.tabs[i].Label)
+		seen[tm.tabs[i].Label] = true
+	}
+}
+
+// TestTabManager_AddReturnsCreatedTab pins that Add reports the tab it created
+// (with its final, uniquified label) so callers such as addMinisterTab toast the
+// label the ruler actually sees.
+func TestTabManager_AddReturnsCreatedTab(t *testing.T) {
+	tm := newTestTabManager()
+	before := len(tm.tabs)
+
+	tab := tm.Add("Secretary", TabType(ministers.Secretary), "secretary-2")
+	require.NotNil(t, tab)
+	assert.Len(t, tm.tabs, before+1)
+	assert.Equal(t, "secretary-2", tab.Target)
+	assert.Equal(t, "Secretary 2", tab.Label)
+	// The returned pointer addresses the stored tab, not a copy.
+	assert.Same(t, tab, tm.TabByTarget("secretary-2"))
+	assert.Equal(t, before, tm.activeTab, "Add switches to the new tab")
+}
+
 func TestUniqueTarget_GeneratesUniqueIDs(t *testing.T) {
 	tm := newTestTabManager()
 	// Default tabs include "chancellor" as a target

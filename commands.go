@@ -947,8 +947,8 @@ func addMinisterTab(model *TUIModel, defsByID map[string]ministers.MinisterDef, 
 		label = strings.ToUpper(ministerID[:1]) + ministerID[1:]
 	}
 	target := model.tabs.UniqueTarget(ministerID)
-	model.addTab(label, TabType(ministerID), target, nil)
-	model.commandLine.AddToast(fmt.Sprintf("Opened %s tab", label), "success", time.Second*2)
+	tab := model.tabs.Add(label, TabType(ministerID), target)
+	model.commandLine.AddToast(fmt.Sprintf("Opened %s tab", tab.Label), "success", time.Second*2)
 }
 
 func handleTabCloseCommand(model *TUIModel, args []string) tea.Cmd {

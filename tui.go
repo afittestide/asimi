@@ -34,7 +34,7 @@ type TUIModel struct {
 
 	// UI Components
 	status      StatusComponent
-	prompts     map[string]*PromptComponent
+	prompts     map[string]*PromptComponent // keyed by tab Target
 	tabs        TabManager
 	completions CompletionDialog
 	commandLine *CommandLineComponent
@@ -149,15 +149,15 @@ type pendingRetry struct {
 
 // prompt returns the PromptComponent for the active tab, creating one if needed.
 func (m *TUIModel) prompt() *PromptComponent {
-	label := m.tabs.ActiveTab().Label
-	p, ok := m.prompts[label]
+	target := m.tabs.ActiveTab().Target
+	p, ok := m.prompts[target]
 	if !ok {
 		np := NewPromptComponent(m.width, 5)
 		if m.config != nil && m.config.UI.PromptExpandedHeight > 0 {
 			np.SetExpandedHeight(m.config.UI.PromptExpandedHeight)
 		}
 		p = &np
-		m.prompts[label] = p
+		m.prompts[target] = p
 	}
 	return p
 }
@@ -287,6 +287,7 @@ func NewTUIModel(cfg *Config, repoInfo *repo.RepoInfo, promptHistory *PromptHist
 	registry := NewCommandRegistry()
 	theme := NewTheme()
 
+	// keyed by tab Target
 	prompts := map[string]*PromptComponent{}
 
 	// Create status component and set repo info

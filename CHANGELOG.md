@@ -5,6 +5,12 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Duplicate minister tabs** — opening a second tab for a minister no longer shares one prompt box; tabs are labelled "Secretary 2" and hold independent input (e1018)
+
 ## [0.15.0] - 2026-11-1
 
 ### Added

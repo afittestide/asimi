@@ -83,6 +83,8 @@ func NewTabManager(w, h int, mdEnabled bool, getStatus func() string, defs []min
 	defsByID := ministers.LookupMap(defs)
 
 	var tabs []Tab
+	// Default tab labels are assumed unique (distinct minister Titles), so they
+	// are built with NewTab directly rather than through Add/UniqueLabel.
 	for _, id := range ministers.DefaultTabIDs {
 		d := defsByID[id]
 		tabs = append(tabs, NewTab(d.Label(), TabType(id), id,
@@ -371,8 +373,30 @@ func (tm *TabManager) UniqueTarget(ministerID string) string {
 	}
 }
 
-// Add creates a new tab and switches to it
-func (tm *TabManager) Add(label string, tabType TabType, target string) {
+// UniqueLabel returns a label for the given base label that does not collide
+// with any existing tab's Label. The first occurrence uses the bare label
+// (e.g. "Secretary"); subsequent ones get a space-separated counter
+// (e.g. "Secretary 2", "Secretary 3").
+func (tm *TabManager) UniqueLabel(label string) string {
+	existing := map[string]bool{}
+	for i := range tm.tabs {
+		existing[tm.tabs[i].Label] = true
+	}
+	if !existing[label] {
+		return label
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s %d", label, n)
+		if !existing[candidate] {
+			return candidate
+		}
+	}
+}
+
+// Add creates a new tab and switches to it. The label is made unique so no
+// two tabs share a label. It returns the created tab.
+func (tm *TabManager) Add(label string, tabType TabType, target string) *Tab {
+	label = tm.UniqueLabel(label)
 	newContent := newContentComponent(tm.width, tm.height, tm.markdownEnabled, tm.getStatus)
 	// Wire loadSessionFn into dynamically-added tabs too
 	for i := range tm.tabs {
@@ -383,6 +407,7 @@ func (tm *TabManager) Add(label string, tabType TabType, target string) {
 	}
 	tm.tabs = append(tm.tabs, NewTab(label, tabType, target, newContent))
 	tm.SwitchTo(len(tm.tabs) - 1)
+	return &tm.tabs[len(tm.tabs)-1]
 }
 
 // SetLoadSessionFn wires a session-loading function into every tab's
@@ -412,6 +437,8 @@ func (tm *TabManager) ResetToDefaults() bool {
 
 	defsByID := ministers.LookupMap(tm.defs)
 	tabs := make([]Tab, 0, len(ministers.DefaultTabIDs))
+	// Default tab labels are assumed unique (distinct minister Titles), so they
+	// are built with NewTab directly rather than through Add/UniqueLabel.
 	for _, id := range ministers.DefaultTabIDs {
 		d := defsByID[id]
 		c := newContentComponent(tm.width, tm.height, tm.markdownEnabled, tm.getStatus)

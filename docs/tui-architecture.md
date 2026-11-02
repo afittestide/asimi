@@ -91,7 +91,7 @@ Default tabs are derived from `DefaultTabIDs` in `internal/ministers/constants.g
 
 - **SwitchTo(index)** — Switch active tab, calls `onTabSwitch` callback
 - **NextTab() / PrevTab()** — Wrap-around navigation (bound to `gt`/`gT` in normal mode)
-- **Add(label, type, target)** — Create a new tab and switch to it
+- **Add(label, type, target)** — Create a new tab and switch to it; the label is uniquified via `UniqueLabel` (e.g. `Secretary` → `Secretary 2`) and the created `*Tab` is returned
 - **Close()** — Close active tab (refuses if last tab or currently streaming)
 - **StreamingChat()** — Returns the chat component of the active streaming tab (falls back to any streaming tab, then active tab)
 - **StreamingChatByTab(tabID)** — Returns the chat component for a specific streaming tab
@@ -123,7 +123,7 @@ type TUIModel struct {
 
     // UI Components
     status      StatusComponent
-    prompts     map[string]*PromptComponent  // per-tab prompt components
+    prompts     map[string]*PromptComponent  // keyed by tab Target
     tabs        TabManager                    // manages all content tabs
     completions CompletionDialog
     commandLine *CommandLineComponent
@@ -156,19 +156,19 @@ Each component is self-contained and follows these patterns:
 
 ### Component Access
 
-The prompt for the active tab is accessed via the `prompt()` method (not a field), which lazily creates a `PromptComponent` if one doesn't exist for the active tab's label:
+The prompt for the active tab is accessed via the `prompt()` method (not a field), which lazily creates a `PromptComponent` if one doesn't exist for the active tab's Target. Keying by `Target` — not `Label` — is what keeps two tabs for the same minister (e.g. `Secretary` and `Secretary 2`) from sharing one input box:
 
 ```go
 func (m *TUIModel) prompt() *PromptComponent {
-    label := m.tabs.ActiveTab().Label
-    p, ok := m.prompts[label]
+    target := m.tabs.ActiveTab().Target
+    p, ok := m.prompts[target]
     if !ok {
         np := NewPromptComponent(m.width, 5)
         if m.config != nil && m.config.UI.PromptExpandedHeight > 0 {
             np.SetExpandedHeight(m.config.UI.PromptExpandedHeight)
         }
         p = &np
-        m.prompts[label] = p
+        m.prompts[target] = p
     }
     return p
 }
