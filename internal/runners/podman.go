@@ -521,6 +521,14 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	}
 
 	for _, m := range r.config.AdditionalMounts {
+		if _, err := os.Stat(m.Source); err != nil {
+			// Never hand podman a missing bind source: it silently creates an
+			// empty root-owned directory on the host, which then shadows the
+			// real config dir (e.g. ~/.config/gcloud) on the next attempt.
+			slog.Warn("skipping additional mount with a missing source",
+				"source", m.Source, "destination", m.Destination, "error", err)
+			continue
+		}
 		slog.Debug("adding additional mount", "source", m.Source, "destination", m.Destination)
 		mounts = append(mounts, spec.Mount{
 			Type:        "bind",

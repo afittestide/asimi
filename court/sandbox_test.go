@@ -138,6 +138,154 @@ func TestDockerfileThrottleIsEnvDefault(t *testing.T) {
 		"throttle must not be scoped to a RUN via go env -w")
 }
 
+// TestLiveDockerfileInstallsGoogleCloudCLI guards edict 1023: this repo's
+// live sandbox image must install the gcloud CLI from Google's apt repo so
+// ministers and rituals can run `gcloud` inside the sandbox, and it must
+// disable gcloud's interactive prompts because `podman exec` has no TTY.
+// Only the live file is guarded — the embedded template stays minimal, as the
+// Ruler scoped gcloud to this repo.
+func TestLiveDockerfileInstallsGoogleCloudCLI(t *testing.T) {
+	dockerfile := readRootFile(t, ".agents/sandbox/Dockerfile")
+
+	rawLayer, layer := gcloudDockerfileLayer(t, dockerfile)
+
+	assert.Contains(t, layer, "packages.cloud.google.com/apt",
+		"gcloud must come from Google's auditable apt repo, not a hand-rolled tarball")
+	assert.Regexp(t, `apt-get install -y --no-install-recommends[^\n]*\bgoogle-cloud-cli\b`, layer,
+		"the gcloud layer must actually install google-cloud-cli — a mention in the header comment is not an install")
+	assert.Regexp(t, `(?m)^ENV\s+CLOUDSDK_CORE_DISABLE_PROMPTS=1`, layer,
+		"non-interactive exec would stall on a gcloud prompt without this ENV")
+
+	// The gcloud layer must not use sudo: the image runs as root already.
+	assert.NotContains(t, rawLayer, "sudo",
+		"the gcloud layer must not use sudo — the image runs as root")
+}
+
+// gcloudDockerfileLayer returns the gcloud install block of a sandbox
+// Dockerfile: raw includes the comment header, code has the comment lines
+// stripped. Assertions run against code so prose in the header comment (which
+// names google-cloud-cli and CLOUDSDK_CORE_DISABLE_PROMPTS) cannot satisfy a
+// guard whose real subject — the RUN/ENV instruction — has been deleted.
+func gcloudDockerfileLayer(t *testing.T, dockerfile string) (raw, code string) {
+	t.Helper()
+	start := strings.Index(dockerfile, "# Google Cloud CLI")
+	require.NotEqual(t, -1, start, "Dockerfile must carry the gcloud install layer")
+	end := strings.Index(dockerfile[start:], "# install gh")
+	require.NotEqual(t, -1, end, "gcloud layer must sit with its own comment header")
+	// Slice only after the guard: a reworded "# install gh" header must fail
+	// with the message above, never panic on a negative index.
+	raw = dockerfile[start:]
+	if end >= 0 {
+		raw = dockerfile[start : start+end]
+	}
+
+	var b strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return raw, b.String()
+}
+
+// TestLiveProjectConfigMountsGcloudADC guards the second half of edict 1023:
+// the image's gcloud is useless unless the live project config binds the host's
+// Application Default Credentials at /root/.config/gcloud — gcloud's default
+// CLOUDSDK_CONFIG for the root user the sandbox runs as. Deleting that mount
+// leaves every other test green while the sandbox silently runs
+// unauthenticated, so the mount itself is asserted, not just the image.
+func TestLiveProjectConfigMountsGcloudADC(t *testing.T) {
+	conf := readRootFile(t, ".agents/asimi.conf")
+
+	// Parse the mounts by hand rather than pulling a TOML dependency into the
+	// court package: the file is small and the assertions are about the mount
+	// pair, not about TOML semantics.
+	fieldRe := regexp.MustCompile(`(?m)^\s*(source|destination)\s*=\s*"([^"]*)"`)
+	var mounted bool
+	for _, block := range strings.Split(conf, "[[sandbox.additional_mounts]]")[1:] {
+		var text strings.Builder
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "[") {
+				break // next table
+			}
+			text.WriteString(line)
+			text.WriteString("\n")
+		}
+		fields := map[string]string{}
+		for _, f := range fieldRe.FindAllStringSubmatch(text.String(), -1) {
+			fields[f[1]] = f[2]
+		}
+		if fields["destination"] == "/root/.config/gcloud" {
+			mounted = true
+			assert.Equal(t, "~/.config/gcloud", fields["source"],
+				"the ADC mount must source the host's ~/.config/gcloud")
+		}
+	}
+	assert.True(t, mounted,
+		"project config must bind the host's gcloud ADC to /root/.config/gcloud")
+
+	// The ruling forbids moving CLOUDSDK_CONFIG into passthrough_env:
+	// /root/.config/gcloud is already gcloud's default config dir for root, and
+	// an inherited host value would point gcloud at an unmounted path.
+	for _, line := range strings.Split(conf, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "passthrough_env") {
+			continue
+		}
+		assert.NotContains(t, line, "CLOUDSDK_CONFIG",
+			"CLOUDSDK_CONFIG must not be passed through — the container path is gcloud's default")
+	}
+}
+
+// TestLiveProjectConfigHeaderIsAccurate guards the load path description that
+// heads the live project config. It is the file a user opens when a sandbox
+// mount misbehaves, so the header is the instructions they follow at that
+// moment — and it was wrong for asimi.conf's whole life (conf.toml, asimi.toml,
+// and a general ASIMI_* layer that no longer exists).
+//
+// The e985 bad-boy-scout precedent the edict invokes covers this file, but the
+// guard for the seeded template (TestDefaultConfContent_ReferencesCorrectPaths,
+// internal/config/loader_test.go) only reads the embedded default.conf — nothing
+// read the live copy, so the correction was unguarded and a reforge could
+// revert it with a green suite. The variables named here are pinned to the
+// loader's actual reads, not to prose: ASIMI_HOME (loader.go:51) and the three
+// LLM overrides (loader.go:217-223).
+func TestLiveProjectConfigHeaderIsAccurate(t *testing.T) {
+	conf := readRootFile(t, ".agents/asimi.conf")
+	header := conf
+	if i := strings.Index(conf, "\n["); i >= 0 {
+		header = conf[:i]
+	}
+	require.Contains(t, header, "asimi.conf",
+		"live config must not be headed by stale filenames (the header names the load order)")
+
+	for _, stale := range []string{"conf.toml", "asimi.toml", "ASIMI_LLM_PROVIDER"} {
+		assert.NotContains(t, header, stale,
+			"live config header still describes a path/env layer that no longer exists: %s", stale)
+	}
+	// No ASIMI_* layer exists beyond the individually read variables — koanf is
+	// loaded from file providers only (loader.go:170-197), so a wildcard layer
+	// claim is false. Allow it only as part of the list below.
+	for _, line := range strings.Split(header, "\n") {
+		if !strings.Contains(line, "ASIMI_*") {
+			continue
+		}
+		assert.Contains(t, line, "no general ASIMI_*",
+			"the header must not claim a general ASIMI_* override layer: %q", line)
+	}
+	// The variables it does name must be the ones the loader reads.
+	for _, v := range []string{"ASIMI_MODEL", "ASIMI_PROVIDER", "ASIMI_REASONING_EFFORT"} {
+		assert.Contains(t, header, v,
+			"header must name the LLM env override %s that loader.go actually reads", v)
+	}
+	assert.Contains(t, header, "ASIMI_HOME",
+		"header must name ASIMI_HOME, which loader.go reads to relocate storage")
+	// The "everything is commented out" claim was false: live tables follow.
+	assert.NotContains(t, header, "All options are commented out by default",
+		"live config's [sandbox]/[run_shell_command]/[storage] tables are active; the header cannot say all options are commented out")
+}
+
 // goFixFloor is the toolchain version that fixes GO-2026-6809
 // (crypto/x509 intermediate-cert verification). Every Go pin site must be at
 // least this version or the security gate e986 exists to pass regresses.

@@ -27,6 +27,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
+# Google Cloud CLI, for gcloud commands run by ministers inside the sandbox.
+# Installed from Google's apt repo (the distro has no google-cloud-cli package).
+# Components are pulled on demand at runtime; only the base `google-cloud-cli`
+# is baked in to keep the image small. Auth comes from the host's ADC directory,
+# bind-mounted read-write (see .agents/asimi.conf).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    apt-transport-https \
+    ca-certificates \
+    gnupg \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+       | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+       > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-cloud-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# `podman exec` runs non-interactively (bash -c, no TTY), so any gcloud prompt
+# would stall the command forever. Image ENV applies to every exec, unlike a
+# ~/.bashrc export.
+ENV CLOUDSDK_CORE_DISABLE_PROMPTS=1
+
 # install gh
 RUN mkdir -p -m 755 /etc/apt/keyrings \
 	&& out=$(mktemp) && wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg \

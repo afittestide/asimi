@@ -1847,3 +1847,40 @@ func TestDefaultConf_DiskMinFreeMiB(t *testing.T) {
 		t.Fatal("default.conf must surface sandbox.disk_min_free_mib so the field is discoverable")
 	}
 }
+
+// TestLoadProjectConfig_ExpandsAdditionalMountTilde guards the contract edict
+// 1023 depends on: the runner now os.Stat's every additional_mounts source and
+// skips it when missing, so a source the loader failed to expand would be
+// silently dropped — the sandbox would start with no ADC mount and every test
+// would stay green. Both halves are asserted: "~/..." becomes HOME-prefixed,
+// and an absolute source is passed through untouched.
+func TestLoadProjectConfig_ExpandsAdditionalMountTilde(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := `[[sandbox.additional_mounts]]
+source = "~/.config/gcloud"
+destination = "/root/.config/gcloud"
+
+[[sandbox.additional_mounts]]
+source = "/abs/host/path"
+destination = "/container/path"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.Len(t, cfg.Sandbox.AdditionalMounts, 2)
+
+	assert.Equal(t, filepath.Join(tempHome, ".config", "gcloud"), cfg.Sandbox.AdditionalMounts[0].Source,
+		"a ~/ mount source must be expanded to an absolute host path, or the runner's os.Stat check skips it")
+	assert.Equal(t, "/root/.config/gcloud", cfg.Sandbox.AdditionalMounts[0].Destination,
+		"the container destination must not be home-expanded")
+	assert.Equal(t, "/abs/host/path", cfg.Sandbox.AdditionalMounts[1].Source,
+		"an absolute source must be passed through unchanged")
+}

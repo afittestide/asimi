@@ -1644,6 +1644,103 @@ func TestCreateContainerNoCacheVolumesEmitsNone(t *testing.T) {
 	assert.Empty(t, spec.Volumes, "empty CacheVolumes must emit no named volumes")
 }
 
+// TestCreateContainerEmitsAdditionalMount proves the additional_mounts wiring:
+// a configured mount whose source exists must reach the create spec as a bind
+// mount. Edict 1023 needs this so ~/.config/gcloud lands in the sandbox.
+func TestCreateContainerEmitsAdditionalMount(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	source := t.TempDir()
+	cfg := &Config{
+		AdditionalMounts: []Mount{{Source: source, Destination: "/root/.config/gcloud"}},
+	}
+	runner := NewPodmanRunner(cfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body, "createContainer must have posted a spec to /containers/create")
+
+	var spec struct {
+		Mounts []struct {
+			Source      string `json:"source"`
+			Destination string `json:"destination"`
+			Type        string `json:"type"`
+		} `json:"mounts"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec), "create body must be a specgen JSON spec")
+
+	var found bool
+	for _, m := range spec.Mounts {
+		if m.Destination == "/root/.config/gcloud" {
+			found = true
+			assert.Equal(t, "bind", m.Type)
+			assert.Equal(t, source, m.Source)
+		}
+	}
+	assert.True(t, found, "create spec must carry the additional mount: %s", body)
+}
+
+// TestCreateContainerSkipsAdditionalMountWithMissingSource guards the
+// warn-and-skip ruling: a missing bind source must be dropped (podman would
+// silently create an empty root-owned dir on the host) and Asimi must not
+// create it itself.
+func TestCreateContainerSkipsAdditionalMountWithMissingSource(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	source := filepath.Join(t.TempDir(), "absent")
+	cfg := &Config{
+		AdditionalMounts: []Mount{{Source: source, Destination: "/root/.config/gcloud"}},
+	}
+	runner := NewPodmanRunner(cfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()),
+		"a missing mount source must not fail container creation")
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body)
+
+	var spec struct {
+		Mounts []struct {
+			Source      string `json:"source"`
+			Destination string `json:"destination"`
+			Type        string `json:"type"`
+		} `json:"mounts"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec))
+
+	for _, m := range spec.Mounts {
+		if m.Destination == "/root/.config/gcloud" {
+			t.Fatalf("a mount with a missing source must not reach the create spec: %+v", m)
+		}
+		assert.NotEqual(t, source, m.Source,
+			"the missing source must not be emitted under any destination")
+	}
+
+	_, err := os.Stat(source)
+	assert.Error(t, err, "Asimi must not create the missing mount source itself")
+}
+
 // TestCloseRemovesContainerWithVolumesFlag is the deterministic (CI-runnable)
 // half of edict 977's load-bearing survival claim. Podman reaps anonymous
 // volumes with their container but leaves *named* volumes unless the remove

@@ -125,6 +125,13 @@ destination = "/path/in/container"
 [[sandbox.additional_mounts]]
 source = "/another/host/path"
 destination = "/another/container/path"
+
+# gcloud inside the sandbox: mount the host's Application Default Credentials.
+# Read-write by design — gcloud refreshes its token DB in place, so a write
+# inside the container mutates the host's real credentials.
+[[sandbox.additional_mounts]]
+source = "~/.config/gcloud"
+destination = "/root/.config/gcloud"
 ```
 
 

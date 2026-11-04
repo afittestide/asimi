@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **gcloud in the sandbox** — this repo's sandbox image now installs the Google Cloud CLI and `.agents/asimi.conf` bind-mounts the host's gcloud Application Default Credentials (read-write, so token refresh works, at the cost that a sandbox `gcloud` write mutates the host's real credentials); a missing `additional_mounts` source is now warned about and skipped instead of being silently auto-created on the host (e1023)
+
 ### Fixed
 
 - **Duplicate minister tabs** — opening a second tab for a minister no longer shares one prompt box; tabs are labelled "Secretary 2" and hold independent input (e1018)
