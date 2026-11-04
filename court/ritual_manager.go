@@ -29,6 +29,50 @@ CRITICAL RULES:
 - Escalate urgent Zhengming that times out
 - Move failed events to DLQ after retries`
 
+// defaultFlatlineAge is how stale a running execution's updated_at may be
+// before the sweep considers reaping it. It is the *timeout* half of the
+// liveness margin: the heartbeat interval (defaultStepHeartbeat, ritual.go) is
+// the other half.
+//
+// The ratio between the two is the point of this constant. It used to be 10x
+// (30s beating, 5m window), which a starved scheduler can close: the burst
+// behind edict 1025 ran four concurrent Go forgings on a 4-core host (load
+// 7.54, every TUI frame 3.6-3.9s), and a live goroutine missed ~10 consecutive
+// beats in ~5m18s, so the reaper declared a working ritual dead. 30m against
+// 30s is a 60x margin — it absorbs the ~100x scheduling slowdown that was
+// observed for far longer than the starvation bursts last. See also the
+// sweep's re-read rule, which catches a starved beat even inside the window.
+//
+// A genuinely hung goroutine is still reaped (60x is bounded, not infinite),
+// and the idle-step timer plus the held-lock liveness guard handle the
+// hung-but-young and hung-but-locked cases respectively.
+const defaultFlatlineAge = 30 * time.Minute
+
+// staleScanInterval is the period of the stale-ritual sweep in Run. It is a
+// named constant because the reap decision depends on it: a row stale by more
+// than one full interval beyond flatlineAge was necessarily already stale at
+// the previous sweep, so it is unambiguous and needs no second observation.
+const staleScanInterval = 2 * time.Minute
+
+// staleSweepSeen tracks a running execution's staleness across consecutive
+// sweeps. flatlineAge alone cannot be re-read atomically with the reap, so a
+// single snapshot can be an unlucky tick; a row that is only *just* past the
+// window (stale by less than flatlineAge+staleScanInterval) must read stale
+// again on the next sweep before it is reaped, and a heartbeat landing in the
+// gap clears the count. Rows stale beyond that band were stale at the previous
+// sweep too and are reaped on one observation.
+//
+// It is deliberately in-memory: losing it on restart only ever *delays* a reap
+// (the row re-earns its confirmation), never causes one.
+type staleSweepSeen struct {
+	mu sync.Mutex
+	// seen[executionID] is the ordinal of the most recent sweep in which the
+	// row read stale. An entry is deleted when the row is reaped or spared.
+	seen map[string]uint64
+	// sweep is the monotonic ordinal of the current sweep pass.
+	sweep uint64
+}
+
 // EventNotificationMsg notifies the UI of significant Court events
 type EventNotificationMsg struct {
 	ChannelID string                 `msgpack:"channel_id,omitempty"`
@@ -58,6 +102,9 @@ type RitualGuard struct {
 	maxRetries     int
 	batchSize      int
 	flatlineAge    time.Duration
+	// staleSweep tracks consecutive stale observations so a single unlucky
+	// snapshot cannot reap a live ritual (see staleSweepSeen).
+	staleSweep staleSweepSeen
 	// Dependency injection (replaces *Court back-reference)
 	getMinister  func(id string) Minister
 	streamingCtx func(string) context.Context
@@ -111,7 +158,7 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 		blessedLocks:     make(map[string]*sync.Mutex),
 		maxRetries:       3,
 		batchSize:        100,
-		flatlineAge:      5 * time.Minute,
+		flatlineAge:      defaultFlatlineAge,
 		getMinister:      opts.GetMinister,
 		streamingCtx:     opts.StreamingCtx,
 		cancelRitual:     opts.CancelRitual,
@@ -383,6 +430,33 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 // the heartbeat (touchExecution) covers the complementary case, a live holder
 // whose timestamp would otherwise age past the window.
 //
+// Two guards make a *pair* the unit of evidence, not a single snapshot:
+//
+//  1. The age query is the primary signal. A row younger than flatlineAge is
+//     never touched, whatever the lock says — the lock check only ever narrows
+//     what is reaped, never widens it. (The old direction, where a free lock
+//     let a fresh row be reaped, is the e1025 live-reap bug.)
+//  2. A row that is only *just* stale — past flatlineAge by less than one
+//     sweep interval — must read stale again on the *next* sweep before it is
+//     reaped (staleSweepSeen). The gap between two sweeps is a full ticker
+//     period, so a live heartbeat has ample time to land in it and reset the
+//     row; a single unlucky snapshot — the host starving the goroutine for
+//     exactly the moment we look — cannot condemn it. A row stale by more
+//     than flatlineAge+staleScanInterval was already stale at the previous
+//     sweep, so it is unambiguous and is reaped on one observation (this is
+//     what keeps genuinely hung rows reapable, and the existing sweep tests
+//     passing).
+//
+// Before reaping we also re-read updated_at inside the decision, so the reap
+// is based on the row as it is now, not as it was when the candidate list was
+// fetched. A beat that landed while this sweep was iterating rescues the row
+// even on a second stale observation.
+//
+// Lock and re-read are evaluated together for the row, and that is the race
+// the old code ate: "lock free" was true only at the instant of the call, so
+// a ritual that had just released (or not yet taken) the lock and was still
+// heartbeating got reaped. Age is now the authority; the lock only spares.
+//
 // It is NOT called from the queue path in startRitual, where a failed TryLock
 // already proves the holder is alive and a sweep would be pure risk. The ticker
 // path (Run) is the right caller: it holds no lock, so the check is meaningful.
@@ -397,7 +471,11 @@ func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 		return
 	}
 
-	cutoff := time.Now().Add(-rg.flatlineAge)
+	now := time.Now()
+	cutoff := now.Add(-rg.flatlineAge)
+
+	staleSweep := rg.staleSweep.begin()
+
 	var staleRituals []RitualExecution
 	if err := rg.db.Where("state = ? AND username = ? AND project = ? AND updated_at < ?", RitualStateRunning, rg.Username(), rg.Project(), cutoff).
 		Find(&staleRituals).Error; err != nil {
@@ -405,32 +483,128 @@ func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 		return
 	}
 
-	for _, ritual := range staleRituals {
+	for i := range staleRituals {
+		ritual := &staleRituals[i]
+
+		// Age is the primary signal and the lock only ever narrows the reap.
+		// A row that read fresh on this re-read has just heartbeated: spare it.
+		fresh, age := rg.executionIsFresh(ritual.ID, cutoff)
+		if fresh {
+			rg.staleSweep.clear(ritual.ID)
+			continue
+		}
+
+		// Ambiguous band: the row is stale, but not by more than one sweep
+		// interval. Require a second consecutive stale observation, so a
+		// heartbeat landing between the two sweeps saves the row and a single
+		// starved snapshot cannot condemn it.
+		if age < rg.flatlineAge+staleScanInterval && !rg.staleSweep.observeStale(staleSweep, ritual.ID) {
+			rg.logger.Debug("stale-ritual sweep: awaiting second stale observation",
+				"execution_id", ritual.ID,
+				"ritual", ritual.RitualName,
+				"edict_id", ritual.EdictID,
+				"age", age)
+			continue
+		}
+
 		// Liveness guard: a held edict lock means a live goroutine owns this
 		// edict. Never reap it, however old its timestamp.
 		if !rg.edictLockFree(ritual.EdictID) {
+			rg.staleSweep.clear(ritual.ID)
 			rg.logger.Debug("skipping stale-ritual sweep: edict lock is held by a live ritual",
 				"execution_id", ritual.ID,
 				"ritual", ritual.RitualName,
 				"edict_id", ritual.EdictID)
 			continue
 		}
+
+		// Final re-read immediately before the reap: the lock probe takes a
+		// moment, and we would rather skip a reap than kill a row that just
+		// heartbeated.
+		if fresh, age := rg.executionIsFresh(ritual.ID, cutoff); fresh {
+			rg.staleSweep.clear(ritual.ID)
+			rg.logger.Debug("stale-ritual sweep: heartbeat landed before reap, sparing ritual",
+				"execution_id", ritual.ID,
+				"ritual", ritual.RitualName,
+				"edict_id", ritual.EdictID,
+				"age", age)
+			continue
+		}
+
 		rg.logger.Info("aborting stale ritual",
 			"execution_id", ritual.ID,
 			"ritual", ritual.RitualName,
 			"edict_id", ritual.EdictID,
 			"updated_at", ritual.UpdatedAt)
-		if err := rg.abortRitual(context.Background(), &ritual, "ritual exceeded flatline age"); err != nil {
+		if err := rg.abortRitual(context.Background(), ritual, "ritual exceeded flatline age"); err != nil {
 			rg.logger.Warn("failed to abort stale ritual",
 				"execution_id", ritual.ID,
 				"error", err)
+			continue
+		}
+		rg.staleSweep.clear(ritual.ID)
+	}
+}
+
+// executionIsFresh reports whether the execution row id is younger than cutoff
+// as of right now, along with its current age. A read error is treated as NOT
+// fresh — the age predicate already selected the row, so an unreadable row
+// ages out exactly like a genuinely stale one; the second-sweep confirmation
+// still has to agree, so a transient read error cannot cause a reap on its own.
+func (rg *RitualGuard) executionIsFresh(execID string, cutoff time.Time) (bool, time.Duration) {
+	var row RitualExecution
+	if err := rg.db.Select("updated_at").First(&row, "id = ?", execID).Error; err != nil {
+		return false, 0
+	}
+	return row.UpdatedAt.After(cutoff), time.Since(row.UpdatedAt)
+}
+
+// begin opens a sweep pass and returns its ordinal. Entries not touched in the
+// previous pass are pruned: keep only value >= sweep-1, so the map holds at
+// most the rows stale in the last two sweeps. An entry for a row that went
+// fresh (and therefore dropped out of the candidate query) never lingers.
+func (s *staleSweepSeen) begin() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweep++
+	if s.seen == nil {
+		s.seen = make(map[string]uint64)
+		return s.sweep
+	}
+	for id, lastStale := range s.seen {
+		if lastStale < s.sweep-1 {
+			delete(s.seen, id)
 		}
 	}
+	return s.sweep
+}
+
+// observeStale records that execID read stale during sweep pass and reports
+// whether this is the second-or-later consecutive stale observation. The map
+// holds the previous pass ordinal only: any fresh observation clears the entry,
+// so a stored value from an earlier pass is exactly "stale on the previous
+// sweep".
+func (s *staleSweepSeen) observeStale(sweep uint64, execID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.seen[execID]
+	s.seen[execID] = sweep
+	return ok && prev == sweep-1
+}
+
+// clear forgets execID's stale history — the row read fresh, was spared by a
+// guard, or was reaped.
+func (s *staleSweepSeen) clear(execID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.seen, execID)
 }
 
 // edictLockFree reports whether no in-process goroutine currently holds
 // edictID's ritual lock. It takes and immediately releases a free lock, so a
-// true result is valid at the instant of the call only.
+// true result is valid at the instant of the call only — which is why it may
+// only ever be used to *spare* a row. It must never widen a reap: a fresh row
+// is safe even when this returns true (see abortStaleRitualsIfLocked).
 func (rg *RitualGuard) edictLockFree(edictID uint) bool {
 	l := rg.edictRitualLock(edictID)
 	if !l.TryLock() {
@@ -1016,7 +1190,7 @@ func (rg *RitualGuard) Run(ctx context.Context) {
 	// Create ticker for stale ritual scan every 2 minutes. The same tick also
 	// sweeps idle per-edict containers (flatline), so no new goroutine is
 	// introduced.
-	staleScanTicker := time.NewTicker(2 * time.Minute)
+	staleScanTicker := time.NewTicker(staleScanInterval)
 	defer staleScanTicker.Stop()
 
 	for {

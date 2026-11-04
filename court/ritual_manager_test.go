@@ -886,6 +886,186 @@ func TestSweepSparesLongGivenStepInFlight(t *testing.T) {
 	}
 }
 
+// TestFreshRowWithFreeLockIsNeverReaped pins the *direction* of the liveness
+// guard: the lock check may only ever spare a row, never condemn one. A running
+// row inside the flatline window is not a reap candidate at all, however free
+// its edict lock (see TestAmbiguousStaleNeedsTwoSweeps for the reap-direction
+// regression lock). The check is the invariant; the age predicate is what
+// enforces it.
+func TestFreshRowWithFreeLockIsNeverReaped(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	// Fresh: 1m old against a 5m window.
+	fresh := &RitualExecution{
+		ID:          "fresh-and-free",
+		RitualName:  "swift-strike",
+		EdictID:     601,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	require.NoError(t, db.Save(fresh).Error)
+	freshTime := time.Now().Add(-1 * time.Minute)
+	require.NoError(t, db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?", freshTime, fresh.ID).Error)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base, flatlineAge: 5 * time.Minute}
+
+	// The lock is genuinely free — the old guard's trigger.
+	require.True(t, rg.edictLockFree(601), "precondition: the edict lock must be free")
+
+	rg.abortStaleRitualsIfLocked()
+
+	var got RitualExecution
+	require.NoError(t, db.First(&got, "id = ?", fresh.ID).Error)
+	assert.Equal(t, RitualStateRunning, got.State,
+		"a row inside the flatline window must never be reaped, whatever the lock says")
+}
+
+// TestLiveRitualSurvivesReaperReplay is the direct reversal of the e1009 reap
+// (exec 818ddae574d99aa4). That execution was aborted at 17:48:16 with a last
+// heartbeat of 17:42:58 — 317s (~5m17s) earlier, against a 30s beat — while the
+// ritual then streamed again at 17:52 and 17:55. A dead goroutine cannot
+// stream: the reaper killed work that was provably alive.
+//
+// Replayed at the real numbers: a row aged exactly 317s, with a free edict
+// lock (the old reaper's trigger). The first sweep must not act; the heartbeat
+// that the starved scheduler owed lands between sweeps; the second sweep must
+// find the row fresh and spare it. Under the old code the very first sweep
+// aborted it.
+func TestLiveRitualSurvivesReaperReplay(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	const staleFor = 317 * time.Second // the e1009 gap between beat and reap
+	exec := &RitualExecution{
+		ID:          "818ddae574d99aa4",
+		RitualName:  "swift-strike",
+		EdictID:     1009,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	require.NoError(t, db.Save(exec).Error)
+	require.NoError(t, db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?",
+		time.Now().Add(-staleFor), exec.ID).Error)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{
+		MinisterBase: base,
+		flatlineAge:  5 * time.Minute,
+		cancelRitual: func(string) { t.Error("a live ritual's context must not be cancelled") },
+	}
+	require.True(t, rg.edictLockFree(1009), "precondition: the edict lock was free when e1009 was reaped")
+
+	rg.abortStaleRitualsIfLocked()
+	var afterFirst RitualExecution
+	require.NoError(t, db.First(&afterFirst, "id = ?", exec.ID).Error)
+	require.Equal(t, RitualStateRunning, afterFirst.State,
+		"the first sweep must not reap a live, working ritual")
+
+	// The starved heartbeat finally lands — as it did at 17:52 and 17:55.
+	require.NoError(t, db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?",
+		time.Now(), exec.ID).Error)
+
+	rg.abortStaleRitualsIfLocked()
+	var afterSecond RitualExecution
+	require.NoError(t, db.First(&afterSecond, "id = ?", exec.ID).Error)
+	assert.Equal(t, RitualStateRunning, afterSecond.State,
+		"a ritual that heartbeated between sweeps must survive the reaper")
+}
+
+// TestAmbiguousStaleNeedsTwoSweeps is the e1025 confirmation rule: a row only
+// *just* past the window (stale by less than one sweep interval beyond
+// flatlineAge) is not reaped on a single observation. One snapshot can be an
+// unlucky tick — a starved scheduler holding the heartbeat off for exactly the
+// moment the sweep looks.
+func TestAmbiguousStaleNeedsTwoSweeps(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	exec := &RitualExecution{
+		ID:          "ambiguous-stale",
+		RitualName:  "swift-strike",
+		EdictID:     602,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	require.NoError(t, db.Save(exec).Error)
+	// 6m old: past the 5m window, but by less than the 2m confirmation band.
+	require.NoError(t, db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?",
+		time.Now().Add(-6*time.Minute), exec.ID).Error)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base, flatlineAge: 5 * time.Minute}
+
+	// First sweep: recorded, not reaped.
+	rg.abortStaleRitualsIfLocked()
+	var afterFirst RitualExecution
+	require.NoError(t, db.First(&afterFirst, "id = ?", exec.ID).Error)
+	assert.Equal(t, RitualStateRunning, afterFirst.State,
+		"a single ambiguous stale observation must not reap a ritual")
+
+	// Second sweep, still stale: now confirmed, and the lock is free.
+	rg.abortStaleRitualsIfLocked()
+	var afterSecond RitualExecution
+	require.NoError(t, db.First(&afterSecond, "id = ?", exec.ID).Error)
+	assert.Equal(t, RitualStateAborted, afterSecond.State,
+		"stale across two consecutive sweeps with a free lock must be reaped")
+}
+
+// TestHeartbeatBetweenSweepsSparesAmbiguousRow: the complement of the rule
+// above. A row stale on the first sweep is spared for good once a heartbeat
+// lands before the second — the live-ritual case, where the timestamp looked
+// old only because the beat had not been scheduled yet.
+func TestHeartbeatBetweenSweepsSparesAmbiguousRow(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	exec := &RitualExecution{
+		ID:          "beats-between-sweeps",
+		RitualName:  "swift-strike",
+		EdictID:     603,
+		Username:    "testuser",
+		Project:     "testproject",
+		State:       RitualStateRunning,
+		CurrentStep: 1,
+	}
+	require.NoError(t, db.Save(exec).Error)
+	require.NoError(t, db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?",
+		time.Now().Add(-6*time.Minute), exec.ID).Error)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := &RitualGuard{MinisterBase: base, flatlineAge: 5 * time.Minute}
+
+	rg.abortStaleRitualsIfLocked() // first observation: recorded
+
+	// The starved heartbeat finally lands, exactly as touchExecution would.
+	require.NoError(t, db.Exec("UPDATE ritual_executions SET updated_at = ? WHERE id = ?",
+		time.Now(), exec.ID).Error)
+
+	rg.abortStaleRitualsIfLocked() // row is now fresh: never even a candidate
+
+	var got RitualExecution
+	require.NoError(t, db.First(&got, "id = ?", exec.ID).Error)
+	assert.Equal(t, RitualStateRunning, got.State,
+		"a heartbeat between sweeps must save a live ritual from the reaper")
+}
+
+// TestFlatlineMarginOutlastsStarvedScheduler pins the ratio that is the margin
+// half of the e1025 fix. The heartbeat period must stay at least an order of
+// magnitude inside the flatline window, with headroom for the ~100x scheduling
+// slowdown observed when four Go forgings ran on a 4-core host. A regression
+// that shrinks flatlineAge back toward 5m (10x) would re-open the live-reap.
+func TestFlatlineMarginOutlastsStarvedScheduler(t *testing.T) {
+	require.Positive(t, defaultStepHeartbeat, "heartbeat must be a positive interval")
+	ratio := defaultFlatlineAge / defaultStepHeartbeat
+	assert.GreaterOrEqual(t, ratio, time.Duration(60),
+		"flatlineAge must be >= 60x the heartbeat: got %v window / %v beat = %dx",
+		defaultFlatlineAge, defaultStepHeartbeat, ratio)
+}
+
 // TestNoAbortForFreshRituals verifies that fresh running rituals are not aborted.
 func TestNoAbortForFreshRituals(t *testing.T) {
 	db := setupEventTestDB(t)

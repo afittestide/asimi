@@ -47,9 +47,18 @@ const mergeWorktreeRitual = "merge-worktree"
 // defaultStepHeartbeat is how often a running step refreshes its execution's
 // liveness timestamp in the DB. A step boundary (saveExecution) is the only
 // other writer of updated_at, so a step that legitimately runs longer than
-// flatlineAge — a full `go test`, say — is otherwise indistinguishable from a
-// hung one. At 30s the reaper's 5m window tolerates ~10 missed beats, far
-// above scheduler jitter.
+// defaultFlatlineAge — a full `go test`, say — is otherwise indistinguishable
+// from a hung one.
+//
+// This interval is only half of the liveness margin; the other half is
+// defaultFlatlineAge (ritual_manager.go). The pair is sized against a
+// *starved scheduler*, not against how long a step "should" take: the burst
+// behind edict 1025 (four concurrent Go forgings on a 4-core host, load 7.5)
+// stretched every scheduling unit by ~100x and missed ~10 consecutive beats,
+// closing the old 30s/5m (10x) margin on a live goroutine. The ratio is 60x
+// now. Widening it is safe because age is only the backstop: a stalled step is
+// normally caught by defaultStepIdleTimeout, and a live lock holder is spared
+// at any age regardless.
 const defaultStepHeartbeat = 30 * time.Second
 
 //go:embed dotagents/Justfile
