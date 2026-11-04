@@ -235,12 +235,22 @@ type responseChoice struct {
 // These carry across the RPC wire as MessagePack notifications. Field
 // tags match the canonical JSON-ish on-wire names; keep them stable.
 
-// StreamChunkMsg contains a streaming text chunk from the LLM
+// StreamChunkMsg contains a streaming text chunk from the LLM.
+//
+// LingID and MinisterID attribute the chunk to the per-ling ignition session
+// that produced it. Every ling session is attributed unconditionally: the
+// court cannot know how many lings will end up sharing one "e<N>" tab (lings are
+// inserted and ignited progressively), so the decision belongs to the renderer,
+// which shows the visible token only when two or more owners actually landed.
+// Interactive sessions and ritual steps leave both empty and render exactly as
+// before.
 type StreamChunkMsg struct {
 	ChannelID          string  `msgpack:"channel_id"`
 	Text               string  `msgpack:"text"`
 	Reasoning          string  `msgpack:"reasoning,omitempty"`
 	PercentContextUsed float64 `msgpack:"percent_context_used,omitempty"`
+	LingID             string  `msgpack:"ling_id,omitempty"`
+	MinisterID         string  `msgpack:"minister_id,omitempty"`
 }
 
 // StreamStartMsg signals that streaming has begun
@@ -249,30 +259,46 @@ type StreamStartMsg struct {
 	EdictID   uint   `msgpack:"edict_id,omitempty"`
 }
 
-// StreamCompleteMsg signals that streaming has completed successfully
+// StreamCompleteMsg signals that streaming has completed successfully.
+//
+// LingID identifies the ling whose stream finished, so the TUI finalizes only
+// that ling's block when several lings share one "e<N>" tab. Set on every ling
+// session (attribution is unconditional); empty for streams that are not a
+// ling's — interactive sessions and ritual steps — whose state is channel-wide.
 type StreamCompleteMsg struct {
 	ChannelID string `msgpack:"channel_id"`
+	LingID    string `msgpack:"ling_id,omitempty"`
 }
 
-// StreamInterruptedMsg signals that streaming was interrupted
+// StreamInterruptedMsg signals that streaming was interrupted.
+//
+// LingID identifies the ling whose stream was interrupted (see
+// StreamCompleteMsg); empty for unattributed streams, whose state is
+// channel-wide.
 type StreamInterruptedMsg struct {
 	ChannelID      string `msgpack:"channel_id"`
 	PartialContent string `msgpack:"partial_content,omitempty"`
+	LingID         string `msgpack:"ling_id,omitempty"`
 }
 
 // StreamErrorMsg signals an error during streaming. Err crosses the wire
 // as a string; decoded values reconstruct a simple errors.New error.
 // PartialContent carries any text accumulated before the failure.
+//
+// LingID identifies the ling whose stream failed, so a sibling ling's stream
+// is not cancelled by it. Empty means the failure is channel-wide.
 type StreamErrorMsg struct {
 	ChannelID      string `msgpack:"-"`
 	Err            error  `msgpack:"-"`
 	PartialContent string `msgpack:"-"`
+	LingID         string `msgpack:"-"`
 }
 
 type streamErrorMsgWire struct {
 	ChannelID      string `msgpack:"channel_id"`
 	Err            string `msgpack:"err,omitempty"`
 	PartialContent string `msgpack:"partial_content,omitempty"`
+	LingID         string `msgpack:"ling_id,omitempty"`
 }
 
 // MarshalMsgpack encodes StreamErrorMsg with Err as a plain string.
@@ -280,6 +306,7 @@ func (s StreamErrorMsg) MarshalMsgpack() ([]byte, error) {
 	w := streamErrorMsgWire{
 		ChannelID:      s.ChannelID,
 		PartialContent: s.PartialContent,
+		LingID:         s.LingID,
 	}
 	if s.Err != nil {
 		w.Err = s.Err.Error()
@@ -295,6 +322,7 @@ func (s *StreamErrorMsg) UnmarshalMsgpack(b []byte) error {
 	}
 	s.ChannelID = w.ChannelID
 	s.PartialContent = w.PartialContent
+	s.LingID = w.LingID
 	if w.Err != "" {
 		s.Err = errors.New(w.Err)
 	}
@@ -305,6 +333,7 @@ func (s *StreamErrorMsg) UnmarshalMsgpack(b []byte) error {
 type StreamMaxTokensReachedMsg struct {
 	ChannelID string `msgpack:"channel_id"`
 	Content   string `msgpack:"content,omitempty"`
+	LingID    string `msgpack:"ling_id,omitempty"`
 }
 
 // StreamContextOverflowMsg signals that a provider rejected the request
@@ -316,6 +345,7 @@ type StreamMaxTokensReachedMsg struct {
 type StreamContextOverflowMsg struct {
 	ChannelID string `msgpack:"channel_id"`
 	Window    int    `msgpack:"window,omitempty"`
+	LingID    string `msgpack:"ling_id,omitempty"`
 }
 
 // SessionConfig holds configuration for minister sessions
@@ -392,6 +422,15 @@ type Session struct {
 	systemPrompt        string
 	channelID           string
 
+	// lingID / ministerID attribute this session's stream messages to the ling
+	// that owns them. They are set on every per-ling ignition session — the court
+	// cannot know how many lings will share the "e<N>" tab, so the TUI decides at
+	// render time whether to show the visible token (it does so only when two or
+	// more distinct owners landed). Empty for interactive sessions and ritual
+	// steps, which therefore render exactly as before.
+	lingID     string
+	ministerID string
+
 	// Tool execution.
 	//
 	// toolMu guards toolCatalog and toolDefs. Sessions are normally
@@ -446,7 +485,7 @@ type Session struct {
 	startTime time.Time
 
 	// persister, if set, receives the session after every message append.
-	// Sessions without a TabType never persist; see persist().
+	// Sessions without a persister are ephemeral; see persist().
 	// Implementations are expected to snapshot synchronously — the
 	// streaming goroutine is the sole writer of messages, so reading
 	// inside SaveSession before returning avoids races with later appends.
@@ -554,6 +593,14 @@ func (s *Session) SetPersister(p SessionPersister) {
 	s.persister = p
 }
 
+// SetLingAttribution marks this session as the stream owner of a ling, so its
+// StreamChunkMsgs carry the ling and minister identity to the TUI. A blank
+// lingID clears the attribution (plain interactive or ritual-step session).
+func (s *Session) SetLingAttribution(lingID, ministerID string) {
+	s.lingID = lingID
+	s.ministerID = ministerID
+}
+
 // SetAtifRecorder attaches an ATIF trajectory recorder. The recorder is
 // started when the session is created and closed on session teardown.
 func (s *Session) SetAtifRecorder(r atifRecorder) {
@@ -598,8 +645,9 @@ func (s *Session) closeAtif() {
 // streaming goroutine after every message-list mutation. Sessions with
 // no persister attached (ephemeral ritual tasks, sage diff reviews,
 // forge/judge inner task sessions) silently skip; the call sites in
-// chancellor.go, sage.go, and MinisterBase.ProcessPrompt are the only
-// places that attach one.
+// chancellor.go, sage.go, MinisterBase.ProcessPrompt and Court.runLing are
+// the only places that attach one. A ling session persists with an empty
+// TabType so its transcript is durable without posing as a minister tab.
 func (s *Session) persist() {
 	if s.persister == nil {
 		return
@@ -1934,6 +1982,8 @@ func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*resp
 					Reasoning:          chunkReasoning,
 					Text:               chunkContent,
 					PercentContextUsed: s.GetContextUsagePercent(),
+					LingID:             s.lingID,
+					MinisterID:         s.ministerID,
 				})
 			}
 
@@ -2409,7 +2459,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 		case <-ctx.Done():
 			accumulatedText := s.getStreamBuffer()
 			if s.notify != nil {
-				s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText})
+				s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText, LingID: s.lingID})
 			}
 			return accumulatedText, ctx.Err()
 		default:
@@ -2420,7 +2470,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 		case <-ctx.Done():
 			accumulatedText := s.getStreamBuffer()
 			if s.notify != nil {
-				s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText})
+				s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText, LingID: s.lingID})
 			}
 			return accumulatedText, ctx.Err()
 		default:
@@ -2445,7 +2495,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 			if ctx.Err() != nil {
 				accumulatedText := s.getStreamBuffer()
 				if s.notify != nil {
-					s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText})
+					s.notify(StreamInterruptedMsg{ChannelID: s.channelID, PartialContent: accumulatedText, LingID: s.lingID})
 				}
 				return accumulatedText, ctx.Err()
 			}
@@ -2454,12 +2504,12 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 			// session failure — the prompt stays recoverable.
 			if window, ok := contextOverflowWindow(err); ok {
 				if s.notify != nil {
-					s.notify(StreamContextOverflowMsg{ChannelID: s.channelID, Window: window})
+					s.notify(StreamContextOverflowMsg{ChannelID: s.channelID, Window: window, LingID: s.lingID})
 				}
 				return "", err
 			}
 			if s.notify != nil {
-				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err})
+				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err, LingID: s.lingID})
 			}
 			return "", err
 		}
@@ -2474,7 +2524,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 		// Check if response was truncated
 		if choice.StopReason == "max_tokens" {
 			if s.notify != nil {
-				s.notify(StreamMaxTokensReachedMsg{ChannelID: s.channelID, Content: responseContent})
+				s.notify(StreamMaxTokensReachedMsg{ChannelID: s.channelID, Content: responseContent, LingID: s.lingID})
 			}
 			s.appendMessage(choice)
 			// ATIF: assistant message_end (max_tokens)
@@ -2496,7 +2546,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 				"content_length", len(responseContent),
 			)
 			if s.notify != nil {
-				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err, PartialContent: responseContent})
+				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err, PartialContent: responseContent, LingID: s.lingID})
 			}
 			// ATIF: assistant message_end (error)
 			errMsg := err.Error()
@@ -2630,7 +2680,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 		if shouldReturn {
 			allToolResults = append(allToolResults, toolResults...)
 			if s.notify != nil {
-				s.notify(StreamCompleteMsg{ChannelID: s.channelID})
+				s.notify(StreamCompleteMsg{ChannelID: s.channelID, LingID: s.lingID})
 			}
 			turnEnded = true
 			s.atifTurnEnded(lastAssistant, allToolResults)
@@ -2640,7 +2690,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 		if s.toolCallLoopHits >= 3 {
 			err := fmt.Errorf("tool call loop persisted after %d interventions", s.toolCallLoopHits)
 			if s.notify != nil {
-				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err})
+				s.notify(StreamErrorMsg{ChannelID: s.channelID, Err: err, LingID: s.lingID})
 			}
 			allToolResults = append(allToolResults, toolResults...)
 			turnEnded = true
@@ -2657,7 +2707,7 @@ func (s *Session) AskWithStreaming(ctx context.Context, prompt string, contextFi
 	}
 
 	if s.notify != nil {
-		s.notify(StreamCompleteMsg{ChannelID: s.channelID})
+		s.notify(StreamCompleteMsg{ChannelID: s.channelID, LingID: s.lingID})
 	}
 
 	return finalText, nil

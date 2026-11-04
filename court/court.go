@@ -481,8 +481,9 @@ func (s *Court) GetToolRegistry() *tools.ToolRegistry {
 
 // SetSessionPersister wires a persister into the court. Sessions
 // created afterwards (and any currently held by interactive ministers)
-// receive it; sessions without a TabType are silently skipped at save
-// time. Idempotent — safe to call again with a different persister.
+// receive it. Sessions it never reaches stay ephemeral; a persisted
+// session with an empty TabType (a ling transcript) is durable without
+// ever listing as a minister tab. Idempotent — safe to call again.
 func (s *Court) SetSessionPersister(p SessionPersister) {
 	if s == nil {
 		return

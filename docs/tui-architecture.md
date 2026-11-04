@@ -688,8 +688,46 @@ The TUI handles streaming responses from the AI through the Court's message type
 ### Message Types
 
 - `court.StreamStartMsg` — Streaming has started; sets the tab as streaming, captures edict ID
-- `court.StreamChunkMsg` — Content chunk with optional `Text` and `Reasoning` fields
-- `court.StreamCompleteMsg` — Marks the end of a streaming response
+- `court.StreamChunkMsg` — Content chunk with optional `Text` and `Reasoning` fields, plus
+  the ling attribution rider `LingID` / `MinisterID`
+- `court.StreamCompleteMsg` — Marks the end of a streaming response (carries `LingID` for lings)
+- `court.StreamInterruptedMsg` / `StreamErrorMsg` / `StreamMaxTokensReachedMsg` /
+  `StreamContextOverflowMsg` — Terminal events; each carries `LingID` for lings
+
+### Ling output attribution
+
+Several lings of one edict run concurrently and stream into the **same** `e<N>`
+tab, so a chunk's `ChannelID` alone cannot say who produced it. Every ling
+session is stamped with its identity (`Session.SetLingAttribution`) and rides
+`LingID` + `MinisterID` on each chunk and `LingID` on each terminal message.
+
+On the TUI side:
+
+- `ChatComponent.AddAIChunkOwned` / `AddThinkingChunkOwned` start a **new block
+  whenever the owner changes**, so concurrent lings never merge into one
+  unattributable block. Block splitting is unconditional.
+- The visible `[minister/ling]` prefix is emitted only when the chat holds more
+  than one distinct `Owner` (`hasMultipleOwners`). A single-ling edict therefore
+  renders exactly as it did before attribution existed, and a ritual step (no
+  owner at all) is untouched.
+- Terminal banners (error, interrupted/ABORTED, truncation) carry the **same**
+  `[minister/ling]` token as the blocks. The minister is resolved from the ling's
+  own blocks (`ChatComponent.OwnerMinisterFor`) rather than widened onto the
+  terminal wire messages, so the banner and the block it explains can never
+  disagree. `lingBanner` applies the multi-owner rule too.
+- `ChatComponent.FinalizeLingAIMessages(owner)` finalizes only one ling's blocks;
+  `FinalizeDeadLingAIMessages(live, asFailure)` closes the blocks of lings that
+  failed, were interrupted, timed out or were cancelled.
+- `TUIModel.streamingLings` tracks which lings are live per channel, so one
+  ling's completion does not stop the tab while its siblings still stream, and
+  the last one still stops it and runs the completion callback.
+- Every handler resolves its tab with `TabByTarget`, never `ChatByTab`: a
+  terminal event for a closed channel must not fall back to the active tab.
+
+Known limit: tool-call messages (`runners.ToolCall*Msg`) carry no ling token, so
+a tool call made by one ling appears in the shared tab unattributed. Closing
+that needs a rider on the runner message types (a different package and a
+different contract) and is tracked as a follow-up, not part of this edict.
 
 ### Message Flow
 
@@ -701,9 +739,10 @@ AI starts response
        → Clear error state
        ↓
    court.StreamChunkMsg (repeated)
-       → Route to correct tab via ChatByTab(channelID)
-       → If msg.Reasoning != "": chat.AddThinkingChunk(reasoning)
-       → If msg.Text != "": chat.AddAIChunk(text)
+       → Drop if the channel has no tab, or the tab was cancelled
+       → Route to that tab's own chat via TabByTarget(channelID)
+       → If msg.Reasoning != "": chat.AddThinkingChunkOwned(reasoning, LingID, MinisterID)
+       → If msg.Text != "": chat.AddAIChunkOwned(text, LingID, MinisterID)
        → Update stream rate on status component
        → Mark chat as contentDirty
        → Schedule 50ms debounce tick if not already pending
@@ -712,8 +751,9 @@ AI starts response
        → FlushDirtyChats() — calls UpdateContent on every dirty tab
        ↓
    court.StreamCompleteMsg
-       → ClearStreamingByTab(channelID)
-       → FinalizeLastAIMessage() — marks as SUCCESS or FAILURE
+       → If LingID set and siblings remain: finalize only that ling, keep the tab streaming
+       → Otherwise: ClearStreamingByTab(channelID), finalize every remaining block
+         (FinalizeLingAIMessages when attributed, else FinalizeLastAIMessage)
        → Run streamCompleteCallback if set
        → Save session, refresh diff
 ```

@@ -205,6 +205,12 @@ func (s *Court) igniteLings(ctx context.Context, key storage.EdictKey) error {
 // runs the ling's description as the prompt. On success the ling's own paths are
 // committed on the edict branch under the per-edict commit mutex; failures are
 // reported as ling_failed events and leave the work for inspection.
+//
+// The session streams into the edict's "e<N>" tab. When the edict has more
+// than one ling, concurrent streams would be indistinguishable there, so the
+// session carries a ling/minister attribution token on every chunk. The ling
+// transcript is persisted (no TabType, so it never masquerades as a minister
+// tab) while plain ritual-step sessions remain ephemeral.
 func (s *Court) runLing(ctx context.Context, key storage.EdictKey, u dagUnit, wtRoot string) error {
 	lingID := u.ID
 	var ling storage.Ling
@@ -275,6 +281,13 @@ func (s *Court) runLing(ctx context.Context, key storage.EdictKey, u dagUnit, wt
 		s.failLing(key, lingID, ministerID, err)
 		return err
 	}
+	// Always attribute: whether the tab ends up holding one ling or several is
+	// only knowable to the TUI at render time (lings are inserted and ignited
+	// progressively), so the court must not guess with a point-in-time count.
+	// The TUI emits the visible prefix only when two or more distinct owners
+	// actually landed, which keeps single-ling rendering unchanged.
+	session.SetLingAttribution(lingID, ministerID)
+	session.SetPersister(s.persister)
 	if _, err := session.AskWithStreaming(ctx, ling.Description, nil); err != nil {
 		s.failLing(key, lingID, ministerID, err)
 		return err

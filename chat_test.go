@@ -7,6 +7,7 @@ import (
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ===== Debounced Chat Render Tests =====
@@ -885,4 +886,328 @@ func TestToolCallHandlers_ConsistentDirtyStateAfterFlush(t *testing.T) {
 	assert.False(t, chat.contentDirty, "after flush, contentDirty should be false")
 	assert.Contains(t, chat.Viewport.View(), "shell: ok",
 		"viewport should show the final tool call result")
+}
+
+// ===== Ling output attribution tests =====
+
+// TestAddAIChunkOwned_KeepsConcurrentLingsSeparate verifies the core
+// attribution property: chunks from different lings never merge into one
+// anonymous block, so a reader can tell which ling produced which text.
+func TestAddAIChunkOwned_KeepsConcurrentLingsSeparate(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.AddAIChunkOwned("forge ", "ling-a", "forge")
+	chat.AddAIChunkOwned("work", "ling-a", "forge")
+	chat.AddAIChunkOwned("judge ", "ling-b", "judge")
+	chat.AddAIChunkOwned("verdict", "ling-b", "judge")
+	chat.AddAIChunkOwned(" done", "ling-a", "forge")
+
+	assert.Len(t, chat.Messages, 3, "owner change must start a new block")
+	assert.Equal(t, "forge work", chat.Messages[0].Content)
+	assert.Equal(t, "ling-a", chat.Messages[0].Owner)
+	assert.Equal(t, "forge", chat.Messages[0].OwnerMinister)
+	assert.Equal(t, "judge verdict", chat.Messages[1].Content)
+	assert.Equal(t, "ling-b", chat.Messages[1].Owner)
+	assert.Equal(t, " done", chat.Messages[2].Content)
+	assert.Equal(t, "ling-a", chat.Messages[2].Owner)
+}
+
+// TestAddAIChunkOwned_EmptyOwnerIsUnchanged locks backwards compatibility:
+// an unattributed chunk renders and accumulates exactly like AddAIChunk.
+func TestAddAIChunkOwned_EmptyOwnerIsUnchanged(t *testing.T) {
+	owned := NewChatComponent(80, 20, false)
+	plain := NewChatComponent(80, 20, false)
+
+	owned.AddAIChunkOwned("hello ", "", "")
+	owned.AddAIChunkOwned("world", "", "")
+	plain.AddAIChunk("hello ")
+	plain.AddAIChunk("world")
+
+	assert.Len(t, owned.Messages, 1)
+	assert.Equal(t, plain.Messages[0].Content, owned.Messages[0].Content)
+	assert.Empty(t, owned.Messages[0].Owner)
+	owned.UpdateContent()
+	plain.UpdateContent()
+	assert.Equal(t, plain.Viewport.View(), owned.Viewport.View(),
+		"unattributed output must render identically to before")
+}
+
+// TestRenderSystemMessage_LingPrefixOnlyWhenAttributed verifies the visible
+// token: when the chat holds several owners, attributed blocks are labelled with
+// minister/ling; unattributed blocks carry no prefix at all.
+func TestRenderSystemMessage_LingPrefixOnlyWhenAttributed(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	attributed := chat.renderSystemMessage("text", MessageTypeAI, "ling-a", "forge", true)
+	assert.Contains(t, attributed, "[forge/ling-a]")
+
+	unattributed := chat.renderSystemMessage("text", MessageTypeAI, "", "", true)
+	assert.NotContains(t, unattributed, "[")
+}
+
+// TestRenderSystemMessage_SingleOwnerHasNoPrefix pins backwards compatibility at
+// the point where it now lives: a tab whose blocks all belong to one ling shows
+// no attribution token, so a single-ling edict renders byte-for-byte as before,
+// even though the court always attributes its lings.
+func TestRenderSystemMessage_SingleOwnerHasNoPrefix(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	chat.AddAIChunkOwned("solo answer", "ling-solo", "forge")
+	chat.AddThinkingChunkOwned("solo reasoning", "ling-solo", "forge")
+
+	require.True(t, chat.HasAttributedMessages(), "the ling is attributed on the wire")
+	chat.UpdateContent()
+
+	view := chat.Viewport.View()
+	assert.NotContains(t, view, "[", "a single owner needs no attribution token")
+	assert.Contains(t, view, "solo answer")
+
+	// A second owner makes the prefix informative and it appears for both.
+	chat.AddAIChunkOwned("second answer", "ling-two", "judge")
+	chat.UpdateContent()
+	view = chat.Viewport.View()
+	assert.Contains(t, view, "[forge/ling-solo]")
+	assert.Contains(t, view, "[judge/ling-two]")
+
+	// Block splitting itself is unconditional, even for one owner.
+	assert.Len(t, chat.Messages, 3, "per-owner blocks are always separate")
+}
+
+// TestFinalizeLingAIMessages_SingleOwnerChannelWide pins the behaviour delta of
+// unconditional attribution: a single-ling tab takes the attributed
+// channel-wide finalize path (FinalizeLingAIMessages("")) rather than
+// FinalizeLastAIMessage. Both end with the block complete and no owner left
+// streaming-looking, which is what the TUI's StreamCompleteMsg path relies on.
+func TestFinalizeLingAIMessages_SingleOwnerChannelWide(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	chat.AddAIChunkOwned("only answer", "ling-solo", "forge")
+
+	require.True(t, chat.HasAttributedMessages(),
+		"a single-ling tab is attributed, so the TUI takes the attributed path")
+	assert.False(t, chat.FinalizeLingAIMessages(""))
+
+	require.Len(t, chat.Messages, 1)
+	assert.Equal(t, MessageTypeAISuccess, chat.Messages[0].Type,
+		"the sole block is finalized exactly as FinalizeLastAIMessage would")
+	assert.Equal(t, "only answer", chat.Messages[0].Content)
+	assert.Equal(t, "ling-solo", chat.Messages[0].Owner)
+}
+
+// TestFinalizeLingAIMessages_OnlyFinalizesThatLing verifies that one ling's
+// completion leaves the other concurrent lings' blocks still streaming, and
+// that a channel-wide finalize clears whatever remains.
+func TestFinalizeLingAIMessages_OnlyFinalizesThatLing(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.AddAIChunkOwned("a", "ling-a", "forge")
+	chat.AddAIChunkOwned("b", "ling-b", "forge")
+	require.True(t, chat.HasAttributedMessages())
+
+	assert.False(t, chat.FinalizeLingAIMessages("ling-a"))
+	assert.Equal(t, MessageTypeAISuccess, chat.Messages[0].Type)
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type,
+		"another ling's block must stay streaming")
+
+	assert.False(t, chat.FinalizeLingAIMessages(""))
+	assert.Equal(t, MessageTypeAISuccess, chat.Messages[1].Type)
+}
+
+// TestAddThinkingChunkOwned_KeepsConcurrentLingsSeparate covers the reasoning
+// half of attribution: thinking chunks of two lings sharing one tab must not
+// merge, and each block must be labelled with its own minister/ling token.
+// Without this a reader sees one long "💭" block and cannot tell who reasoned.
+func TestAddThinkingChunkOwned_KeepsConcurrentLingsSeparate(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+
+	chat.AddThinkingChunkOwned("weighing ", "ling-a", "forge")
+	chat.AddThinkingChunkOwned("evidence", "ling-a", "forge")
+	chat.AddThinkingChunkOwned("judging ", "ling-b", "judge")
+	chat.AddThinkingChunkOwned("slowly", "ling-b", "judge")
+
+	require.Len(t, chat.Messages, 2, "owner change must start a new thinking block")
+	assert.Equal(t, "weighing evidence", chat.Messages[0].Content)
+	assert.Equal(t, "ling-a", chat.Messages[0].Owner)
+	assert.Equal(t, "forge", chat.Messages[0].OwnerMinister)
+	assert.Equal(t, MessageTypeThinking, chat.Messages[1].Type)
+	assert.Equal(t, "judging slowly", chat.Messages[1].Content)
+
+	chat.UpdateContent()
+	view := chat.Viewport.View()
+	assert.Contains(t, view, "[forge/ling-a]", "attributed reasoning must be labelled")
+	assert.Contains(t, view, "[judge/ling-b]")
+}
+
+// TestAddThinkingChunkOwned_EmptyOwnerAndBlankChunk locks the two delegating
+// branches: a ritual step (no owner) must render exactly like AddThinkingChunk,
+// and a blank chunk is dropped before any block is created.
+func TestAddThinkingChunkOwned_EmptyOwnerAndBlankChunk(t *testing.T) {
+	owned := NewChatComponent(80, 20, false)
+	plain := NewChatComponent(80, 20, false)
+
+	owned.AddThinkingChunkOwned("pondering", "", "")
+	plain.AddThinkingChunk("pondering")
+	owned.AddThinkingChunkOwned("   ", "ling-a", "forge")
+
+	require.Len(t, owned.Messages, 1, "blank reasoning must not open a block")
+	assert.Empty(t, owned.Messages[0].Owner)
+	owned.UpdateContent()
+	plain.UpdateContent()
+	assert.Equal(t, plain.Viewport.View(), owned.Viewport.View(),
+		"unattributed reasoning must render exactly as before")
+}
+
+// TestFinalizeLastAIMessage_FailureToken pins the success/failure split that the
+// finalize refactor now shares between the last-message and per-ling paths: a
+// block prefixed with the failure token must become an AI failure block with
+// the token stripped, and no other block may be touched.
+func TestFinalizeLastAIMessage_FailureToken(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	chat.AddAIChunk(failureToken + " the tool failed")
+
+	require.True(t, chat.FinalizeLastAIMessage(), "failure token marks the block as failed")
+	assert.Equal(t, MessageTypeAIFailure, chat.Messages[0].Type)
+	assert.Equal(t, "the tool failed", chat.Messages[0].Content,
+		"the failure token must not leak into the rendered text")
+}
+
+// TestFinalizeLingAIMessages_FailureToken verifies the per-ling path keeps the
+// same failure semantics as the channel-wide path, and that only the named
+// ling's block is finalized.
+func TestFinalizeLingAIMessages_FailureToken(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	chat.AddAIChunkOwned(failureToken+" ling one broke", "ling-1", "forge")
+	chat.AddAIChunkOwned("ling two is fine", "ling-2", "forge")
+
+	require.True(t, chat.FinalizeLingAIMessages("ling-1"))
+	assert.Equal(t, MessageTypeAIFailure, chat.Messages[0].Type)
+	assert.Equal(t, "ling one broke", chat.Messages[0].Content)
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type, "an unrelated ling must not be finalized")
+}
+
+// TestHasAttributedMessages_FalseForUnattributedChat verifies the predicate that
+// routes the channel-wide completion path: an ordinary single-ling or ritual
+// chat holds no owned block, so the old FinalizeLastAIMessage path is used.
+func TestHasAttributedMessages_FalseForUnattributedChat(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	chat.AddAIChunk("plain streaming")
+	assert.False(t, chat.HasAttributedMessages())
+
+	chat.AddAIChunkOwned("owned", "ling-1", "forge")
+	assert.True(t, chat.HasAttributedMessages(), "any owned block makes the tab attributed")
+}
+
+// TestFinalizeDeadLingAIMessages_ClosesOnlyDeadLings covers the terminal-path
+// helper: blocks of lings still live must keep streaming, every other owned
+// block is closed — as failure on error/cancel paths, as success otherwise.
+func TestFinalizeDeadLingAIMessages_ClosesOnlyDeadLings(t *testing.T) {
+	chat := NewChatComponent(80, 20, false)
+	chat.AddAIChunkOwned("dead one", "ling-1", "forge")
+	chat.AddAIChunkOwned("still running", "ling-2", "forge")
+	chat.AddAIChunkOwned("dead two", "ling-3", "judge")
+
+	live := map[string]bool{"ling-2": true}
+	assert.True(t, chat.FinalizeDeadLingAIMessages(live, true))
+	assert.Equal(t, MessageTypeAIFailure, chat.Messages[0].Type)
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type, "a live ling must keep streaming")
+	assert.Equal(t, MessageTypeAIFailure, chat.Messages[2].Type)
+
+	// Unattributed blocks are never touched: they are not a ling's to close.
+	plain := NewChatComponent(80, 20, false)
+	plain.AddAIChunk("plain streaming")
+	assert.False(t, plain.FinalizeDeadLingAIMessages(nil, true))
+	assert.Equal(t, MessageTypeAI, plain.Messages[0].Type)
+}
+
+// TestHasMultipleOwners_Semantics pins the predicate that decides whether the
+// visible attribution prefix appears. It must count DISTINCT owners across the
+// whole chat, not merely adjacent changes: concurrent lings interleave (A,B,A),
+// so an adjacency-based test would hide the prefix exactly when it matters.
+func TestHasMultipleOwners_Semantics(t *testing.T) {
+	t.Run("interleaved owners", func(t *testing.T) {
+		c := NewChatComponent(80, 20, false)
+		c.AddAIChunkOwned("1", "ling-a", "forge")
+		c.AddAIChunkOwned("2", "ling-b", "judge")
+		c.AddAIChunkOwned("3", "ling-a", "forge")
+		assert.True(t, c.hasMultipleOwners(), "A,B,A holds two distinct owners")
+	})
+
+	t.Run("repeated second owner", func(t *testing.T) {
+		c := NewChatComponent(80, 20, false)
+		c.AddAIChunkOwned("1", "ling-a", "forge")
+		c.AddAIChunkOwned("2", "ling-b", "judge")
+		c.AddAIChunkOwned("3", "ling-b", "judge")
+		c.AddAIChunkOwned("4", "ling-a", "forge")
+		assert.True(t, c.hasMultipleOwners())
+	})
+
+	t.Run("single owner", func(t *testing.T) {
+		c := NewChatComponent(80, 20, false)
+		c.AddAIChunkOwned("1", "ling-a", "forge")
+		assert.False(t, c.hasMultipleOwners(), "one owner needs no prefix")
+	})
+
+	t.Run("no owners", func(t *testing.T) {
+		c := NewChatComponent(80, 20, false)
+		c.AddAIChunk("plain")
+		assert.False(t, c.hasMultipleOwners())
+	})
+
+	t.Run("unowned messages between owned ones", func(t *testing.T) {
+		c := NewChatComponent(80, 20, false)
+		c.AddAIChunkOwned("1", "ling-a", "forge")
+		c.AddAIChunk("plain")
+		assert.False(t, c.hasMultipleOwners(),
+			"unowned messages are not owners and must not trigger the prefix")
+	})
+}
+
+// TestLingBanner_NamesLingOnlyWhenMultipleOwners pins the banner rule added for
+// per-ling terminal events: on a multi-ling tab the ruler must see WHICH ling
+// died, while a single-ling tab's banners stay byte-for-byte unchanged.
+func TestLingBanner_NamesLingOnlyWhenMultipleOwners(t *testing.T) {
+	single := NewChatComponent(80, 20, false)
+	single.AddAIChunkOwned("a", "ling-1", "forge")
+	single.UpdateContent()
+	assert.Equal(t, "ABORTED", lingBanner(single, "ling-1", "ABORTED"),
+		"a lone owner's banner carries no token")
+
+	multi := NewChatComponent(80, 20, false)
+	multi.AddAIChunkOwned("a", "ling-1", "forge")
+	multi.AddAIChunkOwned("b", "ling-2", "judge")
+	multi.UpdateContent()
+	assert.Contains(t, lingBanner(multi, "ling-1", "ABORTED"), "[forge/ling-1]",
+		"a multi-ling banner names the ling that died, with the token the blocks use")
+	assert.NotContains(t, lingBanner(multi, "ling-1", "ABORTED"), "ling-2")
+
+	// A ling with no recorded block has no known minister; the banner still
+	// names the ling rather than swallowing the attribution.
+	assert.Contains(t, lingBanner(multi, "ling-9", "ABORTED"), "[ling-9]",
+		"an unattributed-minister banner still names the ling")
+
+	assert.Equal(t, "ABORTED", lingBanner(multi, "", "ABORTED"),
+		"a channel-wide event has no ling to name")
+}
+
+// TestOwnerMinisterFor_ResolvesFromTheLingsOwnBlocks pins the resolver that lets
+// terminal banners use the same "[minister/ling]" token as the blocks without
+// widening the terminal wire messages. It must never invent a minister: an
+// unknown ling, a ling whose blocks recorded no minister, and the empty ling id
+// all resolve to "" so lingPrefix falls back to the bare "[ling]" form.
+func TestOwnerMinisterFor_ResolvesFromTheLingsOwnBlocks(t *testing.T) {
+	c := NewChatComponent(80, 20, false)
+	c.AddAIChunkOwned("a", "ling-1", "forge")
+	c.AddAIChunkOwned("b", "ling-2", "judge")
+
+	assert.Equal(t, "forge", c.OwnerMinisterFor("ling-1"))
+	assert.Equal(t, "judge", c.OwnerMinisterFor("ling-2"))
+
+	assert.Empty(t, c.OwnerMinisterFor(""), "no ling, no minister")
+	assert.Empty(t, c.OwnerMinisterFor("ling-unknown"), "an unknown ling has no minister")
+
+	// A ling whose block recorded no minister stays without one — the banner
+	// must not borrow another ling's minister.
+	bare := NewChatComponent(80, 20, false)
+	bare.AddAIChunkOwned("a", "ling-3", "")
+	assert.Empty(t, bare.OwnerMinisterFor("ling-3"))
+	assert.Contains(t, lingPrefix("ling-3", bare.OwnerMinisterFor("ling-3")), "[ling-3]",
+		"the bare form still names the ling")
 }

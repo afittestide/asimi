@@ -8049,3 +8049,841 @@ func TestPrompt_KeyedByTargetNotLabel(t *testing.T) {
 	assert.Equal(t, "first tab text", model.prompt().Value(),
 		"first tab's prompt must survive the other tab's edit")
 }
+
+// TestStreamChunkMsg_AttributesConcurrentLings verifies end-to-end TUI
+// attribution: chunks of two lings sharing the edict tab are grouped per ling
+// and visibly labelled, so concurrent output is no longer indistinguishable.
+func TestStreamChunkMsg_AttributesConcurrentLings(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e994"), "ritual", "e994", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e994"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e994", Text: "forge says ", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e994", Text: "judge says ", LingID: "ling-2", MinisterID: "judge"},
+		{ChannelID: "e994", Text: "more", LingID: "ling-1", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	chat := m.tabs.ChatByTab("e994")
+	chat.FlushDirty()
+
+	var blocks []string
+	for _, m := range chat.Messages {
+		if m.Type == MessageTypeAI || m.Type == MessageTypeAISuccess {
+			blocks = append(blocks, m.Owner+"="+m.Content)
+		}
+	}
+	assert.Equal(t, []string{"ling-1=forge says ", "ling-2=judge says ", "ling-1=more"}, blocks,
+		"each block must belong to exactly one ling — no cross-ling bleed")
+
+	view := chat.Viewport.View()
+	assert.Contains(t, view, "[forge/ling-1]")
+	assert.Contains(t, view, "[judge/ling-2]")
+}
+
+// TestStreamChunkMsg_UnattributedRendersUnchanged verifies backwards
+// compatibility: a ritual step's chunks carry no attribution token and render
+// without any prefix.
+func TestStreamChunkMsg_UnattributedRendersUnchanged(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e995"), "ritual", "e995", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e995"})
+
+	m := *model
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e995", Text: "step output"})
+	m = newModel.(TUIModel)
+
+	chat := m.tabs.ChatByTab("e995")
+	chat.FlushDirty()
+
+	require.Len(t, chat.Messages, 1)
+	assert.Empty(t, chat.Messages[0].Owner)
+	assert.NotContains(t, chat.Viewport.View(), "[")
+	assert.Contains(t, chat.Viewport.View(), "step output")
+}
+
+// TestStreamCompleteMsg_PerLingCompletionKeepsTabStreaming verifies that in a
+// multi-ling edict tab one ling finishing neither stops the tab (which would
+// drop the other lings' chunks) nor finalizes their blocks.
+func TestStreamCompleteMsg_PerLingCompletionKeepsTabStreaming(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e996"), "ritual", "e996", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e996"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e996", Text: "forge work", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e996", Text: "judge work", LingID: "ling-2", MinisterID: "judge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	newModel, _ := m.Update(court.StreamCompleteMsg{ChannelID: "e996", LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	chat := m.tabs.ChatByTab("e996")
+	require.Len(t, chat.Messages, 2)
+	assert.Equal(t, MessageTypeAISuccess, chat.Messages[0].Type, "finished ling's block is final")
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type, "other ling is still streaming")
+
+	tab := m.tabs.TabByTarget("e996")
+	require.NotNil(t, tab)
+	assert.True(t, tab.Streaming, "tab must stay streaming while another ling runs")
+
+	// A late chunk from the still-running ling must not be dropped.
+	newModel, _ = m.Update(court.StreamChunkMsg{ChannelID: "e996", Text: " continues", LingID: "ling-2", MinisterID: "judge"})
+	m = newModel.(TUIModel)
+	chat = m.tabs.ChatByTab("e996")
+	assert.Equal(t, "judge work continues", chat.Messages[1].Content)
+
+	// The last ling's completion stops the tab.
+	newModel, _ = m.Update(court.StreamCompleteMsg{ChannelID: "e996", LingID: "ling-2"})
+	m = newModel.(TUIModel)
+	tab = m.tabs.TabByTarget("e996")
+	require.NotNil(t, tab)
+	assert.False(t, tab.Streaming, "tab stops when the last ling completes")
+}
+
+// TestStreamChunkMsg_CancelledTabDropsAttributedChunks locks the pre-existing
+// invariant the attribution rider must not break: chunks arriving for a tab the
+// ruler already cancelled are dropped. They must not resurrect the tab's
+// Streaming flag either, or a cancelled edict tab can never be closed.
+func TestStreamChunkMsg_CancelledTabDropsAttributedChunks(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e997"), "ritual", "e997", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e997"})
+
+	m := *model
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e997", Text: "before", LingID: "ling-1", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+	require.True(t, m.tabs.TabByTarget("e997").Streaming)
+
+	// The ruler cancels the tab (Ctrl-C / :quit while streaming).
+	m.stopStreamingTab("e997")
+	require.False(t, m.tabs.TabByTarget("e997").Streaming, "cancel stops the tab")
+
+	// The daemon emits a few in-flight chunks before its ctx-cancel lands.
+	newModel, _ = m.Update(court.StreamChunkMsg{ChannelID: "e997", Text: "late", LingID: "ling-1", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+
+	assert.False(t, m.tabs.TabByTarget("e997").Streaming,
+		"a cancelled tab must not start streaming again")
+	for _, msg := range m.tabs.ChatByTab("e997").Messages {
+		assert.NotContains(t, msg.Content, "late", "late chunk of a cancelled tab is dropped")
+	}
+	assert.Empty(t, m.streamingLings["e997"], "a dropped chunk must not register a live ling")
+}
+
+// TestStreamErrorMsg_ForgetsFailedLing locks the liveness bookkeeping: a ling
+// whose stream ends in an error is no longer streaming. Its StreamErrorMsg
+// carries no LingID, so the failure clears the channel outright — otherwise a
+// stale entry keeps the tab Streaming forever after the surviving lings finish,
+// the guardrail callback never runs and :quit refuses to close the tab.
+func TestStreamErrorMsg_ForgetsFailedLing(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e998"), "ritual", "e998", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e998"})
+
+	callbackRan := false
+	model.streamCompleteCallback = func(*TUIModel) tea.Cmd {
+		callbackRan = true
+		return nil
+	}
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e998", Text: "one", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e998", Text: "two", LingID: "ling-2", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	newModel, _ := m.Update(court.StreamErrorMsg{ChannelID: "e998", Err: errors.New("provider down")})
+	m = newModel.(TUIModel)
+	assert.Empty(t, m.streamingLings["e998"], "a failed ling must not stay tracked as streaming")
+
+	// The surviving ling keeps working, then completes.
+	newModel, _ = m.Update(court.StreamChunkMsg{ChannelID: "e998", Text: " more", LingID: "ling-2", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+	newModel, _ = m.Update(court.StreamCompleteMsg{ChannelID: "e998", LingID: "ling-2"})
+	m = newModel.(TUIModel)
+
+	assert.Empty(t, m.streamingLings["e998"])
+	assert.False(t, m.tabs.TabByTarget("e998").Streaming,
+		"the tab stops once its last ling is done")
+	assert.True(t, callbackRan, "the stream-complete callback must run for the last ling")
+}
+
+// TestStreamInterruptedMsg_ClearsLingTracking locks the same invariant for the
+// interrupt path: an interrupted multi-ling tab must leave no live ling behind,
+// so a later tab is not held open by a dead entry.
+func TestStreamInterruptedMsg_ClearsLingTracking(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e999"), "ritual", "e999", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e999"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e999", Text: "a", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e999", Text: "b", LingID: "ling-2", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	newModel, _ := m.Update(court.StreamInterruptedMsg{ChannelID: "e999", PartialContent: "a"})
+	m = newModel.(TUIModel)
+
+	assert.False(t, m.tabs.TabByTarget("e999").Streaming, "interrupt stops the tab")
+	assert.Empty(t, m.streamingLings["e999"], "interrupt must clear every ling on the channel")
+}
+
+// TestStreamErrorMsg_PerLingFailureForgetsOnlyThatLing verifies the error path
+// honours the ling rider: a failed ling is forgotten and its block closed while
+// its siblings keep streaming and can still complete the tab.
+func TestStreamErrorMsg_PerLingFailureForgetsOnlyThatLing(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e1001"), "ritual", "e1001", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e1001"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e1001", Text: "one", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e1001", Text: "two", LingID: "ling-2", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	newModel, _ := m.Update(court.StreamErrorMsg{ChannelID: "e1001", Err: errors.New("boom"), LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	assert.NotContains(t, m.streamingLings["e1001"], "ling-1", "the failed ling must be forgotten")
+	assert.True(t, m.streamingLings["e1001"]["ling-2"], "the sibling ling keeps streaming")
+	chat := m.tabs.ChatByTab("e1001")
+	assert.Equal(t, MessageTypeAIFailure, chat.Messages[0].Type, "the dead ling's block is closed as a failure")
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type, "the live ling's block stays streaming")
+	assert.True(t, m.tabs.TabByTarget("e1001").Streaming, "the tab stays open for the survivor")
+}
+
+// TestStopStreamingTab_ClosesLingBlocks verifies cancellation is terminal for
+// every ling on the tab: liveness entries are dropped and their blocks closed,
+// so a cancelled multi-ling tab is finished (not left mid-stream) and closable.
+func TestStopStreamingTab_ClosesLingBlocks(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e1002"), "ritual", "e1002", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e1002"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e1002", Text: "one", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e1002", Text: "two", LingID: "ling-2", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	m.stopStreamingTab("e1002")
+
+	assert.Empty(t, m.streamingLings["e1002"], "cancelling forgets every ling on the tab")
+	chat := m.tabs.ChatByTab("e1002")
+	for i, msgs := range chat.Messages {
+		assert.Equal(t, MessageTypeAIFailure, msgs.Type, "block %d must be closed on cancel", i)
+	}
+}
+
+// TestStreamStartMsg_LiftsCancellationTombstone verifies a genuine new stream on
+// a cancelled tab is not mistaken for late in-flight output: the tombstone is
+// lifted and the new chunks render.
+func TestStreamStartMsg_LiftsCancellationTombstone(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e1003"), "ritual", "e1003", nil)
+
+	m := *model
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e1003", Text: "first", LingID: "ling-1", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+	m.stopStreamingTab("e1003")
+	require.True(t, m.tabs.TabByTarget("e1003").Stopped)
+
+	newModel, _ = m.Update(court.StreamStartMsg{ChannelID: "e1003"})
+	m = newModel.(TUIModel)
+	newModel, _ = m.Update(court.StreamChunkMsg{ChannelID: "e1003", Text: "second", LingID: "ling-2", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+
+	chat := m.tabs.ChatByTab("e1003")
+	last := chat.Messages[len(chat.Messages)-1]
+	assert.Contains(t, last.Content, "second", "a freshly started stream must render after a cancel")
+}
+
+// TestStreamContextOverflowMsg_ClosesOnlyOverflowedLing verifies the overflow
+// path honours the rider too: the overflowing ling's block is closed while its
+// siblings keep streaming and the tab stays open for them.
+func TestStreamContextOverflowMsg_ClosesOnlyOverflowedLing(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e1004"), "ritual", "e1004", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e1004"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e1004", Text: "one", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: "e1004", Text: "two", LingID: "ling-2", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+
+	newModel, _ := m.Update(court.StreamContextOverflowMsg{ChannelID: "e1004", Window: 1000, LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	assert.NotContains(t, m.streamingLings["e1004"], "ling-1")
+	assert.True(t, m.streamingLings["e1004"]["ling-2"], "a sibling ling keeps streaming")
+	assert.True(t, m.tabs.TabByTarget("e1004").Streaming, "the tab stays open for the survivor")
+	chat := m.tabs.ChatByTab("e1004")
+	assert.Equal(t, MessageTypeAIFailure, chat.Messages[0].Type)
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type)
+}
+
+// --- Per-ling terminal events of a multi-ling edict tab ---
+
+// bannerLines returns the chat's unowned system messages that are terminal
+// banners (the lines the TUI adds to announce an error, interrupt or
+// truncation). They are the only messages a ling's terminal event adds besides
+// its own blocks.
+func bannerLines(chat *ChatComponent) []string {
+	var out []string
+	for _, msg := range chat.Messages {
+		if msg.Owner != "" {
+			continue
+		}
+		switch msg.Type {
+		case MessageTypeAISuccess, MessageTypeAIFailure, MessageTypeAI:
+			continue
+		}
+		out = append(out, msg.Content)
+	}
+	return out
+}
+
+// twoLingTab returns a model whose "e<N>" tab carries two live lings, one
+// streamed block each. It is the fixture for the per-ling terminal paths.
+func twoLingTab(t *testing.T, channel string) TUIModel {
+	t.Helper()
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel(channel), "ritual", channel, nil)
+	model.Update(court.StreamStartMsg{ChannelID: channel})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: channel, Text: "one", LingID: "ling-1", MinisterID: "forge"},
+		{ChannelID: channel, Text: "two", LingID: "ling-2", MinisterID: "forge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+	return m
+}
+
+// TestStreamInterruptedMsg_PerLingKeepsSibling verifies an interrupted ling is
+// closed as a failure while its sibling keeps streaming: killing one ling must
+// not abort the tab or the other ling's work.
+func TestStreamInterruptedMsg_PerLingKeepsSibling(t *testing.T) {
+	m := twoLingTab(t, "e880")
+
+	newModel, _ := m.Update(court.StreamInterruptedMsg{ChannelID: "e880", PartialContent: "one", LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	assert.Equal(t, map[string]bool{"ling-2": true}, m.streamingLings["e880"],
+		"only the interrupted ling is forgotten")
+	assert.True(t, m.tabs.TabByTarget("e880").Streaming, "the sibling is still streaming")
+
+	// Only the ling-owned blocks matter here: the interrupt path also emits its
+	// long-standing "ABORTED" banner, which is an unowned system message.
+	chat := m.tabs.ChatByTab("e880")
+	var blocks []ChatMessage
+	for _, msg := range chat.Messages {
+		if msg.Owner != "" {
+			blocks = append(blocks, msg)
+		}
+	}
+	require.Len(t, blocks, 2, "each ling keeps exactly one block")
+	assert.Equal(t, MessageTypeAIFailure, blocks[0].Type,
+		"an interrupted ling's block is closed, not left looking busy")
+	assert.Equal(t, MessageTypeAI, blocks[1].Type, "the sibling's block is untouched")
+}
+
+// TestStreamErrorMsg_PerLingKeepsSibling covers the same contract for a failure
+// that is attributable to one ling (StreamErrorMsg.LingID). A second ling must
+// survive, or one ling's crash would take the whole edict's output with it.
+func TestStreamErrorMsg_PerLingKeepsSibling(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"model error", errors.New("provider exploded")},
+		{"connection drop", errors.New("rpc: conn closed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := twoLingTab(t, "e883")
+
+			newModel, _ := m.Update(court.StreamErrorMsg{ChannelID: "e883", Err: tc.err, LingID: "ling-1"})
+			m = newModel.(TUIModel)
+
+			assert.Equal(t, map[string]bool{"ling-2": true}, m.streamingLings["e883"],
+				"only the failed ling is forgotten")
+			assert.True(t, m.tabs.TabByTarget("e883").Streaming, "the sibling is still streaming")
+			assert.Equal(t, MessageTypeAIFailure, m.tabs.ChatByTab("e883").Messages[0].Type,
+				"the failed ling's block is closed")
+		})
+	}
+}
+
+// TestStreamMaxTokensReachedMsg_PerLingKeepsSibling verifies truncation is
+// terminal for one ling only: the truncated block is closed as a completed
+// block (truncation is not a failure) and the sibling keeps streaming.
+func TestStreamMaxTokensReachedMsg_PerLingKeepsSibling(t *testing.T) {
+	m := twoLingTab(t, "e884")
+
+	newModel, _ := m.Update(court.StreamMaxTokensReachedMsg{ChannelID: "e884", Content: "cut", LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	assert.Equal(t, map[string]bool{"ling-2": true}, m.streamingLings["e884"])
+	assert.True(t, m.tabs.TabByTarget("e884").Streaming, "the sibling is still streaming")
+
+	chat := m.tabs.ChatByTab("e884")
+	assert.Equal(t, MessageTypeAISuccess, chat.Messages[0].Type,
+		"a truncated ling's block is closed as complete, not failed")
+	assert.Equal(t, MessageTypeAI, chat.Messages[1].Type, "the sibling's block is untouched")
+}
+
+// TestPerLingTerminal_SurvivorCompletionStillStopsTab is the end-to-end point of
+// the fix: after one ling dies by any terminal path, the surviving ling's
+// completion must still stop the tab and run the guardrail callback. Before the
+// fix the dead ling's stale entry pinned the tab open forever.
+func TestPerLingTerminal_SurvivorCompletionStillStopsTab(t *testing.T) {
+	terminals := map[string]tea.Msg{
+		"error":      court.StreamErrorMsg{ChannelID: "e885", Err: errors.New("boom"), LingID: "ling-1"},
+		"interrupt":  court.StreamInterruptedMsg{ChannelID: "e885", PartialContent: "one", LingID: "ling-1"},
+		"max tokens": court.StreamMaxTokensReachedMsg{ChannelID: "e885", Content: "cut", LingID: "ling-1"},
+	}
+	for name, terminal := range terminals {
+		t.Run(name, func(t *testing.T) {
+			m := twoLingTab(t, "e885")
+
+			callbackRan := false
+			m.streamCompleteCallback = func(*TUIModel) tea.Cmd {
+				callbackRan = true
+				return nil
+			}
+
+			newModel, _ := m.Update(terminal)
+			m = newModel.(TUIModel)
+
+			newModel, _ = m.Update(court.StreamCompleteMsg{ChannelID: "e885", LingID: "ling-2"})
+			m = newModel.(TUIModel)
+
+			assert.Empty(t, m.streamingLings["e885"], "no ling is left behind")
+			assert.False(t, m.tabs.TabByTarget("e885").Streaming,
+				"the tab stops once its last living ling completes")
+			assert.True(t, callbackRan, "the guardrail callback runs for the last ling")
+		})
+	}
+}
+
+// TestTerminalMsg_UnknownChannelIsSafe verifies the terminal handlers do not
+// panic when the channel has no tab (a message can outlive its tab).
+func TestTerminalMsg_UnknownChannelIsSafe(t *testing.T) {
+	model := newTestModel(t)
+	m := *model
+	newModel, _ := m.Update(court.StreamErrorMsg{ChannelID: "e888", Err: errors.New("boom"), LingID: "ling-1"})
+	m = newModel.(TUIModel)
+	assert.Nil(t, m.tabs.TabByTarget("e888"))
+}
+
+// TestTerminalMsg_NoTabDoesNotTouchAnotherChannelsBlocks verifies terminal
+// events are scoped to their own channel. A channel can have no tab at all: the
+// ruler closes an edict tab while its lings are still running, and the cancelled
+// session then reports its failure (context canceled) on that closed channel.
+// ChatByTab falls back to the *active* tab, so a forget/finalize keyed through
+// it closes another edict's live ling blocks — the ruler watches real work turn
+// into failure text.
+func TestTerminalMsg_NoTabDoesNotTouchAnotherChannelsBlocks(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e892"), "ritual", "e892", nil)
+	model.addTab(ritualTabLabel("e893"), "ritual", "e893", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e892"})
+	model.Update(court.StreamStartMsg{ChannelID: "e893"})
+
+	m := *model
+	for _, msg := range []court.StreamChunkMsg{
+		{ChannelID: "e893", Text: "A", LingID: "ling-A", MinisterID: "forge"},
+		{ChannelID: "e893", Text: "B", LingID: "ling-B", MinisterID: "judge"},
+	} {
+		newModel, _ := m.Update(msg)
+		m = newModel.(TUIModel)
+	}
+	survivor := m.tabs.ChatByTab("e893")
+
+	// The ruler cancels and closes the other edict's tab mid-stream.
+	m.stopStreamingTab("e892")
+	require.True(t, m.tabs.SwitchToTarget("e892"))
+	require.NoError(t, m.tabs.Close())
+	require.Nil(t, m.tabs.TabByTarget("e892"), "the tab is gone")
+
+	// The ruler watches the surviving edict tab...
+	require.True(t, m.tabs.SwitchToTarget("e893"))
+
+	// ...while the cancelled session reports its failure on the closed channel.
+	newModel, _ := m.Update(court.StreamErrorMsg{ChannelID: "e892", Err: errors.New("context canceled"), LingID: "ling-X"})
+	m = newModel.(TUIModel)
+
+	var blocks []ChatMessage
+	for _, msg := range survivor.Messages {
+		if msg.Owner != "" {
+			blocks = append(blocks, msg)
+		}
+	}
+	require.Len(t, blocks, 2)
+	for i, blk := range blocks {
+		assert.Equal(t, MessageTypeAI, blk.Type,
+			"block %d belongs to another channel and must stay streaming", i)
+	}
+	assert.Equal(t, map[string]bool{"ling-A": true, "ling-B": true}, m.streamingLings["e893"],
+		"another channel's liveness must be untouched")
+	assert.True(t, m.tabs.TabByTarget("e893").Streaming,
+		"another channel's tab must stay streaming")
+}
+
+// TestClosedTabChunksDoNotLeakIntoActiveTab verifies a late chunk for a closed
+// channel never lands in another channel's conversation. Closing a tab cancels
+// its context, so in-flight chunks outlive it; attribution must not route them
+// into an unrelated tab.
+func TestClosedTabChunksDoNotLeakIntoActiveTab(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e890"), "ritual", "e890", nil)
+	model.addTab(ritualTabLabel("e891"), "ritual", "e891", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e890"})
+	model.Update(court.StreamStartMsg{ChannelID: "e891"})
+
+	m := *model
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e891", Text: "mine", LingID: "ling-9", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+
+	// Hold the surviving channel's chat directly: the active tab can move.
+	survivor := m.tabs.ChatByTab("e891")
+
+	// The ruler cancels and closes e890.
+	m.stopStreamingTab("e890")
+	require.True(t, m.tabs.SwitchToTarget("e890"))
+	require.NoError(t, m.tabs.Close())
+	require.Nil(t, m.tabs.TabByTarget("e890"), "the tab is gone")
+
+	// An in-flight chunk for the closed channel arrives late.
+	newModel, _ = m.Update(court.StreamChunkMsg{ChannelID: "e890", Text: "LATE", LingID: "ling-8", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+
+	for _, msg := range survivor.Messages {
+		assert.NotContains(t, msg.Content, "LATE",
+			"a closed channel's late chunk must not leak into another channel")
+		assert.NotEqual(t, "ling-8", msg.Owner,
+			"another channel's ling must never own a block here")
+	}
+}
+
+// TestTerminalMsg_TablessChannelClosesNothingElse extends the cross-channel
+// contract to every terminal message: whichever event arrives for a channel
+// whose tab is gone, only that channel's bookkeeping is dropped. Nothing may
+// reach the active tab, whose ling blocks must stay streaming.
+func TestTerminalMsg_TablessChannelClosesNothingElse(t *testing.T) {
+	terminals := map[string]tea.Msg{
+		"complete":   court.StreamCompleteMsg{ChannelID: "e886", LingID: "ling-X"},
+		"interrupt":  court.StreamInterruptedMsg{ChannelID: "e886", PartialContent: "x", LingID: "ling-X"},
+		"error":      court.StreamErrorMsg{ChannelID: "e886", Err: errors.New("context canceled"), LingID: "ling-X"},
+		"max tokens": court.StreamMaxTokensReachedMsg{ChannelID: "e886", Content: "cut", LingID: "ling-X"},
+		"overflow":   court.StreamContextOverflowMsg{ChannelID: "e886", Window: 1000, LingID: "ling-X"},
+		"start":      court.StreamStartMsg{ChannelID: "e886"},
+	}
+	for name, terminal := range terminals {
+		t.Run(name, func(t *testing.T) {
+			model := newTestModel(t)
+			model.addTab(ritualTabLabel("e887"), "ritual", "e887", nil)
+			model.Update(court.StreamStartMsg{ChannelID: "e887"})
+
+			m := *model
+			for _, msg := range []court.StreamChunkMsg{
+				{ChannelID: "e887", Text: "one", LingID: "ling-1", MinisterID: "forge"},
+				{ChannelID: "e887", Text: "two", LingID: "ling-2", MinisterID: "forge"},
+			} {
+				newModel, _ := m.Update(msg)
+				m = newModel.(TUIModel)
+			}
+			survivor := m.tabs.TabByTarget("e887")
+			require.NotNil(t, survivor)
+
+			newModel, _ := m.Update(terminal)
+			m = newModel.(TUIModel)
+
+			assert.Nil(t, m.tabs.TabByTarget("e886"), "no tab is conjured for the dead channel")
+			assert.Equal(t, map[string]bool{"ling-1": true, "ling-2": true}, m.streamingLings["e887"],
+				"another channel's liveness is untouched")
+			assert.NotContains(t, m.streamingLings, "e886", "the dead channel leaves no bookkeeping")
+			assert.True(t, survivor.Streaming, "another channel's tab stays streaming")
+			for i, msg := range survivor.Content.Chat.Messages {
+				if msg.Owner == "" {
+					continue
+				}
+				assert.Equal(t, MessageTypeAI, msg.Type,
+					"block %d of another channel must stay streaming", i)
+			}
+		})
+	}
+}
+
+// TestStreamChunkMsg_TablessChannelDoesNotMarkActiveTab verifies a late chunk
+// for a channel with no tab neither renders nor flips the active tab to
+// streaming. (A ritual "e<N>" channel auto-creates its tab by design, so this
+// uses a minister-style channel that never auto-creates one.)
+func TestStreamChunkMsg_TablessChannelDoesNotMarkActiveTab(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e889"), "ritual", "e889", nil)
+	active := model.tabs.ActiveTab()
+	require.NotNil(t, active)
+
+	m := *model
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "banished", Text: "LATE", LingID: "ling-8", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+
+	assert.Nil(t, m.tabs.TabByTarget("banished"))
+	assert.Empty(t, m.streamingLings, "a tabless channel registers no ling")
+	assert.False(t, m.tabs.ActiveTab().Streaming, "the active tab is not marked streaming")
+	for _, msg := range m.tabs.ActiveTab().Content.Chat.Messages {
+		assert.NotContains(t, msg.Content, "LATE")
+	}
+}
+
+// TestTerminalMsg_ForClosedChannelCoversAllTerminals verifies every terminal
+// message type tolerates a channel whose tab is gone. A closed tab's session
+// reports completion, interruption, overflow, truncation or failure; none of
+// them may render into, or mutate, another channel's conversation.
+func TestTerminalMsg_ForClosedChannelCoversAllTerminals(t *testing.T) {
+	terminals := map[string]tea.Msg{
+		"complete":         court.StreamCompleteMsg{ChannelID: "e898", LingID: "ling-1"},
+		"interrupt":        court.StreamInterruptedMsg{ChannelID: "e898", PartialContent: "x", LingID: "ling-1"},
+		"context overflow": court.StreamContextOverflowMsg{ChannelID: "e898", Window: 100, LingID: "ling-1"},
+		"max tokens":       court.StreamMaxTokensReachedMsg{ChannelID: "e898", Content: "x", LingID: "ling-1"},
+		"error":            court.StreamErrorMsg{ChannelID: "e898", Err: errors.New("context canceled"), LingID: "ling-1"},
+	}
+	for name, terminal := range terminals {
+		t.Run(name, func(t *testing.T) {
+			model := newTestModel(t)
+			model.addTab(ritualTabLabel("e897"), "ritual", "e897", nil)
+			model.Update(court.StreamStartMsg{ChannelID: "e897"})
+
+			m := *model
+			newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e897", Text: "live", LingID: "ling-9", MinisterID: "forge"})
+			m = newModel.(TUIModel)
+
+			newModel, _ = m.Update(terminal)
+			m = newModel.(TUIModel)
+
+			chat := m.tabs.ChatByTab("e897")
+			require.Len(t, chat.Messages, 1, "no terminal banner may leak into another channel")
+			assert.Equal(t, MessageTypeAI, chat.Messages[0].Type, "the live block stays streaming")
+			assert.Equal(t, map[string]bool{"ling-9": true}, m.streamingLings["e897"],
+				"the other channel's liveness is untouched")
+			assert.Nil(t, m.tabs.TabByTarget("e898"))
+		})
+	}
+}
+
+// TestStreamStartMsg_ForClosedChannelIsIgnored verifies a start for a channel
+// with no tab does not mark the active tab as streaming — that would make an
+// unrelated tab look busy and block closing it.
+func TestStreamStartMsg_ForClosedChannelIsIgnored(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e895"), "ritual", "e895", nil)
+	m := *model
+	require.True(t, m.tabs.SwitchToTarget("e895"))
+
+	newModel, _ := m.Update(court.StreamStartMsg{ChannelID: "e896"})
+	m = newModel.(TUIModel)
+
+	assert.False(t, m.tabs.TabByTarget("e895").Streaming,
+		"the active tab must not be marked streaming for a closed channel")
+	assert.Nil(t, m.tabs.TabByTarget("e896"))
+}
+
+// TestStreamChunkMsg_NoChannelStillRendersOnActiveTab preserves the legacy path:
+// a chunk with an empty channel is not from a session with a tab and keeps
+// routing to the active tab, exactly as before this edict.
+func TestStreamChunkMsg_NoChannelStillRendersOnActiveTab(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e894"), "ritual", "e894", nil)
+	m := *model
+
+	newModel, _ := m.Update(court.StreamChunkMsg{Text: "local output"})
+	m = newModel.(TUIModel)
+
+	chat := m.tabs.ChatByTab("e894")
+	require.Len(t, chat.Messages, 1)
+	assert.Contains(t, chat.Messages[0].Content, "local output")
+	assert.Empty(t, m.streamingLings[""], "a channel-less chunk tracks no ling liveness")
+}
+
+// TestTerminalMsg_ClosedChannelWithNoLiveTabsStopsWaiting verifies the
+// bookkeeping tail of the closed-channel path: when the only streaming tab is
+// gone, a terminal message for it must also clear the "waiting for response"
+// state, or the status bar keeps spinning for work that can never arrive.
+func TestTerminalMsg_ClosedChannelWithNoLiveTabsStopsWaiting(t *testing.T) {
+	for name, terminal := range map[string]tea.Msg{
+		"interrupt":        court.StreamInterruptedMsg{ChannelID: "e878", PartialContent: "x", LingID: "ling-1"},
+		"context overflow": court.StreamContextOverflowMsg{ChannelID: "e878", Window: 10, LingID: "ling-1"},
+		"max tokens":       court.StreamMaxTokensReachedMsg{ChannelID: "e878", Content: "x", LingID: "ling-1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			model := newTestModel(t)
+			model.addTab(ritualTabLabel("e877"), "ritual", "e877", nil)
+			m := *model
+			m.startWaitingForResponse()
+
+			newModel, _ := m.Update(terminal)
+			m = newModel.(TUIModel)
+
+			assert.False(t, m.waitingForResponse,
+				"a terminal message for the last streaming channel must stop the wait indicator")
+			assert.Nil(t, m.tabs.TabByTarget("e878"))
+		})
+	}
+}
+
+// TestMarkLingStreaming_NoTabIsNoOp verifies a chunk for a channel with no tab
+// cannot register liveness for, or mark, another tab. Without the guard the
+// active tab would be flagged streaming on behalf of a closed channel.
+func TestMarkLingStreaming_NoTabIsNoOp(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e876"), "ritual", "e876", nil)
+	m := *model
+	require.True(t, m.tabs.SwitchToTarget("e876"))
+
+	m.markLingStreaming("e999", "ling-ghost")
+
+	assert.Nil(t, m.streamingLings["e999"], "no liveness for a channel with no tab")
+	assert.False(t, m.tabs.TabByTarget("e876").Streaming,
+		"an unrelated tab must not be marked streaming")
+}
+
+// TestStreamErrorMsg_PerLingBannerNamesTheLing extends the per-ling failure
+// contract to the visible banner: on a multi-ling tab the ruler must be able to
+// tell WHICH ling died, not merely that something failed.
+func TestStreamErrorMsg_PerLingBannerNamesTheLing(t *testing.T) {
+	m := twoLingTab(t, "e886")
+
+	newModel, _ := m.Update(court.StreamErrorMsg{ChannelID: "e886", Err: errors.New("provider exploded"), LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	chat := m.tabs.ChatByTab("e886")
+	chat.FlushDirty()
+	// The banner MESSAGE must carry the token; the viewport also holds the
+	// blocks' own prefixed lines, so checking the view alone would not prove it.
+	require.Contains(t, strings.Join(bannerLines(chat), "\n"), "[forge/ling-1]",
+		"the failure banner must name the ling that died, with the same token the blocks use")
+	assert.Contains(t, chat.Viewport.View(), "[forge/ling-2] two",
+		"the surviving ling's block is untouched")
+}
+
+// TestTerminalBanners_UnprefixedWhenSingleOwner verifies the banner prefix obeys
+// the same rule as block rendering: a single-ling tab shows no attribution, so
+// single-ling and ritual-step presentation is unchanged.
+func TestTerminalBanners_UnprefixedWhenSingleOwner(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e887"), "ritual", "e887", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e887"})
+
+	m := *model
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e887", Text: "solo", LingID: "ling-1", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+	newModel, _ = m.Update(court.StreamErrorMsg{ChannelID: "e887", Err: errors.New("boom"), LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	chat := m.tabs.ChatByTab("e887")
+	chat.FlushDirty()
+	assert.NotContains(t, chat.Viewport.View(), "[", "a lone owner needs no attribution token")
+}
+
+// TestStreamCompleteMsg_SingleLingUsesAttributedFinalize pins the behaviour delta
+// the Chancellor flagged: because the court now always attributes, even a
+// single-ling tab takes the attributed channel-wide finalize path
+// (FinalizeLingAIMessages("")) instead of FinalizeLastAIMessage. The observable
+// contract is unchanged — the block completes as success and the tab stops.
+func TestStreamCompleteMsg_SingleLingUsesAttributedFinalize(t *testing.T) {
+	model := newTestModel(t)
+	model.addTab(ritualTabLabel("e1005"), "ritual", "e1005", nil)
+	model.Update(court.StreamStartMsg{ChannelID: "e1005"})
+
+	callbackRan := false
+	m := *model
+	m.streamCompleteCallback = func(*TUIModel) tea.Cmd {
+		callbackRan = true
+		return nil
+	}
+
+	newModel, _ := m.Update(court.StreamChunkMsg{ChannelID: "e1005", Text: "only", LingID: "ling-1", MinisterID: "forge"})
+	m = newModel.(TUIModel)
+	chat := m.tabs.ChatByTab("e1005")
+	require.True(t, chat.HasAttributedMessages(), "a ling block is attributed even when alone")
+
+	newModel, _ = m.Update(court.StreamCompleteMsg{ChannelID: "e1005", LingID: "ling-1"})
+	m = newModel.(TUIModel)
+
+	require.Len(t, chat.Messages, 1)
+	assert.Equal(t, MessageTypeAISuccess, chat.Messages[0].Type,
+		"the attributed path finalizes the sole block exactly like the old one")
+	assert.False(t, m.tabs.TabByTarget("e1005").Streaming)
+	assert.True(t, callbackRan, "the completion callback still runs")
+}
+
+// TestTerminalBanners_NameLingForEveryAttributedTerminal verifies the remaining
+// two banners carry the same attribution token as the blocks: an interrupt and a
+// truncation of one ling must say WHICH ling, from the ruler's point of view.
+// The token matches the block rendering ([minister/ling]) because the minister
+// is resolved from the ling's own blocks, not carried on the terminal message.
+func TestTerminalBanners_NameLingForEveryAttributedTerminal(t *testing.T) {
+	terminals := map[string]struct {
+		msg      tea.Msg
+		contains string
+	}{
+		"interrupt": {
+			msg:      court.StreamInterruptedMsg{ChannelID: "e1006", PartialContent: "one", LingID: "ling-1"},
+			contains: "[forge/ling-1]",
+		},
+		"max tokens": {
+			msg:      court.StreamMaxTokensReachedMsg{ChannelID: "e1006", Content: "cut", LingID: "ling-1"},
+			contains: "[forge/ling-1]",
+		},
+	}
+	for name, tc := range terminals {
+		t.Run(name, func(t *testing.T) {
+			m := twoLingTab(t, "e1006")
+
+			newModel, _ := m.Update(tc.msg)
+			m = newModel.(TUIModel)
+
+			chat := m.tabs.ChatByTab("e1006")
+			chat.FlushDirty()
+			// Assert on the banner MESSAGE, not the viewport: the viewport also
+			// contains the blocks' own prefixed lines, which would satisfy a
+			// substring check even if the banner stayed anonymous.
+			banners := bannerLines(chat)
+			require.NotEmpty(t, banners)
+			assert.Contains(t, strings.Join(banners, "\n"), tc.contains,
+				"the %s banner must name the ling that ended", name)
+			assert.Contains(t, chat.Viewport.View(), "[forge/ling-2] two",
+				"the surviving ling's block is untouched")
+		})
+	}
+}

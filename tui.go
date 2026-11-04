@@ -137,6 +137,13 @@ type TUIModel struct {
 	// active stream, each streaming tab's prompt is saved here for
 	// auto-retry after reconnect.
 	connDropPendingRetry map[string]pendingRetry
+
+	// streamingLings tracks, per channel, the ling ids whose streams are still
+	// in flight. Several lings of one edict share the "e<N>" tab, so a single
+	// tab-level Streaming flag cannot tell whether the whole tab is done: the
+	// first ling's StreamCompleteMsg must not stop the tab (dropping the other
+	// lings' chunks) nor finalize their blocks.
+	streamingLings map[string]map[string]bool
 }
 
 // pendingRetry stores the prompt text and context files from a stream
@@ -1631,6 +1638,33 @@ func isRitualChannel(channelID string) bool {
 	return err == nil
 }
 
+// lingAttributed tags raw-history text with the ling that produced it, so the
+// debug history of a multi-ling edict tab stays attributable too. Unattributed
+// chunks pass through unchanged.
+func lingAttributed(msg court.StreamChunkMsg, text string) string {
+	if msg.LingID == "" {
+		return text
+	}
+	if msg.MinisterID != "" {
+		return fmt.Sprintf("[%s/%s] %s", msg.MinisterID, msg.LingID, text)
+	}
+	return fmt.Sprintf("[%s] %s", msg.LingID, text)
+}
+
+// lingBanner prefixes a terminal banner with its ling attribution. It uses the
+// same "[minister/ling]" token the blocks use, resolving the minister from the
+// ling's own blocks rather than adding a minister field to the terminal
+// messages. The prefix is shown only when the tab actually holds several lings
+// (the block rendering rule), so a single-ling edict's banners stay
+// byte-for-byte as before while a multi-ling tab names which ling (and
+// minister) failed, was interrupted or was truncated.
+func lingBanner(chat *ChatComponent, lingID, text string) string {
+	if lingID == "" || !chat.hasMultipleOwners() {
+		return text
+	}
+	return lingPrefix(lingID, chat.OwnerMinisterFor(lingID)) + text
+}
+
 // ritualTabLabel returns the display label for a ritual tab.
 // Edict 1 is the reserved Court Infrastructure edict, so its
 // tab shows as "Court" instead of "e1".
@@ -2349,6 +2383,11 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		chat.AddMessage(fmt.Sprintf("Error: %v", msg.err))
 
 	case court.StreamStartMsg:
+		// A start can outlive its tab (the ruler closed it mid-stream).
+		// Ignore it: SetStreamingTabByTab would otherwise mark the active tab.
+		if m.tabs.TabByTarget(msg.ChannelID) == nil {
+			return m, nil
+		}
 		// Streaming has started — capture edict ID for multi-turn
 		m.tabs.SetStreamingTabByTab(msg.ChannelID)
 		if msg.EdictID != 0 {
@@ -2361,16 +2400,44 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status.ClearError() // Clear any previous error state
 
 	case court.StreamCompleteMsg:
-		chat := m.tabs.ChatByTab(msg.ChannelID)
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil {
+			// The tab is gone; only drop this channel's bookkeeping.
+			m.forgetLings(msg.ChannelID, false)
+			if !m.tabs.AnyStreaming() {
+				m.stopWaitingForResponse()
+			}
+			return m, nil
+		}
+		chat := tab.Content.Chat
 		chat.AddToRawHistory("STREAM_COMPLETE", "AI streaming response completed")
 		slog.Debug("streamCompleteMsg", "messages_count", len(chat.Messages))
+
+		// A multi-ling edict tab interleaves several lings' blocks. Only the
+		// ling named by the message is done: finalize its block alone and keep
+		// the tab streaming until the last ling finishes.
+		if msg.LingID != "" && m.clearLingStreaming(msg.ChannelID, msg.LingID) {
+			if isFailure := chat.FinalizeLingAIMessages(msg.LingID); isFailure {
+				slog.Debug("AI response marked as failure", "ling_id", msg.LingID)
+			}
+			return m, nil
+		}
+
 		m.tabs.ClearStreamingByTab(msg.ChannelID)
+		m.forgetLings(msg.ChannelID, false) // channel-wide completion closes any leftover blocks
 		if !m.tabs.AnyStreaming() {
 			m.stopWaitingForResponse()
 		}
 
-		// Finalize the last AI message with success/failure prefix
-		isFailure := chat.FinalizeLastAIMessage()
+		// Finalize the last AI message with success/failure prefix. An
+		// attributed tab may still hold earlier lings' blocks, so finalize them
+		// all rather than only whichever landed last.
+		var isFailure bool
+		if chat.HasAttributedMessages() {
+			isFailure = chat.FinalizeLingAIMessages("")
+		} else {
+			isFailure = chat.FinalizeLastAIMessage()
+		}
 		if isFailure {
 			slog.Debug("AI response marked as failure")
 		}
@@ -2390,7 +2457,17 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case court.StreamInterruptedMsg:
 		// Session already stopped — just reset UI state, don't re-cancel ctx.
-		chat := m.tabs.ChatByTab(msg.ChannelID)
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil {
+			// Closed mid-stream: drop bookkeeping only, never the active tab's.
+			m.forgetLings(msg.ChannelID, true)
+			if !m.tabs.AnyStreaming() {
+				m.stopWaitingForResponse()
+			}
+			m.streamCompleteCallback = nil
+			return m, nil
+		}
+		chat := tab.Content.Chat
 		chat.AddToRawHistory("STREAM_INTERRUPTED", fmt.Sprintf("AI streaming interrupted, partial content: %s", msg.PartialContent))
 		// Suppress the "ABORTED" message when the ritual tab is in chat mode
 		// (paused for ruler interjection) — the step was intentionally
@@ -2399,13 +2476,21 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if tab := m.tabs.TabByTarget(msg.ChannelID); tab != nil && tab.ChatMode {
 				slog.Debug("streamInterruptedMsg suppressed (ritual paused)", "channel", msg.ChannelID)
 			} else {
-				chat.AddMessage(systemPrefix + "ABORTED")
+				chat.AddMessage(lingBanner(chat, msg.LingID, systemPrefix+"ABORTED"))
 			}
 		} else {
-			chat.AddMessage(systemPrefix + "ABORTED")
+			chat.AddMessage(lingBanner(chat, msg.LingID, systemPrefix+"ABORTED"))
 		}
 		slog.Debug("streamInterruptedMsg", "partial_content_length", len(msg.PartialContent))
+		if msg.LingID != "" && m.forgetLing(msg.ChannelID, msg.LingID, true) {
+			// Sibling lings are still working: keep the tab (and the wait
+			// indicator) alive, and leave the completion callback armed for
+			// whichever ling finishes last.
+			m.repoInfo.RefreshDiff()
+			return m, nil
+		}
 		m.tabs.ClearStreamingByTab(msg.ChannelID)
+		m.forgetLings(msg.ChannelID, true) // channel-wide interrupt closes every ling's block
 		if !m.tabs.AnyStreaming() {
 			m.stopWaitingForResponse()
 		}
@@ -2416,7 +2501,16 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Context overflow that recovery could not fit. Distinct from a
 		// generic model error: the session stays alive, the prompt is
 		// recoverable, and we show an actionable hint instead of SetError.
-		chat := m.tabs.ChatByTab(msg.ChannelID)
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil {
+			m.forgetLings(msg.ChannelID, true)
+			if !m.tabs.AnyStreaming() {
+				m.stopWaitingForResponse()
+			}
+			m.streamCompleteCallback = nil
+			return m, nil
+		}
+		chat := tab.Content.Chat
 		chat.AddToRawHistory("STREAM_CONTEXT_OVERFLOW", fmt.Sprintf("context window exceeded: %d", msg.Window))
 		slog.Warn("court.StreamContextOverflowMsg", "window", msg.Window, "channel", msg.ChannelID)
 
@@ -2429,12 +2523,31 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		chat.AddMessage(fmt.Sprintf("\n%s⚠️  %s", systemPrefix, hint))
 		m.commandLine.AddToast(hint, "warning", time.Second*5)
 		// Leave the session usable: reset streaming state but do not SetError.
+		// A ling that overflowed is dead and its block must be closed;
+		// sibling lings are untouched and still finish normally.
+		if msg.LingID != "" && m.forgetLing(msg.ChannelID, msg.LingID, true) {
+			m.repoInfo.RefreshDiff()
+			return m, nil
+		}
+		m.forgetLings(msg.ChannelID, true)
 		m.clearStreamingTab(msg.ChannelID)
 		m.streamCompleteCallback = nil // Clear callback on overflow (no completion will follow)
 		m.repoInfo.RefreshDiff()
 
 	case court.StreamErrorMsg:
-		chat := m.tabs.ChatByTab(msg.ChannelID)
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil {
+			// The tab was closed mid-stream (a cancel reports back as an
+			// error). Drop this channel's bookkeeping and never render into
+			// another channel's conversation.
+			m.forgetLings(msg.ChannelID, true)
+			if !m.tabs.AnyStreaming() {
+				m.stopWaitingForResponse()
+			}
+			m.streamCompleteCallback = nil
+			return m, nil
+		}
+		chat := tab.Content.Chat
 		chat.AddToRawHistory("STREAM_ERROR", fmt.Sprintf("AI streaming error: %v", msg.Err))
 		slog.Error("court.StreamErrorMsg", "error", msg.Err)
 
@@ -2448,38 +2561,61 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if connErr {
 			friendlyErr := friendlyConnError(msg.Err)
-			chat.AddMessage(fmt.Sprintf("\n%s⚠️  %s", systemPrefix, friendlyErr))
+			chat.AddMessage(lingBanner(chat, msg.LingID, fmt.Sprintf("\n%s⚠️  %s", systemPrefix, friendlyErr)))
 			chat.AddMessage(fmt.Sprintf("%s[Reconnecting… Your last message will be retried.]", systemPrefix))
 			m.commandLine.AddToast(friendlyErr+" — Reconnecting…", "warning", time.Second*5)
-			// Reset status but don't show error icon for connection drops
+			// Reset status but don't show error icon for connection drops.
+			// Only the failed ling is forgotten; its siblings keep streaming.
+			if msg.LingID != "" && m.forgetLing(msg.ChannelID, msg.LingID, true) {
+				m.repoInfo.RefreshDiff()
+				return m, nil
+			}
+			m.forgetLings(msg.ChannelID, true) // channel-wide failure closes every ling's block
 			m.clearStreamingTab(msg.ChannelID)
 			m.repoInfo.RefreshDiff()
 		} else {
 			fullError := fmt.Sprintf("Model Error: %v", msg.Err)
-			chat.AddMessage(fmt.Sprintf("\n%s❌ %s", systemPrefix, fullError))
+			chat.AddMessage(lingBanner(chat, msg.LingID, fmt.Sprintf("\n%s❌ %s", systemPrefix, fullError)))
 			m.commandLine.AddToast(fullError, "error", time.Second*5)
 			m.status.SetError()
+			// A ling failure is not the tab's failure: forget just that ling
+			// and let its siblings finish, so a later completion still stops
+			// the tab and runs the guardrail callback.
+			if msg.LingID != "" && m.forgetLing(msg.ChannelID, msg.LingID, true) {
+				m.repoInfo.RefreshDiff()
+				return m, nil
+			}
+			m.forgetLings(msg.ChannelID, true) // channel-wide failure closes every ling's block
 			m.clearStreamingTab(msg.ChannelID)
 			m.repoInfo.RefreshDiff()
 		}
 
-		/* TODO: Add the message bellow
-		case streamMaxTurnsExceededMsg:
-			// Max turns exceeded, mark session as inactive and show warning
-			m.tabs.Content().Chat.AddToRawHistory("STREAM_MAX_TURNS_EXCEEDED", fmt.Sprintf("AI streaming ended after reaching max turns limit: %d", msg.maxTurns))
-			slog.Warn("streamMaxTurnsExceededMsg", "max_turns", msg.maxTurns)
-			m.tabs.Content().Chat.AddMessage(fmt.Sprintf("\n⚠️  Conversation ended after reaching maximum turn limit (%d turns)", msg.maxTurns))
-			m.stopStreaming()
-			m.streamCompleteCallback = nil // Clear callback on max turns
-			m.repoInfo.RefreshDiff()
-		*/
+		// Struck by the Chancellor's ruling on edict 994: this commented-out
+		// branch referenced a streamMaxTurnsExceededMsg type that does not exist
+		// anywhere in the tree, so it could never be enabled as written. A
+		// max-turns feature needs a design (and its own edict), not a TODO.
 	case court.StreamMaxTokensReachedMsg:
 		// Max tokens reached, mark session as inactive and show warning
-		chat := m.tabs.ChatByTab(msg.ChannelID)
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil {
+			m.forgetLings(msg.ChannelID, false)
+			if !m.tabs.AnyStreaming() {
+				m.stopWaitingForResponse()
+			}
+			m.streamCompleteCallback = nil
+			return m, nil
+		}
+		chat := tab.Content.Chat
 		chat.AddToRawHistory("STREAM_MAX_TOKENS_REACHED", fmt.Sprintf("AI response truncated due to length limit: %s", msg.Content))
 		slog.Warn("streamMaxTokensReachedMsg", "content_length", len(msg.Content))
-		chat.AddMessage("\n\n⚠️  Response truncated due to length limit")
+		chat.AddMessage(lingBanner(chat, msg.LingID, "\n\n⚠️  Response truncated due to length limit"))
 		// Session already stopped — just reset UI state, don't re-cancel ctx.
+		// The truncated ling is done; close its block and leave siblings alone.
+		if msg.LingID != "" && m.forgetLing(msg.ChannelID, msg.LingID, false) {
+			m.repoInfo.RefreshDiff()
+			return m, nil
+		}
+		m.forgetLings(msg.ChannelID, false)
 		m.clearStreamingTab(msg.ChannelID)
 		m.streamCompleteCallback = nil // Clear callback on max tokens
 		m.repoInfo.RefreshDiff()
@@ -2490,20 +2626,40 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if isRitualChannel(msg.ChannelID) {
 			m.addTab(ritualTabLabel(msg.ChannelID), "ritual", msg.ChannelID, nil)
 		}
-		// Drop chunks for tabs the user already cancelled; daemon may still
-		// emit a few in-flight chunks before its ctx-cancel takes effect.
-		if tab := m.tabs.TabByTarget(msg.ChannelID); tab != nil && !tab.Streaming {
+		// A chunk is only ever delivered to its own channel's tab. When the
+		// ruler closed that tab mid-stream, the daemon may still emit a few
+		// in-flight chunks; ChatByTab would fall back to the ACTIVE tab and
+		// plant one edict's output in another edict's conversation. Drop them.
+		// A chunk with no channel is not from a session at all (tests, local
+		// callers); it keeps routing to the active tab as it always did.
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil && msg.ChannelID != "" {
 			return m, nil
+		}
+		// Drop chunks for tabs the ruler already cancelled; the daemon may
+		// still emit a few in-flight chunks before its ctx-cancel lands. This
+		// holds for attributed chunks too: a cancelled tab must not be
+		// resurrected by a ling's late output.
+		//   * Cancelled is tracked explicitly (Tab.Stopped), never inferred:
+		//     a "never started" tab (a fresh ritual tab, a ling's very first
+		//     chunk) is not cancelled and must accept its output.
+		//   * Unattributed chunks additionally keep the old "only while
+		//     streaming" rule, so no existing rendering path changes.
+		if tab != nil && (tab.Stopped || (msg.LingID == "" && !tab.Streaming)) {
+			return m, nil
+		}
+		if msg.LingID != "" && msg.ChannelID != "" {
+			m.markLingStreaming(msg.ChannelID, msg.LingID)
 		}
 		// Handle text chunks from Court — route to correct tab
 		chat := m.tabs.ChatByTab(msg.ChannelID)
 		if msg.Reasoning != "" {
-			chat.AddToRawHistory("COURT_REASONING", msg.Reasoning)
-			chat.AddThinkingChunk(msg.Reasoning)
+			chat.AddToRawHistory("COURT_REASONING", lingAttributed(msg, msg.Reasoning))
+			chat.AddThinkingChunkOwned(msg.Reasoning, msg.LingID, msg.MinisterID)
 		}
 		if msg.Text != "" {
-			chat.AddToRawHistory("COURT_TEXT", msg.Text)
-			chat.AddAIChunk(msg.Text)
+			chat.AddToRawHistory("COURT_TEXT", lingAttributed(msg, msg.Text))
+			chat.AddAIChunkOwned(msg.Text, msg.LingID, msg.MinisterID)
 		}
 		m.status.AddStreamChars(len(msg.Text) + len(msg.Reasoning))
 		m.status.SetVerified() // LLM returned content — provider is confirmed working
@@ -4184,6 +4340,10 @@ func (m TUIModel) renderRawSessionView(width, height int) string {
 // the same channelID via CancellableStreamCtx) also tears down.
 func (m *TUIModel) stopStreamingTab(tabTarget string) {
 	m.tabs.CancelTabByID(tabTarget)
+	// Cancelling is terminal for every ling on the tab: drop their liveness
+	// entries and close their blocks, or late in-flight chunks would keep
+	// resurrecting state and the blocks would never finalize.
+	m.forgetLings(tabTarget, true)
 	if m.court != nil {
 		m.court.CancelTab(tabTarget)
 	}
@@ -4196,9 +4356,72 @@ func (m *TUIModel) stopStreamingTab(tabTarget string) {
 	}
 }
 
+// markLingStreaming records that lingID is streaming on channel, and keeps the
+// tab itself streaming so chunks are not dropped while another ling finishes.
+// It is a no-op for a channel with no tab: SetStreamingTabByTab would otherwise
+// mark the active tab as streaming on behalf of a closed channel.
+func (m *TUIModel) markLingStreaming(channel, lingID string) {
+	if m.tabs.TabByTarget(channel) == nil {
+		return
+	}
+	if m.streamingLings == nil {
+		m.streamingLings = make(map[string]map[string]bool)
+	}
+	if m.streamingLings[channel] == nil {
+		m.streamingLings[channel] = make(map[string]bool)
+	}
+	m.streamingLings[channel][lingID] = true
+	m.tabs.SetStreamingTabByTab(channel)
+}
+
+// clearLingStreaming marks lingID done on channel. It reports whether other
+// lings on the same channel are still streaming.
+func (m *TUIModel) clearLingStreaming(channel, lingID string) bool {
+	lings := m.streamingLings[channel]
+	if lings == nil {
+		return false
+	}
+	delete(lings, lingID)
+	if len(lings) > 0 {
+		return true
+	}
+	delete(m.streamingLings, channel)
+	return false
+}
+
+// forgetLings drops the channel's liveness bookkeeping for every ling and
+// closes the blocks of the lings that are now dead. asFailure marks those
+// blocks failed (error/cancel paths). The survivors keep streaming.
+//
+// The chat is resolved strictly by channel: a channel with no tab left (the
+// ruler closed the edict tab mid-stream) must not fall back to the active tab,
+// or one edict's closure would finalize another edict's live ling blocks.
+func (m *TUIModel) forgetLings(channel string, asFailure bool) {
+	delete(m.streamingLings, channel)
+	if tab := m.tabs.TabByTarget(channel); tab != nil && tab.Content.Chat != nil {
+		tab.Content.Chat.FinalizeDeadLingAIMessages(m.streamingLings[channel], asFailure)
+	}
+}
+
+// forgetLing drops one ling from the channel's bookkeeping and closes its block
+// if it was the last one there. It reports whether other lings remain streaming.
+// Like forgetLings it never resolves the chat through the active-tab fallback.
+func (m *TUIModel) forgetLing(channel, lingID string, asFailure bool) bool {
+	remaining := m.clearLingStreaming(channel, lingID)
+	if tab := m.tabs.TabByTarget(channel); tab != nil && tab.Content.Chat != nil {
+		tab.Content.Chat.FinalizeDeadLingAIMessages(m.streamingLings[channel], asFailure)
+	}
+	return remaining
+}
+
 // clearStreamingTab resets UI streaming state for a tab without touching its
 // context. Use this when the session has already stopped itself (interrupted,
 // errored, max-tokens) — cancelling again only creates feedback loops.
+//
+// It deliberately leaves ling liveness alone: it is also reached by non-terminal
+// bookkeeping (a ritual step completing), where no ling died. The error and
+// interrupt paths call forgetLings explicitly so a dead ling's block is closed
+// and its entry cannot keep the tab Streaming forever.
 func (m *TUIModel) clearStreamingTab(tabTarget string) {
 	m.tabs.ClearStreamingByTab(tabTarget)
 	if !m.tabs.AnyStreaming() {
@@ -4209,6 +4432,9 @@ func (m *TUIModel) clearStreamingTab(tabTarget string) {
 // stopStreaming cancels all streaming globally (used for shutdown).
 func (m *TUIModel) stopStreaming() {
 	m.tabs.CancelAllTabs()
+	for channel := range m.streamingLings {
+		m.forgetLings(channel, true)
+	}
 	m.stopWaitingForResponse()
 	// Clear pending connection-drop retries — user cancelled
 	m.connDropPendingRetry = nil

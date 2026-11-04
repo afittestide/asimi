@@ -167,13 +167,14 @@ in `internal/rpc/notifications.go`.
 | Method                      | Payload shape                                                                    |
 | --------------------------- | -------------------------------------------------------------------------------- |
 | `stream.start`              | `{channel_id, edict_id}`                                                         |
-| `stream.chunk`              | `{channel_id, text}`                                                             |
+| `stream.chunk`              | `{channel_id, text, reasoning?, percent_context_used?, ling_id?, minister_id?}`  |
 | `stream.reasoning`          | `{channel_id, text}`                                                             |
-| `stream.complete`           | `{channel_id}`                                                                   |
+| `stream.complete`           | `{channel_id, ling_id?}`                                                         |
 | `stream.done`               | `{channel_id}`                                                                   |
-| `stream.interrupted`        | `{channel_id, partial_content}`                                                  |
-| `stream.max_tokens`         | `{channel_id, content}`                                                          |
-| `stream.error`              | `{channel_id, err string}` — `error` value is serialised as a string             |
+| `stream.interrupted`        | `{channel_id, partial_content, ling_id?}`                                        |
+| `stream.max_tokens`         | `{channel_id, content, ling_id?}`                                                |
+| `stream.context_overflow`   | `{channel_id, window, ling_id?}`                                                 |
+| `stream.error`              | `{channel_id, err string, ling_id?}` — `error` value is serialised as a string   |
 | `events.drained`            | `{channel_id, events []DrainedEvent}` — crash-recovery replay                    |
 | `minister.invoking`         | `{channel_id, minister_id, edict_key, task}`                                     |
 | `minister.completed`        | `{channel_id, minister_id, edict_key, output, sealed, err string}`               |
@@ -182,6 +183,15 @@ in `internal/rpc/notifications.go`.
 | `zhengming.answered`        | `{request_id, answer}`                                                           |
 | `ritual.step`               | `{channel_id, ritual_name, execution_id, edict_id, step_name, step_index, total_steps, status, message}` |
 | `runner.container_launched` | `{message, container_id}`                                                        |
+
+**Ling attribution rider.** `ling_id` / `minister_id` are set on the stream
+notifications of a *ling* session (an edict's work item, run under a minister).
+Several lings of one edict stream into the same `e<N>` channel, so these fields
+are what let the TUI tell their output apart. They are `omitempty` and empty for
+every other stream (interactive minister tabs, ritual steps, single-ling
+edicts), which keeps old decoders working and unattributed rendering unchanged.
+`stream.chunk` is the only notification that carries `minister_id`; the terminal
+notifications carry `ling_id` alone.
 
 **Delivery guarantees**: in arrival order per connection (notifications
 run on a single dispatcher goroutine). Drop on slow consumer: if the

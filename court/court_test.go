@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -5019,4 +5020,252 @@ func TestCourt_reconcileSandboxOrphans_NoJanitorIsSafe(t *testing.T) {
 	db := setupCourtTestDB(t)
 	s := NewCourt(db, config.DefaultCourtConfig(), &trackingRunner{label: "plain"}, slog.Default())
 	s.reconcileSandboxOrphans(context.Background())
+}
+
+// TestRunLing_AttributesChunksForMultiLingEdict verifies the output
+// attribution contract: with more than one ling on the edict, each ling's
+// stream chunks carry its own ling_id and minister_id so concurrent streams in
+// one "e<N>" tab stay distinguishable.
+func TestRunLing_AttributesChunksForMultiLingEdict(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+
+	var mu sync.Mutex
+	var chunks []StreamChunkMsg
+	s.notify = func(msg any) {
+		if c, ok := msg.(StreamChunkMsg); ok {
+			mu.Lock()
+			chunks = append(chunks, c)
+			mu.Unlock()
+		}
+	}
+
+	for i := range []int{0, 1} {
+		ling := storage.Ling{
+			LingID: fmt.Sprintf("ling-%d", i), EdictID: 71,
+			Username: "testuser", Project: "testproject",
+			Description: "task", Status: storage.LingPending,
+		}
+		require.NoError(t, db.Create(&ling).Error)
+	}
+
+	key := storage.EdictKey{ID: 71, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, chunks, "lings should emit stream chunks")
+	seen := map[string]bool{}
+	for _, c := range chunks {
+		assert.NotEmpty(t, c.LingID, "multi-ling chunk must be attributed")
+		assert.Equal(t, "forge", c.MinisterID, "minister rides along with the ling")
+		assert.Equal(t, "e71", c.ChannelID, "attribution must not change the tab")
+		seen[c.LingID] = true
+	}
+	assert.True(t, seen["ling-0"] && seen["ling-1"], "each ling's chunks must be attributable, got %v", seen)
+}
+
+// TestRunLing_SingleLingEdictIsAttributed pins the decision point: the court
+// attributes every ling, including an edict's only one. A point-in-time count
+// cannot know how many lings will share the tab (later insert_ling batches may
+// add more), so backwards compatibility is the TUI's job: it renders the prefix
+// only when two or more distinct owners actually landed (see
+// TestRenderSystemMessage_SingleOwnerHasNoPrefix in the TUI package).
+func TestRunLing_SingleLingEdictIsAttributed(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+
+	var mu sync.Mutex
+	var chunks []StreamChunkMsg
+	s.notify = func(msg any) {
+		if c, ok := msg.(StreamChunkMsg); ok {
+			mu.Lock()
+			chunks = append(chunks, c)
+			mu.Unlock()
+		}
+	}
+
+	ling := storage.Ling{
+		LingID: "ling-solo", EdictID: 72, Username: "testuser", Project: "testproject",
+		Description: "task", Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&ling).Error)
+
+	key := storage.EdictKey{ID: 72, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, chunks)
+	for _, c := range chunks {
+		assert.Equal(t, "ling-solo", c.LingID, "the court always attributes a ling")
+		assert.Equal(t, "forge", c.MinisterID)
+	}
+}
+
+// TestRunLing_PersistsTranscript verifies the durability decision: a ling's
+// session is handed to the persister, while a ritual-channel step session
+// (created by MinisterBase.ProcessPrompt) remains ephemeral.
+func TestRunLing_PersistsTranscript(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+
+	var mu sync.Mutex
+	var savedTabTypes []string
+	s.SetSessionPersister(sessionPersisterFunc(func(sess *Session) {
+		mu.Lock()
+		savedTabTypes = append(savedTabTypes, sess.TabType)
+		mu.Unlock()
+	}))
+
+	ling := storage.Ling{
+		LingID: "ling-durable", EdictID: 73, Username: "testuser", Project: "testproject",
+		Description: "task", Status: storage.LingPending,
+	}
+	require.NoError(t, db.Create(&ling).Error)
+
+	key := storage.EdictKey{ID: 73, Username: "testuser", Project: "testproject"}
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, savedTabTypes, "a completed ling must leave a durable transcript")
+	for _, tabType := range savedTabTypes {
+		assert.Empty(t, tabType, "a ling transcript must not pose as a minister tab")
+	}
+}
+
+// TestRunLing_AttributesAcrossProgressiveInsertion verifies attribution is not
+// decided by how many lings exist at ignition time. The court cannot know how
+// many lings will share the tab (they are insert_ling'd and ignited one batch at
+// a time), so every ling is attributed unconditionally: a ling ignited when it
+// was the edict's only ling must still carry its token when a later ling joins.
+func TestRunLing_AttributesAcrossProgressiveInsertion(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+
+	var mu sync.Mutex
+	var chunks []StreamChunkMsg
+	s.notify = func(msg any) {
+		if c, ok := msg.(StreamChunkMsg); ok {
+			mu.Lock()
+			chunks = append(chunks, c)
+			mu.Unlock()
+		}
+	}
+
+	key := storage.EdictKey{ID: 83, Username: "testuser", Project: "testproject"}
+
+	// Batch 1: the edict has exactly one ling when it ignites.
+	a := storage.Ling{LingID: "ling-a", EdictID: 83, Username: "testuser",
+		Project: "testproject", Description: "task a", Status: storage.LingPending}
+	require.NoError(t, db.Create(&a).Error)
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	// Batch 2: a second ling is inserted and ignited later, as a dependency
+	// chain or a follow-up insert_ling would.
+	b := storage.Ling{LingID: "ling-b", EdictID: 83, Username: "testuser",
+		Project: "testproject", Description: "task b", Status: storage.LingPending}
+	require.NoError(t, db.Create(&b).Error)
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, chunks)
+	seen := map[string]bool{}
+	for _, c := range chunks {
+		assert.NotEmpty(t, c.LingID, "every ling must be attributed, however it was batched")
+		assert.Equal(t, "forge", c.MinisterID)
+		seen[c.LingID] = true
+	}
+	assert.True(t, seen["ling-a"], "the ling ignited first must not be anonymous: %v", seen)
+	assert.True(t, seen["ling-b"], "the later ling must be attributed: %v", seen)
+}
+
+// realSessionPersister attaches a REAL storage session store to a Court, so a
+// durability test can assert rows rather than calls.
+type realSessionPersister struct {
+	store *storage.SessionStore
+}
+
+func (p *realSessionPersister) SaveSession(sess *Session) {
+	if sess == nil {
+		return
+	}
+	msgs, err := json.Marshal(sess.GetMessages())
+	if err != nil {
+		return
+	}
+	if sess.ID == "" {
+		sess.ID = GenerateID("session", sess.CreatedAt.String())
+	}
+	_ = p.store.SaveSession(&storage.SessionData{
+		ID:          sess.ID,
+		CreatedAt:   sess.CreatedAt,
+		LastUpdated: sess.LastUpdated,
+		FirstPrompt: sess.FirstPrompt,
+		Provider:    sess.Provider,
+		Model:       sess.Model,
+		WorkingDir:  sess.WorkingDir,
+		TabType:     sess.TabType,
+		Messages:    msgs,
+	}, "localhost", "testuser", "testproject", "main")
+}
+
+// TestLingTranscriptStoreIsolation is the edict's durability acceptance
+// criterion, asserted against a REAL session store: a completed ling leaves one
+// sessions row whose tab_type is empty (durable, but never listed as a minister
+// tab), and a prompt on the edict's ritual channel afterwards adds no row at all
+// (a ritual step stays ephemeral).
+func TestLingTranscriptStoreIsolation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sessions.db")
+	sdb, err := storage.InitDB(dbPath)
+	require.NoError(t, err)
+	defer sdb.Close()
+
+	secStore := storage.NewSessionStore(sdb, &config.SessionConfig{Enabled: true})
+	db := setupCourtTestDB(t)
+	s, _ := newLingTestCourt(t, db)
+	s.SetSessionPersister(&realSessionPersister{store: secStore})
+
+	key := storage.EdictKey{ID: 84, Username: "testuser", Project: "testproject"}
+	ling := storage.Ling{LingID: "ling-store", EdictID: 84, Username: "testuser",
+		Project: "testproject", Description: "durable task", Status: storage.LingPending}
+	require.NoError(t, db.Create(&ling).Error)
+	require.NoError(t, s.igniteLings(context.Background(), key))
+
+	countSessions := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, sdb.Conn().QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&n))
+		return n
+	}
+	countMessages := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, sdb.Conn().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n))
+		return n
+	}
+
+	require.Equal(t, 1, countSessions(), "a completed ling must leave one durable transcript")
+	assert.Greater(t, countMessages(), 0, "the transcript must contain the ling's messages")
+
+	var tabType string
+	require.NoError(t, sdb.Conn().QueryRow(`SELECT tab_type FROM sessions`).Scan(&tabType))
+	assert.Empty(t, tabType, "the transcript must not pose as a minister tab")
+
+	// A ritual step on the same edict's channel is ephemeral: no new row.
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	base.SetSessionPersister(&realSessionPersister{store: secStore})
+	forge := NewForge(base)
+	forge.SetMinisterConfig(mocks.NewLLMProvider(),
+		&SessionConfig{LLM: config.LLMConfig{Provider: "test", Model: "test"}}, repo.RepoInfo{})
+	base.SetNotify(func(any) {})
+	base.ProcessPrompt(context.Background(), forge, &Prompt{
+		EdictKey:  key,
+		Message:   "step prompt",
+		ChannelID: ritualChannelID(key.ID),
+	})
+
+	assert.Equal(t, 1, countSessions(), "a ritual-channel step session must stay ephemeral")
 }

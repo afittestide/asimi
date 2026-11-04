@@ -30,6 +30,10 @@ type Tab struct {
 	Cancel          context.CancelFunc // per-tab streaming cancellation
 	CurrentMinister string             // For ritual tabs: the minister running the current step
 	ChatMode        bool               // For ritual tabs: true when ruler is chatting (ritual paused)
+	// Stopped marks a tab the ruler explicitly cancelled. It is distinct from
+	// "not streaming yet": a cancelled tab must never resume streaming, so
+	// late in-flight chunks are dropped rather than resurrecting it.
+	Stopped bool
 }
 
 // NewTab creates a Tab with its own context and cancellation.
@@ -267,11 +271,15 @@ func (tm *TabManager) FlushDirtyChats() {
 	}
 }
 
-// SetStreamingTabByTab marks the tab with matching Target as streaming
+// SetStreamingTabByTab marks the tab with matching Target as streaming.
+// Re-asserting streaming also lifts a previous cancellation tombstone: a tab
+// that receives a genuine new StreamStartMsg (or a retried prompt) is live
+// again, and its chunks must not be mistaken for a cancelled tab's leftovers.
 func (tm *TabManager) SetStreamingTabByTab(tabID string) {
 	for i := range tm.tabs {
 		if tm.tabs[i].Target == tabID {
 			tm.tabs[i].Streaming = true
+			tm.tabs[i].Stopped = false
 			return
 		}
 	}
@@ -319,6 +327,7 @@ func (tm *TabManager) CancelTabByID(tabID string) {
 			tab.Ctx, tab.Cancel = context.WithCancel(context.Background())
 			slog.Debug("Created a new cancelable context", "tab", tabID)
 			tab.Streaming = false
+			tab.Stopped = true
 			return
 		}
 	}
@@ -338,6 +347,7 @@ func (tm *TabManager) CancelAllTabs() {
 			tm.tabs[i].Cancel = nil
 		}
 		tm.tabs[i].Streaming = false
+		tm.tabs[i].Stopped = true
 	}
 }
 

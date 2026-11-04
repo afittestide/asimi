@@ -2660,6 +2660,11 @@ func (p *recordingPersister) SaveSession(s *Session) {
 	p.lastTabType = s.TabType
 }
 
+// sessionPersisterFunc adapts a function to the SessionPersister interface.
+type sessionPersisterFunc func(*Session)
+
+func (f sessionPersisterFunc) SaveSession(s *Session) { f(s) }
+
 func TestSession_AddMessage_TriggersPersisterWhenTabTypeSet(t *testing.T) {
 	t.Parallel()
 
@@ -3780,4 +3785,18 @@ func TestApproximateContextSize(t *testing.T) {
 	assert.Equal(t, 128_000, ApproximateContextSize("openai", "gpt-4o:nitro"))
 	// Unknown providers/models yield 0 rather than a fabricated default.
 	assert.Equal(t, 0, ApproximateContextSize("cohere", "totally-unknown-model"))
+}
+
+// TestSetLingAttribution_ClearsWithBlankLingID verifies the token can be reset:
+// a blank ling id returns the session to unattributed output, so a reused
+// session never keeps streaming an identity that no longer owns it.
+func TestSetLingAttribution_ClearsWithBlankLingID(t *testing.T) {
+	sess := &Session{}
+	sess.SetLingAttribution("ling-1", "forge")
+	assert.Equal(t, "ling-1", sess.lingID)
+	assert.Equal(t, "forge", sess.ministerID)
+
+	sess.SetLingAttribution("", "")
+	assert.Empty(t, sess.lingID)
+	assert.Empty(t, sess.ministerID)
 }

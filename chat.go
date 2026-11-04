@@ -46,6 +46,15 @@ type ChatMessage struct {
 	Indent  int
 	Type    MessageType // Type of message for proper rendering
 
+	// Owner is the attribution token (ling id) of the stream block that
+	// produced this message, and OwnerMinister the minister it ran under. Set
+	// for every ling block (attribution is unconditional); the visible prefix
+	// appears only when the chat holds more than one distinct owner. Empty for
+	// unattributed output (interactive sessions, ritual steps), which renders
+	// exactly as before.
+	Owner         string
+	OwnerMinister string
+
 	// Table, when set, carries the raw markdown_table envelope so the table can
 	// be re-laid-out from its cells at the live component width on every render
 	// (and therefore on resize). Content then caches the latest rendering.
@@ -116,6 +125,21 @@ const (
 	ministerPrefix = "🔱  "  // Minister invoked
 	ritualPrefix   = "⛩️  " // Ritual enacted
 )
+
+// lingPrefix renders the attribution token for a ling-owned block or banner. It
+// returns "" when the producer is not a ling, so unattributed output renders
+// exactly as before. Callers gate it on there being more than one owner, so a
+// single-ling tab shows no token.
+func lingPrefix(lingID, minister string) string {
+	if lingID == "" {
+		return ""
+	}
+	token := lingID
+	if minister != "" {
+		token = minister + "/" + lingID
+	}
+	return "[" + token + "] "
+}
 
 // ChatMsgBuilder builds multi-line messages with tree prefixes.
 // It mimics strings.Builder but automatically adds treeMidPrefix to intermediate
@@ -321,7 +345,8 @@ func (c *ChatComponent) AddMessage(message string) {
 // Sets contentDirty=true; the TUI's debounce tick flushes via UpdateContent.
 func (c *ChatComponent) AddAIChunk(chunk string) {
 	// Check if last message is an AI message we can append to
-	if len(c.Messages) > 0 && c.Messages[len(c.Messages)-1].Type == MessageTypeAI {
+	if len(c.Messages) > 0 && c.Messages[len(c.Messages)-1].Type == MessageTypeAI &&
+		c.Messages[len(c.Messages)-1].Owner == "" {
 		c.Messages[len(c.Messages)-1].Content += chunk
 	} else {
 		// Start a new AI message
@@ -331,6 +356,41 @@ func (c *ChatComponent) AddAIChunk(chunk string) {
 			Type:    MessageTypeAI,
 		})
 	}
+	if !c.ScrollLocked {
+		c.AutoScroll = true
+		c.UserScrolled = false
+	}
+	c.contentDirty = true
+}
+
+// AddAIChunkOwned appends a streamed AI chunk attributed to owner (a ling id
+// and its minister). A new message block starts whenever the owner changes, so
+// the chunks of concurrent lings sharing one tab never merge into a single
+// unattributable block. An empty owner behaves exactly like AddAIChunk.
+func (c *ChatComponent) AddAIChunkOwned(chunk, owner, minister string) {
+	if owner == "" {
+		c.AddAIChunk(chunk)
+		return
+	}
+	if len(c.Messages) > 0 {
+		last := &c.Messages[len(c.Messages)-1]
+		if last.Type == MessageTypeAI && last.Owner == owner {
+			last.Content += chunk
+			if !c.ScrollLocked {
+				c.AutoScroll = true
+				c.UserScrolled = false
+			}
+			c.contentDirty = true
+			return
+		}
+	}
+	c.Messages = append(c.Messages, ChatMessage{
+		Content:       chunk,
+		Indent:        c.Indent,
+		Type:          MessageTypeAI,
+		Owner:         owner,
+		OwnerMinister: minister,
+	})
 	if !c.ScrollLocked {
 		c.AutoScroll = true
 		c.UserScrolled = false
@@ -413,7 +473,8 @@ func (c *ChatComponent) AddThinkingChunk(chunk string) {
 		return // Skip empty thinking chunks
 	}
 	// Check if last message is a thinking message we can append to
-	if len(c.Messages) > 0 && c.Messages[len(c.Messages)-1].Type == MessageTypeThinking {
+	if len(c.Messages) > 0 && c.Messages[len(c.Messages)-1].Type == MessageTypeThinking &&
+		c.Messages[len(c.Messages)-1].Owner == "" {
 		c.Messages[len(c.Messages)-1].Content += chunk
 	} else {
 		// Start a new thinking message
@@ -423,6 +484,43 @@ func (c *ChatComponent) AddThinkingChunk(chunk string) {
 			Type:    MessageTypeThinking,
 		})
 	}
+	if !c.ScrollLocked {
+		c.AutoScroll = true
+		c.UserScrolled = false
+	}
+	c.contentDirty = true
+}
+
+// AddThinkingChunkOwned appends a streamed reasoning chunk attributed to
+// owner (a ling id and its minister), starting a new thinking block when the
+// owner changes. An empty owner behaves exactly like AddThinkingChunk.
+func (c *ChatComponent) AddThinkingChunkOwned(chunk, owner, minister string) {
+	if strings.TrimSpace(chunk) == "" {
+		return
+	}
+	if owner == "" {
+		c.AddThinkingChunk(chunk)
+		return
+	}
+	if len(c.Messages) > 0 {
+		last := &c.Messages[len(c.Messages)-1]
+		if last.Type == MessageTypeThinking && last.Owner == owner {
+			last.Content += chunk
+			if !c.ScrollLocked {
+				c.AutoScroll = true
+				c.UserScrolled = false
+			}
+			c.contentDirty = true
+			return
+		}
+	}
+	c.Messages = append(c.Messages, ChatMessage{
+		Content:       chunk,
+		Indent:        c.Indent,
+		Type:          MessageTypeThinking,
+		Owner:         owner,
+		OwnerMinister: minister,
+	})
 	if !c.ScrollLocked {
 		c.AutoScroll = true
 		c.UserScrolled = false
@@ -628,7 +726,70 @@ func (c *ChatComponent) FinalizeLastAIMessage() bool {
 	if lastMsg.Type != MessageTypeAI {
 		return false
 	}
+	isFailure := finalizeAIMessage(lastMsg)
+	c.UpdateContent()
+	return isFailure
+}
 
+// FinalizeLingAIMessages finalizes the streaming AI blocks belonging to owner
+// (a ling id). Ling-attributed tabs interleave several lings' blocks, so a
+// channel-wide "last message" finalize would mark another ling's still-streaming
+// block complete. An empty owner finalizes every streaming block.
+// Returns true when any finalized block was marked as a failure.
+func (c *ChatComponent) FinalizeLingAIMessages(owner string) bool {
+	anyFailure := false
+	finalized := false
+	for i := range c.Messages {
+		if c.Messages[i].Type != MessageTypeAI {
+			continue
+		}
+		if owner != "" && c.Messages[i].Owner != owner {
+			continue
+		}
+		finalized = true
+		if finalizeAIMessage(&c.Messages[i]) {
+			anyFailure = true
+		}
+	}
+	if finalized {
+		c.UpdateContent()
+	}
+	return anyFailure
+}
+
+// FinalizeDeadLingAIMessages finalizes the streaming AI blocks of every ling
+// that is NOT in live. It is the terminal-path counterpart of
+// FinalizeLingAIMessages: when a ling fails or its stream is interrupted, no
+// StreamCompleteMsg will follow, so its block must be closed here or it would
+// stay MessageTypeAI (and look like it is still working) forever. asFailure
+// marks the closed blocks as failures rather than successes. Returns true when
+// any block was closed.
+func (c *ChatComponent) FinalizeDeadLingAIMessages(live map[string]bool, asFailure bool) bool {
+	closed := false
+	for i := range c.Messages {
+		if c.Messages[i].Type != MessageTypeAI {
+			continue
+		}
+		owner := c.Messages[i].Owner
+		if owner == "" || live[owner] {
+			continue
+		}
+		closed = true
+		if asFailure {
+			c.Messages[i].Type = MessageTypeAIFailure
+		} else {
+			finalizeAIMessage(&c.Messages[i])
+		}
+	}
+	if closed {
+		c.UpdateContent()
+	}
+	return closed
+}
+
+// finalizeAIMessage converts one streaming AI message into its final
+// success/failure form, returning true when it carried the failure token.
+func finalizeAIMessage(lastMsg *ChatMessage) bool {
 	isFailure := strings.HasPrefix(lastMsg.Content, failureToken)
 	if isFailure {
 		lastMsg.Content = strings.TrimPrefix(lastMsg.Content, failureToken)
@@ -637,14 +798,65 @@ func (c *ChatComponent) FinalizeLastAIMessage() bool {
 	} else {
 		lastMsg.Type = MessageTypeAISuccess
 	}
-	c.UpdateContent()
 	return isFailure
+}
+
+// HasAttributedMessages reports whether the chat holds any ling-attributed
+// stream block. The court attributes every ling (it cannot know how many will
+// share the tab), so this is true even for a single-ling edict: use it to pick
+// the finalization strategy, not to decide whether to show a prefix.
+func (c *ChatComponent) HasAttributedMessages() bool {
+	for i := range c.Messages {
+		if c.Messages[i].Owner != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMultipleOwners reports whether the chat holds blocks from more than one
+// distinct ling. Only then is attribution informative: with one owner the
+// prefix would be noise, so a single-ling edict (and a single-ling ritual tab)
+// renders exactly as it did before attribution existed.
+func (c *ChatComponent) hasMultipleOwners() bool {
+	owner := ""
+	for i := range c.Messages {
+		o := c.Messages[i].Owner
+		if o == "" {
+			continue
+		}
+		if owner == "" {
+			owner = o
+			continue
+		}
+		if o != owner {
+			return true
+		}
+	}
+	return false
+}
+
+// OwnerMinisterFor returns the minister a ling's blocks ran under, as recorded
+// on any of its blocks. It lets terminal banners render the same
+// "[minister/ling]" token as the blocks without adding a minister field to the
+// terminal wire messages (the information is already in the chat).
+func (c *ChatComponent) OwnerMinisterFor(lingID string) string {
+	if lingID == "" {
+		return ""
+	}
+	for i := range c.Messages {
+		if c.Messages[i].Owner == lingID && c.Messages[i].OwnerMinister != "" {
+			return c.Messages[i].OwnerMinister
+		}
+	}
+	return ""
 }
 
 // UpdateContent updates the viewport content based on the messages.
 // Clears contentDirty — this is the work the flag tracks.
 func (c *ChatComponent) UpdateContent() {
 	c.contentDirty = false
+	showOwner := c.hasMultipleOwners()
 	var messageViews []string
 	for msgIdx, msg := range c.Messages {
 		var rendered string
@@ -656,7 +868,7 @@ func (c *ChatComponent) UpdateContent() {
 			rendered = c.renderTableMessage(msg.Table)
 			c.Messages[msgIdx].Content = rendered
 		} else {
-			rendered = c.renderSystemMessage(message, msg.Type)
+			rendered = c.renderSystemMessage(message, msg.Type, msg.Owner, msg.OwnerMinister, showOwner)
 		}
 
 		// Apply indentation if needed
@@ -704,7 +916,11 @@ func (c *ChatComponent) UpdateContent() {
 
 // renderSystemMessage routes a non-table message to its type-specific
 // renderer. Split out of UpdateContent so the table-reflow path stays clear.
-func (c *ChatComponent) renderSystemMessage(message string, msgType MessageType) string {
+// owner/minister are the ling attribution of a streamed block and showOwner says
+// whether the chat holds more than one owner and the prefix is therefore
+// informative. When either is empty the rendering is byte-for-byte what it has
+// always been.
+func (c *ChatComponent) renderSystemMessage(message string, msgType MessageType, owner, minister string, showOwner bool) string {
 	switch msgType {
 	case MessageTypeShell:
 		// Shell command input styling
@@ -716,9 +932,14 @@ func (c *ChatComponent) renderSystemMessage(message string, msgType MessageType)
 		// Thinking/reasoning content styling
 		thinkingStyle := lipgloss.NewStyle().
 			Foreground(globalTheme.ThinkingColor)
-		builder := NewChatMsgBuilder("💭   ")
-		// Word wrap and split into lines (c.Width-1 for gutter, -6 for prefix)
-		wrapped := wordwrap.String(message, c.Width-7)
+		attrib := ""
+		if showOwner {
+			attrib = lingPrefix(owner, minister)
+		}
+		builder := NewChatMsgBuilder(attrib + "💭   ")
+		// Word wrap and split into lines (c.Width-1 for gutter, -6 for prefix,
+		// minus the attribution token when this ling's block is tagged)
+		wrapped := wordwrap.String(message, c.Width-7-len(attrib))
 		lines := strings.Split(wrapped, "\n")
 		for i, line := range lines {
 			if i < len(lines)-1 {
@@ -763,7 +984,11 @@ func (c *ChatComponent) renderSystemMessage(message string, msgType MessageType)
 		default: // MessageTypeAI (streaming, not finalized)
 			prefix = lipgloss.NewStyle().Bold(true).Render(asimiPrefix)
 		}
-		return prefix + c.renderMarkdown(message)
+		attrib := ""
+		if showOwner {
+			attrib = lingPrefix(owner, minister)
+		}
+		return prefix + attrib + c.renderMarkdown(message)
 
 	case MessageTypeGreeting:
 		builder := NewChatMsgBuilder(greetingPrefix + " ")
