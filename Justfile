@@ -1,4 +1,5 @@
 PROJECT_NAME := `git config --get remote.origin.url | sed -E 's/.*[:\/]([^\/]+)\/([^\/]+)\.git$/\1\/\2/' | tr '[A-Z]' '[a-z]'`
+NOW := `date +%Y%m%dT%H%M%S`
 
 # List all available recipes
 default:
@@ -50,7 +51,7 @@ hello-harbor *args:
 #   heaven/runs/<run-id>/<job-id>-<job>.log   full log per job (gh run view --job --log)
 # A run whose run.json already exists is skipped, so re-running only fetches
 # newly-failed runs. A partial run (dir without run.json) is re-fetched.
-fetch-runs:
+get-runs:
     #!/usr/bin/env bash
     set -euo pipefail
     # gh is the instrument; a missing one is a hard failure, not an empty
@@ -146,7 +147,7 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p heaven/tests
-    go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test_$(date +%Y%m%dT%H%M%S).out"
+    go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test-{{NOW}}.out"
     if [ -n "${CI:-}" ]; then
         just test-race
     fi
@@ -324,7 +325,7 @@ vuln:
     allowlist="security/vuln-allowlist.txt"
     report_dir="heaven/security"
     mkdir -p "$report_dir"
-    report="$report_dir/${tool}-$(date +%Y%m%dT%H%M%S).txt"
+    report="$report_dir/${tool}-{{NOW}}.txt"
     go build -tags containers_image_openpgp -o /tmp/asimi-vuln .
     out=$("$tool" -mode=binary /tmp/asimi-vuln 2>&1)
     status=$?

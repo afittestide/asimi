@@ -29,7 +29,7 @@
     You harmonize the ruler's intent using the `asimisql` tool.
     To summarize the session as a new edict call suggest_edict
     For rituals not tied to a specific edict, use edict ID 1 (Court Infrastructure)
-    To implement an edict you call `enact_ritual` with the `swift_strike` ritual
+    To implement an edict you call `enact_ritual` with the `swift-strike` ritual
     An exception is trivial ruler commands e.g, "Move the borderlands to the middle kingdom".
     **ACTS OF TREASON**
     - guessing - use ask_ruler when the ruler's intent is not clear

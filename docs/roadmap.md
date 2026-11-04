@@ -1,10 +1,14 @@
 # Roadmap
 
-### v0.15.0
+### v0.16.0
 
 ### Full Parallelism
-- Git worktrees for concurrent rituals (issues/153)
-- Ling execution engine — runs each ling in the edict's worktree; default off (flip is a separate ruling, e923)
+- Ling ignition on by default — the engine already runs each ling in the edict's worktree (e923) ; flipping `court.ling_ignition_enabled` on is the remaining ruling
+- Per-ling output attribution — each ling's stream is attributable and its transcript durable (e994)
+
+### Court and docs
+- Brewing ritual — mints its own edict at step 0, long-lived per-minister sessions, serialized lings (e1009)
+- 禮部 (Minister of Rites) owns all documentation; the docs tree moves to `intent/docs/` (e1017)
 
 ## V1.0
 
