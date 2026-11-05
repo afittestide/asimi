@@ -10,6 +10,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 // TestAsimiRuntimeNotEmpty verifies that the embedded asimi_runtime.sh is present.
@@ -505,4 +506,103 @@ func TestCIUploadsTestArtifactsAlways(t *testing.T) {
 	assert.Contains(t, body, "if: always()", "upload step must run even when tests fail")
 	assert.Contains(t, body, "name: heaven-tests", "artifact must be named heaven-tests")
 	assert.Contains(t, body, "path: heaven/tests/", "artifact must upload heaven/tests/")
+}
+
+// dependabotConfig mirrors the subset of .github/dependabot.yml the invariant
+// guards. Only fields the invariant depends on are modelled; unknown keys are
+// ignored by yaml.v3, so the config stays free to grow.
+type dependabotConfig struct {
+	Version int `yaml:"version"`
+	Updates []struct {
+		PackageEcosystem      string `yaml:"package-ecosystem"`
+		Directory             string `yaml:"directory"`
+		OpenPullRequestsLimit int    `yaml:"open-pull-requests-limit"`
+		Ignore                []struct {
+			DependencyName string `yaml:"dependency-name"`
+		} `yaml:"ignore"`
+	} `yaml:"updates"`
+}
+
+// dependabotIgnoredDependencies parses .github/dependabot.yml and returns the
+// config plus the set of dependency names ignored in the gomod entry.
+func dependabotIgnoredDependencies(t *testing.T) (dependabotConfig, []string) {
+	t.Helper()
+	var cfg dependabotConfig
+	require.NoError(t,
+		yaml.Unmarshal([]byte(readRootFile(t, ".github/dependabot.yml")), &cfg),
+		".github/dependabot.yml must be valid YAML")
+
+	var ignored []string
+	for _, u := range cfg.Updates {
+		for _, rule := range u.Ignore {
+			ignored = append(ignored, rule.DependencyName)
+		}
+	}
+	return cfg, ignored
+}
+
+// TestDependabotIgnoresOnlyUnsatisfiableDependency guards e1016's invariant: an
+// open Dependabot alert for a dependency with no available patched version,
+// whose vulnerable code this module does not build, must not leave `main` with
+// a failing status check. The durable mechanism is a single, exactly-scoped
+// `ignore` entry in .github/dependabot.yml.
+//
+// This test is deliberately adversarial about breadth. The failure mode the
+// edict forbids is an over-broad ignore that also silences *actionable*
+// findings — above all github.com/go-jose/go-jose/v4, whose alerts 49/50/51 are
+// patched while go.mod pins it below the floor. A wildcard, an ecosystem-wide
+// suppression, or an extra ignored name must fail here.
+func TestDependabotIgnoresOnlyUnsatisfiableDependency(t *testing.T) {
+	const unsatisfiable = "github.com/docker/distribution"
+
+	cfg, ignored := dependabotIgnoredDependencies(t)
+
+	require.Equal(t, 2, cfg.Version, "dependabot.yml must declare `version: 2`")
+	require.Len(t, cfg.Updates, 1, "exactly one update entry is expected")
+	entry := cfg.Updates[0]
+	assert.Equal(t, "gomod", entry.PackageEcosystem)
+	assert.Equal(t, "/", entry.Directory)
+	assert.Equal(t, 0, entry.OpenPullRequestsLimit,
+		"open-pull-requests-limit must stay 0: adding dependabot.yml must not enable "+
+			"version-update PRs this repo has never had (security updates use a separate limit)")
+
+	assert.Equal(t, []string{unsatisfiable}, ignored,
+		"ignore must name exactly one dependency; a wildcard or an extra name is a regression")
+
+	for _, name := range ignored {
+		assert.NotContains(t, name, "*",
+			"ignore entry %q must be an exact module path, never a wildcard", name)
+	}
+
+	// The actionable dependency must stay loud: go-jose alerts 49/50/51 are
+	// patched (GHSA-mgcc-cww5-fp2q in 4.1.6; the other two in 4.1.5) while
+	// go.mod pins v4.1.4, so silencing it would suppress real, fixable findings.
+	// The exact-list assertion above is what enforces this — it rejects any
+	// second ignore name unconditionally. Asserting the same thing again with a
+	// version comparison would be dead code: the list check always fires first
+	// and fires regardless of which version go.mod happens to pin.
+	assert.NotContains(t, ignored, "github.com/go-jose/go-jose/v4",
+		"go-jose/v4 is actionable (alerts 49/50/51) and must never be ignored")
+
+	// The justification for ignoring the dependency at all is that the
+	// vulnerable code is not vendored. Make that falsifiable: if
+	// registry/client (the package carrying the advisory) ever enters the
+	// vendor tree, the ignore rule is no longer safe and must be revisited.
+	// NoDirExists, not NoFileExists — testify's NoFileExists passes for a
+	// directory, which is exactly what this path would be.
+	assert.NoDirExists(t, filepath.Join("..", "vendor", unsatisfiable, "registry", "client"),
+		"registry/client is vendored — the vulnerable code is now built and the ignore rule is unsafe")
+
+	modules := readRootFile(t, "vendor/modules.txt")
+	prefix := unsatisfiable + "/"
+	for _, line := range strings.Split(modules, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		assert.Contains(t, []string{
+			unsatisfiable + "/registry/api/errcode",
+			unsatisfiable + "/registry/api/v2",
+		}, line, "unexpected vendored package %q — the ignore rule assumes only API types are built", line)
+	}
 }

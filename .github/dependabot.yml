@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Version updates are not wanted here — this repo has never run them. The
+    # entry exists solely to carry the `ignore` rule that silences the
+    # unsatisfiable security-update attempt for github.com/docker/distribution.
+    # Security updates use their own fixed limit of 10 and are unaffected by
+    # this option, so they stay enabled.
+    open-pull-requests-limit: 0
+    # GHSA-685w-q87j-wqw3 has no patched version (first_patched_version: null)
+    # for github.com/docker/distribution <= 2.8.3, so the security-update job
+    # can never succeed. Only registry/api/{v2,errcode} are vendored; the
+    # vulnerable registry/client (manifests.Get) is not built. Ignore exactly
+    # this one dependency — go-jose/v4 alerts 49/50/51 are patched and must
+    # stay loud.
+    ignore:
+      - dependency-name: "github.com/docker/distribution"
