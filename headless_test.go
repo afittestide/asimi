@@ -1230,10 +1230,11 @@ func buildAsimiBinary(t *testing.T) string {
 // --isolated-host startup crash where a read-only $HOME aborted asimi with a
 // SQLite readonly error (1544) before it ever reached the model.
 //
-// It is gated twice: CI=true (like the other git/network E2E tests) and a
-// dedicated HARBOR_E2E=1 gate, because it additionally needs network access
-// (to clone daonb/harbor@staging) and a working git. It does NOT need Docker
-// or an LLM: the provider gate is reached with a deliberately bogus provider.
+// It is gated once: CI=true (the single gate now shared by all git/network
+// E2E tests; the former per-test HARBOR_E2E flag is deprecated), because it
+// needs network access (to clone daonb/harbor@staging) and a working git.
+// It does NOT need Docker or an LLM: the provider gate is reached with a
+// deliberately bogus provider.
 //
 // Steps:
 //  1. clone daonb/harbor@staging;
