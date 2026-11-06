@@ -1070,6 +1070,96 @@ func TestLogDir_HonorsASIMIHome(t *testing.T) {
 	require.Equal(t, ".", logDir())
 }
 
+// TestLogLevel verifies the ruled resolution contract: --debug wins, empty
+// --log-level defaults to info, valid levels map through, and an unrecognized
+// level is a hard error rather than a silent info fallback.
+func TestLogLevel(t *testing.T) {
+	origDebug, origLevel := cli.Debug, cli.LogLevel
+	t.Cleanup(func() { cli.Debug, cli.LogLevel = origDebug, origLevel })
+
+	cases := []struct {
+		name     string
+		debug    bool
+		logLevel string
+		want     slog.Level
+		wantErr  bool
+	}{
+		{name: "empty defaults to info", logLevel: "", want: slog.LevelInfo},
+		{name: "debug level", logLevel: "debug", want: slog.LevelDebug},
+		{name: "info level", logLevel: "info", want: slog.LevelInfo},
+		{name: "warn level", logLevel: "warn", want: slog.LevelWarn},
+		{name: "error level", logLevel: "error", want: slog.LevelError},
+		{name: "unknown level errors", logLevel: "trace", wantErr: true},
+		{name: "debug flag wins over empty level", debug: true, logLevel: "", want: slog.LevelDebug},
+		{name: "debug flag wins over warn", debug: true, logLevel: "warn", want: slog.LevelDebug},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cli.Debug, cli.LogLevel = tc.debug, tc.logLevel
+			got, err := logLevel()
+			if tc.wantErr {
+				require.Error(t, err, "invalid level must be rejected, not silently defaulted")
+				require.Contains(t, err.Error(), "--log-level")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestLogDir_LogLevelDebug verifies that --log-level=debug mirrors --debug's
+// cwd location effect (ruling 4) while other levels and ASIMI_HOME keep their
+// existing behavior.
+func TestLogDir_LogLevelDebug(t *testing.T) {
+	origDebug, origLevel := cli.Debug, cli.LogLevel
+	t.Cleanup(func() { cli.Debug, cli.LogLevel = origDebug, origLevel })
+	cli.Debug = false
+
+	t.Setenv("HOME", t.TempDir())
+
+	// No ASIMI_HOME: level debug sends logs to cwd.
+	t.Setenv("ASIMI_HOME", "")
+	cli.LogLevel = "debug"
+	require.Equal(t, ".", logDir(), "--log-level=debug must mirror --debug's cwd fallback")
+
+	// Other levels keep the classic location.
+	cli.LogLevel = "info"
+	require.True(t, strings.HasSuffix(logDir(), filepath.Join(".local", "share", "asimi")),
+		"--log-level=info must use the default location, got %q", logDir())
+
+	// ASIMI_HOME still wins over --log-level=debug.
+	home := t.TempDir()
+	t.Setenv("ASIMI_HOME", home)
+	cli.LogLevel = "debug"
+	require.Equal(t, home, logDir(), "ASIMI_HOME must win over --log-level=debug")
+}
+
+// TestLogLevelRegression_NoFlags verifies the regression bar: with no debug
+// flag and no level set, the effective level is info, the log dir is the
+// default, and no announcement is printed.
+func TestLogLevelRegression_NoFlags(t *testing.T) {
+	origDebug, origLevel := cli.Debug, cli.LogLevel
+	origMode := runHeadlessMode
+	t.Cleanup(func() { cli.Debug, cli.LogLevel = origDebug, origLevel; runHeadlessMode = origMode })
+
+	cli.Debug, cli.LogLevel = false, ""
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ASIMI_HOME", "")
+
+	level, err := logLevel()
+	require.NoError(t, err)
+	require.Equal(t, slog.LevelInfo, level)
+	require.True(t, strings.HasSuffix(logDir(), filepath.Join(".local", "share", "asimi")),
+		"default log dir must be unchanged, got %q", logDir())
+
+	runHeadlessMode = func() int { return 0 }
+	var buf bytes.Buffer
+	runHeadless(&buf, time.Now())
+	require.Empty(t, buf.String(), "no announcement without --debug")
+}
+
 // TestDebugLogAnnouncement verifies the harness-visible line printed in
 // headless --debug runs, table-testing both path-resolution success and
 // failure cases.

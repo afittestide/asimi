@@ -44,7 +44,8 @@ var runHeadlessMode = runHeadlessModeImpl
 var cli struct {
 	Version         bool   `help:"Print version information"`
 	Prompt          string `short:"p" help:"Prompt to send to the agent"`
-	Debug           bool   `help:"Enable debug logging"`
+	Debug           bool   `help:"Enable debug logging (shortcut for --log-level=debug)"`
+	LogLevel        string `help:"Log verbosity: debug|info|warn|error (default info); --debug is a shortcut for --log-level=debug"`
 	NoCleanup       bool   `help:"Don't remove container on exit (for debugging)"`
 	Handsoff        bool   `help:"Auto-answer zhengming and YESNO prompts (hands-off mode)"`
 	MaxTurns        int    `help:"Override max conversation turns (benchmark control)"`
@@ -57,6 +58,37 @@ var cli struct {
 	Trace           string `help:"Write execution trace to file"`
 	ProfileExitMs   int    `help:"Exit after N milliseconds (for profiling startup)"`
 	Atif            bool   `help:"Enable ATIF trajectory recording (agent name: asimi)"`
+}
+
+// logLevel resolves the effective slog level from --log-level and --debug.
+// --debug forces debug. An empty --log-level defaults to info. An
+// unrecognized value is a hard error: a silently-ignored level is the same
+// class of manufactured false state the court forbids (cf. e1024).
+func logLevel() (slog.Level, error) {
+	if cli.Debug {
+		return slog.LevelDebug, nil
+	}
+	switch cli.LogLevel {
+	case "":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("invalid --log-level %q: want debug|info|warn|error", cli.LogLevel)
+	}
+}
+
+// debugLogging reports whether the effective configuration is debug-level:
+// --debug (the shortcut) or --log-level=debug. This is the predicate for the
+// debug-only location and file-open behavior; it is not the verbosity lookup.
+func debugLogging() bool {
+	return cli.Debug || cli.LogLevel == "debug"
 }
 
 // logDir returns the directory for the log file, following this scenario
@@ -75,7 +107,7 @@ func logDir() string {
 	if home := os.Getenv("ASIMI_HOME"); home != "" {
 		return home
 	}
-	if cli.Debug {
+	if debugLogging() {
 		return "."
 	}
 	homeDir, err := os.UserHomeDir()
@@ -137,9 +169,10 @@ func initLogger() {
 		return
 	}
 
-	level := slog.LevelInfo
-	if cli.Debug {
-		level = slog.LevelDebug
+	level, err := logLevel()
+	if err != nil {
+		// main() rejects invalid levels before logging starts; defensive only.
+		level = slog.LevelInfo
 	}
 	var w io.Writer = &lumberjack.Logger{
 		Filename:   logPath,
@@ -148,7 +181,7 @@ func initLogger() {
 		MaxAge:     28, // days
 		Compress:   true,
 	}
-	if cli.Debug {
+	if debugLogging() {
 		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			slog.Warn("failed to open log file; logging to stderr", "path", logPath, "error", err)
@@ -382,6 +415,10 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "daemon" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		kong.Parse(&cli, cliOptions...)
+		if _, err := logLevel(); err != nil {
+			fmt.Fprintln(os.Stderr, "asimi:", err)
+			os.Exit(1)
+		}
 		if err := daemon.Run(initDaemonShared); err != nil {
 			fmt.Fprintln(os.Stderr, "daemon:", err)
 			os.Exit(1)
@@ -391,6 +428,13 @@ func main() {
 
 	startTime := time.Now()
 	kong.Parse(&cli, cliOptions...)
+
+	// Reject an invalid --log-level before doing anything else: a
+	// silently-ignored level would be manufactured false state.
+	if _, err := logLevel(); err != nil {
+		fmt.Fprintln(os.Stderr, "asimi:", err)
+		os.Exit(1)
+	}
 
 	// Handle --version flag
 	if cli.Version {
