@@ -7,8 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"os/user"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/afittestide/asimi/court"
 	"github.com/afittestide/asimi/court/tools"
@@ -151,9 +154,19 @@ func headlessContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParam
 	return buildSetContextParams(cfg, ri)
 }
 
+// handsoffSealCourt is the narrow Court seam the handsoff seal pass needs: it
+// lists the court-scoped active edicts and grants the Ruler's seal. It exists
+// so the pass can be driven by a fake in tests without a live git repo or the
+// full Court machinery; *court.Court satisfies it in production.
+type handsoffSealCourt interface {
+	ListActiveEdicts() ([]storage.ActiveEdict, error)
+	GrantRulerSeal(edictID uint, notes string) error
+}
+
 // headlessSink receives court events and writes plain text to stdout.
-// When handsoff is true, it auto-answers zhengming requests and auto-enacts
-// swift-strike rituals, mirroring the TUI's handsoff mode behavior.
+// When handsoff is true, it auto-answers zhengming requests, auto-enacts
+// swift-strike rituals, and — once the initial ritual run completes — seals
+// every pending-ascension edict and waits for its merge-worktree landing.
 // When handsoff is false, zhengming requests are answered interactively:
 // each question is printed as a numbered menu and the user selects from stdin.
 type headlessSink struct {
@@ -166,17 +179,44 @@ type headlessSink struct {
 	stdout             io.Writer     // for interactive zhengming menus
 	streaming          bool          // true while the LLM is streaming (StreamStart→StreamComplete)
 	streamingEdictID   uint          // edict bound to the active stream, 0 when none (from StreamStartMsg)
+
+	// sealCourt is the Court seam used by the handsoff seal pass. Nil for a
+	// bare sink with no court (nothing to seal).
+	sealCourt handsoffSealCourt
+	// landingTimeout bounds how long the handsoff seal pass waits per sealed
+	// edict for its terminal landing event. Defaults to handsoffLandingTimeout;
+	// overridable so tests can exercise the bound without waiting minutes.
+	landingTimeout time.Duration
+
+	// Seal-pass state (handsoff only), guarded by mu. The pass runs once when
+	// the initial ritual completes: it seals every pending-ascension edict and
+	// waits for their merge-worktree landings before the run exits.
+	mu              sync.Mutex
+	sealPassStarted bool          // the initial ritual completed and the pass was entered
+	sealPassPending bool          // the pass is still discovering/sealing and must not be exited
+	sealPassFailed  bool          // the pass could not enumerate pending edicts
+	handsoffSealed  map[uint]bool // edicts the pass sealed, awaiting a terminal landing event
+	handsoffLanded  map[uint]bool // sealed edicts whose landing reported edict_sealed
+	handsoffFailed  map[uint]bool // sealed edicts whose landing terminally failed or timed out
 }
 
 func newHeadlessSink(c *court.Court) *headlessSink {
-	return &headlessSink{
-		court:      c,
-		handsoff:   true, // default true for backward compat; overridden in runHeadlessMode
-		done:       make(chan int, 1),
-		enactedSet: make(map[uint]bool),
-		stdin:      os.Stdin,
-		stdout:     os.Stdout,
+	s := &headlessSink{
+		court:          c,
+		handsoff:       true, // default true for backward compat; overridden in runHeadlessMode
+		done:           make(chan int, 1),
+		enactedSet:     make(map[uint]bool),
+		handsoffSealed: make(map[uint]bool),
+		handsoffLanded: make(map[uint]bool),
+		handsoffFailed: make(map[uint]bool),
+		landingTimeout: handsoffLandingTimeout,
+		stdin:          os.Stdin,
+		stdout:         os.Stdout,
 	}
+	if c != nil {
+		s.sealCourt = c
+	}
+	return s
 }
 
 // drain reads events from the subscription channel and dispatches them.
@@ -208,8 +248,10 @@ func (s *headlessSink) handle(msg any) {
 		// If an edict suggestion is pending auto-approval (async chain:
 		// auto-answer → zhengzhang answered → EdictCreated → ritual), the
 		// edict creation hasn't landed yet, so wait rather than exit now.
+		// maybeFinish keeps this stream-phase exit mutually exclusive with
+		// the handsoff seal-pass exit.
 		if len(s.enactedSet) == 0 && s.pendingSuggestions == 0 {
-			s.finish(0)
+			s.maybeFinish()
 		}
 
 	case court.StreamErrorMsg:
@@ -348,7 +390,7 @@ func (s *headlessSink) handleEvent(msg court.EventNotificationMsg) {
 
 	case storage.EventRitualCompleted:
 		fmt.Printf("\n[ritual completed for edict %d]\n", msg.EdictKey.ID)
-		s.finish(0)
+		s.onRitualCompleted()
 
 	case storage.EventRitualFailed:
 		errMsg, _ := msg.Payload["error"].(string)
@@ -357,6 +399,10 @@ func (s *headlessSink) handleEvent(msg court.EventNotificationMsg) {
 
 	case storage.EventEdictSealed:
 		fmt.Printf("\n[edict %d sealed — ascended to Heaven]\n", msg.EdictKey.ID)
+		s.recordLanding(msg.EdictKey.ID, true)
+
+	case storage.EventWorktreeMergeFailed:
+		s.handleMergeFailed(msg)
 	}
 }
 
@@ -379,11 +425,233 @@ func (s *headlessSink) handleRitualStep(msg court.RitualStepMsg) {
 		fmt.Printf("  ✗ Failed: %s\n", msg.StepName)
 	case "ritual_completed":
 		fmt.Printf("\n[ritual %s completed in %s]\n", msg.RitualName, msg.Message)
-		s.finish(0)
+		s.onRitualCompleted()
 	case "ritual_failed":
 		fmt.Fprintf(os.Stderr, "\n[ritual %s failed: %s]\n", msg.RitualName, msg.Message)
 		s.finish(1)
 	}
+}
+
+// onRitualCompleted is the single funnel for "the initial ritual run
+// finished". In handsoff it enters the seal pass (seal every pending-ascension
+// edict and wait for its landing) instead of exiting; otherwise it finishes as
+// before. The pass runs at most once per run, so a later ritual completion
+// cannot restart it.
+func (s *headlessSink) onRitualCompleted() {
+	if !s.handsoff {
+		s.maybeFinish()
+		return
+	}
+	s.mu.Lock()
+	if s.sealPassStarted {
+		s.mu.Unlock()
+		s.maybeFinish()
+		return
+	}
+	s.sealPassStarted = true
+	s.sealPassPending = true
+	s.mu.Unlock()
+	s.sealPendingEdicts()
+}
+
+// maybeFinish is the only place the run exits. It refuses while the handsoff
+// seal pass is still sealing or while any sealed edict still owes a terminal
+// landing event; otherwise it emits the exit code once, derived from the state
+// accumulated at that moment (0 unless a landing failed). Being the sole
+// sender keeps the stream-phase exit and the seal-pass exit mutually exclusive,
+// and a late event cannot downgrade a code already sent: finish keeps the first
+// value, and the code is decided from accumulated state at the moment of the
+// (only) send.
+func (s *headlessSink) maybeFinish() {
+	s.mu.Lock()
+	pending := s.sealPassPending || s.awaitingLandingLocked() > 0
+	code := 0
+	if s.sealPassFailed || len(s.handsoffFailed) > 0 {
+		code = 1
+	}
+	s.mu.Unlock()
+	if pending {
+		return
+	}
+	s.finish(code)
+}
+
+// awaitingLandingLocked counts sealed edicts that have not yet reported a
+// terminal landing. Caller holds s.mu.
+func (s *headlessSink) awaitingLandingLocked() int {
+	return len(s.handsoffSealed) - len(s.handsoffLanded) - len(s.handsoffFailed)
+}
+
+// handsoffLandingTimeout is the default per-edict budget for the seal pass to
+// wait for a landing. Landings retry through merge-worktree (max_retries: 3)
+// and can stall on a live git operation, so an unbounded wait would hang an
+// autonomous run forever. Matching the generous host timeouts elsewhere in the
+// court, the budget is a few minutes per sealed edict (scaled by the number of
+// edicts); on expiry the pass reports the outstanding edicts and exits
+// non-zero rather than exiting silently green.
+const handsoffLandingTimeout = 5 * time.Minute
+
+// sealPendingEdicts is the handsoff seal pass. It runs once when the initial
+// ritual run completes, sweeping *all* edicts in the court's scope that carry
+// both the Judge's and the Chancellor's seals and no Ruler's seal (pending
+// ascension). Each is granted the Ruler's seal, which publishes
+// seal_granted{minister_id: ruler} and triggers the merge-worktree landing;
+// the run then waits (bounded by landingTimeout per edict) for those landings
+// before exiting, with code 0 only when every selected edict reached
+// edict_sealed. ListActiveEdicts already excludes ruler-sealed and cancelled
+// edicts, so re-running never double-seals or re-lands anything.
+//
+// Sealing is synchronous (fast, bounded by the number of pending edicts) and
+// registers each edict as awaiting its landing BEFORE granting the seal, so a
+// terminal event that races ahead of the bookkeeping is never dropped. Only the
+// timeout watchdog runs in a goroutine, so the drain loop keeps handling the
+// landing events the pass is waiting on.
+func (s *headlessSink) sealPendingEdicts() {
+	sealed, err := s.sealableEdicts()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[handsoff] seal pass failed: %v\n", err)
+		s.mu.Lock()
+		s.sealPassFailed = true
+		s.mu.Unlock()
+	}
+
+	for _, edictID := range sealed {
+		fmt.Printf("[handsoff] sealing edict %d (judge+chancellor present)\n", edictID)
+	}
+
+	s.mu.Lock()
+	s.sealPassPending = false
+	outstanding := s.awaitingLandingLocked() > 0
+	s.mu.Unlock()
+
+	// maybeFinish both handles the no-edicts case and releases an edict whose
+	// landing event raced ahead of sealing (it is already terminal).
+	s.maybeFinish()
+	if outstanding {
+		go s.watchLandingTimeout()
+	}
+}
+
+// watchLandingTimeout fails the pass if its sealed edicts never report a
+// terminal landing within landingTimeout each (scaled by the edict count).
+// Outstanding edicts are reported and counted as failures so an autonomous run
+// that left work unlanded exits non-zero.
+func (s *headlessSink) watchLandingTimeout() {
+	s.mu.Lock()
+	timeout := s.landingTimeout
+	count := len(s.handsoffSealed)
+	s.mu.Unlock()
+	if timeout <= 0 {
+		timeout = handsoffLandingTimeout
+	}
+	if count < 1 {
+		count = 1
+	}
+	time.Sleep(timeout * time.Duration(count))
+
+	s.mu.Lock()
+	var outstanding []uint
+	for id := range s.handsoffSealed {
+		if !s.handsoffLanded[id] && !s.handsoffFailed[id] {
+			s.handsoffFailed[id] = true
+			outstanding = append(outstanding, id)
+		}
+	}
+	s.mu.Unlock()
+	if len(outstanding) == 0 {
+		return
+	}
+	sort.Slice(outstanding, func(i, j int) bool { return outstanding[i] < outstanding[j] })
+	fmt.Fprintf(os.Stderr, "[handsoff] landing timed out for edicts %v\n", outstanding)
+	s.maybeFinish()
+}
+
+// sealableEdicts grants the Ruler's seal to every edict the pass must seal and
+// returns their IDs: rows from the court's scoped active list that carry both
+// the Judge's and the Chancellor's seals. Each edict is registered as awaiting
+// its landing before the seal is granted, so an event cannot race ahead of the
+// bookkeeping. Rows lacking either seal are half-sealed and left to the normal
+// flow; edicts 0/1 (system and court infrastructure) are never sealed. A nil
+// court (bare test sink) has nothing to seal.
+func (s *headlessSink) sealableEdicts() ([]uint, error) {
+	if s.sealCourt == nil {
+		return nil, nil
+	}
+	active, err := s.sealCourt.ListActiveEdicts()
+	if err != nil {
+		return nil, err
+	}
+	sealed := make([]uint, 0, len(active))
+	for _, e := range active {
+		if !e.HasJudgeSeal || !e.HasChancellorSeal {
+			continue
+		}
+		if e.ID <= 1 {
+			continue // reserved infrastructure edict
+		}
+		s.mu.Lock()
+		s.handsoffSealed[e.ID] = true
+		s.mu.Unlock()
+		if err := s.sealCourt.GrantRulerSeal(e.ID, "handsoff auto-seal"); err != nil {
+			s.mu.Lock()
+			delete(s.handsoffSealed, e.ID)
+			s.handsoffFailed[e.ID] = true
+			s.mu.Unlock()
+			fmt.Fprintf(os.Stderr, "[handsoff] failed to seal edict %d: %v\n", e.ID, err)
+			continue
+		}
+		sealed = append(sealed, e.ID)
+	}
+	return sealed, nil
+}
+
+// recordLanding records a terminal landing event for a sealed edict: ok true
+// for edict_sealed, false for a terminal failure. An event for an edict the
+// pass did not seal, or a second terminal event for an edict that already has
+// one, is ignored idempotently.
+func (s *headlessSink) recordLanding(edictID uint, ok bool) {
+	s.mu.Lock()
+	if !s.handsoffSealed[edictID] || s.handsoffLanded[edictID] || s.handsoffFailed[edictID] {
+		s.mu.Unlock()
+		return
+	}
+	if ok {
+		s.handsoffLanded[edictID] = true
+	} else {
+		s.handsoffFailed[edictID] = true
+	}
+	s.mu.Unlock()
+	s.maybeFinish()
+}
+
+// handleMergeFailed surfaces a terminal landing failure for an edict the
+// handsoff pass sealed, so the run exits non-zero instead of hiding the red.
+// The payload's `merged` flag distinguishes a merge that succeeded but whose
+// worktree cleanup failed from one that never landed. Events for edicts the
+// pass did not seal — including every merge failure when handsoff is off — are
+// ignored, so the print never leaks into a non-handsoff run and a second
+// terminal event for an already-terminal edict does not print twice.
+func (s *headlessSink) handleMergeFailed(msg court.EventNotificationMsg) {
+	edictID := msg.EdictKey.ID
+	if !s.handsoffAwaitingLanding(edictID) {
+		return
+	}
+	reason, _ := msg.Payload["reason"].(string)
+	merged, _ := msg.Payload["merged"].(bool)
+	if merged {
+		fmt.Fprintf(os.Stderr, "[handsoff] edict %d land failed: %s (landed but cleanup failed)\n", edictID, reason)
+	} else {
+		fmt.Fprintf(os.Stderr, "[handsoff] edict %d land failed: %s (NOT merged)\n", edictID, reason)
+	}
+	s.recordLanding(edictID, false)
+}
+
+// handsoffAwaitingLanding reports whether the pass sealed edictID and has not
+// yet recorded its terminal landing event. Guarded by s.mu.
+func (s *headlessSink) handsoffAwaitingLanding(edictID uint) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handsoffSealed[edictID] && !s.handsoffLanded[edictID] && !s.handsoffFailed[edictID]
 }
 
 // isEdictSuggestion reports whether a zhengming request is an edict

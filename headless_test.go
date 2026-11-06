@@ -1461,3 +1461,250 @@ func gitStatus(t *testing.T, dir string) string {
 	require.NoError(t, err, "git status failed: %s", out)
 	return strings.TrimSpace(string(out))
 }
+
+// fakeSealCourt is a handsoffSealCourt seam for driving the seal pass without
+// a live court, git repo, or ritual machinery.
+type fakeSealCourt struct {
+	mu      sync.Mutex
+	active  []storage.ActiveEdict
+	err     error
+	granted []uint
+	onGrant func(id uint)
+}
+
+func (f *fakeSealCourt) ListActiveEdicts() ([]storage.ActiveEdict, error) {
+	return f.active, f.err
+}
+
+func (f *fakeSealCourt) GrantRulerSeal(edictID uint, notes string) error {
+	f.mu.Lock()
+	f.granted = append(f.granted, edictID)
+	hook := f.onGrant
+	f.mu.Unlock()
+	if hook != nil {
+		hook(edictID)
+	}
+	return nil
+}
+
+func (f *fakeSealCourt) grantedIDs() []uint {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint(nil), f.granted...)
+}
+
+// TestHeadlessSink_SealPassSelectsPendingAscension verifies the handsoff sweep
+// seals exactly the edicts carrying both the Judge's and the Chancellor's
+// seals (and never the reserved edict 1 or system edict 0).
+func TestHeadlessSink_SealPassSelectsPendingAscension(t *testing.T) {
+	fc := &fakeSealCourt{active: []storage.ActiveEdict{
+		{Edict: storage.Edict{ID: 11}, HasJudgeSeal: true, HasChancellorSeal: true},
+		{Edict: storage.Edict{ID: 12}, HasJudgeSeal: true},
+		{Edict: storage.Edict{ID: 1}, HasJudgeSeal: true, HasChancellorSeal: true},
+	}}
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	sink.sealCourt = fc
+
+	sealed, err := sink.sealableEdicts()
+	require.NoError(t, err)
+	assert.Equal(t, []uint{11}, sealed, "only judge+chancellor rows are sealable")
+	assert.Equal(t, []uint{11}, fc.grantedIDs(), "exactly the pending-ascension row is sealed")
+}
+
+// TestHeadlessSink_SealPassWaitsForLanding verifies that a completed ritual in
+// handsoff does not finish while a sealed edict awaits its landing, and that
+// edict_sealed releases it with exit 0.
+func TestHeadlessSink_SealPassWaitsForLanding(t *testing.T) {
+	fc := &fakeSealCourt{active: []storage.ActiveEdict{
+		{Edict: storage.Edict{ID: 11}, HasJudgeSeal: true, HasChancellorSeal: true},
+	}}
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	sink.sealCourt = fc
+	sink.landingTimeout = time.Minute
+
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventRitualCompleted,
+		EdictKey:  storage.EdictKey{ID: 11},
+	})
+
+	select {
+	case code := <-sink.done:
+		t.Fatalf("must not finish while a sealed edict awaits landing (got %d)", code)
+	default:
+	}
+
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventEdictSealed,
+		EdictKey:  storage.EdictKey{ID: 11},
+	})
+
+	select {
+	case code := <-sink.done:
+		assert.Equal(t, 0, code)
+	default:
+		t.Fatal("expected finish(0) after the landing lands")
+	}
+}
+
+// TestHeadlessSink_SealPassMergeFailedExitsOne verifies a terminal landing
+// failure is surfaced and the run exits 1.
+func TestHeadlessSink_SealPassMergeFailedExitsOne(t *testing.T) {
+	fc := &fakeSealCourt{active: []storage.ActiveEdict{
+		{Edict: storage.Edict{ID: 11}, HasJudgeSeal: true, HasChancellorSeal: true},
+	}}
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	sink.sealCourt = fc
+	sink.landingTimeout = time.Minute
+
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventRitualCompleted,
+		EdictKey:  storage.EdictKey{ID: 11},
+	})
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventWorktreeMergeFailed,
+		EdictKey:  storage.EdictKey{ID: 11},
+		Payload:   map[string]interface{}{"reason": "rebase conflict", "merged": false},
+	})
+
+	select {
+	case code := <-sink.done:
+		assert.Equal(t, 1, code)
+	default:
+		t.Fatal("expected finish(1) after a terminal landing failure")
+	}
+}
+
+// TestHeadlessSink_SealPassNonHandsoffUnchanged verifies handsoff=false keeps
+// the historical semantics: ritual completion finishes 0 and no seals are granted.
+func TestHeadlessSink_SealPassNonHandsoffUnchanged(t *testing.T) {
+	fc := &fakeSealCourt{active: []storage.ActiveEdict{
+		{Edict: storage.Edict{ID: 11}, HasJudgeSeal: true, HasChancellorSeal: true},
+	}}
+	sink := newHeadlessSink(nil)
+	sink.handsoff = false
+	sink.sealCourt = fc
+
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventRitualCompleted,
+		EdictKey:  storage.EdictKey{ID: 11},
+	})
+
+	select {
+	case code := <-sink.done:
+		assert.Equal(t, 0, code)
+	default:
+		t.Fatal("non-handsoff ritual completion must finish as before")
+	}
+	assert.Empty(t, fc.grantedIDs(), "non-handsoff must grant no seals")
+}
+
+// TestHeadlessSink_SealPassEarlyTerminalEvent verifies an edict_sealed that
+// races ahead of the seal bookkeeping is not dropped (no hang).
+func TestHeadlessSink_SealPassEarlyTerminalEvent(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	sink.landingTimeout = time.Minute
+	fc := &fakeSealCourt{
+		active: []storage.ActiveEdict{
+			{Edict: storage.Edict{ID: 11}, HasJudgeSeal: true, HasChancellorSeal: true},
+		},
+	}
+	// The landing event arrives (on another goroutine in production) while the
+	// seal is being granted.
+	fc.onGrant = func(id uint) {
+		sink.handleEvent(court.EventNotificationMsg{
+			EventType: storage.EventEdictSealed,
+			EdictKey:  storage.EdictKey{ID: id},
+		})
+	}
+	sink.sealCourt = fc
+
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventRitualCompleted,
+		EdictKey:  storage.EdictKey{ID: 11},
+	})
+
+	select {
+	case code := <-sink.done:
+		assert.Equal(t, 0, code)
+	default:
+		t.Fatal("expected finish(0): an early landing event must not be dropped")
+	}
+}
+
+// TestHeadlessSink_RecordLandingIgnoresUnknownAndRepeats verifies idempotence:
+// events for unsealed edicts are ignored and a second terminal event cannot
+// downgrade an already-sent 0.
+func TestHeadlessSink_RecordLandingIgnoresUnknownAndRepeats(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	sink.mu.Lock()
+	sink.handsoffSealed[11] = true
+	sink.mu.Unlock()
+
+	sink.recordLanding(99, true)
+	select {
+	case code := <-sink.done:
+		t.Fatalf("unknown landing event must be ignored (got %d)", code)
+	default:
+	}
+
+	sink.recordLanding(11, true)
+	assert.Equal(t, 0, <-sink.done, "first terminal event sends 0")
+
+	sink.recordLanding(11, false)
+	select {
+	case code := <-sink.done:
+		t.Fatalf("a repeat terminal event must not send a second code (got %d)", code)
+	default:
+	}
+}
+
+// TestHeadlessSink_SealPassTimeout verifies an unlanded seal pass is bounded
+// and exits non-zero instead of hanging.
+func TestHeadlessSink_SealPassTimeout(t *testing.T) {
+	fc := &fakeSealCourt{active: []storage.ActiveEdict{
+		{Edict: storage.Edict{ID: 11}, HasJudgeSeal: true, HasChancellorSeal: true},
+	}}
+	sink := newHeadlessSink(nil)
+	sink.handsoff = true
+	sink.sealCourt = fc
+	sink.landingTimeout = 20 * time.Millisecond
+
+	sink.handleEvent(court.EventNotificationMsg{
+		EventType: storage.EventRitualCompleted,
+		EdictKey:  storage.EdictKey{ID: 11},
+	})
+
+	select {
+	case code := <-sink.done:
+		assert.Equal(t, 1, code, "a stalled landing must exit non-zero")
+	case <-time.After(3 * time.Second):
+		t.Fatal("seal pass did not honor its landing timeout")
+	}
+}
+
+// TestHeadlessSink_MergeFailedIgnoresUnsealedEdict verifies a
+// worktree_merge_failed event neither prints nor affects the exit code when it
+// is not for an edict the seal pass sealed — the non-handsoff run and events
+// for other flows must stay byte-for-byte unchanged.
+func TestHeadlessSink_MergeFailedIgnoresUnsealedEdict(t *testing.T) {
+	for _, handsoff := range []bool{false, true} {
+		sink := newHeadlessSink(nil)
+		sink.handsoff = handsoff
+
+		sink.handleEvent(court.EventNotificationMsg{
+			EventType: storage.EventWorktreeMergeFailed,
+			EdictKey:  storage.EdictKey{ID: 11},
+			Payload:   map[string]interface{}{"reason": "rebase conflict", "merged": false},
+		})
+
+		select {
+		case code := <-sink.done:
+			t.Fatalf("handsoff=%v: an unsealed merge failure must not finish (got %d)", handsoff, code)
+		default:
+		}
+	}
+}
