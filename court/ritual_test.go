@@ -1282,12 +1282,11 @@ func TestLoadBuiltinRituals(t *testing.T) {
 			if len(r.Steps[0].Given) != 0 {
 				t.Errorf("swift-strike forge: expected no step-level given, got %v", r.Steps[0].Given)
 			}
-			// Judge step should have Given with !CI=1 just test
 			if len(r.Steps[1].Given) == 0 {
 				t.Error("swift-strike judge step: expected given entries")
 			}
-			if r.Steps[1].Given[0] != "!CI=1 just test" {
-				t.Errorf("swift-strike judge given: expected '!CI=1 just test', got %q", r.Steps[1].Given[0])
+			if r.Steps[1].Given[0] != "!just test" {
+				t.Errorf("swift-strike judge given: expected '!just test', got %q", r.Steps[1].Given[0])
 			}
 		}
 	}

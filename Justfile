@@ -1,5 +1,5 @@
-PROJECT_NAME := `git config --get remote.origin.url | sed -E 's/.*[:\/]([^\/]+)\/([^\/]+)\.git$/\1\/\2/' | tr '[A-Z]' '[a-z]'`
-NOW := `date +%Y%m%dT%H%M%S`
+project_name := `git config --get remote.origin.url | sed -E 's/.*[:\/]([^\/]+)\/([^\/]+)\.git$/\1\/\2/' | tr '[A-Z]' '[a-z]'`
+now := `date +%Y%m%dT%H%M%S`
 
 # List all available recipes
 default:
@@ -123,7 +123,7 @@ run:
     go build -tags containers_image_openpgp .
     ./asimi --debug
 
-# Run the test suite. The CI env var forks the two modes (the only such flag):
+# Run the test suite, tee-ing output to `./heaven/tests/test_<datetime>.out`
 #   - Dev station (CI unset): the plain suite, cached by Go. The fast inner loop.
 #   - CI / sandbox (CI=1): the same plain suite, then the -race gate on ./court/.
 # Both modes tee the full output to heaven/tests/test_<datetime>.out (each run
@@ -147,7 +147,7 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p heaven/tests
-    go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test-{{NOW}}.out"
+    go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test-{{now}}.out"
     if [ -n "${CI:-}" ]; then
         just test-race
     fi
@@ -179,7 +179,7 @@ test-intent:
     go test -mod=mod -run TestIntentGherkin -timeout 30s .
 
 # Run the terminal-bench activation E2E test with a real LLM.
-# Requires CI=true, LLM_E2E=1, and a provider API key in the environment
+# Requires CI=1, LLM_E2E=1, and a provider API key in the environment
 # (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY).
 # Uses whatever model/provider the caller has configured (config, ASIMI_MODEL,
 # ASIMI_PROVIDER) — the test does not force a model.
@@ -195,10 +195,11 @@ fmt:
     go fmt ./...
     goimports -w .
 
-# Freeze the log files to asimi.<suffix>.log and asimi-daemon.<suffix>.log
-freeze-log suffix:
-    cp asimi.log asimi.{{suffix}}.log
-    cp asimi-daemon.log asimi-daemon.{{suffix}}.log
+# Freeze the log files to `./heaven/logs/asimi[-deamon]-<datetime>.log`
+freeze-logs:
+    mkdir -p heaven/logs
+    cp asimi.log heaven/logs/asimi-{{now}}.log
+    cp asimi-daemon.log heaven/logs/asimi-daemon-{{now}}.log
 
 # Start neovim with the asimi plugin loaded (interactive dev session)
 nvim:
@@ -307,14 +308,14 @@ bootstrap:
     go install golang.org/x/tools/cmd/goimports@latest
     go install golang.org/x/vuln/cmd/govulncheck@latest
 
-# Run vulnerability scanning (fails on any finding not in security/vuln-allowlist.txt)
+# Run vulnerability scanning, save output to ./heaven/threats/<tool>-<datetime>.out
 #
 # The full scan output is archived under heaven/security as
 # <tool>-<datetime>.txt (e.g. govulncheck-20260522T143000.txt), so a release's
 # security evidence outlives the terminal. Reports are write-only artifacts:
 # each run appends a new file, none is ever overwritten, and the directory is
 # gitignored (like heaven/runs).
-vuln:
+get-threats:
     #!/usr/bin/env bash
     set -o pipefail
     tool="govulncheck"
@@ -323,9 +324,9 @@ vuln:
         exit 1
     fi
     allowlist="security/vuln-allowlist.txt"
-    report_dir="heaven/security"
+    report_dir="heaven/threats"
     mkdir -p "$report_dir"
-    report="$report_dir/${tool}-{{NOW}}.txt"
+    report="$report_dir/${tool}-{{now}}.out"
     go build -tags containers_image_openpgp -o /tmp/asimi-vuln .
     out=$("$tool" -mode=binary /tmp/asimi-vuln 2>&1)
     status=$?
@@ -377,11 +378,11 @@ init-podman:
 # Build the sandbox container.
 build-sandbox: init-podman
     podman builder prune -f >/dev/null 2>&1 || true
-    podman build -t localhost/asimi/sandbox/{{PROJECT_NAME}}:latest -f .agents/sandbox/Dockerfile .
+    podman build -t localhost/asimi/sandbox/{{project_name}}:latest -f .agents/sandbox/Dockerfile .
 
 # Clean up the sandbox container
 clean-sandbox:
-    podman rmi localhost/asimi/sandbox/{{PROJECT_NAME}}:latest
+    podman rmi localhost/asimi/sandbox/{{project_name}}:latest
     # TODO: add removel of the shared go's cache
 
 # Measure run_shell_command tool performance
