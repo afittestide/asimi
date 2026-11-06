@@ -132,7 +132,7 @@ type Court struct {
 	// Per-channel cancel registry; CancelTab(channelID) invokes the
 	// corresponding cancel func. Populated by CancellableStreamCtx.
 	tabCancelsMu sync.Mutex
-	tabCancels   map[string]context.CancelFunc
+	tabCancels   map[string]context.CancelCauseFunc
 
 	// sessionCfg holds the session-level config (sandbox, LLM, agents file)
 	// set via ConfigureModel. Used by CheckHostCommand for RunOnHost patterns
@@ -237,7 +237,7 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		StreamingCtx: func(channelID string) context.Context {
 			return s.CancellableStreamCtx(channelID)
 		},
-		CancelRitual:     s.CancelTab,
+		CancelRitual:     s.CancelTabCause,
 		WaitForZhengming: s.WaitForZhengming,
 		RequestZhengming: s.RequestZhengming,
 		DeliverZhengming: s.DeliverZhengmingAnswer,
@@ -1518,6 +1518,11 @@ func (s *Court) GetEventRegistry() *EventRegistry {
 // root ctx and registers its cancel func under channelID. Any previous
 // cancel for the same channelID is invoked first, so callers don't
 // leak. Use CancelTab(channelID) to trigger cancellation externally.
+//
+// The context carries a cancellation cause: CancelTab attaches
+// errRulerInterrupt (a genuine human cancellation) and the ritual guard's
+// abort paths attach their own cause. A bare context.Canceled never again
+// stands in for "the ruler did this" (edict 1024).
 func (s *Court) CancellableStreamCtx(channelID string) context.Context {
 	if s == nil {
 		return context.Background()
@@ -1525,23 +1530,42 @@ func (s *Court) CancellableStreamCtx(channelID string) context.Context {
 	s.tabCancelsMu.Lock()
 	defer s.tabCancelsMu.Unlock()
 	if s.tabCancels == nil {
-		s.tabCancels = make(map[string]context.CancelFunc)
+		s.tabCancels = make(map[string]context.CancelCauseFunc)
 	}
 	if prev, ok := s.tabCancels[channelID]; ok {
-		prev()
+		prev(errRulerInterrupt)
 	}
 	parent := s.ctx
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancelCause(parent)
 	s.tabCancels[channelID] = cancel
 	return ctx
 }
 
 // CancelTab invokes (and forgets) the cancel func registered under
 // channelID. Idempotent; calling with an unknown channelID is a no-op.
+// This is the ruler-interrupt path: the cancellation carries the
+// errRulerInterrupt cause so the unwinding ritual is labelled honestly.
 func (s *Court) CancelTab(channelID string) {
+	s.cancelTab(channelID, errRulerInterrupt)
+}
+
+// CancelTabCause cancels the context registered under channelID, attributing
+// the cancellation to cause. The ritual guard uses it so a flatline reap or
+// an edict-state abort is never mistaken for a ruler interrupt.
+func (s *Court) CancelTabCause(channelID string, cause error) {
+	if cause == nil {
+		s.CancelTab(channelID)
+		return
+	}
+	s.cancelTab(channelID, cause)
+}
+
+// cancelTab deletes the cancel registered for channelID and invokes it with
+// cause.
+func (s *Court) cancelTab(channelID string, cause error) {
 	if s == nil {
 		return
 	}
@@ -1552,7 +1576,7 @@ func (s *Court) CancelTab(channelID string) {
 	}
 	s.tabCancelsMu.Unlock()
 	if ok {
-		cancel()
+		cancel(cause)
 	}
 }
 

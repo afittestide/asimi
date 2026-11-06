@@ -108,7 +108,9 @@ type RitualGuard struct {
 	// Dependency injection (replaces *Court back-reference)
 	getMinister  func(id string) Minister
 	streamingCtx func(string) context.Context
-	cancelRitual func(channelID string)
+	// cancelRitual cancels a ritual's streaming context, attaching cause so the
+	// unwinding goroutine can report why it was cancelled.
+	cancelRitual func(channelID string, cause error)
 	version      string // Application version for health checks
 
 	// flatlineRunners, injected by the Court, stops and removes idle per-edict
@@ -132,8 +134,8 @@ type RitualGuardOpts struct {
 	GetMinister      func(id string) Minister
 	OnRunnerUpgrade  func(runners.Runner) // propagates runner changes back to court
 	StreamingCtx     func(string) context.Context
-	CancelRitual     func(channelID string) // cancels a ritual's streaming context
-	Version          string                 // Application version for health checks
+	CancelRitual     func(channelID string, cause error) // cancels a ritual's streaming context
+	Version          string                              // Application version for health checks
 	WaitForZhengming func(ctx context.Context, requestID string) (string, error)
 	RequestZhengming func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error)
 	DeliverZhengming func(answer ZhengmingAnswer) bool
@@ -380,11 +382,16 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 			return
 		}
 		if err := rg.ritualRunner.Run(ctx, exec); err != nil {
-			if errors.Is(err, context.Canceled) {
-				// Context cancelled (user interrupt) — StreamInterruptedMsg
-				// already surfaces as 🛑 ABORTED in the TUI. No duplicate
-				// ritual_failed notification needed.
+			if isRulerInterrupt(err, ctx) {
+				// The ruler aborted: StreamInterruptedMsg already surfaces as
+				// 🛑 ABORTED in the TUI. No duplicate ritual_failed notification.
 				rg.logger.Info("ritual cancelled by ruler", "ritual", ritualName)
+				return
+			}
+			if cause := contextCause(err, ctx); isCourtAbortCause(cause) {
+				// A flatline reap or edict-state abort already recorded its own
+				// ritual_aborted event; logging the honest reason is enough here.
+				rg.logger.Info("ritual aborted", "ritual", ritualName, "reason", cause.Error())
 				return
 			}
 			rg.logger.Warn("ritual failed", "ritual", ritualName, "error", err)
@@ -399,7 +406,7 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				merged, _ := exec.Data["merge_landed"].(bool)
 				rg.PublishEvent(key, storage.EventWorktreeMergeFailed, storage.JSON{
 					"minister_id": "ruler",
-					"reason":      getRulersError(err),
+					"reason":      describeFailure(err, ctx),
 					"worktree":    worktree.RelPath(key.ID),
 					"branch":      worktree.Branch(key.ID),
 					"merged":      merged,
@@ -413,7 +420,7 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 				ExecutionID: exec.ID,
 				EdictID:     key.ID,
 				Status:      "ritual_failed",
-				Message:     getRulersError(err),
+				Message:     describeFailure(err, ctx),
 			})
 		}
 	}()
@@ -536,7 +543,7 @@ func (rg *RitualGuard) abortStaleRitualsIfLocked() {
 			"ritual", ritual.RitualName,
 			"edict_id", ritual.EdictID,
 			"updated_at", ritual.UpdatedAt)
-		if err := rg.abortRitual(context.Background(), ritual, "ritual exceeded flatline age"); err != nil {
+		if err := rg.abortRitual(context.Background(), ritual, errFlatlineReaped.Error(), errFlatlineReaped); err != nil {
 			rg.logger.Warn("failed to abort stale ritual",
 				"execution_id", ritual.ID,
 				"error", err)
@@ -1131,7 +1138,8 @@ func (rg *RitualGuard) scanForStaleRituals(ctx context.Context) {
 		}
 		if staleEdictSet[ritual.EdictID] {
 			status := staleStatuses[ritual.EdictID]
-			if err := rg.abortRitual(ctx, &ritual, fmt.Sprintf("edict %d is %s", ritual.EdictID, status)); err != nil {
+			cause := fmt.Errorf("%w: edict %d is %s", errEdictStateAbort, ritual.EdictID, status)
+			if err := rg.abortRitual(ctx, &ritual, cause.Error(), cause); err != nil {
 				rg.logger.Warn("failed to abort stale ritual",
 					"execution_id", ritual.ID,
 					"edict_id", ritual.EdictID,
@@ -1141,8 +1149,11 @@ func (rg *RitualGuard) scanForStaleRituals(ctx context.Context) {
 	}
 }
 
-// abortRitual marks a ritual as aborted and emits an event
-func (rg *RitualGuard) abortRitual(ctx context.Context, exec *RitualExecution, reason string) error {
+// abortRitual marks a ritual as aborted and emits an event. cause names the
+// mechanism of the abort (errFlatlineReaped, errEdictStateAbort) and rides
+// along on the cancellation so the unwinding ritual reports a reaped or
+// state-changed abort rather than a ruler interrupt.
+func (rg *RitualGuard) abortRitual(ctx context.Context, exec *RitualExecution, reason string, cause error) error {
 	// Update ritual state to aborted
 	if err := rg.db.Model(&RitualExecution{}).
 		Where("id = ?", exec.ID).
@@ -1166,12 +1177,13 @@ func (rg *RitualGuard) abortRitual(ctx context.Context, exec *RitualExecution, r
 	// Cancel the ritual's streaming context so the goroutine unwinds at its
 	// next step boundary and releases its edict lock. Without this the DB
 	// state and event lie: the ritual keeps running after being declared
-	// aborted.
+	// aborted. The cause is attached so the unwind does not read as a ruler
+	// interrupt.
 	if rg.cancelRitual != nil {
-		rg.cancelRitual(ritualChannelID(exec.EdictID))
+		rg.cancelRitual(ritualChannelID(exec.EdictID), cause)
 	}
 
-	rg.logger.Info("ritual aborted due to edict state change",
+	rg.logger.Info("ritual aborted",
 		"ritual", exec.RitualName,
 		"execution_id", exec.ID,
 		"edict_id", exec.EdictID,

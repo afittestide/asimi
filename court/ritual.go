@@ -139,16 +139,120 @@ type ZhengmingAnswer struct {
 	EdictID   uint
 }
 
-// getRulersError returns a user-friendly error message.
-// Context cancellation errors are translated to "cancelled by ruler".
-func getRulersError(err error) string {
+// Context-cause sentinels. A cancelled step or ritual context alone cannot
+// say *why* it was cancelled: context.Canceled is the generic sentinel for a
+// ruler interrupt, a flatline reap, a sandbox/exec death and a daemon
+// shutdown alike. Every site that cancels a governed context therefore
+// attaches its own cause (Go 1.20 context.WithCancelCause), and
+// describeFailure names the mechanism the cause identifies. Reporting
+// "cancelled by ruler" for anything but errRulerInterrupt is the e1024 bug.
+var (
+	// errRulerInterrupt is the cause attached when the TUI/ruler path aborts
+	// a ritual (tab close / :abort / CancelTab). Only this cause justifies the
+	// "cancelled by ruler" label and the silent-abort control flow.
+	errRulerInterrupt = errors.New("ruler interrupt")
+	// errFlatlineReaped is the cause attached by the stale-ritual sweep when
+	// it aborts a row past the flatline age, so a reaped ritual is never
+	// reported as a ruler interrupt.
+	errFlatlineReaped = errors.New("ritual reaped: exceeded flatline age")
+	// errEdictStateAbort is the cause attached when a sweep stops a ritual
+	// because its edict was sealed or cancelled mid-run.
+	errEdictStateAbort = errors.New("ritual aborted: edict state changed")
+	// errRitualPaused is the cause attached when a step is cancelled to
+	// interrupt the LLM stream for a ruler interjection (PauseRitual).
+	errRitualPaused = errors.New("step interrupted for ruler interjection")
+	// errStepIdleTimeout is the cause attached when the step's idle timer
+	// fires — the minister went silent past the idle window.
+	errStepIdleTimeout = errors.New("step aborted: idle timeout exceeded")
+)
+
+// contextCauseError carries a cancellation together with the cause that
+// cancelled the governing context, so a caller holding only the error (not
+// the context) can still classify the cancellation honestly.
+type contextCauseError struct {
+	err   error
+	cause error
+}
+
+func (e *contextCauseError) Error() string { return e.err.Error() }
+func (e *contextCauseError) Unwrap() error { return e.err }
+func (e *contextCauseError) Cause() error  { return e.cause }
+
+// withContextCause returns err unchanged unless it is a context cancellation
+// with a specific cause, in which case the cause rides along on the error.
+func withContextCause(err error, ctx context.Context) error {
+	if err == nil || ctx == nil || ctx.Err() == nil {
+		return err
+	}
+	cause := context.Cause(ctx)
+	if cause == nil || errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		return err
+	}
+	return &contextCauseError{err: err, cause: cause}
+}
+
+// contextCause resolves the reason a cancellation happened: the cause carried
+// by err (if any), else the cause of ctx, else nil when neither can say.
+func contextCause(err error, ctx context.Context) error {
+	var ce interface{ Cause() error }
+	if errors.As(err, &ce) {
+		if c := ce.Cause(); c != nil {
+			return c
+		}
+	}
+	if ctx != nil {
+		return context.Cause(ctx)
+	}
+	return nil
+}
+
+// describeFailure returns an honest, recorded failure reason for err.
+//
+// For a cancelled context it classifies by cause, never by the bare
+// context.Canceled sentinel: the cause names the mechanism that actually
+// cancelled the context (ruler interrupt, flatline reap, sandbox/exec death,
+// idle timeout). An unattributable cancel reads "cancelled (cause unknown)"
+// together with the underlying error rather than being generalized into
+// "cancelled by ruler". Non-context errors are returned verbatim.
+func describeFailure(err error, ctx context.Context) string {
 	if err == nil {
 		return ""
 	}
-	if errors.Is(err, context.Canceled) {
-		return "cancelled by ruler"
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return err.Error()
 	}
-	return err.Error()
+	switch cause := contextCause(err, ctx); {
+	case errors.Is(cause, errRulerInterrupt):
+		return "cancelled by ruler"
+	case errors.Is(cause, errFlatlineReaped):
+		return "ritual reaped: exceeded flatline age"
+	case errors.Is(cause, errEdictStateAbort):
+		return "ritual aborted: edict state changed"
+	case errors.Is(cause, errStepIdleTimeout):
+		return "step cancelled: idle timeout exceeded"
+	case cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded):
+		return "step cancelled: " + cause.Error()
+	default:
+		return "cancelled (cause unknown): " + err.Error()
+	}
+}
+
+// isRulerInterrupt reports whether err is a context cancellation whose cause
+// is the ruler-interrupt sentinel. Only then may a caller take the benign
+// "the ruler pressed abort" path — skip the ritual_failed notification, log
+// the human cancellation. Any other cause is a genuine failure.
+func isRulerInterrupt(err error, ctx context.Context) bool {
+	if !errors.Is(err, context.Canceled) {
+		return false
+	}
+	return errors.Is(contextCause(err, ctx), errRulerInterrupt)
+}
+
+// isCourtAbortCause reports whether cause marks an abort the court already
+// recorded (a flatline reap or an edict-state abort), as opposed to a failure
+// that still needs a ritual_failed event of its own.
+func isCourtAbortCause(cause error) bool {
+	return errors.Is(cause, errFlatlineReaped) || errors.Is(cause, errEdictStateAbort)
 }
 
 // RitualDef represents a YAML-defined ritual
@@ -528,8 +632,8 @@ type RitualRunner struct {
 	// LLM stream) but the ritual goroutine blocks on pauseChan until
 	// resumeChan fires (:continue) or the parent context is cancelled (:abort).
 	pauseMu     sync.Mutex
-	pauseChans  map[string]chan struct{}      // keyed by channelID ("e633")
-	stepCancels map[string]context.CancelFunc // keyed by channelID — cancels the active step's context
+	pauseChans  map[string]chan struct{}           // keyed by channelID ("e633")
+	stepCancels map[string]context.CancelCauseFunc // keyed by channelID — cancels the active step's context with a cause
 }
 
 // NewRitualRunner creates a new ritual runner
@@ -955,13 +1059,13 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 			exec.Notify(RitualStepMsg{
 				StepName: raw,
 				Status:   "ritual_failed",
-				Message:  getRulersError(err),
+				Message:  describeFailure(err, ctx),
 			})
 			r.emitEvent(execKey, storage.EventRitualFailed, storage.JSON{
 				"ritual":       exec.RitualName,
 				"execution_id": exec.ID,
 				"step":         raw,
-				"error":        getRulersError(err),
+				"error":        describeFailure(err, ctx),
 			})
 			return fmt.Errorf("background given %q failed: %w", raw, err)
 		}
@@ -975,13 +1079,16 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 		})
 		result, err := r.runGivenStep(ctx, exec, entry)
 		if err != nil {
-			// Context cancelled (user interrupt) — the session layer already
-			// sent StreamInterruptedMsg which surfaces as 🛑 ABORTED in the
-			// TUI. Skip the ritual_failed notification.
-			if errors.Is(err, context.Canceled) {
+			// A ruler interrupt is benign here: the session layer already sent
+			// StreamInterruptedMsg, which surfaces as 🛑 ABORTED in the TUI, so
+			// skip the ritual_failed notification. Any other cancellation (a
+			// sandbox death, a flatline reap, resource starvation) is a real
+			// failure and must fall through to the labeled failure path below —
+			// translating it to "cancelled by ruler" is what hid the e1010 bug.
+			if isRulerInterrupt(err, ctx) {
 				exec.State = RitualStateAborted
 				r.saveExecution(exec)
-				return fmt.Errorf("background given %q failed: %w", raw, err)
+				return withContextCause(fmt.Errorf("background given %q failed: %w", raw, err), ctx)
 			}
 			exec.State = RitualStateFailed
 			r.saveExecution(exec)
@@ -996,15 +1103,15 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 			exec.Notify(RitualStepMsg{
 				StepName: entry.Key,
 				Status:   "ritual_failed",
-				Message:  getRulersError(err),
+				Message:  describeFailure(err, ctx),
 			})
 			r.emitEvent(execKey, storage.EventRitualFailed, storage.JSON{
 				"ritual":       exec.RitualName,
 				"execution_id": exec.ID,
 				"step":         entry.Key,
-				"error":        getRulersError(err),
+				"error":        describeFailure(err, ctx),
 			})
-			return fmt.Errorf("background given %q failed: %w", raw, err)
+			return withContextCause(fmt.Errorf("background given %q failed: %w", raw, err), ctx)
 		}
 		success := runners.ToolCallSuccessMsg{
 			ChannelID: exec.ChannelID(),
@@ -1025,13 +1132,26 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 	for exec.CurrentStep < len(exec.def.Steps) {
 		select {
 		case <-ctx.Done():
+			// The between-steps boundary: the context was cancelled while no
+			// step was running. Attach the cancellation's cause so the recorded
+			// outcome names the mechanism. Only a ruler interrupt logs the
+			// "aborted by user" line; a court abort (flatline reap, edict-state
+			// change) is already recorded by its own abort path.
 			exec.State = RitualStateAborted
 			r.saveExecution(exec)
-			exec.Notify(RitualStepMsg{
-				Status:  "ritual_aborted",
-				Message: "aborted by user",
-			})
-			return ctx.Err()
+			cause := context.Cause(ctx)
+			if isCourtAbortCause(cause) {
+				r.logger.Info("ritual aborted",
+					"ritual", exec.RitualName,
+					"execution_id", exec.ID,
+					"reason", cause.Error())
+			} else {
+				exec.Notify(RitualStepMsg{
+					Status:  "ritual_aborted",
+					Message: "aborted by user",
+				})
+			}
+			return withContextCause(ctx.Err(), ctx)
 		default:
 		}
 
@@ -1039,13 +1159,14 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 		if err := r.waitIfPaused(ctx, exec.ChannelID()); err != nil {
 			exec.State = RitualStateAborted
 			r.saveExecution(exec)
-			return ctx.Err()
+			return withContextCause(ctx.Err(), ctx)
 		}
 		r.clearPause(exec.ChannelID())
 
 		step := exec.def.Steps[exec.CurrentStep]
 		result, err := r.executeStep(ctx, exec, step)
 		if err != nil {
+			err = withContextCause(err, ctx)
 			exec.stepStates[exec.CurrentStep].Status = "failed"
 			exec.stepStates[exec.CurrentStep].Message = err.Error()
 			exec.stepStates[exec.CurrentStep].Output = result
@@ -1063,10 +1184,21 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 				exec.Data["error"] = err.Error()
 			}
 
-			// Context cancelled (user interrupt) — the session layer already
-			// sent StreamInterruptedMsg which surfaces as 🛑 ABORTED in the
-			// TUI.
-			if ctx.Err() != nil {
+			// A ruler interrupt is benign: the session layer already sent
+			// StreamInterruptedMsg, which surfaces as 🛑 ABORTED in the TUI.
+			// Any other cancellation is a genuine failure and must run on to
+			// the labeled failure path — the old test (ctx.Err() != nil) treated
+			// a sandbox death or a reap as a silent ruler abort.
+			if ctx.Err() != nil && isRulerInterrupt(err, ctx) {
+				exec.State = RitualStateAborted
+				r.saveExecution(exec)
+				return err
+			}
+
+			// A court abort (flatline reap / edict state change) already recorded
+			// its own ritual_aborted event; unwinding quietly avoids a second,
+			// misleading failure for the same decision.
+			if cause := contextCause(err, ctx); isCourtAbortCause(cause) {
 				exec.State = RitualStateAborted
 				r.saveExecution(exec)
 				return err
@@ -1084,8 +1216,7 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 				StepName:  step.Name,
 				StepIndex: exec.CurrentStep,
 				Status:    "failed",
-				// TODO: fix this
-				Message: getRulersError(err),
+				Message:   describeFailure(err, ctx),
 			})
 
 			// Emit step_failed Tian event
@@ -1105,7 +1236,7 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 					StepName:  step.Name,
 					StepIndex: exec.CurrentStep,
 					Status:    "ritual_failed",
-					Message:   getRulersError(err),
+					Message:   describeFailure(err, ctx),
 				})
 				// Emit ritual_failed Tian event
 				lastStepOutput := getLastStepOutput(exec)
@@ -1113,7 +1244,7 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 					"ritual":           exec.RitualName,
 					"execution_id":     exec.ID,
 					"step":             step.Name,
-					"error":            getRulersError(err),
+					"error":            describeFailure(err, ctx),
 					"last_step_output": lastStepOutput,
 				})
 				return err
@@ -2033,18 +2164,20 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 		defer mb.SetOnZhengmingResolved(nil)
 	}
 
-	// Create step context that cancels when the timer expires
-	stepCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Create step context that cancels when the timer expires. "pause" governs
+	// a ruler interjection (PauseRitual), so unwinding the step can say why it
+	// was interrupted instead of looking like a bare context.Canceled.
+	stepCtx, cancelCause := context.WithCancelCause(ctx)
+	defer func() { cancelCause(nil) }()
 
 	// Register the step cancel so PauseRitual can interrupt the LLM stream
 	// without cancelling the parent ritual context.
 	channelID := exec.ChannelID()
 	r.pauseMu.Lock()
 	if r.stepCancels == nil {
-		r.stepCancels = make(map[string]context.CancelFunc)
+		r.stepCancels = make(map[string]context.CancelCauseFunc)
 	}
-	r.stepCancels[channelID] = cancel
+	r.stepCancels[channelID] = cancelCause
 	r.pauseMu.Unlock()
 	defer func() {
 		r.pauseMu.Lock()
@@ -2055,7 +2188,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 	go func() {
 		select {
 		case <-stepTimer.C:
-			cancel()
+			cancelCause(errStepIdleTimeout)
 		case <-stepCtx.Done():
 			// Step completed or parent context cancelled
 		}
@@ -2116,7 +2249,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 			r.clearPause(channelID)
 			if pausedErr != nil {
 				// Parent context cancelled (:abort) — return the original error
-				return result.Output, result.Err
+				return result.Output, withContextCause(result.Err, ctx)
 			}
 			// Resumed via :continue — return ErrRitualPaused so the ritual
 			// loop retries the step from scratch.
@@ -2124,7 +2257,7 @@ func (r *RitualRunner) executeMinisterStep(ctx context.Context, exec *RitualExec
 		}
 
 		if result.Err != nil {
-			return result.Output, result.Err
+			return result.Output, withContextCause(result.Err, stepCtx)
 		}
 		// Update session for potential reuse in next turn
 		if result.Session != nil {
@@ -2589,17 +2722,18 @@ func (r *RitualRunner) PauseRitual(channelID string) bool {
 		r.pauseChans = make(map[string]chan struct{})
 	}
 	if r.stepCancels == nil {
-		r.stepCancels = make(map[string]context.CancelFunc)
+		r.stepCancels = make(map[string]context.CancelCauseFunc)
 	}
 	if _, ok := r.pauseChans[channelID]; ok {
 		return false // already paused
 	}
 	r.pauseChans[channelID] = make(chan struct{})
 	// Cancel the active step's context if one is running, to interrupt the
-	// LLM stream. The ritual goroutine stays alive because we don't cancel
-	// the parent context.
+	// LLM stream. The cause marks this as a ruler interjection, not a failure.
+	// The ritual goroutine stays alive because we don't cancel the parent
+	// context.
 	if cancel, ok := r.stepCancels[channelID]; ok {
-		cancel()
+		cancel(errRitualPaused)
 	}
 	return true
 }

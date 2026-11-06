@@ -2517,8 +2517,10 @@ func TestRitualContextCancelledNoAbortNotification(t *testing.T) {
 	}
 
 	ministers := map[string]Minister{"forge": slowMinister}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	// The TUI cancel path (CancelTab) cancels with errRulerInterrupt; carry the
+	// same cause so this remains a genuine ruler interrupt.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	t.Cleanup(func() { cancel(nil) })
 	go slowMinister.Run(ctx)
 
 	court := &Court{
@@ -2545,7 +2547,7 @@ func TestRitualContextCancelledNoAbortNotification(t *testing.T) {
 	// Cancel context shortly after starting — simulates user pressing Ctrl-C
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		cancel()
+		cancel(errRulerInterrupt)
 	}()
 
 	err = runner.Run(ctx, exec)
@@ -6130,4 +6132,113 @@ func TestMergeWorktreeRitual_BackgroundGivenTakesTheLease(t *testing.T) {
 	require.True(t, lock.TryLock(),
 		"the background given must have taken the repo lease and Run must have released it")
 	lock.Unlock()
+}
+
+// TestDescribeFailureClassifiesByCause is the unit contract for edict 1024: a
+// recorded failure reason must name the mechanism that actually cancelled the
+// context. context.Canceled alone is never evidence of a human cancellation.
+func TestDescribeFailureClassifiesByCause(t *testing.T) {
+	sandboxDeath := errors.New("sandbox exec died: exit status 137")
+	cancelledWith := func(cause error) context.Context {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		cancel(cause)
+		return ctx
+	}
+
+	tests := []struct {
+		name string
+		err  error
+		ctx  context.Context
+		want string
+	}{
+		{
+			name: "nil error",
+			want: "",
+		},
+		{
+			name: "plain non-context error is verbatim",
+			err:  errors.New("compile failed"),
+			want: "compile failed",
+		},
+		{
+			name: "ruler interrupt cause",
+			err:  context.Canceled,
+			ctx:  cancelledWith(errRulerInterrupt),
+			want: "cancelled by ruler",
+		},
+		{
+			name: "flatline reap cause",
+			err:  context.Canceled,
+			ctx:  cancelledWith(errFlatlineReaped),
+			want: "ritual reaped: exceeded flatline age",
+		},
+		{
+			name: "edict state abort cause",
+			err:  context.Canceled,
+			ctx:  cancelledWith(errEdictStateAbort),
+			want: "ritual aborted: edict state changed",
+		},
+		{
+			name: "idle timeout cause",
+			err:  context.Canceled,
+			ctx:  cancelledWith(errStepIdleTimeout),
+			want: "step cancelled: idle timeout exceeded",
+		},
+		{
+			name: "sandbox death cause",
+			err:  context.Canceled,
+			ctx:  cancelledWith(sandboxDeath),
+			want: "step cancelled: " + sandboxDeath.Error(),
+		},
+		{
+			name: "unknown cause includes the underlying error",
+			err:  context.Canceled,
+			ctx:  cancelledWith(nil),
+			want: "cancelled (cause unknown): context canceled",
+		},
+		{
+			name: "no context at all is honest about the missing cause",
+			err:  context.Canceled,
+			want: "cancelled (cause unknown): context canceled",
+		},
+		{
+			// A command runner returns a bare ctx.Err() long after the context
+			// unwound; the cause already rode out on the error it returned.
+			name: "cause rides along on the error when the caller has no ctx",
+			err:  withContextCause(context.Canceled, cancelledWith(errFlatlineReaped)),
+			want: "ritual reaped: exceeded flatline age",
+		},
+		{
+			name: "sandbox cause on the error",
+			err:  withContextCause(context.Canceled, cancelledWith(sandboxDeath)),
+			want: "step cancelled: " + sandboxDeath.Error(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, describeFailure(tt.err, tt.ctx))
+		})
+	}
+}
+
+// TestIsRulerInterruptOnlyForRulerCause proves the swallow-site guard: only a
+// cancellation whose cause is the ruler-interrupt sentinel may take the benign
+// abort path.
+func TestIsRulerInterruptOnlyForRulerCause(t *testing.T) {
+	rulerCtx, cancelRuler := context.WithCancelCause(context.Background())
+	cancelRuler(errRulerInterrupt)
+	reapCtx, cancelReap := context.WithCancelCause(context.Background())
+	cancelReap(errFlatlineReaped)
+	sandboxCtx, cancelSandbox := context.WithCancelCause(context.Background())
+	cancelSandbox(errors.New("sandbox died"))
+	bareCtx, cancelBare := context.WithCancelCause(context.Background())
+	cancelBare(nil)
+
+	assert.True(t, isRulerInterrupt(context.Canceled, rulerCtx))
+	assert.False(t, isRulerInterrupt(context.Canceled, reapCtx))
+	assert.False(t, isRulerInterrupt(context.Canceled, sandboxCtx))
+	assert.False(t, isRulerInterrupt(context.Canceled, bareCtx))
+	assert.False(t, isRulerInterrupt(context.Canceled, nil))
+	assert.False(t, isRulerInterrupt(errors.New("plain"), rulerCtx))
 }

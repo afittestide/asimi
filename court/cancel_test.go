@@ -2,6 +2,7 @@ package court
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -138,4 +139,70 @@ func TestCancelEdictCancelsEdictChannel(t *testing.T) {
 		t.Fatal("chancellor ctx should not be cancelled when cancelling a different edict")
 	default:
 	}
+}
+
+// TestCancelTabCauseAttributesCancellation locks the e1024 contract at the
+// Court boundary: the ritual guard's cancelRitual hook (wired to CancelTabCause)
+// must attach the *supplied* cause to the cancelled context, so the unwinding
+// ritual reports a flatline reap or an edict-state abort honestly instead of
+// falling back to "cancelled by ruler". CancelTab, the ruler path, must attach
+// errRulerInterrupt; a nil cause must delegate to that same ruler path.
+func TestCancelTabCauseAttributesCancellation(t *testing.T) {
+	newCourt := func(t *testing.T) *Court {
+		t.Helper()
+		s := &Court{}
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+		t.Cleanup(s.cancel)
+		return s
+	}
+
+	t.Run("CancelTab attaches the ruler-interrupt cause", func(t *testing.T) {
+		s := newCourt(t)
+		ctx := s.CancellableStreamCtx("ruling")
+		s.CancelTab("ruling")
+		<-ctx.Done()
+		if got := context.Cause(ctx); !errors.Is(got, errRulerInterrupt) {
+			t.Fatalf("CancelTab must cancel with errRulerInterrupt, got %v", got)
+		}
+	})
+
+	t.Run("CancelTabCause attaches the supplied court-abort cause", func(t *testing.T) {
+		s := newCourt(t)
+		ctx := s.CancellableStreamCtx("e1024")
+		s.CancelTabCause("e1024", errFlatlineReaped)
+		<-ctx.Done()
+		got := context.Cause(ctx)
+		if !errors.Is(got, errFlatlineReaped) {
+			t.Fatalf("CancelTabCause must attach the supplied cause, got %v", got)
+		}
+		if isRulerInterrupt(ctx.Err(), ctx) {
+			t.Fatal("a court abort must never be classified as a ruler interrupt")
+		}
+		if !isCourtAbortCause(got) {
+			t.Fatal("a flatline reap must be recognized as a court abort cause")
+		}
+	})
+
+	t.Run("a nil cause delegates to the ruler path", func(t *testing.T) {
+		s := newCourt(t)
+		ctx := s.CancellableStreamCtx("e1024")
+		s.CancelTabCause("e1024", nil)
+		<-ctx.Done()
+		if got := context.Cause(ctx); !errors.Is(got, errRulerInterrupt) {
+			t.Fatalf("nil cause must delegate to CancelTab (errRulerInterrupt), got %v", got)
+		}
+	})
+
+	t.Run("a cause-less cancel is never attributed to the ruler", func(t *testing.T) {
+		s := newCourt(t)
+		ctx := s.CancellableStreamCtx("e1024")
+		s.cancelTab("e1024", nil)
+		<-ctx.Done()
+		if isRulerInterrupt(ctx.Err(), ctx) {
+			t.Fatal("a bare context.Canceled must not read as a ruler interrupt")
+		}
+		if got := describeFailure(ctx.Err(), ctx); got != "cancelled (cause unknown): context canceled" {
+			t.Fatalf("a cause-less cancel must be recorded as unknown, got %q", got)
+		}
+	})
 }

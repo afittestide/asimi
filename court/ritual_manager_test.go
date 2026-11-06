@@ -3,6 +3,7 @@ package court
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -955,7 +956,7 @@ func TestLiveRitualSurvivesReaperReplay(t *testing.T) {
 	rg := &RitualGuard{
 		MinisterBase: base,
 		flatlineAge:  5 * time.Minute,
-		cancelRitual: func(string) { t.Error("a live ritual's context must not be cancelled") },
+		cancelRitual: func(string, error) { t.Error("a live ritual's context must not be cancelled") },
 	}
 	require.True(t, rg.edictLockFree(1009), "precondition: the edict lock was free when e1009 was reaped")
 
@@ -1541,8 +1542,11 @@ func TestStartRitualContextCancelNoFailedNotification(t *testing.T) {
 	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
 
 	// streamingCtx returns a cancellable context we control
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// The real TUI cancel path (CancelTab) cancels with errRulerInterrupt;
+	// simulate it faithfully, otherwise this is a cause-less cancel and the
+	// court correctly refuses to call it a ruler interrupt.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 
 	rg := &RitualGuard{
 		MinisterBase:   base,
@@ -1573,7 +1577,7 @@ func TestStartRitualContextCancelNoFailedNotification(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Cancel the context (simulates user abort)
-	cancel()
+	cancel(errRulerInterrupt)
 
 	// Wait for the goroutine to process the cancellation
 	time.Sleep(200 * time.Millisecond)
@@ -1633,8 +1637,8 @@ func TestAbortRitual_CancelsContext(t *testing.T) {
 
 	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	defer cancelCause(nil)
 
 	var mu sync.Mutex
 	var cancelledChannel string
@@ -1648,11 +1652,11 @@ func TestAbortRitual_CancelsContext(t *testing.T) {
 			db, &blockingRunner{}, slog.Default(), repo.RepoInfo{},
 		),
 		streamingCtx: func(string) context.Context { return ctx },
-		cancelRitual: func(channelID string) {
+		cancelRitual: func(channelID string, cause error) {
 			mu.Lock()
 			cancelledChannel = channelID
 			mu.Unlock()
-			cancel()
+			cancelCause(cause)
 		},
 	}
 
@@ -1674,7 +1678,7 @@ func TestAbortRitual_CancelsContext(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if err := rg.abortRitual(context.Background(), &exec, "test abort"); err != nil {
+	if err := rg.abortRitual(context.Background(), &exec, "test abort", errEdictStateAbort); err != nil {
 		t.Fatalf("abortRitual error: %v", err)
 	}
 
@@ -1734,7 +1738,7 @@ func TestAbortStaleRituals_CancelsHoldingRitual(t *testing.T) {
 	rg := &RitualGuard{
 		MinisterBase: base,
 		flatlineAge:  5 * time.Minute,
-		cancelRitual: func(channelID string) {
+		cancelRitual: func(channelID string, cause error) {
 			mu.Lock()
 			cancelledChannel = channelID
 			mu.Unlock()
@@ -2547,4 +2551,92 @@ func TestBlessedWaiters_IndependentOfQueuedCount(t *testing.T) {
 	assert.Equal(t, int32(1), rg.queuedCount.Load(),
 		"a blessed-branch wait must not move the per-edict counter")
 	assert.Equal(t, int32(1), rg.blessedWaiters.Load())
+}
+
+// TestStartRitualNonRulerCancelReportsFailure is the edict 1024 companion to
+// TestStartRitualContextCancelNoFailedNotification: a cancellation whose cause
+// is *not* the ruler-interrupt sentinel (here a sandbox death, the shape the
+// e1010 starvation produced) must not be swallowed as a benign ruler abort. It
+// flows to the failure path and emits a ritual_failed naming the mechanism.
+func TestStartRitualNonRulerCancelReportsFailure(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name:       "nonruler-cancel-test",
+		Background: []string{"!sleep 30"},
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+
+	sandboxDeath := errors.New("sandbox exec died: exit status 137")
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	defer cancelCause(nil)
+
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, &blockingRunner{}, slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return ctx },
+	}
+
+	var notified []RitualStepMsg
+	var mu sync.Mutex
+	rg.SetNotify(func(msg any) {
+		if stepMsg, ok := msg.(RitualStepMsg); ok {
+			mu.Lock()
+			notified = append(notified, stepMsg)
+			mu.Unlock()
+		}
+	})
+
+	key := storage.EdictKey{ID: 89, Username: "testuser", Project: "testproject"}
+	rg.startRitual("nonruler-cancel-test", key, nil)
+
+	// Let the ritual reach the blocking runner, then cancel with a non-ruler
+	// cause.
+	time.Sleep(100 * time.Millisecond)
+	cancelCause(sandboxDeath)
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var failedMsg *RitualStepMsg
+	for i := range notified {
+		if notified[i].Status == "ritual_failed" {
+			failedMsg = &notified[i]
+		}
+	}
+	if failedMsg == nil {
+		t.Fatalf("expected a ritual_failed notification for a non-ruler cancel, got: %+v", notified)
+	}
+	if strings.Contains(failedMsg.Message, "cancelled by ruler") {
+		t.Errorf("non-ruler cancel must never read as a ruler interrupt, got %q", failedMsg.Message)
+	}
+	if !strings.Contains(failedMsg.Message, sandboxDeath.Error()) {
+		t.Errorf("expected the recorded reason to name the sandbox death, got %q", failedMsg.Message)
+	}
+
+	// Run is the single owner of the terminal Tian event — exactly one here.
+	var events []storage.TianEvent
+	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
+	if len(events) != 1 {
+		t.Errorf("expected exactly 1 EventRitualFailed for a non-ruler cancel, got %d", len(events))
+	}
+	for _, ev := range events {
+		if strings.Contains(fmt.Sprint(ev.Payload["error"]), "cancelled by ruler") {
+			t.Errorf("persisted failure reason must not be 'cancelled by ruler': %v", ev.Payload["error"])
+		}
+	}
 }
