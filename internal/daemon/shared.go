@@ -15,4 +15,10 @@ type Shared struct {
 	Config          *config.Config
 	Logger          *slog.Logger
 	NewSessionStore SessionStoreFactory
+
+	// InstanceID identifies this daemon process (a boot nonce). It is
+	// reported to clients so they can tell a transient socket drop (same
+	// process, in-flight state intact) from a restart (new process, all
+	// in-flight state lost) — see internal/rpc.PingResult.
+	InstanceID string
 }

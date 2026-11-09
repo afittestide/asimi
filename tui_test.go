@@ -1966,6 +1966,176 @@ func TestConnectionRestoredMsg_RetriesPendingPrompt(t *testing.T) {
 	assert.True(t, foundReconnected, "should show reconnected message")
 }
 
+// oracleCourtClient is a mockCourtClient that identifies the server process, so
+// tests can drive the same-instance / restarted decision directly.
+type oracleCourtClient struct {
+	mockCourtClient
+	instanceID string
+	restarted  bool
+}
+
+func (o *oracleCourtClient) SessionInfo() (string, bool) { return o.instanceID, o.restarted }
+
+// TestConnectionRestored_SameInstanceRetriesOnce is the regression guard for the
+// case the retry feature exists for: a transient socket drop with the server
+// still running resubmits the saved prompt exactly once.
+func TestConnectionRestored_SameInstanceRetriesOnce(t *testing.T) {
+	model := newTestModel(t)
+	mock := &oracleCourtClient{instanceID: "instance-a"}
+	model.court = mock
+	channelID := model.tabs.ActiveTab().Target
+
+	model.connDropPendingRetry = map[string]pendingRetry{
+		channelID: {prompt: "retry me please"},
+	}
+
+	newModel, _ := model.handleCustomMessages(connectionRestoredMsg{})
+	updatedModel := newModel.(TUIModel)
+
+	assert.Equal(t, 1, mock.submitPromptCalls, "same-instance reconnect must retry the saved prompt once")
+	assert.Nil(t, updatedModel.connDropPendingRetry)
+	for _, m := range updatedModel.tabs.Content().Chat.Messages {
+		assert.NotContains(t, m.Content, "Daemon restarted",
+			"a same-instance reconnect must not report a restart")
+	}
+}
+
+// TestConnectionRestored_DaemonRestartDoesNotRetry verifies that a reconnect on a
+// *different* daemon instance abandons the saved prompt instead of resubmitting
+// it into a dead stream (incident 6c763d82ec035aa6).
+func TestConnectionRestored_DaemonRestartDoesNotRetry(t *testing.T) {
+	model := newTestModel(t)
+	mock := &oracleCourtClient{instanceID: "instance-b", restarted: true}
+	model.court = mock
+	channelID := model.tabs.ActiveTab().Target
+
+	model.connDropPendingRetry = map[string]pendingRetry{
+		channelID: {prompt: "retry me please"},
+	}
+
+	newModel, _ := model.handleCustomMessages(connectionRestoredMsg{})
+	updatedModel := newModel.(TUIModel)
+
+	assert.Equal(t, 0, mock.submitPromptCalls, "a restarted daemon must not receive the retried prompt")
+	assert.Nil(t, updatedModel.connDropPendingRetry, "pending retry must be cleared")
+
+	foundRestarted := false
+	for _, m := range updatedModel.tabs.Content().Chat.Messages {
+		if strings.Contains(m.Content, "Daemon restarted") {
+			foundRestarted = true
+		}
+		assert.NotContains(t, m.Content, "retrying your message",
+			"a restart must not announce a retry")
+	}
+	assert.True(t, foundRestarted, "the ruler must be told the daemon restarted")
+}
+
+// TestClassifyRetry_UnknownInstanceDoesNotBlindlyRetry verifies that when the
+// server will not identify itself the retry is withheld rather than fired blind
+// — the exact defect being fixed.
+func TestClassifyRetry_UnknownInstanceDoesNotBlindlyRetry(t *testing.T) {
+	assert.Equal(t, retryAllowed, classifyRetry(nil), "no oracle (in-process court) keeps retrying")
+
+	unknown := &oracleCourtClient{instanceID: ""}
+	assert.Equal(t, retryDaemonRestarted, classifyRetry(unknown),
+		"an unidentified server must not be blindly retried")
+
+	same := &oracleCourtClient{instanceID: "instance-a"}
+	assert.Equal(t, retryAllowed, classifyRetry(same), "a known, unchanged instance retries")
+}
+
+// TestRitualStepMsg_StaleExecutionNotAttributed verifies the second half of the
+// invariant: a terminal ritual event replayed for a stale execution must not be
+// rendered as the result of the retried prompt on another tab.
+func TestRitualStepMsg_StaleExecutionNotAttributed(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	// The retried tab is streaming execution "exec-live" on e1026.
+	model.tabs.Add("Ritual:e1026", "ritual", "e1026")
+	model.setTabExecutionID("e1026", "exec-live")
+
+	before := len(model.tabs.ChatByTab("e1026").Messages)
+
+	// Recovery replays a terminal event for a *different* (stale) execution.
+	stale := court.RitualStepMsg{
+		ChannelID:   "e1026",
+		RitualName:  "swift-strike",
+		ExecutionID: "exec-stale",
+		Status:      "ritual_aborted",
+		Message:     "sealed edict cleanup",
+	}
+	newModel, _ := model.handleCustomMessages(stale)
+	updatedModel := newModel.(TUIModel)
+
+	chat := updatedModel.tabs.ChatByTab("e1026")
+	assert.Equal(t, before, len(chat.Messages), "a stale terminal event must add no chat line")
+	for _, m := range chat.Messages {
+		assert.NotContains(t, m.Content, "ABORTED", "stale abort must not surface on the retried tab")
+	}
+}
+
+// TestRitualStepMsg_UnrelatedChannelDoesNotLeakToActiveTab covers the fallback
+// vector: a terminal event for a channel with no tab must be labelled, not
+// rendered into the active (possibly retried) tab's chat as its result.
+func TestRitualStepMsg_UnrelatedChannelDoesNotLeakToActiveTab(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	active := model.tabs.ChatByTab(model.tabs.ActiveTab().Target)
+	before := len(active.Messages)
+
+	stale := court.RitualStepMsg{
+		ChannelID:   "e1024",
+		RitualName:  "swift-strike",
+		ExecutionID: "exec-sealed",
+		Status:      "ritual_aborted",
+		Message:     "auto-completed aborted ritual for sealed edict",
+	}
+	newModel, _ := model.handleCustomMessages(stale)
+	updatedModel := newModel.(TUIModel)
+
+	// A channel with no tab is labelled into the active tab rather than silently
+	// dropped — a read failure must stay visible — but never as that tab's own
+	// result.
+	active = updatedModel.tabs.ChatByTab(updatedModel.tabs.ActiveTab().Target)
+	require.Equal(t, before+1, len(active.Messages),
+		"a terminal event for a tabless channel is labelled, not dropped")
+	last := active.Messages[len(active.Messages)-1]
+	assert.Contains(t, last.Content, "e1024",
+		"the labelled line must name the channel the event belongs to")
+}
+
+// TestRitualStepMsg_OwnExecutionStillShowsAbort guards the other direction: a
+// genuine terminal event for the tab's own execution must still be shown — the
+// fix is attribution, not silencing.
+func TestRitualStepMsg_OwnExecutionStillShowsAbort(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e1026", "ritual", "e1026")
+	model.setTabExecutionID("e1026", "exec-live")
+
+	own := court.RitualStepMsg{
+		ChannelID:   "e1026",
+		RitualName:  "swift-strike",
+		ExecutionID: "exec-live",
+		Status:      "ritual_aborted",
+		Message:     "stopped by ruler",
+	}
+	newModel, _ := model.handleCustomMessages(own)
+	updatedModel := newModel.(TUIModel)
+
+	chat := updatedModel.tabs.ChatByTab("e1026")
+	found := false
+	for _, m := range chat.Messages {
+		if strings.Contains(m.Content, "aborted") {
+			found = true
+		}
+	}
+	assert.True(t, found, "a real abort on the tab's own execution must still be shown")
+}
+
 func TestConnectionReconnectFailedMsg_ShowsError(t *testing.T) {
 	model := newTestModel(t)
 	model.court = &mockCourtClient{}

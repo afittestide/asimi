@@ -13,6 +13,11 @@ import (
 
 type PingResult struct {
 	Ok bool `msgpack:"ok"`
+	// InstanceID identifies the daemon process that answered. A client
+	// uses it to tell a transient socket drop (same process) from a
+	// restart (new process, all in-flight state lost). Empty for an
+	// in-process Court, which has no process restart to distinguish.
+	InstanceID string `msgpack:"instance_id,omitempty"`
 }
 
 type HasMinisterParams struct {

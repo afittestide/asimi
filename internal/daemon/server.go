@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -46,6 +48,12 @@ func Run(initFn InitFunc) error {
 	path, err := rpc.SocketPath()
 	if err != nil {
 		return fmt.Errorf("daemon: resolve socket path: %w", err)
+	}
+	// Stamp this process's boot nonce before serving, so every connection
+	// advertises the same instance and a client can distinguish a drop from
+	// a restart (see rpc.PingResult).
+	if shared.InstanceID == "" {
+		shared.InstanceID = daemonInstanceID()
 	}
 	listener, err := rpc.Listen(path)
 	if err != nil {
@@ -134,7 +142,7 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 
 	rpcConn := rpc.New(conn, rpc.Options{})
 	rpcConn.Handle(rpc.MethodPing, func(ctx context.Context, _ []byte) ([]byte, error) {
-		return wire.Encode(rpc.PingResult{Ok: true})
+		return wire.Encode(rpc.PingResult{Ok: true, InstanceID: shared.InstanceID})
 	})
 
 	var ct *court.Court
@@ -223,6 +231,19 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 	shared.Logger.Info("daemon: client connected", "conn_id", connID)
 	<-rpcConn.Done()
 	shared.Logger.Info("daemon: client disconnected", "conn_id", connID)
+}
+
+// daemonInstanceID mints a per-process boot nonce. It is deliberately random
+// per start (not derived from the pid alone, which the OS may reuse) so a
+// restarted daemon is never mistaken for the one that just died.
+func daemonInstanceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Randomness is unavailable — fall back to pid+time, which still
+		// differs across restarts in practice.
+		return fmt.Sprintf("pid-%d-t%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func writePidFile(path string) error {

@@ -32,6 +32,15 @@ type ReconnectingClient struct {
 	reconCtx context.Context
 	cancel   context.CancelFunc
 
+	// instanceID is the boot nonce reported by the server currently
+	// connected. A reconnect that lands on a different id means the daemon
+	// restarted and lost all in-flight state; restarted records that for the
+	// current connection generation. Empty id means the server did not
+	// identify itself (e.g. an in-process Court) and no restart can be
+	// claimed.
+	instanceID string
+	restarted  bool
+
 	// reconnectMu serialises reconnect() calls so only one goroutine
 	// performs the reconnection; others wait for it to complete.
 	reconnectMu sync.Mutex
@@ -69,6 +78,7 @@ func (rc *ReconnectingClient) Start() error {
 	rc.mu.Lock()
 	rc.conn = conn
 	rc.client = NewCourtClient(conn)
+	rc.instanceID = rc.probeInstanceID(conn)
 	if rc.restored == nil {
 		rc.restored = make(chan struct{})
 	}
@@ -77,6 +87,31 @@ func (rc *ReconnectingClient) Start() error {
 	go rc.watchConnection()
 	return nil
 }
+
+// probeInstanceID asks a freshly connected server to identify its process.
+// A failure to probe is not fatal — the id simply stays unknown (""), and
+// liveness (InstanceKnown) then honestly reports it can't attribute events
+// rather than guessing. No ping is sent when the factory handed back a
+// dead conn.
+func (rc *ReconnectingClient) probeInstanceID(conn *Conn) string {
+	select {
+	case <-conn.Done():
+		return ""
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), instanceProbeTimeout)
+	defer cancel()
+	res, err := NewCourtClient(conn).Ping(ctx)
+	if err != nil || !res.Ok {
+		slog.Debug("reconnecting: instance probe failed", "err", err)
+		return ""
+	}
+	return res.InstanceID
+}
+
+// instanceProbeTimeout bounds the boot-nonce probe. Ping is pure (no LLM,
+// DB, or I/O), so a healthy daemon answers well within it.
+const instanceProbeTimeout = 2 * time.Second
 
 func (rc *ReconnectingClient) Close() {
 	rc.cancel()
@@ -164,15 +199,28 @@ func (rc *ReconnectingClient) reconnect() error {
 			continue
 		}
 
+		// Probe the new server before publishing the conn: a differing
+		// instance id means the daemon restarted and lost in-flight state.
+		newInstanceID := rc.probeInstanceID(conn)
+
 		rc.mu.Lock()
+		prevInstanceID := rc.instanceID
 		rc.conn = conn
 		rc.client = NewCourtClient(conn)
+		rc.instanceID = newInstanceID
+		rc.restarted = newInstanceID != "" && prevInstanceID != "" && newInstanceID != prevInstanceID
 		if rc.restored != nil {
 			close(rc.restored)
 		}
 		rc.restored = make(chan struct{})
 		handlers := rc.handlers
+		restarted := rc.restarted
 		rc.mu.Unlock()
+
+		if restarted {
+			slog.Info("reconnecting: daemon restarted; in-flight state lost",
+				"previous_instance_id", prevInstanceID, "instance_id", newInstanceID)
+		}
 
 		for _, h := range handlers {
 			h(conn)
@@ -706,6 +754,19 @@ func (rc *ReconnectingClient) Restored() <-chan struct{} {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 	return rc.restored
+}
+
+// SessionInfo identifies the server behind the current connection.
+//
+// InstanceID is the server's boot nonce; Restarted reports whether the
+// connection most recently swapped in belongs to a different daemon process
+// than the one the client was previously connected to. When InstanceID is
+// empty the server did not identify itself, so liveness cannot be asserted at
+// all and callers must not treat reconnect as resuming in-flight work.
+func (rc *ReconnectingClient) SessionInfo() (instanceID string, restarted bool) {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.instanceID, rc.restarted
 }
 
 // ListModels reads models over the wire from the court that owns the

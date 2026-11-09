@@ -37,6 +37,21 @@ func (c *CourtClient) callVoid(ctx context.Context, method string, params any) e
 	return err
 }
 
+// Ping asks the server to identify itself. The returned instance id (empty
+// for an in-process Court that does not run as a daemon process) lets a
+// reconnecting client tell a transient socket drop from a daemon restart.
+func (c *CourtClient) Ping(ctx context.Context) (PingResult, error) {
+	raw, err := c.conn.Call(ctx, MethodPing, nil)
+	if err != nil {
+		return PingResult{}, err
+	}
+	var r PingResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return PingResult{}, fmt.Errorf("rpc: decode Ping result: %w", err)
+	}
+	return r, nil
+}
+
 func (c *CourtClient) HasMinister(id string) bool {
 	raw, err := c.conn.Call(context.Background(), MethodHasMinister, HasMinisterParams{ID: id})
 	if err != nil {

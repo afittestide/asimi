@@ -179,6 +179,87 @@ func dialServeOne(t *testing.T, shared *Shared, projectRoot string) (*rpc.Conn, 
 	return clientConn, client, cleanup
 }
 
+// TestDaemonPingReportsStableInstanceID verifies the boot-nonce contract the
+// reconnecting client relies on: every connection to one daemon process answers
+// Ping with the same non-empty instance id, and a daemon with a fresh instance
+// id reports a different one. That is what makes a restart distinguishable from
+// a transient socket drop (incident 6c763d82ec035aa6).
+func TestDaemonPingReportsStableInstanceID(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+	// Run() stamps this before serving; do the same here.
+	shared.InstanceID = "boot-nonce-one"
+
+	projectRoot := t.TempDir()
+	_, client, stop := dialServeOne(t, shared, projectRoot)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	first, err := client.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	if !first.Ok {
+		t.Fatal("Ping Ok = false, want true")
+	}
+	if first.InstanceID == "" {
+		t.Fatal("Ping instance id is empty; a restart could not be detected")
+	}
+
+	// A second connection to the same daemon process reports the same id.
+	shared2 := *shared
+	_, client2, stop2 := dialServeOne(t, &shared2, projectRoot)
+	defer stop2()
+
+	second, err := client2.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping (second conn): %v", err)
+	}
+	if second.InstanceID != first.InstanceID {
+		t.Fatalf("instance id changed across conns of one process: %q vs %q",
+			first.InstanceID, second.InstanceID)
+	}
+
+	// A restarted daemon (fresh instance id) looks different to the client.
+	restarted := *shared
+	restarted.InstanceID = "boot-nonce-two"
+	_, client3, stop3 := dialServeOne(t, &restarted, projectRoot)
+	defer stop3()
+
+	third, err := client3.Ping(ctx)
+	if err != nil {
+		t.Fatalf("Ping (restarted): %v", err)
+	}
+	if third.InstanceID == first.InstanceID {
+		t.Fatal("a restarted daemon must report a different instance id")
+	}
+}
+
+// TestDaemonInstanceIDIsNonEmptyAndUnique verifies the boot-nonce generator
+// itself: daemonInstanceID() must always return a non-empty id and a fresh call
+// must not repeat a previous one. This is the load-bearing property behind the
+// restart-distinguishability invariant — if a restarted process could mint the
+// same id as the one it replaced, a restart would be mistaken for a transient
+// socket drop and the TUI would blindly retry into a dead stream (incident
+// 6c763d82ec035aa6). TestDaemonPingReportsStableInstanceID stubs the id by hand;
+// this test covers the real generator.
+func TestDaemonInstanceIDIsNonEmptyAndUnique(t *testing.T) {
+	seen := make(map[string]bool)
+	const n = 256
+	for i := 0; i < n; i++ {
+		id := daemonInstanceID()
+		if id == "" {
+			t.Fatal("daemonInstanceID() returned an empty id; a restart could not be detected")
+		}
+		if seen[id] {
+			t.Fatalf("daemonInstanceID() repeated id %q across %d calls", id, n)
+		}
+		seen[id] = true
+	}
+}
+
 // TestDaemonHandshakeThenRPC verifies that a client that completes the
 // SetContext handshake can then exercise HasMinister and CreateEdict.
 func TestDaemonHandshakeThenRPC(t *testing.T) {

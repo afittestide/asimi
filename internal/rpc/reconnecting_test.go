@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/afittestide/asimi/internal/wire"
 	"github.com/afittestide/asimi/storage"
 )
 
@@ -787,5 +789,159 @@ func TestLoopbackCourt_ConnDone(t *testing.T) {
 		// Good — channel is closed
 	default:
 		t.Fatal("ConnDone should fire after loopback conn is closed")
+	}
+}
+
+// --- Instance identity: telling a daemon restart from a transient drop ---
+
+// fakeDaemon mints fresh connected client Conns whose server answers Ping with
+// a mutable instance id, so a test can simulate both a transient drop (same id)
+// and a daemon restart (new id).
+type fakeDaemon struct {
+	mu         sync.Mutex
+	instanceID string
+	conns      []*Conn
+}
+
+func newFakeDaemon(instanceID string) *fakeDaemon {
+	return &fakeDaemon{instanceID: instanceID}
+}
+
+func (d *fakeDaemon) instance() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.instanceID
+}
+
+func (d *fakeDaemon) setInstance(id string) {
+	d.mu.Lock()
+	d.instanceID = id
+	d.mu.Unlock()
+}
+
+func (d *fakeDaemon) track(conns ...*Conn) {
+	d.mu.Lock()
+	d.conns = append(d.conns, conns...)
+	d.mu.Unlock()
+}
+
+func (d *fakeDaemon) closeAll() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.conns {
+		c.Close()
+	}
+}
+
+// dial returns a factory that mints a fresh connected client conn per call.
+func (d *fakeDaemon) dial() (*Conn, error) {
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	client := New(pb, Options{})
+	server.Handle(MethodPing, func(context.Context, []byte) ([]byte, error) {
+		return wire.Encode(PingResult{Ok: true, InstanceID: d.instance()})
+	})
+	go func() { _ = server.Serve() }()
+	go func() { _ = client.Serve() }()
+	d.track(server, client)
+	return client, nil
+}
+
+func TestReconnectingClient_StartRecordsInstanceID(t *testing.T) {
+	d := newFakeDaemon("instance-a")
+	defer d.closeAll()
+
+	rc := NewReconnectingClient(d.dial, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	id, restarted := rc.SessionInfo()
+	if id != "instance-a" {
+		t.Fatalf("SessionInfo instance = %q, want instance-a", id)
+	}
+	if restarted {
+		t.Fatal("a first connection is not a restart")
+	}
+}
+
+func TestReconnectingClient_ReconnectSameInstanceIsNotRestart(t *testing.T) {
+	d := newFakeDaemon("instance-a")
+	defer d.closeAll()
+
+	rc := NewReconnectingClient(d.dial, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	// Transient drop: the same server process reconnects with the same id.
+	if err := rc.Conn().Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := rc.reconnect(); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+
+	id, restarted := rc.SessionInfo()
+	if id != "instance-a" {
+		t.Fatalf("instance = %q, want instance-a", id)
+	}
+	if restarted {
+		t.Fatal("reconnecting to the same instance must not report a restart")
+	}
+}
+
+func TestReconnectingClient_ReconnectDifferentInstanceIsRestart(t *testing.T) {
+	d := newFakeDaemon("instance-a")
+	defer d.closeAll()
+
+	rc := NewReconnectingClient(d.dial, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	// The daemon restarts: the same socket now leads to a new process.
+	d.setInstance("instance-b")
+	if err := rc.Conn().Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := rc.reconnect(); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+
+	id, restarted := rc.SessionInfo()
+	if id != "instance-b" {
+		t.Fatalf("instance = %q, want instance-b", id)
+	}
+	if !restarted {
+		t.Fatal("a reconnect to a different instance must report a restart")
+	}
+}
+
+func TestReconnectingClient_SessionInfoUnknownWithoutPingHandler(t *testing.T) {
+	// A server that does not answer Ping (older daemon) yields an unknown
+	// instance: the safe state, so the client withholds the blind retry.
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	client := New(pb, Options{})
+	go func() { _ = server.Serve() }()
+	go func() { _ = client.Serve() }()
+	defer server.Close()
+	defer client.Close()
+
+	rc := NewReconnectingClient(func() (*Conn, error) { return client, nil }, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	id, restarted := rc.SessionInfo()
+	if id != "" || restarted {
+		t.Fatalf("unanswerable Ping should leave instance unknown, got id=%q restarted=%v", id, restarted)
 	}
 }

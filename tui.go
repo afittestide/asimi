@@ -144,6 +144,13 @@ type TUIModel struct {
 	// first ling's StreamCompleteMsg must not stop the tab (dropping the other
 	// lings' chunks) nor finalize their blocks.
 	streamingLings map[string]map[string]bool
+
+	// tabExecutionIDs records, per channel, the ritual execution the tab is
+	// currently streaming (from RitualStepMsg.ExecutionID). It lets a terminal
+	// event replayed by daemon startup recovery for a stale/sealed edict be
+	// told apart from the execution on the tab it lands on, so recovery never
+	// renders as the result of the retried prompt (incident 6c763d82ec035aa6).
+	tabExecutionIDs map[string]string
 }
 
 // pendingRetry stores the prompt text and context files from a stream
@@ -152,6 +159,42 @@ type TUIModel struct {
 type pendingRetry struct {
 	prompt       string
 	contextFiles map[string]string
+}
+
+// retryDisposition is the verdict on whether a saved prompt may be retried
+// after reconnect.
+type retryDisposition int
+
+const (
+	retryAllowed retryDisposition = iota
+	retryDaemonRestarted
+)
+
+// classifyRetry decides whether in-flight prompts may be retried on the fresh
+// connection. A transient socket drop keeps the same server process, which
+// still owns the ritual, so the saved prompts are resubmitted (today's
+// behaviour). A reconnect that lands on a different instance — or on a server
+// that will not identify itself after having identified a different one — means
+// the daemon restarted and lost all in-flight state: the tab's stream is dead
+// and resubmitting would produce a phantom result (incident 6c763d82ec035aa6).
+func classifyRetry(courtClient courtapi.Client) retryDisposition {
+	oracle, ok := courtClient.(sessionOracle)
+	if !ok {
+		// No process identity available (e.g. LoopbackCourt, in-process
+		// Court): no restart can be distinguished, so keep retrying.
+		return retryAllowed
+	}
+	instanceID, restarted := oracle.SessionInfo()
+	if restarted {
+		return retryDaemonRestarted
+	}
+	if instanceID == "" {
+		// The server never identified itself, so liveness cannot be asserted.
+		// Blindly retrying is exactly the defect: report the restart honestly.
+		slog.Warn("tui: reconnect with unknown daemon instance; not retrying")
+		return retryDaemonRestarted
+	}
+	return retryAllowed
 }
 
 // prompt returns the PromptComponent for the active tab, creating one if needed.
@@ -338,6 +381,7 @@ func NewTUIModel(cfg *Config, repoInfo *repo.RepoInfo, promptHistory *PromptHist
 		persistentPromptHistory:  promptHistory,
 		persistentCommandHistory: commandHistory,
 		connDropPendingRetry:     make(map[string]pendingRetry),
+		tabExecutionIDs:          make(map[string]string),
 		handsoff:                 cli.Handsoff,
 	}
 
@@ -1667,6 +1711,18 @@ func lingBanner(chat *ChatComponent, lingID, text string) string {
 	return lingPrefix(lingID, chat.OwnerMinisterFor(lingID)) + text
 }
 
+// isTerminalRitualStatus reports whether a RitualStepMsg status ends the
+// ritual execution it belongs to. Recovery replays exactly these for stale
+// executions at daemon startup.
+func isTerminalRitualStatus(status string) bool {
+	switch status {
+	case "ritual_completed", "ritual_failed", "ritual_aborted":
+		return true
+	default:
+		return false
+	}
+}
+
 // ritualTabLabel returns the display label for a ritual tab.
 // Edict 1 is the reserved Court Infrastructure edict, so its
 // tab shows as "Court" instead of "e1".
@@ -1740,6 +1796,14 @@ const connRestoreTimeout = 30 * time.Second
 // by closing a channel, e.g. *rpc.ReconnectingClient.
 type restorable interface {
 	Restored() <-chan struct{}
+}
+
+// sessionOracle is implemented by clients that can identify the server
+// process behind the current connection, e.g. *rpc.ReconnectingClient. A
+// reconnect that lands on a different instance id means the daemon restarted
+// and lost all in-flight state, so the retry path must not blindly resubmit.
+type sessionOracle interface {
+	SessionInfo() (instanceID string, restarted bool)
 }
 
 // watchConnDrop returns a tea.Cmd that blocks on the court's ConnDone
@@ -2717,6 +2781,33 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case court.RitualStepMsg:
+		// Attribution guard (incident 6c763d82ec035aa6): daemon startup
+		// recovery replays terminal events for stale/sealed edicts, and those
+		// must never render as a different tab's result.
+		if isTerminalRitualStatus(msg.Status) {
+			// A terminal event for an execution this tab is provably not
+			// streaming: drop the chat rendering, keeping only a raw-history
+			// note so the debug trail shows it was seen and attributed away.
+			if m.staleTerminalEvent(msg.ChannelID, msg.ExecutionID) {
+				slog.Debug("ritual terminal event ignored (stale execution)",
+					"channel", msg.ChannelID, "status", msg.Status,
+					"event_execution_id", msg.ExecutionID,
+					"tab_execution_id", m.tabExecutionIDs[msg.ChannelID])
+				return m, nil
+			}
+			// No tab of its own: label the event with its channel in the active
+			// chat rather than falling through onto the current tab and dressing
+			// a stale recovery event as that tab's result. A real terminal
+			// failure stays visible; attribution is explicit.
+			if m.tabs.TabByTarget(msg.ChannelID) == nil {
+				active := m.tabs.Content().Chat
+				active.AddToRawHistory("RITUAL_STEP_UNROUTED",
+					fmt.Sprintf("Ritual %s on %s: %s", msg.RitualName, msg.ChannelID, msg.Status))
+				active.AddMessage(fmt.Sprintf("%s⚠️  Ritual %s [%s] %s — this event belongs to another channel",
+					systemPrefix, msg.RitualName, msg.ChannelID, msg.Status))
+				return m, nil
+			}
+		}
 		// Auto-create a ritual tab for "e<N>" channels that don't have one yet
 		if isRitualChannel(msg.ChannelID) {
 			m.addTab(ritualTabLabel(msg.ChannelID), "ritual", msg.ChannelID, nil)
@@ -2760,6 +2851,9 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.MinisterID != "" {
 				m.tabs.SetTabMinister(msg.ChannelID, msg.MinisterID)
 			}
+			// Record which execution this tab is streaming, so terminal events
+			// replayed for another (stale) execution can be recognised as such.
+			m.setTabExecutionID(msg.ChannelID, msg.ExecutionID)
 			text := ""
 			if msg.StepName == "" {
 				text = fmt.Sprintf("%sRitual %s started",
@@ -2817,6 +2911,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			chat.AddMessage(text)
 			chat.Indent--
 			m.clearStreamingTab(msg.ChannelID)
+			m.clearTabExecutionID(msg.ChannelID)
 		case "ritual_failed":
 			m.tabs.SetTabChatMode(msg.ChannelID, false)
 			chat.AddMessage(fmt.Sprintf("%s Ritual %s failed: %s", completeFailurePrefix, msg.RitualName, msg.Message))
@@ -2824,6 +2919,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				chat.Indent--
 			}
 			m.clearStreamingTab(msg.ChannelID)
+			m.clearTabExecutionID(msg.ChannelID)
 		case "ritual_aborted":
 			m.tabs.SetTabChatMode(msg.ChannelID, false)
 			chat.AddMessage(fmt.Sprintf("%s Ritual %s aborted: %s", completeFailurePrefix, msg.RitualName, msg.Message))
@@ -2831,6 +2927,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				chat.Indent--
 			}
 			m.clearStreamingTab(msg.ChannelID)
+			m.clearTabExecutionID(msg.ChannelID)
 		}
 		return m, nil
 
@@ -4431,6 +4528,44 @@ func (m *TUIModel) clearStreamingTab(tabTarget string) {
 	}
 }
 
+// setTabExecutionID records the ritual execution a tab is streaming. An empty
+// executionID (a live ritual step message always carries one) is ignored so a
+// tab's known execution is not lost to a bookkeeping message that lacks it.
+func (m *TUIModel) setTabExecutionID(channel, executionID string) {
+	if channel == "" || executionID == "" {
+		return
+	}
+	if m.tabExecutionIDs == nil {
+		m.tabExecutionIDs = make(map[string]string)
+	}
+	m.tabExecutionIDs[channel] = executionID
+}
+
+// clearTabExecutionID drops a tab's tracked execution once it has reached a
+// terminal state, so a later unrelated event for the same channel is not
+// misattributed to an execution that has already ended.
+func (m *TUIModel) clearTabExecutionID(channel string) {
+	delete(m.tabExecutionIDs, channel)
+}
+
+// staleTerminalEvent reports whether a terminal ritual event carrying
+// executionID belongs to an execution the client is not waiting on, so it must
+// not be rendered into the tab's chat. It is the attribution guard incident
+// 6c763d82ec035aa6 demands: daemon startup recovery replays terminal events for
+// stale/sealed edicts, and those must never be rendered as the result of a
+// freshly retried prompt.
+//
+// True only when the channel has a tab whose tracked execution provably differs
+// from the event's. A tab with no tracked execution is not guessed at — a real
+// terminal failure must stay visible.
+func (m *TUIModel) staleTerminalEvent(channel, executionID string) bool {
+	if channel == "" || executionID == "" {
+		return false
+	}
+	current := m.tabExecutionIDs[channel]
+	return current != "" && current != executionID
+}
+
 // stopStreaming cancels all streaming globally (used for shutdown).
 func (m *TUIModel) stopStreaming() {
 	m.tabs.CancelAllTabs()
@@ -4494,7 +4629,9 @@ func (m TUIModel) handleConnectionLost() (tea.Model, tea.Cmd) {
 
 // handleConnectionRestored is called after the RPC connection is re-established.
 // It re-submits the prompt for each tab that was streaming when the connection
-// dropped.
+// dropped — but only when the reconnect landed on the same server process. A
+// different instance id means the daemon restarted, so the saved prompts are
+// dropped with an honest message rather than resubmitted into a dead stream.
 func (m TUIModel) handleConnectionRestored() (tea.Model, tea.Cmd) {
 	// The reconnecting client has swapped in a fresh conn; re-arm the
 	// drop watcher so the next connection loss is detected too.
@@ -4504,6 +4641,10 @@ func (m TUIModel) handleConnectionRestored() (tea.Model, tea.Cmd) {
 	if len(m.connDropPendingRetry) == 0 {
 		// No pending retries — connectivity is back, nothing to resubmit.
 		return m, tea.Batch(cmds...)
+	}
+
+	if classifyRetry(m.court) == retryDaemonRestarted {
+		return m.handleDaemonRestarted(cmds)
 	}
 
 	for tabTarget, retry := range m.connDropPendingRetry {
@@ -4528,6 +4669,24 @@ func (m TUIModel) handleConnectionRestored() (tea.Model, tea.Cmd) {
 		cmds = append(cmds, waitCmd)
 	}
 
+	return m, tea.Batch(cmds...)
+}
+
+// handleDaemonRestarted abandons the saved retries after a reconnect that
+// landed on a new daemon process. The restarted server has no memory of the
+// in-flight streams, so resubmitting would attach a terminal event from a
+// stale execution to the retried prompt — the phantom ABORTED of incident
+// 6c763d82ec035aa6. Tell the ruler plainly instead.
+func (m TUIModel) handleDaemonRestarted(cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	const notice = "⚠️  Daemon restarted — your message was not retried; re-send"
+	for tabTarget := range m.connDropPendingRetry {
+		chat := m.tabs.ChatByTab(tabTarget)
+		chat.AddMessage(fmt.Sprintf("%s%s", systemPrefix, notice))
+		chat.AddToRawHistory("CONN_RESTARTED", "daemon restarted; pending retry abandoned")
+	}
+	m.connDropPendingRetry = nil
+	m.commandLine.AddToast(notice, "warning", time.Second*10)
+	m.stopWaitingForResponse()
 	return m, tea.Batch(cmds...)
 }
 
