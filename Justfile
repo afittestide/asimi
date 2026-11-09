@@ -16,7 +16,6 @@ build:
 
 
 # Recipe: build the latest asimi for linux, then hand it to Harbor
-# (cross-compiles a static linux/amd64 binary, then runs a hello-world trial)
 hello-harbor *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -40,17 +39,6 @@ hello-harbor *args:
     echo "<== results written to ${ROOT}/jobs"
 
 # Fetch failed CI runs since the last success, with their entire logs, to heaven/runs.
-#
-# Scope (Ruler ruling 2026-10-21): ALL workflows, all branches — includes
-# Dependabot/Copilot/Dependency-Graph noise. "Since the last success" = the most
-# recent run (any workflow) that concluded success; every run that concluded
-# failure and is newer than it is downloaded.
-#
-# Layout (additive — never deletes):
-#   heaven/runs/<run-id>/run.json        metadata incl. provenance (sha, branch, event, url)
-#   heaven/runs/<run-id>/<job-id>-<job>.log   full log per job (gh run view --job --log)
-# A run whose run.json already exists is skipped, so re-running only fetches
-# newly-failed runs. A partial run (dir without run.json) is re-fetched.
 get-runs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -123,26 +111,7 @@ run:
     go build -tags containers_image_openpgp .
     ./asimi --debug
 
-# Run the test suite, tee-ing output to `./heaven/tests/test_<datetime>.out`
-#   - Dev station (CI unset): the plain suite, cached by Go. The fast inner loop.
-#   - CI / sandbox (CI=1): the same plain suite, then the -race gate on ./court/.
-# Both modes tee the full output to heaven/tests/test_<datetime>.out (each run
-# appends a new file, none is overwritten; heaven/ is gitignored) and CI uploads
-# heaven/ as the build artifact, so a red run's evidence outlives the job.
-#
-# `set -euo pipefail` is load-bearing twice: without pipefail the `tee` exit
-# status would mask a failing `go test`, and without -e a failing `just
-# test-race` (a non-final command in the CI branch) would be swallowed and the
-# recipe would still exit 0.
-#
-# The Go build throttle (GOFLAGS/GOMAXPROCS/GOMEMLIMIT, edict 948) bounds
-# compilation of the full ./... tree (modernc.org/sqlite/lib,
-# aws-sdk-go-v2/service/s3) so it cannot OOM-kill the compiler on a ~2GiB host,
-# which surfaces as `compile: signal: killed` → `[build failed]` and makes the
-# swift-strike judge gate misread a resource failure as a test failure. It is a
-# host limit, not a project one, so it is not set here: on a dev station the
-# repo-root .envrc exports it via direnv, and the sandbox image carries its own
-# defaults (.agents/sandbox/Dockerfile). Nothing is skipped or weakened.
+# Run the test suite, tee-ing output to `./heaven/tests/test-<datetime>.out`
 test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -152,17 +121,11 @@ test:
         just test-race
     fi
 
-# Run tests under the race detector. Data races are invisible to the plain
-# `test` recipe and must be caught before a release. Scoped by default to the
-# court package — where the ritual/fork concurrency lives — because -race needs
-# CGO and the full ./... tree OOM-kills the compiler in the 2GiB sandbox. The Go
-# build throttle is a host limit and comes from .envrc / the sandbox image, not
-# from this recipe (edict 948).
-# Override with: just test-race ./court/ ./internal/runners/
+# Run tests under the race detector, tee-ing output to `./heaven/tests/test-race-<datetime>.out`
 test-race *packages="./court/":
     #!/usr/bin/env bash
     set -o pipefail
-    go test -race -parallel 1 -tags containers_image_openpgp -timeout 10m {{packages}}
+    go test -race -parallel 1 -tags containers_image_openpgp -timeout 10m {{packages}} | tee "heaven/tests/test-race-{{now}}.out"
 
 # Run performance benchmarks and guardrail tests
 test-performance:
@@ -309,12 +272,6 @@ bootstrap:
     go install golang.org/x/vuln/cmd/govulncheck@latest
 
 # Run vulnerability scanning, save output to ./heaven/threats/<tool>-<datetime>.out
-#
-# The full scan output is archived under heaven/security as
-# <tool>-<datetime>.txt (e.g. govulncheck-20260522T143000.txt), so a release's
-# security evidence outlives the terminal. Reports are write-only artifacts:
-# each run appends a new file, none is ever overwritten, and the directory is
-# gitignored (like heaven/runs).
 get-threats:
     #!/usr/bin/env bash
     set -o pipefail
