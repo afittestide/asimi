@@ -11,15 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Per-ling attribution and transcripts** — `StreamChunkMsg` now carries the originating ling and minister, and per-ling transcripts are persisted, so a ling's streamed output can be attributed and replayed rather than merged into one undifferentiated channel (e994)
 - **gcloud in the sandbox** — this repo's sandbox image now installs the Google Cloud CLI and `.agents/asimi.conf` bind-mounts the host's gcloud Application Default Credentials (read-write, so token refresh works, at the cost that a sandbox `gcloud` write mutates the host's real credentials); a missing `additional_mounts` source is now warned about and skipped instead of being silently auto-created on the host (e1023)
+- **`--log-level` flag** — a new `--log-level` kong flag (`debug|info|warn|error`) sets the log level explicitly; `--debug` remains a shortcut for `--log-level=debug`, `--log-level=debug` mirrors `--debug`’s cwd log-dir and plain file-open behavior, and an unrecognized level exits 1 with a stderr message instead of silently defaulting to info (e1027)
+- **`--handsoff` seals pending-ascension edicts** — in headless `--handsoff` mode, once the initial ritual run completes, every pending-ascension edict (judge and chancellor seals present) is sealed so `merge-worktree` lands it, the run waits (bounded per edict) for each landing, then exits 0; a landing failure or timeout exits non-zero (e1026)
 
 ### Changed
 
 - **String fork work-units are xargs-splittable** — fork steps emitting a JSON-array work-unit can now have those units split across processes, so a large string-fork batch no longer has to run as a single unit (e1000)
+- **Single-record Court reads render as markdown** — `get_incident` and `get_manifest_by_commit` now emit the TUI `markdown` result envelope (the e975/e988 path) instead of a bare indented JSON blob, keeping the untouched record under `raw` so the model keeps full structured fidelity (e1031)
 
 ### Fixed
 
 - **Flatline reaper killed live, CPU-starved rituals** — a thin heartbeat margin plus a TOCTOU liveness check let the reaper abort a ritual whose host was merely CPU-starved; the margin is widened and liveness is re-checked before reaping (e1025)
 - **Duplicate minister tabs** — opening a second tab for a minister no longer shares one prompt box; tabs are labelled "Secretary 2" and hold independent input (e1018)
+- **`context.Canceled` mislabelled as “cancelled by ruler”** — a cancellation with no attributable cause (an OOM or timeout death) was reported as a human ruler interrupt; cancellations now carry an explicit cause, the ruler-interrupt path attaches `errRulerInterrupt`, and the guard’s own abort paths attach theirs, so a bare `context.Canceled` no longer stands in for “the ruler did this” (e1024)
+- **Daemon restart read as a phantom abort** — when the daemon restarted mid-stream, the retried message surfaced the stale recovery abort as its own result; a restart is now distinguished from a socket drop before auto-retry, and recovery events are attributed to the execution that raised them (e1028)
+- **Vertex AI project resolution** — the GCP project for Vertex AI is now resolved from `GOOGLE_CLOUD_PROJECT` when set, otherwise from the gcloud CLI’s active configuration, so `gcloud config set project` is enough and an exported variable is no longer required (e1030)
+- **Stale abort-recovery prompts blocked ascent** — a pending abort-recovery zhengming prompt whose abort was later superseded (a later execution of the same edict+ritual completed, or the edict was sealed/cancelled) is now retired automatically — at boot, on a ritual's terminal completion, and on a granted Ruler seal — so a stale prompt can no longer outvote a completed seal chain. Retirement is a typed disposition (`zhengming_requests.status = 'dismissed'` with a `disposition_reason` naming the superseding cause, never `answered`), is idempotent (the conditional update touches one row at most and emits one `zhengming_dismissed` event), and is available to ministers through the new `dismiss_zhengming` tool instead of direct SQL. Genuinely actionable prompts are left pending (e1010)
+
+### Security
+
+- **Vulnerability gate repaired and re-baselined** — the `release-version` ritual invoked the Justfile recipe `vuln`, which was renamed to `get-threats` with no alias, so the release looped between `prepare-changelog` and `verify-release-readiness` and could never tag; the invocation and its seven stale doc references are corrected. `klauspost/compress` and `andybalholm/brotli` are bumped past GO-2026-6865 and GO-2026-6888, GO-2026-6911 (mcp-go, no upstream fix) is accepted in the allowlist and `docs/security.md` on the honest basis that Asimi never constructs bifrost’s MCP manager, and the stale GO-2026-5932 acceptance is retired (e1032)
 
 ### Developer tooling
 
@@ -27,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GO\* host limits moved out of the Justfile into `.envrc`** — `GOFLAGS`/`GOMAXPROCS`/`GOMEMLIMIT` host limits are now exported by the direnv environment instead of being baked into the Justfile (e1)
 - **Dependabot security-update noise silenced** — the chronic Dependabot security-update red on main (github.com/docker/distribution has no patched version) is suppressed so it stops reading as a CI failure (e1016)
 - **`transmute-tests` ritual delivered to PoisonBench** — the ritual and its fork fix are delivered by letter as `0003-transmute-tests-ritual-and-fork-fix.md` (e1000)
+- **`TestCoreToolScheduler_ClearQueue` premise fixed** — the test asserted a cleared queue but scheduled exactly `maxConcurrency` calls, so nothing was ever queued to clear; the premise is now deterministic (e1033)
 
 ## [0.15.0] - 2026-11-1
 
@@ -73,7 +85,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Integration image was never pulled** — the preflight ran only `podman image exists` and rejected an absent image before any pull was attempted, so a cold CI machine failed five integration tests; an absent pullable remote reference is now pulled once and re-checked, while a `localhost/...` build local to the machine still reports `SandboxMissingError` (e1011)
 - **Loose-object retry was git-version-specific** — the torn-read predicate required both `loose object` and `is corrupt`, which git 2.55 does not emit when the fault strikes mid-replay, so the seal aborted instead of retrying; the predicate now recognizes the `unable to unpack … header` / `inflate: data stream error` shape too, staying false for ordinary merge conflicts and absent branches and keeping the retry to exactly one attempt (e1011)
 - **Tool-call results could beat their own notification** — a tool call's result channel was signalled *before* its terminal `success`/`error` message was dispatched, so a consumer that received the result could still be missing the complete terminal message sequence; the terminal notification now goes out first, and `ClearQueue` likewise delivers every aborted call's abort notification before its result channel yields (e982)
-- **Stale abort-recovery prompts blocked ascent** — a pending abort-recovery zhengming prompt whose abort was later superseded (a later execution of the same edict+ritual completed, or the edict was sealed/cancelled) is now retired automatically — at boot, on a ritual's terminal completion, and on a granted Ruler seal — so a stale prompt can no longer outvote a completed seal chain. Retirement is a typed disposition (`zhengming_requests.status = 'dismissed'` with a `disposition_reason` naming the superseding cause, never `answered`), is idempotent (the conditional update touches one row at most and emits one `zhengming_dismissed` event), and is available to ministers through the new `dismiss_zhengming` tool instead of direct SQL. Genuinely actionable prompts are left pending (e1010)
 
 ### Security
 

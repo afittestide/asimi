@@ -1,13 +1,20 @@
 # Roadmap
 
-### v0.16.0
+### v0.17.0
 
 ### Full Parallelism
 - Ling ignition on by default — the engine already runs each ling in the edict's worktree (e923) ; flipping `court.ling_ignition_enabled` on is the remaining ruling
+- Brewing ritual — mints its own edict at step 0, long-lived per-minister sessions, serialized lings (e1009)
+
+### Carry-over from the 0.16.0 stock-take
+- Test debt stranded in worktrees — the tilde-expansion tests from e992 and the 13 `EnsureEdictWorktree` / `:switch` test funcs from e952 exist only as uncommitted worktree diffs, not in `main`
+
+### v0.16.0
+
+### Full Parallelism
 - Per-ling output attribution — each ling's stream is attributable and its transcript durable (e994)
 
 ### Court and docs
-- Brewing ritual — mints its own edict at step 0, long-lived per-minister sessions, serialized lings (e1009)
 - 禮部 (Minister of Rites) owns all documentation; the docs tree moves to `intent/docs/` (e1017)
 
 ## V1.0
