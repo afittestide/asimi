@@ -2,6 +2,7 @@ package runners
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -167,6 +168,14 @@ func TestCoreToolScheduler_ClearQueueOrdering(t *testing.T) {
 	}
 }
 
+// schedulerState reports how many calls the scheduler currently holds, read
+// under its mutex so the snapshot cannot race with dispatch or completion.
+func schedulerState(s *CoreToolScheduler) (active, queued int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.activeCalls), len(s.queue)
+}
+
 func TestCoreToolScheduler_ClearQueue(t *testing.T) {
 	var abortedCalls []ToolCallAbortedMsg
 	var abortedMu sync.Mutex
@@ -179,12 +188,15 @@ func TestCoreToolScheduler_ClearQueue(t *testing.T) {
 		}
 	})
 
+	// Both tools block until their context is cancelled. A call that finished on
+	// its own would drain from activeCalls before ClearQueue observes it, making
+	// the counts depend on scheduling luck instead of scheduler semantics.
 	slowTool := &mockTool{
 		name:        "slow-tool",
 		description: "A slow tool",
 		callFunc: func(ctx context.Context, input string) (string, error) {
-			time.Sleep(500 * time.Millisecond)
-			return "done", nil
+			<-ctx.Done()
+			return "", ctx.Err()
 		},
 	}
 
@@ -192,36 +204,45 @@ func TestCoreToolScheduler_ClearQueue(t *testing.T) {
 		name:        "fast-tool",
 		description: "A fast tool",
 		callFunc: func(ctx context.Context, input string) (string, error) {
-			return "fast", nil
+			<-ctx.Done()
+			return "", ctx.Err()
 		},
 	}
 
-	// Schedule the slow tool first (it will start executing)
-	slowResult := scheduler.Schedule(context.Background(), slowTool, "slow-input")
+	// Schedule one call, then enough to overfill every concurrency slot. The
+	// excess genuinely sits in the queue: scheduling exactly maxConcurrency
+	// calls (the old setup) queues nothing at all.
+	fastCount := scheduler.maxConcurrency + 2
+	results := make([]<-chan ToolCallResult, 0, fastCount+1)
+	results = append(results, scheduler.Schedule(context.Background(), slowTool, "slow-input"))
+	for i := 0; i < fastCount; i++ {
+		results = append(results, scheduler.Schedule(context.Background(), fastTool, fmt.Sprintf("fast-input-%d", i)))
+	}
 
-	// Give it a moment to start executing
-	time.Sleep(10 * time.Millisecond)
+	active, queued := schedulerState(scheduler)
+	assert.Equal(t, scheduler.maxConcurrency, active, "every concurrency slot should be in flight")
+	assert.Equal(t, fastCount+1-scheduler.maxConcurrency, queued, "calls beyond maxConcurrency should be queued")
+	require.Greater(t, queued, 0, "test premise: the queue must be non-empty")
 
-	// Schedule multiple fast tools (they will be queued)
-	fastResult1 := scheduler.Schedule(context.Background(), fastTool, "fast-input-1")
-	fastResult2 := scheduler.Schedule(context.Background(), fastTool, "fast-input-2")
-	fastResult3 := scheduler.Schedule(context.Background(), fastTool, "fast-input-3")
-
-	// Clear the queue — aborts all calls: the active slow tool + 3 queued fast tools
 	abortedCount := scheduler.ClearQueue()
+	require.Equal(t, active+queued, abortedCount,
+		"every in-flight and every queued call should abort, including %d queued calls", queued)
+	require.Greater(t, abortedCount, active,
+		"abort count exceeding the active calls is what proves queued calls abort")
 
-	assert.Equal(t, 4, abortedCount, "should have aborted 1 active + 3 queued tool calls")
-
-	for _, result := range []<-chan ToolCallResult{fastResult1, fastResult2, fastResult3, slowResult} {
-		res := <-result
-		assert.Error(t, res.Error)
-		_, ok := res.Error.(SandboxRestartedError)
-		assert.True(t, ok, "error should be SandboxRestartedError")
+	for _, result := range results {
+		select {
+		case res := <-result:
+			_, ok := res.Error.(SandboxRestartedError)
+			assert.True(t, ok, "error should be SandboxRestartedError, got %v", res.Error)
+		case <-time.After(2 * time.Second):
+			t.Fatal("aborted call never signalled its result channel")
+		}
 	}
 
 	abortedMu.Lock()
 	defer abortedMu.Unlock()
-	assert.Equal(t, 4, len(abortedCalls), "should have received 4 aborted notifications")
+	assert.Equal(t, active+queued, len(abortedCalls), "every aborted call should notify")
 
 	toolNames := make(map[string]int)
 	for _, aborted := range abortedCalls {
@@ -229,7 +250,7 @@ func TestCoreToolScheduler_ClearQueue(t *testing.T) {
 		toolNames[aborted.ToolName]++
 	}
 	assert.Equal(t, 1, toolNames["slow-tool"], "should have 1 aborted slow-tool notification")
-	assert.Equal(t, 3, toolNames["fast-tool"], "should have 3 aborted fast-tool notifications")
+	assert.Equal(t, fastCount, toolNames["fast-tool"], "every fast-tool call should notify its abort")
 }
 
 func TestCoreToolScheduler_ClearQueue_EmptyQueue(t *testing.T) {
@@ -298,23 +319,27 @@ func TestCoreToolScheduler_ConcurrentClearQueueWithMultipleActive(t *testing.T) 
 	slowTool := &mockTool{
 		name: "slow-tool",
 		callFunc: func(ctx context.Context, input string) (string, error) {
-			time.Sleep(500 * time.Millisecond)
-			return "done", nil
+			<-ctx.Done()
+			return "", ctx.Err()
 		},
 	}
 
-	// Schedule 3 slow tools — with maxConcurrency=4, all should start immediately
-	r1 := scheduler.Schedule(context.Background(), slowTool, "a")
-	r2 := scheduler.Schedule(context.Background(), slowTool, "b")
-	r3 := scheduler.Schedule(context.Background(), slowTool, "c")
+	// Schedule fewer calls than the concurrency limit so all of them start
+	// immediately and none is left queued.
+	callCount := scheduler.maxConcurrency - 1
+	results := make([]<-chan ToolCallResult, 0, callCount)
+	for i := 0; i < callCount; i++ {
+		results = append(results, scheduler.Schedule(context.Background(), slowTool, string(rune('a'+i))))
+	}
 
-	// Give them time to start
-	time.Sleep(20 * time.Millisecond)
+	active, queued := schedulerState(scheduler)
+	require.Equal(t, callCount, active, "all scheduled calls should be in flight")
+	require.Equal(t, 0, queued, "test premise: nothing should be queued")
 
 	abortedCount := scheduler.ClearQueue()
-	assert.Equal(t, 3, abortedCount, "should have aborted 3 active calls")
+	assert.Equal(t, active+queued, abortedCount, "should have aborted every active call")
 
-	for _, ch := range []<-chan ToolCallResult{r1, r2, r3} {
+	for _, ch := range results {
 		res := <-ch
 		_, ok := res.Error.(SandboxRestartedError)
 		assert.True(t, ok, "error should be SandboxRestartedError")
