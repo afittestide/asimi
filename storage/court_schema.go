@@ -206,13 +206,23 @@ const (
 	PriorityUrgent ZhengmingPriority = "urgent"
 )
 
-// ZhengmingStatus represents the status of a clarification request
+// ZhengmingStatus represents the status of a clarification request.
 type ZhengmingStatus string
 
+// Every writer must route through these constants. The live database already
+// holds rows written by paths that bypassed the typed set (how 'dismissed' and
+// 'cancelled' entered the data), so the vocabulary is closed here for future
+// writers (e1010).
 const (
 	ZhengmingPending  ZhengmingStatus = "pending"
 	ZhengmingAnswered ZhengmingStatus = "answered"
 	ZhengmingExpired  ZhengmingStatus = "expired"
+	// ZhengmingDismissed marks a prompt the Court retired without the Ruler
+	// answering it — a superseded abort-recovery prompt, or a request closed by
+	// a sanctioned disposition (including a Ruler abandonment). It is NOT
+	// 'answered': the record must not claim the Ruler spoke when the Court
+	// retired the prompt. The reason is recorded in DispositionReason.
+	ZhengmingDismissed ZhengmingStatus = "dismissed"
 )
 
 // Zhengming represents a clarification request from a minister
@@ -225,12 +235,18 @@ type Zhengming struct {
 	SessionID  string             `gorm:"column:session_id"`
 	Questions  ZhengmingQuestions `gorm:"column:question;type:text"`
 	Answer     string             `gorm:"column:answer"`
-	Priority   ZhengmingPriority  `gorm:"column:priority"`
-	Status     ZhengmingStatus    `gorm:"column:status"`
-	TimeoutAt  time.Time          `gorm:"column:timeout_at"`
-	AnsweredAt *time.Time         `gorm:"column:answered_at"`
-	CreatedAt  time.Time          `gorm:"column:created_at;autoCreateTime"`
-	UpdatedAt  time.Time          `gorm:"column:updated_at;autoUpdateTime"`
+	// DispositionReason records why the Court retired a prompt nobody
+	// answered (a superseded abort prompt, or a sanctioned manual dismissal).
+	// It is deliberately distinct from Answer, which must keep meaning "the
+	// Ruler replied" — a Court-authored retirement must not masquerade as the
+	// Ruler speaking (e1010).
+	DispositionReason string            `gorm:"column:disposition_reason"`
+	Priority          ZhengmingPriority `gorm:"column:priority"`
+	Status            ZhengmingStatus   `gorm:"column:status"`
+	TimeoutAt         time.Time         `gorm:"column:timeout_at"`
+	AnsweredAt        *time.Time        `gorm:"column:answered_at"`
+	CreatedAt         time.Time         `gorm:"column:created_at;autoCreateTime"`
+	UpdatedAt         time.Time         `gorm:"column:updated_at;autoUpdateTime"`
 }
 
 // TableName returns the table name for Zhengming
@@ -267,9 +283,15 @@ const (
 	EventLingIgnitionSkipped CourtEvent = "ling_ignition_skipped"
 	EventZhengmingNeeded     CourtEvent = "zhengming_needed"
 	EventZhengmingAnswered   CourtEvent = "zhengming_answered"
-	EventEdictCancelled      CourtEvent = "edict_cancelled"
-	EventSealGranted         CourtEvent = "seal_granted"
-	EventEdictSealed         CourtEvent = "edict_sealed"
+	// EventZhengmingDismissed records that the Court retired a pending
+	// zhengming request (superseded abort prompt, or sanctioned manual
+	// disposition) without the Ruler answering it. Distinct from
+	// EventZhengmingAnswered: the ledger must show the Court closed the
+	// prompt, not that the Ruler spoke (e1010).
+	EventZhengmingDismissed CourtEvent = "zhengming_dismissed"
+	EventEdictCancelled     CourtEvent = "edict_cancelled"
+	EventSealGranted        CourtEvent = "seal_granted"
+	EventEdictSealed        CourtEvent = "edict_sealed"
 	// EventWorktreeMergeFailed records that a ruler seal could not land the
 	// edict's worktree on the merge target (or remove it afterwards). The seal
 	// is already recorded, so without this event the seal looks like an

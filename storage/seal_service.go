@@ -201,6 +201,33 @@ func (s *SealService) GetSealStatus(key EdictKey) (map[string]bool, error) {
 	return status, nil
 }
 
+// DisposeZhengming writes a terminal disposition for a pending zhengming
+// request, recording reason in disposition_reason so the ledger explains
+// itself without pretending the Ruler answered (answer stays untouched). It is
+// scoped to pending rows: a request that was already answered or retired is
+// left untouched and reports false, which makes retirement idempotent. Use it
+// instead of raw SQL when the Court or a minister closes a prompt nobody
+// answered (e1010).
+func (s *SealService) DisposeZhengming(requestID string, status ZhengmingStatus, reason string) (bool, error) {
+	if requestID == "" {
+		return false, fmt.Errorf("request_id is required")
+	}
+	if status != ZhengmingDismissed && status != ZhengmingExpired {
+		return false, fmt.Errorf("status %q is not a terminal disposition", status)
+	}
+
+	res := s.db.Model(&Zhengming{}).
+		Where("request_id = ? AND status = ?", requestID, ZhengmingPending).
+		Updates(map[string]any{
+			"status":             status,
+			"disposition_reason": reason,
+		})
+	if res.Error != nil {
+		return false, fmt.Errorf("failed to dispose zhengming: %w", res.Error)
+	}
+	return res.RowsAffected > 0, nil
+}
+
 // GetEdictStatus derives the status of an edict from seals and zhengming tables
 func (s *SealService) GetEdictStatus(key EdictKey) (EdictStatus, error) {
 	var edict Edict

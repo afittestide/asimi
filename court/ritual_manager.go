@@ -183,6 +183,11 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 	)
 	rg.ritualRunner.onRunnerUpgrade = opts.OnRunnerUpgrade
 	rg.ritualRunner.waitZhengming = opts.WaitForZhengming
+	// A completed ritual may supersede a pending abort prompt; retire it then,
+	// not only at boot (e1010).
+	rg.ritualRunner.SetRitualCompletedHook(func() {
+		rg.retireSupersededAbortPrompts(context.Background())
+	})
 
 	return rg
 }

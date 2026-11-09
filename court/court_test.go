@@ -5283,3 +5283,162 @@ func TestLingTranscriptStoreIsolation(t *testing.T) {
 
 	assert.Equal(t, 1, countSessions(), "a ritual-channel step session must stay ephemeral")
 }
+
+// --- Sanctioned manual disposition of a pending zhengming (e1010) ---
+
+// newDisposalTestCourt builds a Court whose db has every table and whose
+// derived edict status the disposal path can move. NewCourt reserves edict 1
+// for court infrastructure, so per-test edicts start at 2.
+func newDisposalTestCourt(t *testing.T) (*Court, *gorm.DB) {
+	t.Helper()
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Project = "testproject"
+	return NewCourt(db, cfg, nil, nil), db
+}
+
+// insertPendingAbortPrompt creates an edict and a pending abort prompt for it,
+// scoped to the OS user the Court resolves as its identity (edict 1006).
+func insertPendingAbortPrompt(t *testing.T, db *gorm.DB, execID string) (storage.Edict, string) {
+	t.Helper()
+	edict := storage.Edict{Intent: "dispose me", Username: config.OSUsername(), Project: "testproject"}
+	require.NoError(t, db.Create(&edict).Error)
+	req := storage.Zhengming{
+		RequestID:  "abort-prompt-" + execID,
+		EdictID:    edict.ID,
+		Username:   config.OSUsername(),
+		Project:    "testproject",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "aborted at step 0 [exec:" + execID + "]"}},
+		Status:     storage.ZhengmingPending,
+		Priority:   storage.PriorityUrgent,
+		TimeoutAt:  time.Now().Add(time.Hour),
+	}
+	require.NoError(t, db.Create(&req).Error)
+	return edict, req.RequestID
+}
+
+// TestCourt_DismissZhengming_RecordsDisposition covers e1010 acceptance 5: a
+// minister can close a pending prompt through the sanctioned path without
+// direct SQL, and the disposition (status + reason) is visible in
+// zhengming_requests. It must never be recorded as an answer.
+func TestCourt_DismissZhengming_RecordsDisposition(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict, reqID := insertPendingAbortPrompt(t, db, "exec-aborted")
+
+	// The pending row blocks the edict's derived status.
+	status, err := s.GetSealService().GetEdictStatus(edict.Key())
+	require.NoError(t, err)
+	require.Equal(t, storage.EdictBlocked, status, "precondition: a pending prompt blocks the edict")
+
+	require.NoError(t, s.DismissZhengming(reqID, "court: superseded by execution exec-done"))
+
+	var got storage.Zhengming
+	require.NoError(t, db.First(&got, "request_id = ?", reqID).Error)
+	assert.Equal(t, storage.ZhengmingDismissed, got.Status)
+	assert.Equal(t, "court: superseded by execution exec-done", got.DispositionReason)
+	assert.Empty(t, got.Answer, "a Court dismissal must not claim the Ruler answered")
+
+	// Retirement unblocks the edict's derived status.
+	status, err = s.GetSealService().GetEdictStatus(edict.Key())
+	require.NoError(t, err)
+	assert.NotEqual(t, storage.EdictBlocked, status, "a retired prompt no longer blocks ascent")
+}
+
+// TestCourt_DismissZhengming_DefaultReasonAndErrors covers the reason default
+// and the error paths: a missing request is an error, and dismissing an
+// already-terminal request is refused rather than silently overwritten.
+func TestCourt_DismissZhengming_DefaultReasonAndErrors(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	_, reqID := insertPendingAbortPrompt(t, db, "exec-aborted")
+
+	// Empty reason must still record an explanatory disposition.
+	require.NoError(t, s.DismissZhengming(reqID, ""))
+	var got storage.Zhengming
+	require.NoError(t, db.First(&got, "request_id = ?", reqID).Error)
+	assert.Equal(t, storage.ZhengmingDismissed, got.Status)
+	assert.NotEmpty(t, got.DispositionReason, "a dismissal with no reason must still explain itself")
+
+	// Re-dismissing a terminal request is refused: idempotent, never a second write.
+	assert.Error(t, s.DismissZhengming(reqID, "again"), "dismissing a non-pending request must be refused")
+
+	// An unknown request is an error, not a silent no-op.
+	assert.Error(t, s.DismissZhengming("no-such-request", "why"), "an unknown request must error")
+}
+
+// TestCourt_CancelZhengming_WritesDisposition covers e1010 change 6: the old
+// DB-less CancelZhengming now records the disposition (status dismissed, a
+// reason naming the cancellation) instead of only deleting the in-process
+// wait. The reason distinguishes a Ruler cancellation from a superseded prompt.
+func TestCourt_CancelZhengming_WritesDisposition(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict, reqID := insertPendingAbortPrompt(t, db, "exec-aborted")
+
+	s.CancelZhengming(reqID)
+
+	var got storage.Zhengming
+	require.NoError(t, db.First(&got, "request_id = ?", reqID).Error)
+	assert.Equal(t, storage.ZhengmingDismissed, got.Status)
+	assert.Contains(t, got.DispositionReason, "cancelled", "the reason must name the cancellation")
+	assert.Empty(t, got.Answer)
+
+	status, err := s.GetSealService().GetEdictStatus(edict.Key())
+	require.NoError(t, err)
+	assert.NotEqual(t, storage.EdictBlocked, status, "a cancelled prompt no longer blocks the edict")
+
+	// A nil Court must not panic.
+	var nilCourt *Court
+	nilCourt.CancelZhengming("whatever")
+}
+
+// TestCourt_DisposeZhengming_RefusedWriteDoesNotReleaseOrAnnounce locks the
+// write_before_side_effect_ordering contract (e1010 round 2): when the
+// disposition write is refused (the request is not pending), disposeZhengming
+// must NOT release a parked waiter and must NOT publish a zhengming_dismissed
+// event. A failed write leaves the world untouched.
+func TestCourt_DisposeZhengming_RefusedWriteDoesNotReleaseOrAnnounce(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	_, reqID := insertPendingAbortPrompt(t, db, "exec-aborted")
+
+	// Park a waiter on the request, then make the DB row non-pending directly,
+	// simulating a concurrent answer that already consumed it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.WaitForZhengming(ctx, reqID)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Force the row terminal so the conditional UPDATE refuses it.
+	require.NoError(t, db.Model(&storage.Zhengming{}).Where("request_id = ?", reqID).Update("status", storage.ZhengmingDismissed).Error)
+
+	// Drain any pre-existing events so only a disposal event could appear.
+	for len(s.ritualGuard.eventCh) > 0 {
+		<-s.ritualGuard.eventCh
+	}
+
+	err := s.DismissZhengming(reqID, "court: superseded")
+	require.Error(t, err, "dismissing a non-pending request must be refused")
+
+	// The parked waiter must still be parked: a refused write released nothing.
+	delivered := s.DeliverZhengmingAnswer(ZhengmingAnswer{RequestID: reqID, Answer: "still here"})
+	assert.True(t, delivered, "a refused write must not release the parked waiter")
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("parked waiter never received the answer")
+	}
+
+	// No zhengming_dismissed event may have been published.
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		t.Fatalf("refused write published event %q, want none", ev.Type)
+	default:
+		// Good — the ledger never claims a retirement that did not happen.
+	}
+}

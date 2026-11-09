@@ -153,6 +153,9 @@ func (s *Court) DeliverZhengmingAnswer(answer ZhengmingAnswer) bool {
 // CancelZhengmingDispatch cancels a pending zhengming wait, unblocking
 // WaitForZhengming by deleting the channel from the pending map.
 func (s *Court) CancelZhengmingDispatch(requestID string) {
+	if s == nil || s.zhengming == nil {
+		return
+	}
 	s.zhengming.mu.Lock()
 	defer s.zhengming.mu.Unlock()
 	delete(s.zhengming.pending, requestID)

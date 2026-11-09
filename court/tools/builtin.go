@@ -45,6 +45,10 @@ type ToolRegistrationOpts struct {
 	// EdictSealer, when set, lands a ruler seal through the Court so
 	// transition_edict's "sealed" transition also merges the worktree.
 	EdictSealer EdictSealer
+
+	// ZhengmingDisposer, when set, lets a minister close a pending
+	// zhengming prompt on the Court's authority (e1010) instead of direct SQL.
+	ZhengmingDisposer ZhengmingDisposer
 }
 
 // RegisterBuiltinTools populates the registry with all builtin tools,
@@ -118,6 +122,9 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	r.Register(InsertLingTool{Ctx: opts.Ctx, Igniter: opts.LingIgniter}, intentWrite)
 	r.Register(UpdateLingStatusTool{Ctx: opts.Ctx}, intentWrite)
 	r.Register(TransitionEdictTool{DB: opts.Ctx.DB, Username: opts.Ctx.Username, Project: opts.Ctx.Project, Sealer: opts.EdictSealer}, intentWrite)
+	if opts.ZhengmingDisposer != nil {
+		r.Register(DismissZhengmingTool{Ctx: opts.Ctx, Disposer: opts.ZhengmingDisposer}, intentWrite)
+	}
 	r.Register(CreateIncidentTool{Ctx: opts.Ctx}, intentWrite)
 	r.Register(ResolveIncidentTool{Ctx: opts.Ctx}, intentWrite)
 

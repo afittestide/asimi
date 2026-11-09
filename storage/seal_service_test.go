@@ -474,3 +474,85 @@ func TestInvalidateSealsOnlyAffectsTargetEdict(t *testing.T) {
 		t.Error("Expected edict2 judge seal to still be valid")
 	}
 }
+
+// TestDisposeZhengming_IdempotentAndUnblocks is the storage-level guard for the
+// e1010 idempotency contract: DisposeZhengming only touches a pending row, and
+// retiring the prompt lifts the edict's derived blocked status.
+func TestDisposeZhengming_IdempotentAndUnblocks(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	edict := Edict{ID: 10, Username: "testuser", Project: "testproject", Intent: "dispose"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("create edict: %v", err)
+	}
+	req := Zhengming{
+		RequestID: "req-1", EdictID: edict.ID, Username: "testuser", Project: "testproject",
+		MinisterID: "secretary", Questions: ZhengmingQuestions{{Text: "aborted [exec:x]"}},
+		Status: ZhengmingPending, Priority: PriorityUrgent, TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&req).Error; err != nil {
+		t.Fatalf("create zhengming: %v", err)
+	}
+
+	status, err := svc.GetEdictStatus(edict.Key())
+	if err != nil {
+		t.Fatalf("get status: %v", err)
+	}
+	if status != EdictBlocked {
+		t.Fatalf("precondition: status = %q, want blocked", status)
+	}
+
+	wrote, err := svc.DisposeZhengming("req-1", ZhengmingDismissed, "court: superseded by execution exec-done")
+	if err != nil {
+		t.Fatalf("dispose: %v", err)
+	}
+	if !wrote {
+		t.Fatal("first dispose wrote no row, want one")
+	}
+
+	// Second dispose is a reported no-op: the row is no longer pending.
+	wrote, err = svc.DisposeZhengming("req-1", ZhengmingDismissed, "court: superseded by execution exec-done")
+	if err != nil {
+		t.Fatalf("second dispose: %v", err)
+	}
+	if wrote {
+		t.Error("second dispose wrote a row, want none (idempotent)")
+	}
+
+	var got Zhengming
+	if err := db.First(&got, "request_id = ?", "req-1").Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != ZhengmingDismissed {
+		t.Errorf("status = %q, want dismissed", got.Status)
+	}
+	if got.DispositionReason != "court: superseded by execution exec-done" {
+		t.Errorf("disposition_reason = %q, want it recorded verbatim", got.DispositionReason)
+	}
+	if got.Answer != "" {
+		t.Errorf("answer = %q, want empty", got.Answer)
+	}
+
+	status, err = svc.GetEdictStatus(edict.Key())
+	if err != nil {
+		t.Fatalf("get status after dispose: %v", err)
+	}
+	if status == EdictBlocked {
+		t.Errorf("status = blocked after dispose, want unblocked")
+	}
+}
+
+// TestDisposeZhengming_RejectsNonTerminalStatus guards the typed vocabulary: a
+// caller cannot dispose a prompt into a non-terminal or non-dismissed state.
+func TestDisposeZhengming_RejectsNonTerminalStatus(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	if _, err := svc.DisposeZhengming("req-1", ZhengmingAnswered, "nope"); err == nil {
+		t.Error("disposing into 'answered' must be refused")
+	}
+	if _, err := svc.DisposeZhengming("", ZhengmingDismissed, "nope"); err == nil {
+		t.Error("an empty request_id must be refused")
+	}
+}

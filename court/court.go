@@ -429,6 +429,9 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		// transition_edict "sealed" path land the edict's worktree instead of
 		// recording a seal that never merges (edict 955).
 		EdictSealer: s,
+		// The Court implements tools.ZhengmingDisposer so a minister can close
+		// a superseded prompt without direct SQL (e1010).
+		ZhengmingDisposer: s,
 	}
 
 	tools.RegisterBuiltinTools(registry, opts)
@@ -1927,12 +1930,83 @@ func (s *Court) HandleZhengmingResponse(ctx context.Context, requestID, answer s
 	return fmt.Errorf("no minister accepted zhengming response")
 }
 
-// CancelZhengming cancels a pending zhengming request on the Court's dispatch.
+// CancelZhengming retires a pending zhengming request the Ruler abandoned.
+// Unlike the previous implementation it writes the disposition (status
+// dismissed, with a reason naming the cancellation) as well as clearing the
+// in-process wait, so a cancelled request stops blocking the edict's derived
+// status instead of lingering as pending. It uses the same typed disposition as
+// the Court's own retirement — 'dismissed' never claims the Ruler answered, and
+// the reason distinguishes a Ruler cancellation from a superseded prompt
+// (e1010).
 func (s *Court) CancelZhengming(requestID string) {
 	if s == nil {
 		return
 	}
+	if err := s.disposeZhengming(requestID, storage.ZhengmingDismissed, "court: cancelled by ruler"); err != nil {
+		s.logger.Warn("failed to cancel zhengming", "request_id", requestID, "error", err)
+	}
+}
+
+// DismissZhengming retires a pending zhengming request on the Court's own
+// authority — a superseded abort prompt, say — recording a reason that names
+// why. It is the sanctioned alternative to direct SQL for closing a prompt no
+// one answered (e1010). The request must be pending; an already-answered or
+// already-retired request is reported, never overwritten.
+func (s *Court) DismissZhengming(requestID, reason string) error {
+	if s == nil {
+		return fmt.Errorf("court not initialized")
+	}
+	if reason == "" {
+		reason = "court: dismissed by minister"
+	}
+	return s.disposeZhengming(requestID, storage.ZhengmingDismissed, reason)
+}
+
+// disposeZhengming writes a request's terminal disposition with a recorded
+// reason, releases its in-process wait (if one exists), and only then announces
+// the retirement on the ledger. The record is written before the side effect
+// (releasing the parked waiter) and before the event, so a failed write leaves
+// the prompt untouched and the ledger never claims a retirement that did not
+// happen. It is scoped to pending rows, so retirement is idempotent: a second
+// call for the same request is a reported no-op, never a double write.
+func (s *Court) disposeZhengming(requestID string, status storage.ZhengmingStatus, reason string) error {
+	if s.db == nil {
+		return fmt.Errorf("court has no database")
+	}
+	if requestID == "" {
+		return fmt.Errorf("request_id is required")
+	}
+
+	var req storage.Zhengming
+	if err := s.db.First(&req, "request_id = ?", requestID).Error; err != nil {
+		return fmt.Errorf("zhengming request not found: %w", err)
+	}
+
+	// Write the disposition first. Only a written pending→terminal transition
+	// justifies releasing the parked waiter and announcing the event.
+	wrote, err := storage.NewSealService(s.db).DisposeZhengming(requestID, status, reason)
+	if err != nil {
+		return err
+	}
+	if !wrote {
+		return fmt.Errorf("zhengming request %s is not pending (status: %s)", requestID, req.Status)
+	}
+
+	// Release any in-process waiter, matching the old CancelZhengming
+	// behaviour: the dismissal must unblock a ritual that is parked on it.
 	s.CancelZhengmingDispatch(requestID)
+
+	key := storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project}
+	s.PublishEvent(key, storage.EventZhengmingDismissed, storage.JSON{
+		"request_id": requestID,
+		"status":     string(status),
+		"reason":     reason,
+	})
+	if s.logger != nil {
+		s.logger.Info("disposed zhengming request",
+			"request_id", requestID, "status", status, "edict_id", req.EdictID, "reason", reason)
+	}
+	return nil
 }
 
 // SessionState is a wire-safe snapshot of a minister's conversation state,

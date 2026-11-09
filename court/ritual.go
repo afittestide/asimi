@@ -604,6 +604,11 @@ type RitualRunner struct {
 	// just-finished ritual).
 	onRitualDone func(edictID uint)
 
+	// onRitualCompleted runs once a ritual reaches the terminal completed
+	// state. The RitualGuard uses it to retire abort prompts that this
+	// completed run superseded, so a stale prompt cannot outlive the chain it
+	// described (e1010).
+	onRitualCompleted func()
 	// mutationRunner resolves the runner used for repository mutations
 	// (worktree rebase/squash-merge/remove). Injected by the Court so
 	// mutations run on the host, never the sandbox: the container
@@ -682,6 +687,13 @@ func (r *RitualRunner) SetConfig(sandboxCfg *config.SandboxConfig, projectSlug s
 func (r *RitualRunner) SetRunnerResolver(getRunner func(edictID uint) (runners.Runner, error), onDone func(edictID uint)) {
 	r.getRunner = getRunner
 	r.onRitualDone = onDone
+}
+
+// SetRitualCompletedHook injects the callback run when a ritual reaches the
+// terminal completed state. The guard uses it to retire abort prompts the
+// completed run superseded (e1010).
+func (r *RitualRunner) SetRitualCompletedHook(onCompleted func()) {
+	r.onRitualCompleted = onCompleted
 }
 
 // SetAtifAgentName sets the ATIF agent name so ritual step sessions get an
@@ -1338,6 +1350,13 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 
 	exec.State = RitualStateCompleted
 	r.saveExecution(exec)
+
+	// Retire any abort prompts this completed run superseded before the
+	// completion event fans out, so the pending row is already gone when the
+	// completed chain is evaluated (e1010).
+	if r.onRitualCompleted != nil {
+		r.onRitualCompleted()
+	}
 
 	duration := time.Since(exec.CreatedAt).Round(time.Millisecond)
 

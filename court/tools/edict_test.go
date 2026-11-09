@@ -465,3 +465,155 @@ func TestListEdictsTool_FormatCoversEnvelope(t *testing.T) {
 		t.Errorf("Format(envelope) = %q, want counted summary", got)
 	}
 }
+
+// TestTransitionEdictTool_SealedAfterSupersededPromptRetired covers e1010
+// acceptance 1 and 2: an edict whose only pending request is an abort prompt
+// for a superseded execution is not blocked, and transition_edict -> sealed
+// succeeds once the prompt is retired with a recorded reason (never
+// 'answered').
+func TestTransitionEdictTool_SealedAfterSupersededPromptRetired(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	edict := storage.Edict{ID: 1010, Username: "testuser", Project: "testproject", Intent: "Retire stale abort prompts"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	// A pending abort prompt for an execution that a later run of the same
+	// ritual superseded. This is what blocks ascent.
+	execID := "exec-aborted"
+	prompt := storage.Zhengming{
+		RequestID:  "abort-prompt-" + execID,
+		EdictID:    edict.ID,
+		Username:   "testuser",
+		Project:    "testproject",
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{
+			Text: "Ritual was aborted at step 0. What should we do? [exec:" + execID + "]",
+		}},
+		Status:    storage.ZhengmingPending,
+		Priority:  storage.PriorityUrgent,
+		TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&prompt).Error; err != nil {
+		t.Fatalf("failed to create abort prompt: %v", err)
+	}
+
+	sealService := storage.NewSealService(db)
+	status, err := sealService.GetEdictStatus(edict.Key())
+	if err != nil {
+		t.Fatalf("get edict status: %v", err)
+	}
+	if status != storage.EdictBlocked {
+		t.Fatalf("precondition: status = %q, want blocked", status)
+	}
+
+	// The superseding cause: the Court retires the prompt on its own
+	// authority, recording why. DisposeZhengming is the sanctioned path — no
+	// direct SQL.
+	wrote, err := sealService.DisposeZhengming(prompt.RequestID, storage.ZhengmingDismissed, "court: superseded by execution exec-done")
+	if err != nil {
+		t.Fatalf("dispose zhengming: %v", err)
+	}
+	if !wrote {
+		t.Fatal("dispose reported no row written, want one")
+	}
+
+	// The prompt no longer blocks: the edict is no longer blocked.
+	status, err = sealService.GetEdictStatus(edict.Key())
+	if err != nil {
+		t.Fatalf("get edict status: %v", err)
+	}
+	if status == storage.EdictBlocked {
+		t.Fatalf("status = blocked after retirement, want unblocked")
+	}
+
+	// Ascent succeeds without manual SQL.
+	tool := TransitionEdictTool{DB: db, Username: "testuser", Project: "testproject"}
+	if _, err := tool.Call(context.Background(), fmt.Sprintf(`{"edict_id": %d, "status": "sealed"}`, edict.ID)); err != nil {
+		t.Fatalf("sealing a retired-prompt edict failed: %v", err)
+	}
+
+	status, err = sealService.GetEdictStatus(edict.Key())
+	if err != nil {
+		t.Fatalf("get edict status: %v", err)
+	}
+	if status != storage.EdictSealed {
+		t.Errorf("status = %q, want sealed", status)
+	}
+
+	// The retirement is recorded, and it is NOT 'answered'.
+	var retired storage.Zhengming
+	if err := db.First(&retired, "request_id = ?", prompt.RequestID).Error; err != nil {
+		t.Fatalf("failed to reload prompt: %v", err)
+	}
+	if retired.Status != storage.ZhengmingDismissed {
+		t.Errorf("status = %q, want %q", retired.Status, storage.ZhengmingDismissed)
+	}
+	if retired.Status == storage.ZhengmingAnswered {
+		t.Errorf("retirement marked the prompt answered; the Court retired it, the Ruler did not speak")
+	}
+	if retired.DispositionReason == "" {
+		t.Errorf("disposition_reason is empty; the retirement must explain itself")
+	}
+	if retired.Answer != "" {
+		t.Errorf("answer = %q, want empty on a Court retirement", retired.Answer)
+	}
+}
+
+// recordingDisposer captures the request_id and reason it was asked to
+// dispose, so the tool's contract can be asserted without a live Court.
+type recordingDisposer struct {
+	requestID string
+	reason    string
+	called    bool
+	err       error
+}
+
+func (d *recordingDisposer) DismissZhengming(requestID, reason string) error {
+	d.called = true
+	d.requestID = requestID
+	d.reason = reason
+	return d.err
+}
+
+// TestDismissZhengmingTool_Call covers e1010 change 6/acceptance 5: the tool a
+// minister uses to close a superseded prompt without direct SQL passes the
+// request_id and reason through to the disposer.
+func TestDismissZhengmingTool_Call(t *testing.T) {
+	d := &recordingDisposer{}
+	tool := DismissZhengmingTool{Ctx: ToolContext{Username: "testuser", Project: "testproject"}, Disposer: d}
+
+	result, err := tool.Call(context.Background(), `{"request_id": "req-1", "reason": "court: superseded"}`)
+	if err != nil {
+		t.Fatalf("Call returned error: %v", err)
+	}
+	if !d.called {
+		t.Fatal("disposer was not called")
+	}
+	if d.requestID != "req-1" || d.reason != "court: superseded" {
+		t.Errorf("disposer got (%q,%q), want (req-1, court: superseded)", d.requestID, d.reason)
+	}
+	if result == "" {
+		t.Error("Call returned an empty result")
+	}
+}
+
+// TestDismissZhengmingTool_CallErrors covers the tool's guards: malformed
+// input, a missing request_id, and an unwired disposer must all surface an
+// error rather than pretend the prompt was closed.
+func TestDismissZhengmingTool_CallErrors(t *testing.T) {
+	tool := DismissZhengmingTool{Ctx: ToolContext{Username: "testuser", Project: "testproject"}, Disposer: &recordingDisposer{}}
+
+	if _, err := tool.Call(context.Background(), `not json`); err == nil {
+		t.Error("malformed input must error")
+	}
+	if _, err := tool.Call(context.Background(), `{"reason": "no id"}`); err == nil {
+		t.Error("missing request_id must error")
+	}
+
+	unwired := DismissZhengmingTool{Ctx: ToolContext{Username: "testuser", Project: "testproject"}}
+	if _, err := unwired.Call(context.Background(), `{"request_id": "req-1"}`); err == nil {
+		t.Error("an unwired disposer must error, not silently succeed")
+	}
+}

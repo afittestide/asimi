@@ -2632,3 +2632,314 @@ func TestDoubleRestart_MintsNoPhantomPromptForHealthyRitual(t *testing.T) {
 		t.Errorf("the startup invariant was violated: %d executions still `running`", stillRunning)
 	}
 }
+
+// --- Superseded abort prompt retirement (e1010) ---
+
+// createSupersedeEdict inserts an edict scoped to the recovery test DB.
+func createSupersedeEdict(t *testing.T, db *gorm.DB, intent string) storage.Edict {
+	t.Helper()
+	edict := storage.Edict{Intent: intent, Username: "testuser", Project: "testproject"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+	return edict
+}
+
+// createAbortPrompt inserts a pending zhengming carrying the abort marker for
+// execID, returning its request ID.
+func createAbortPrompt(t *testing.T, db *gorm.DB, edictID uint, execID string) string {
+	t.Helper()
+	req := storage.Zhengming{
+		RequestID:  "abort-prompt-" + execID,
+		EdictID:    edictID,
+		Username:   "testuser",
+		Project:    "testproject",
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{
+			Text: "Ritual \"swift-strike\" was aborted at step 0. What should we do? " + abortPromptMarker(execID),
+		}},
+		Status:    storage.ZhengmingPending,
+		Priority:  storage.PriorityUrgent,
+		TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&req).Error; err != nil {
+		t.Fatalf("failed to create abort prompt: %v", err)
+	}
+	return req.RequestID
+}
+
+// createRitualExec inserts a ritual execution row.
+func createRitualExec(t *testing.T, db *gorm.DB, id string, edictID uint, ritual string, state RitualState, createdAt time.Time) {
+	t.Helper()
+	exec := &RitualExecution{
+		ID: id, RitualName: ritual, EdictID: edictID,
+		Username: "testuser", Project: "testproject", State: state,
+		CreatedAt: createdAt,
+	}
+	if err := db.Save(exec).Error; err != nil {
+		t.Fatalf("failed to create ritual execution: %v", err)
+	}
+}
+
+// statusOfZhengming reads a request's status, answer, and disposition reason.
+func statusOfZhengming(t *testing.T, db *gorm.DB, requestID string) (storage.ZhengmingStatus, string, string) {
+	t.Helper()
+	var req storage.Zhengming
+	if err := db.First(&req, "request_id = ?", requestID).Error; err != nil {
+		t.Fatalf("failed to find zhengming: %v", err)
+	}
+	return req.Status, req.Answer, req.DispositionReason
+}
+
+// TestRetireSupersededAbortPrompts_LaterCompletedExecution covers acceptance 2
+// and 3: an abort prompt for an execution later superseded by a completed run
+// of the same edict+ritual is dismissed, with a reason naming the superseder.
+func TestRetireSupersededAbortPrompts_LaterCompletedExecution(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "superseded by a later completed run")
+	base := time.Now().Add(-time.Hour)
+
+	createRitualExec(t, db, "exec-aborted", edict.ID, "swift-strike", RitualStateAborted, base)
+	createRitualExec(t, db, "exec-done", edict.ID, "swift-strike", RitualStateCompleted, base.Add(time.Minute))
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	status, answer, reason := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingDismissed {
+		t.Errorf("status = %q, want %q", status, storage.ZhengmingDismissed)
+	}
+	if !strings.Contains(reason, "superseded by execution exec-done") {
+		t.Errorf("disposition_reason = %q, want it to name the superseding execution", reason)
+	}
+	if answer != "" {
+		t.Errorf("answer = %q, want empty: a Court retirement must not claim the Ruler spoke", answer)
+	}
+}
+
+// TestRetireSupersededAbortPrompts_DifferentRitualStaysPending covers
+// acceptance 3's negative half: only a different ritual's completion, and no
+// seal, leaves the prompt first-class work in progress.
+func TestRetireSupersededAbortPrompts_DifferentRitualStaysPending(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "different ritual is irrelevant")
+	base := time.Now().Add(-time.Hour)
+
+	createRitualExec(t, db, "exec-aborted", edict.ID, "swift-strike", RitualStateAborted, base)
+	createRitualExec(t, db, "exec-other", edict.ID, "other-ritual", RitualStateCompleted, base.Add(time.Minute))
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	status, _, _ := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingPending {
+		t.Errorf("status = %q, want pending: a different ritual's completion does not supersede", status)
+	}
+}
+
+// TestRetireSupersededAbortPrompts_SealedEdict covers the seal cause.
+func TestRetireSupersededAbortPrompts_SealedEdict(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "sealed edict supersedes")
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	seal := storage.Seal{
+		SealID: "seal-ruler", EdictID: edict.ID, Username: "testuser",
+		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+	}
+	if err := db.Create(&seal).Error; err != nil {
+		t.Fatalf("failed to create seal: %v", err)
+	}
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	status, _, reason := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingDismissed {
+		t.Errorf("status = %q, want %q", status, storage.ZhengmingDismissed)
+	}
+	if !strings.Contains(reason, "edict sealed") {
+		t.Errorf("disposition_reason = %q, want it to name the seal", reason)
+	}
+}
+
+// TestRetireSupersededAbortPrompts_CancelledEdict covers the cancellation cause.
+func TestRetireSupersededAbortPrompts_CancelledEdict(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	now := time.Now()
+	edict := storage.Edict{Intent: "cancelled edict supersedes", Username: "testuser", Project: "testproject", CancelledAt: &now}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	status, _, reason := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingDismissed {
+		t.Errorf("status = %q, want %q", status, storage.ZhengmingDismissed)
+	}
+	if !strings.Contains(reason, "edict cancelled") {
+		t.Errorf("disposition_reason = %q, want it to name the cancellation", reason)
+	}
+}
+
+// TestRetireSupersededAbortPrompts_ActionableStaysPending covers acceptance 4:
+// neither sealed, cancelled, nor re-executed leaves a genuinely actionable
+// prompt pending.
+func TestRetireSupersededAbortPrompts_ActionableStaysPending(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "genuinely actionable")
+
+	createRitualExec(t, db, "exec-aborted", edict.ID, "swift-strike", RitualStateAborted, time.Now().Add(-time.Hour))
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	status, _, _ := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingPending {
+		t.Errorf("status = %q, want pending: nothing superseded this prompt", status)
+	}
+}
+
+// TestRetireSupersededAbortPrompts_IgnoresNonAbortPrompts verifies the rule only
+// touches abort-recovery prompts; a normal zhengming carries no marker and must
+// never be retired by the supersede sweep.
+func TestRetireSupersededAbortPrompts_IgnoresNonAbortPrompts(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	now := time.Now()
+	edict := storage.Edict{Intent: "non-abort prompt", Username: "testuser", Project: "testproject", CancelledAt: &now}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+	req := storage.Zhengming{
+		RequestID: "plain-request", EdictID: edict.ID, Username: "testuser", Project: "testproject",
+		MinisterID: "secretary", Questions: storage.ZhengmingQuestions{{Text: "Proceed with the plan?"}},
+		Status: storage.ZhengmingPending, Priority: storage.PriorityNormal, TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&req).Error; err != nil {
+		t.Fatalf("failed to create zhengming: %v", err)
+	}
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	status, _, _ := statusOfZhengming(t, db, req.RequestID)
+	if status != storage.ZhengmingPending {
+		t.Errorf("status = %q, want pending: a markerless prompt is never superseded", status)
+	}
+}
+
+// TestRetireSupersededAbortPrompts_Idempotent covers acceptance 6: re-running
+// the retirement writes nothing twice.
+func TestRetireSupersededAbortPrompts_Idempotent(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "idempotent retirement")
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	seal := storage.Seal{
+		SealID: "seal-ruler", EdictID: edict.ID, Username: "testuser",
+		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+	}
+	if err := db.Create(&seal).Error; err != nil {
+		t.Fatalf("failed to create seal: %v", err)
+	}
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	rg.retireSupersededAbortPrompts(context.Background())
+
+	_, firstAnswer, firstReason := statusOfZhengming(t, db, reqID)
+
+	// Second pass must be a no-op: nothing is pending, so nothing is written.
+	rg.retireSupersededAbortPrompts(context.Background())
+	status, secondAnswer, secondReason := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingDismissed {
+		t.Errorf("status = %q, want %q", status, storage.ZhengmingDismissed)
+	}
+	if firstReason == "" {
+		t.Errorf("first pass recorded no disposition_reason")
+	}
+	if firstAnswer != secondAnswer || firstReason != secondReason {
+		t.Errorf("request changed on re-run: (%q,%q) -> (%q,%q)", firstAnswer, firstReason, secondAnswer, secondReason)
+	}
+}
+
+// TestPromptForAbortedRituals_DoesNotReRaiseSupersededExecution covers
+// acceptance 1 and 6's second half: once the abort is retired, the boot pass
+// must not raise a fresh prompt for the same dead execution.
+func TestPromptForAbortedRituals_DoesNotReRaiseSupersededExecution(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "do not re-raise")
+	base := time.Now().Add(-time.Hour)
+
+	createRitualExec(t, db, "exec-aborted", edict.ID, "swift-strike", RitualStateAborted, base)
+	createRitualExec(t, db, "exec-done", edict.ID, "swift-strike", RitualStateCompleted, base.Add(time.Minute))
+
+	raised := 0
+	chancellor := newMockZhengmingMinister(
+		func(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error) {
+			raised++
+			return "req", nil
+		},
+		func(ctx context.Context, requestID string) (string, error) { return "Pass", nil },
+	)
+	rg := newTestRitualGuard(t, db, func(id string) Minister {
+		if id == "secretary" {
+			return chancellor
+		}
+		return nil
+	}, chancellor)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rg.promptForAbortedRituals(ctx)
+
+	if raised != 0 {
+		t.Errorf("raised %d prompts for a superseded execution, want 0", raised)
+	}
+
+	var pending int64
+	db.Model(&storage.Zhengming{}).Where("status = ?", storage.ZhengmingPending).Count(&pending)
+	if pending != 0 {
+		t.Errorf("found %d pending prompts, want 0", pending)
+	}
+}
+
+// TestPromptForAbortedRituals_RetiresSupersededPromptWithNoAbortedRows is the
+// regression guard for the trap this pass exists to avoid: a superseded
+// prompt's execution is by definition `completed`, so it is OUTSIDE the
+// aborted/stopped/failed filter the boot loop scans. If retirement were gated
+// behind that scan (or its len==0 early return), this prompt would survive -
+// which is precisely how a stale prompt blocked ascent before e1010.
+func TestPromptForAbortedRituals_RetiresSupersededPromptWithNoAbortedRows(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "retire even with zero aborted rows")
+
+	// A sealed edict whose abort prompt is still pending. No aborted/stopped/
+	// failed execution rows exist at all.
+	seal := storage.Seal{
+		SealID: "seal-ruler", EdictID: edict.ID, Username: "testuser",
+		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+	}
+	if err := db.Create(&seal).Error; err != nil {
+		t.Fatalf("failed to create seal: %v", err)
+	}
+	reqID := createAbortPrompt(t, db, edict.ID, "exec-aborted")
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rg.promptForAbortedRituals(ctx)
+
+	status, _, reason := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingDismissed {
+		t.Errorf("status = %q, want %q: boot retirement must not be gated on the aborted scan", status, storage.ZhengmingDismissed)
+	}
+	if !strings.Contains(reason, "edict sealed") {
+		t.Errorf("disposition_reason = %q, want it to name the seal", reason)
+	}
+}

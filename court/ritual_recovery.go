@@ -3,6 +3,7 @@ package court
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -114,6 +115,165 @@ func abortPromptMarker(executionID string) string {
 	return fmt.Sprintf("[exec:%s]", executionID)
 }
 
+// abortPromptMarkerPattern extracts the execution ID from an abort prompt's
+// marker. It is the inverse of abortPromptMarker and deliberately matches only
+// the marker's shape, so a non-abort prompt (no marker) yields no match.
+var abortPromptMarkerPattern = regexp.MustCompile(`\[exec:([^\]]+)\]`)
+
+// abortPromptExecID returns the execution ID embedded in question's abort
+// marker, or "" when the question carries no marker (i.e. it is not an
+// abort-recovery prompt).
+func abortPromptExecID(question string) string {
+	m := abortPromptMarkerPattern.FindStringSubmatch(question)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// promptExecID returns the execution ID an abort prompt refers to, scanning
+// every question for the marker. A prompt with no marker is not an
+// abort-recovery prompt and yields "".
+func promptExecID(req *storage.Zhengming) string {
+	for _, q := range req.Questions {
+		if id := abortPromptExecID(q.Text); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// supersedingCause reports whether a pending abort prompt for the execution
+// is superseded, returning a reason string that names the superseding cause.
+// The rule is the reverse of hasPendingAbortPrompt's dedup: the prompt is
+// retired when the work it described no longer stands as unfinished — either a
+// later execution of the same edict and ritual completed, or the edict holds a
+// live Ruler seal, or the edict was cancelled. A genuinely actionable prompt
+// (none of the above) is left pending.
+//
+// exec may be nil: the edict-level causes (seal, cancellation) are decidable
+// from the edict alone, so a prompt whose referenced execution row has been
+// pruned is still retired when its edict has ascended.
+func (rg *RitualGuard) supersedingCause(key storage.EdictKey, exec *RitualExecution) (string, bool) {
+	var edict storage.Edict
+	if err := rg.db.First(&edict, "id = ? AND username = ? AND project = ?",
+		key.ID, key.Username, key.Project).Error; err != nil {
+		return "", false
+	}
+	if edict.CancelledAt != nil {
+		return "court: edict cancelled", true
+	}
+
+	var sealCount int64
+	if err := rg.db.Model(&storage.Seal{}).
+		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND stale_at IS NULL",
+			key.ID, key.Username, key.Project, "ruler").
+		Count(&sealCount).Error; err == nil && sealCount > 0 {
+		return "court: edict sealed", true
+	}
+
+	if exec == nil {
+		return "", false
+	}
+
+	// A later execution of the same edict and ritual that reached completed
+	// supersedes the abort the prompt describes. Restricting to the same
+	// ritual name keeps a different ritual's completion from retiring a
+	// prompt that is still the edict's freshest word on this ritual.
+	var later RitualExecution
+	err := rg.db.Where("edict_id = ? AND username = ? AND project = ? AND ritual_name = ? AND state = ? AND id != ? AND created_at > ?",
+		exec.EdictID, exec.Username, exec.Project, exec.RitualName, RitualStateCompleted, exec.ID, exec.CreatedAt).
+		Order("created_at DESC").
+		First(&later).Error
+	if err == nil {
+		return fmt.Sprintf("court: superseded by execution %s", later.ID), true
+	}
+
+	return "", false
+}
+
+// retireSupersededAbortPrompts scans pending zhengming requests for
+// abort-recovery prompts (those carrying an [exec:<id>] marker) and retires
+// each whose execution's abort has been superseded. It is the single owner of
+// the supersede rule: boot, a completed ritual, and a granted Ruler seal all
+// call it, so a prompt raised and superseded within one session cannot
+// survive to the next boot. Retirement is idempotent — the update is guarded
+// on status='pending', so re-running retires nothing twice.
+func (rg *RitualGuard) retireSupersededAbortPrompts(ctx context.Context) {
+	if rg.db == nil {
+		return
+	}
+
+	var pending []storage.Zhengming
+	if err := rg.db.Where("status = ? AND username = ? AND project = ?",
+		storage.ZhengmingPending, rg.Username(), rg.Project()).
+		Find(&pending).Error; err != nil {
+		rg.logger.Warn("failed to scan pending zhengming for superseded abort prompts", "error", err)
+		return
+	}
+
+	for i := range pending {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		req := &pending[i]
+		execID := promptExecID(req)
+		if execID == "" {
+			// Not an abort-recovery prompt — leave it alone.
+			continue
+		}
+
+		// Look up the execution the prompt refers to. A pruned row leaves
+		// exec nil; the edict-level causes (seal, cancellation) still apply.
+		// An edict with no superseding cause keeps its prompt pending.
+		var exec *RitualExecution
+		var found RitualExecution
+		if err := rg.db.First(&found, "id = ? AND username = ? AND project = ?",
+			execID, req.Username, req.Project).Error; err == nil {
+			exec = &found
+		}
+
+		reason, superseded := rg.supersedingCause(storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project}, exec)
+		if !superseded {
+			continue
+		}
+
+		rg.retireZhengming(req, reason)
+	}
+}
+
+// retireZhengming writes a pending zhengming request's dismissal, recording
+// the reason in disposition_reason (never answer, which keeps meaning "the
+// Ruler replied") so the ledger explains itself, and announces it with a
+// zhengming_dismissed event. It is a no-op when the request is no longer
+// pending (idempotent) or the write fails; the in-process wait is left for
+// WaitForZhengming's own cleanup, which is keyed on request identity.
+func (rg *RitualGuard) retireZhengming(req *storage.Zhengming, reason string) {
+	wrote, err := storage.NewSealService(rg.db).DisposeZhengming(req.RequestID, storage.ZhengmingDismissed, reason)
+	if err != nil {
+		rg.logger.Warn("failed to retire superseded zhengming",
+			"request_id", req.RequestID, "error", err)
+		return
+	}
+	if !wrote {
+		// Already retired (or answered) — idempotent no-op.
+		return
+	}
+
+	rg.PublishEvent(storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project}, storage.EventZhengmingDismissed, storage.JSON{
+		"request_id": req.RequestID,
+		"status":     string(storage.ZhengmingDismissed),
+		"reason":     reason,
+	})
+	rg.logger.Info("retired superseded zhengming prompt",
+		"request_id", req.RequestID,
+		"edict_id", req.EdictID,
+		"reason", reason)
+}
+
 // hasPendingAbortPrompt reports whether a PENDING abort prompt already exists
 // for this execution. Dedup is by execution identity, embedded in the question
 // text as abortPromptMarker — the same aborted execution may be re-scanned on
@@ -158,6 +318,18 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 	rg.recoveryMu.Lock()
 	rg.recoveryComplete = true
 	rg.recoveryMu.Unlock()
+
+	// Retire pending abort prompts whose abort has been superseded. This runs
+	// BEFORE the aborted-execution scan below and must not be gated on it: a
+	// superseded prompt's execution is by definition `completed`, hence
+	// outside the aborted/stopped/failed filter — the very reason the boot loop
+	// cannot reach it by extending that scan (e1010). Retiring here is the
+	// reverse of the dedup rule, so a prompt whose edict was sealed/cancelled,
+	// or whose same-ritual execution completed later, is closed with a recorded
+	// reason and can never outvote the completed chain.
+	if ctx.Err() == nil {
+		rg.retireSupersededAbortPrompts(ctx)
+	}
 
 	// Query aborted/stopped/failed rituals, excluding edict_id=0
 	var abortedExecs []RitualExecution
@@ -225,6 +397,17 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 		var stepStates []RitualStepState
 		rg.db.Where("execution_id = ?", exec.ID).Order("step_index").Find(&stepStates)
 		incompleteStep := findFirstIncompleteStep(stepStates)
+
+		// A superseded abort must not be re-prompted: retiring the old prompt
+		// and then raising a fresh one for the same dead execution would just
+		// re-block the edict (e1010).
+		if reason, superseded := rg.supersedingCause(exec.EdictKey(), &exec); superseded {
+			rg.logger.Info("skipping abort prompt for superseded execution",
+				"execution_id", exec.ID,
+				"edict_id", exec.EdictID,
+				"reason", reason)
+			continue
+		}
 
 		// Raise the abort prompt at most once per execution: if a PENDING
 		// zhengming already carries this execution's marker, do not raise
