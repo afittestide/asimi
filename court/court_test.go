@@ -39,6 +39,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// TestMain keeps tests away from the developer's real gcloud project so
+// Vertex AI does not look authenticated in tests that expect no credentials.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "asimi-test-gcloud")
+	if err == nil {
+		os.Setenv("CLOUDSDK_CONFIG", dir)
+	}
+	code := m.Run()
+	if err == nil {
+		os.RemoveAll(dir)
+	}
+	os.Exit(code)
+}
+
 func setupCourtTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	tmpDir, err := os.MkdirTemp("", "court_test")

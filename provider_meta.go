@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/afittestide/asimi/internal/keyring"
+	"github.com/afittestide/asimi/internal/utils"
 )
 
 // AuthType classifies how a provider authenticates.
@@ -131,7 +132,7 @@ func checkProviderAuth(provider string) bool {
 	// gcloud ADC providers (Vertex AI) are authenticated when the gcloud
 	// project is set; credentials are configured out-of-band.
 	if providerAuthType(provider) == AuthTypeGCloud {
-		return os.Getenv("GOOGLE_CLOUD_PROJECT") != ""
+		return utils.GCloudProject() != ""
 	}
 
 	// Bedrock uses a credential pair

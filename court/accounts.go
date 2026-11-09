@@ -141,10 +141,17 @@ func hasAWSEnvCredentials() bool {
 // apiKeys map (daemon mode) or environment variables (in-process mode). Project
 // is the gating dimension; region may default to "global" per bifrost.
 func (a *Account) hasVertexCredentials() bool {
+	return a.vertexProject() != ""
+}
+
+// vertexProject resolves the GCP project. The apiKeys map is authoritative in
+// daemon mode; in-process mode falls back to gcloud's active configuration so
+// `gcloud config set project` is enough to authenticate Vertex AI.
+func (a *Account) vertexProject() string {
 	if a.apiKeys != nil {
-		return a.apiKeys["GOOGLE_CLOUD_PROJECT"] != ""
+		return a.apiKeys["GOOGLE_CLOUD_PROJECT"]
 	}
-	return os.Getenv("GOOGLE_CLOUD_PROJECT") != ""
+	return utils.GCloudProject()
 }
 
 // vertexEnv reads a gcloud env value from the apiKeys map (daemon mode) or
@@ -274,7 +281,7 @@ func (a *Account) GetKeysForProvider(ctx context.Context, provider schemas.Model
 // configured using gcloud Application Default Credentials. Returns an empty
 // slice when no project is configured so vertex is not presented.
 func (a *Account) vertexKeys() []schemas.Key {
-	project := a.vertexEnv("GOOGLE_CLOUD_PROJECT")
+	project := a.vertexProject()
 	if project == "" {
 		return []schemas.Key{}
 	}

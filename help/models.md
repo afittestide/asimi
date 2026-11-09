@@ -71,7 +71,8 @@ out-of-band — no API key prompt and no VERTEX_API_KEY.
 
 Setup:
   1. gcloud auth application-default login
-  2. export GOOGLE_CLOUD_PROJECT=<your-project-id>
+  2. gcloud config set project <your-project-id>
+     (or export GOOGLE_CLOUD_PROJECT=<your-project-id>)
 
 Optionally set GOOGLE_CLOUD_REGION (defaults to "global") and
 GOOGLE_APPLICATION_CREDENTIALS (path to a service-account JSON) instead of

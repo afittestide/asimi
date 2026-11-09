@@ -55,7 +55,7 @@ Supported providers:
   No VERTEX_API_KEY is used.
   Auth for Vertex uses gcloud Application Default Credentials (ADC):
    gcloud auth application-default login
-  GOOGLE_CLOUD_PROJECT       - GCP project ID for Vertex AI (required)
+  GOOGLE_CLOUD_PROJECT       - GCP project ID for Vertex AI (optional when gcloud config has a project)
   GOOGLE_CLOUD_REGION        - GCP region for Vertex AI (optional, defaults to "global")
   GOOGLE_APPLICATION_CREDENTIALS - Path to a service-account JSON, or the JSON itself (optional)
 

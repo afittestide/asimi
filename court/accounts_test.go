@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -615,6 +616,27 @@ func TestGetKeysForVertex_AuthCredentialsJSONPassthrough_RegionDefaultsGlobal(t 
 		"empty region in apiKeys map should default to global")
 	assert.Equal(t, `{"type":"service_account"}`, cfg.AuthCredentials.Val,
 		"inline JSON credentials should pass through from the map")
+}
+
+func TestGetKeysForProvider_Vertex_FromGcloudConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLOUDSDK_CONFIG", dir)
+	os.Unsetenv("GOOGLE_CLOUD_PROJECT")
+	os.Unsetenv("GOOGLE_CLOUD_REGION")
+	os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "configurations"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "active_config"), []byte("default\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "configurations", "config_default"),
+		[]byte("[core]\nproject = gcloud-project\n"), 0o644))
+
+	account := &Account{}
+	keys, err := account.GetKeysForProvider(context.Background(), schemas.Vertex)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	require.NotNil(t, keys[0].VertexKeyConfig)
+	assert.Equal(t, "gcloud-project", keys[0].VertexKeyConfig.ProjectID.Val)
+	assert.Equal(t, "global", keys[0].VertexKeyConfig.Region.Val)
 }
 
 func TestGetKeysForProvider_Vertex_WithoutProject(t *testing.T) {

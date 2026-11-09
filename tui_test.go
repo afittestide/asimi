@@ -4548,6 +4548,23 @@ func TestCollectAPIKeys_ForwardsGcloudVars(t *testing.T) {
 	assert.Equal(t, "", keys["vertex"])
 }
 
+// TestCollectAPIKeys_VertexProjectFromGcloudConfig verifies that a project
+// configured with `gcloud config set project` reaches the daemon handshake
+// without exporting GOOGLE_CLOUD_PROJECT.
+func TestCollectAPIKeys_VertexProjectFromGcloudConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLOUDSDK_CONFIG", dir)
+	os.Unsetenv("GOOGLE_CLOUD_PROJECT")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "configurations"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "active_config"), []byte("default\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "configurations", "config_default"),
+		[]byte("[core]\nproject = gcloud-project\n"), 0o644))
+
+	keys := collectAPIKeys()
+	assert.Equal(t, "gcloud-project", keys["GOOGLE_CLOUD_PROJECT"])
+}
+
 // --- Tests for in-app API key input flow ---
 
 // TestHandleAPIKeyInput_CancelReturnsModelSelection verifies that when the user

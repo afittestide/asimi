@@ -41,7 +41,10 @@ Vertex AI requires no login within Asimi. It authenticates using gcloud
 Application Default Credentials (ADC), configured out-of-band:
 
   gcloud auth application-default login
-  export GOOGLE_CLOUD_PROJECT=<your-project-id>
+  gcloud config set project <your-project-id>
+
+The project is read from GOOGLE_CLOUD_PROJECT when set, otherwise from
+`gcloud config get-value project`.
 
 Optionally set GOOGLE_CLOUD_REGION (defaults to "global") and
 GOOGLE_APPLICATION_CREDENTIALS (service-account JSON path or JSON). No

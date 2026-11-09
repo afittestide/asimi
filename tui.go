@@ -656,8 +656,10 @@ func collectAPIKeys() map[string]string {
 		keys["AWS_SESSION_TOKEN"] = key
 	}
 
-	// gcloud credentials for Vertex AI (Application Default Credentials)
-	if key := os.Getenv("GOOGLE_CLOUD_PROJECT"); key != "" {
+	// gcloud credentials for Vertex AI (Application Default Credentials).
+	// The project falls back to gcloud's active config so a user who only ran
+	// `gcloud auth application-default login` still gets a usable vertex key.
+	if key := utils.GCloudProject(); key != "" {
 		keys["GOOGLE_CLOUD_PROJECT"] = key
 	}
 	if key := os.Getenv("GOOGLE_CLOUD_REGION"); key != "" {

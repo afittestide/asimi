@@ -22,12 +22,22 @@ func TestMain(m *testing.M) {
 		keyring.MockKeyring()
 	}
 
-	defer func() {
-		os.Setenv("ASIMI_KEYRING_SERVICE", original)
-	}()
+	// Keep tests away from the developer's real gcloud project. Otherwise a
+	// configured host makes Vertex AI look authenticated in tests that expect
+	// no credentials.
+	gcloudDir := ""
+	if dir, err := os.MkdirTemp("", "asimi-test-gcloud"); err == nil {
+		gcloudDir = dir
+		os.Setenv("CLOUDSDK_CONFIG", dir)
+	}
 
 	// Run tests
 	code := m.Run()
+
+	if gcloudDir != "" {
+		os.RemoveAll(gcloudDir)
+	}
+	os.Setenv("ASIMI_KEYRING_SERVICE", original)
 
 	// Exit with test result code
 	os.Exit(code)
