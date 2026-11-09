@@ -187,6 +187,144 @@ func TestListPendingManifestsTool_PopulatedReturnsTableEnvelope(t *testing.T) {
 	}
 }
 
+// TestGetManifestByCommitTool_PopulatedReturnsMarkdownEnvelope verifies a
+// populated lookup opts into the TUI markdown envelope (edict 1031) with raw
+// carrying the full manifest (manifest_id unmarshals back to the record).
+func TestGetManifestByCommitTool_PopulatedReturnsMarkdownEnvelope(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	if err := db.AutoMigrate(&storage.ForgeManifest{}); err != nil {
+		t.Fatalf("failed to migrate: %v", err)
+	}
+
+	manifest := storage.ForgeManifest{
+		ManifestID: "m1", EdictID: 7, Username: "testuser", Project: "testproject",
+		LingID: "l1", FilePath: "a.go", FuncName: "Foo", ContentSHA: "sha1",
+		CommitHash: "abc123", Status: storage.ManifestForged, VerdictID: "v1",
+	}
+	if err := db.Create(&manifest).Error; err != nil {
+		t.Fatalf("failed to create manifest: %v", err)
+	}
+
+	tool := GetManifestByCommitTool{Ctx: ToolContext{DB: db, Username: "testuser", Project: "testproject"}}
+	result, err := tool.Call(context.Background(), `{"commit_hash":"abc123"}`)
+	if err != nil {
+		t.Fatalf("get_manifest_by_commit failed: %v", err)
+	}
+
+	env, ok := isMarkdownEnvelope(result)
+	if !ok {
+		t.Fatalf("result is not a markdown envelope: %s", result)
+	}
+
+	raw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	var rawManifest storage.ForgeManifest
+	if err := json.Unmarshal(raw, &rawManifest); err != nil {
+		t.Fatalf("raw is not a storage.ForgeManifest: %v\n%s", err, raw)
+	}
+	if rawManifest.ManifestID != "m1" || rawManifest.FilePath != "a.go" {
+		t.Errorf("raw = %+v, want the manifest", rawManifest)
+	}
+
+	if strings.Contains(env.Content, "{") || strings.Contains(env.Content, `"file_path"`) {
+		t.Errorf("content %q must be markdown, not JSON", env.Content)
+	}
+	if !strings.Contains(env.Content, "a.go") {
+		t.Errorf("content %q should mention the file", env.Content)
+	}
+	// Every populated optional field must be present as its own bullet (edict 1031).
+	for _, want := range []string{
+		"**Manifest `m1`** — status: forged",
+		"- **file**: a.go",
+		"- **func**: Foo",
+		"- **edict**: 7 · ling: l1",
+		"- **commit**: abc123",
+		"- **verdict**: v1",
+		"- **content sha**: sha1",
+	} {
+		if !strings.Contains(env.Content, want) {
+			t.Errorf("content %q, want it to contain %q", env.Content, want)
+		}
+	}
+	// Username and project are the query scope, not manifest data (edict 1031).
+	for _, leaked := range []string{manifest.Username, manifest.Project} {
+		if leaked != "" && strings.Contains(env.Content, leaked) {
+			t.Errorf("content %q must not echo query scope %q", env.Content, leaked)
+		}
+	}
+
+	formatted := tool.Format(`{"commit_hash":"abc123"}`, result, nil)
+	if strings.Contains(formatted, "{") || strings.Contains(formatted, `"file_path"`) {
+		t.Errorf("Format output %q must not echo JSON", formatted)
+	}
+	// The Formatted line names the manifest and the commit it was fetched under.
+	if !strings.Contains(formatted, "Manifest m1") || !strings.Contains(formatted, "abc123") {
+		t.Errorf("Format output %q, want it to name the manifest and commit", formatted)
+	}
+}
+
+// TestRenderManifestMarkdown covers the branch matrix of the shared renderer
+// (edict 1031): a sparse record renders no empty bullets, and each optional
+// field is omitted independently when its part is empty.
+func TestRenderManifestMarkdown(t *testing.T) {
+	sparse := renderManifestMarkdown(storage.ForgeManifest{
+		ManifestID: "m2", FilePath: "b.go", Status: storage.ManifestForged,
+	})
+	if !strings.Contains(sparse, "**Manifest `m2`** — status: forged") {
+		t.Errorf("sparse render = %q, want the Manifest header", sparse)
+	}
+	if !strings.Contains(sparse, "- **file**: b.go") {
+		t.Errorf("sparse render = %q, want the file bullet", sparse)
+	}
+	for _, omitted := range []string{"**func**", "**edict**", "ling:", "**commit**", "**verdict**", "**content sha**"} {
+		if strings.Contains(sparse, omitted) {
+			t.Errorf("sparse render = %q must omit %q when the field is empty", sparse, omitted)
+		}
+	}
+
+	// The edict/ling bullet joins only the parts that are present.
+	lingOnly := renderManifestMarkdown(storage.ForgeManifest{
+		ManifestID: "m3", FilePath: "c.go", LingID: "l9",
+	})
+	if !strings.Contains(lingOnly, "- ling: l9") || strings.Contains(lingOnly, "edict") {
+		t.Errorf("lingOnly render = %q, want only the ling part", lingOnly)
+	}
+	edictOnly := renderManifestMarkdown(storage.ForgeManifest{
+		ManifestID: "m4", FilePath: "d.go", EdictID: 5,
+	})
+	if !strings.Contains(edictOnly, "- **edict**: 5") || strings.Contains(edictOnly, "ling:") {
+		t.Errorf("edictOnly render = %q, want only the edict part", edictOnly)
+	}
+}
+
+// TestGetManifestByCommitTool_FormatScopeReport covers the Format branch that
+// surfaces a bare scope report (edict 1031): the scope message is shown and the
+// report's JSON must not leak into the Formatted line.
+func TestGetManifestByCommitTool_FormatScopeReport(t *testing.T) {
+	report := ScopeReport{
+		Rows: 0, Username: "u", Project: "p",
+		Nearby:  []ScopeMatch{{Username: "o", Project: "o/p", Count: 1}},
+		Message: `0 rows for username="u" project="p"; 1 rows exist elsewhere`,
+	}
+	bare, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal scope report: %v", err)
+	}
+
+	got := GetManifestByCommitTool{}.Format(`{"commit_hash":"abc123"}`, string(bare), nil)
+	if !strings.Contains(got, report.Message) {
+		t.Errorf("Format = %q, want it to surface the scope message", got)
+	}
+	if strings.Contains(got, `"rows"`) {
+		t.Errorf("Format = %q must not echo the scope report JSON", got)
+	}
+}
+
 // TestGetManifestByCommitTool_EmptyScopeReportsScope covers edict 968 for the
 // single-row manifest reader: a wrong-scope lookup must not collapse into a bare
 // "manifest not found", while a commit that matches nowhere stays an error.

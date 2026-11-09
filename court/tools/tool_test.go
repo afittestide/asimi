@@ -357,6 +357,48 @@ func TestMarkdownTableEnvelope(t *testing.T) {
 	}
 }
 
+// TestMarkdownEnvelope covers the shared markdown-envelope helper (edict 1031):
+// it emits the opt-in format with the given content and carries raw intact, and
+// a markdown_table envelope is not detected as a markdown envelope.
+func TestMarkdownEnvelope(t *testing.T) {
+	raw := map[string]any{"id": "x1", "n": float64(2)}
+	encoded, err := newMarkdownEnvelope("**Hi**", raw)
+	if err != nil {
+		t.Fatalf("newMarkdownEnvelope: %v", err)
+	}
+
+	env, ok := isMarkdownEnvelope(encoded)
+	if !ok {
+		t.Fatalf("encoded result is not a markdown envelope: %s", encoded)
+	}
+	if env.Format != markdownFormat {
+		t.Errorf("Format = %q, want %q", env.Format, markdownFormat)
+	}
+	if env.Content != "**Hi**" {
+		t.Errorf("Content = %q, want **Hi**", env.Content)
+	}
+
+	gotRaw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(gotRaw, &got); err != nil || got["id"] != "x1" {
+		t.Errorf("raw = %s, want the untouched record", gotRaw)
+	}
+
+	table, err := newMarkdownTableEnvelope("T", []string{"a"}, [][]string{{"1"}}, nil)
+	if err != nil {
+		t.Fatalf("newMarkdownTableEnvelope: %v", err)
+	}
+	if _, ok := isMarkdownEnvelope(table); ok {
+		t.Errorf("a markdown_table envelope must not be detected as a markdown envelope")
+	}
+	if _, ok := isMarkdownEnvelope(`{"legacy":true}`); ok {
+		t.Errorf("a bare record must not be detected as a markdown envelope")
+	}
+}
+
 // TestTableCell covers cell collapsing and truncation.
 func TestTableCell(t *testing.T) {
 	if got := tableCell("  a\n b  ", 100); got != "a b" {

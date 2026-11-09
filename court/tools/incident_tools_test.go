@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/afittestide/asimi/storage"
@@ -204,9 +205,42 @@ func TestGetIncidentTool(t *testing.T) {
 		t.Fatalf("GetIncident failed: %v", err)
 	}
 
+	env, ok := isMarkdownEnvelope(result)
+	if !ok {
+		t.Fatalf("GetIncident result is not a markdown envelope: %s", result)
+	}
+	if !strings.Contains(env.Content, "memory leak") {
+		t.Errorf("Content = %q, want it to contain the description", env.Content)
+	}
+	if !strings.Contains(env.Content, "medium") {
+		t.Errorf("Content = %q, want it to contain the severity", env.Content)
+	}
+	// The rendered block must be the markdown the edict specifies, not merely a
+	// string that happens to carry the description: header and Description
+	// section must both be present.
+	if !strings.Contains(env.Content, "**Incident `"+incident.IncidentID+"`**") {
+		t.Errorf("Content = %q, want the Incident header", env.Content)
+	}
+	if !strings.Contains(env.Content, "**Description**") {
+		t.Errorf("Content = %q, want the Description section", env.Content)
+	}
+	// Username and project are the query scope, not incident data (edict 1031).
+	for _, leaked := range []string{incident.Username, incident.Project} {
+		if leaked != "" && strings.Contains(env.Content, leaked) {
+			t.Errorf("Content = %q must not echo query scope %q", env.Content, leaked)
+		}
+	}
+
+	raw, err := json.Marshal(env.Raw)
+	if err != nil {
+		t.Fatalf("marshal raw: %v", err)
+	}
 	var fetched storage.Incident
-	if err := json.Unmarshal([]byte(result), &fetched); err != nil {
-		t.Fatalf("failed to parse result: %v", err)
+	if err := json.Unmarshal(raw, &fetched); err != nil {
+		t.Fatalf("raw is not a storage.Incident: %v\n%s", err, raw)
+	}
+	if fetched != incident {
+		t.Errorf("raw = %+v, want the identical incident %+v", fetched, incident)
 	}
 	if fetched.Description != "memory leak" {
 		t.Errorf("Description = %q, want %q", fetched.Description, "memory leak")
@@ -216,6 +250,78 @@ func TestGetIncidentTool(t *testing.T) {
 	}
 	if fetched.Status != "open" {
 		t.Errorf("Status = %q, want %q", fetched.Status, "open")
+	}
+
+	formatted := getTool.Format(`{"incident_id":"`+incident.IncidentID+`"}`, result, nil)
+	if strings.Contains(formatted, "{") || strings.Contains(formatted, `"description"`) {
+		t.Errorf("Format output %q must not echo JSON", formatted)
+	}
+	if !strings.Contains(formatted, incident.IncidentID) {
+		t.Errorf("Format output %q should name the incident", formatted)
+	}
+}
+
+// TestRenderIncidentMarkdown covers the branch matrix of the shared renderer
+// (edict 1031): optional short fields are omitted rather than left as empty
+// bullets, a multi-line free-text field is rendered as its own verbatim
+// paragraph instead of being flattened into a bullet, and the optional
+// Root cause/Resolution sections appear only when populated.
+func TestRenderIncidentMarkdown(t *testing.T) {
+	sparse := renderIncidentMarkdown(storage.Incident{
+		IncidentID: "inc-1", Severity: "high", Status: "open",
+		Description: "short one\nline two",
+	})
+	if !strings.Contains(sparse, "**Incident `inc-1`**") ||
+		!strings.Contains(sparse, "severity: `high`") ||
+		!strings.Contains(sparse, "status: `open`") {
+		t.Errorf("sparse render = %q, want the header to carry id, severity and status", sparse)
+	}
+	if strings.Contains(sparse, "**edict**") {
+		t.Errorf("sparse render = %q must omit the edict bullet when EdictID is 0", sparse)
+	}
+	if strings.Contains(sparse, "**commit**") {
+		t.Errorf("sparse render = %q must omit the commit bullet when CommitHash is empty", sparse)
+	}
+	if strings.Contains(sparse, "**Root cause**") || strings.Contains(sparse, "**Resolution**") {
+		t.Errorf("sparse render = %q must omit empty Root cause/Resolution sections", sparse)
+	}
+	// Multi-line free text stays verbatim: no bullet may swallow its second line.
+	if !strings.Contains(sparse, "\nshort one\nline two\n") {
+		t.Errorf("sparse render = %q, want the description as a verbatim paragraph", sparse)
+	}
+
+	full := renderIncidentMarkdown(storage.Incident{
+		IncidentID: "inc-2", Severity: "low", Status: "resolved",
+		EdictID: 1234, CommitHash: "abc123", Description: "d",
+		RootCause: "rc", Resolution: "fix",
+	})
+	for _, want := range []string{"- **edict**: 1234", "- **commit**: abc123", "**Root cause**\nrc", "**Resolution**\nfix"} {
+		if !strings.Contains(full, want) {
+			t.Errorf("full render = %q, want it to contain %q", full, want)
+		}
+	}
+}
+
+// TestGetIncidentTool_FormatScopeReport covers the Format branch that surfaces a
+// bare scope report (edict 1031): the scope message must be shown and the
+// envelope's JSON must not leak into the Formatted line.
+func TestGetIncidentTool_FormatScopeReport(t *testing.T) {
+	report := ScopeReport{
+		Rows: 0, Username: "testuser", Project: "testproject",
+		Nearby:  []ScopeMatch{{Username: "other", Project: "other/proj", Count: 2}},
+		Message: `0 rows for username="testuser" project="testproject"; 2 rows exist elsewhere`,
+	}
+	bare, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal scope report: %v", err)
+	}
+
+	got := GetIncidentTool{}.Format(`{"incident_id":"inc-9"}`, string(bare), nil)
+	if !strings.Contains(got, report.Message) {
+		t.Errorf("Format = %q, want it to surface the scope message", got)
+	}
+	if strings.Contains(got, "{") || strings.Contains(got, `"rows"`) {
+		t.Errorf("Format = %q must not echo the scope report JSON", got)
 	}
 }
 

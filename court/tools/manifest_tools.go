@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/afittestide/asimi/storage"
@@ -468,11 +469,45 @@ func (t GetManifestByCommitTool) Call(ctx context.Context, input string) (string
 		return "", fmt.Errorf("manifest not found for commit: %s", params.CommitHash)
 	}
 
-	result, err := json.MarshalIndent(manifest, "", "  ")
+	env, err := newMarkdownEnvelope(renderManifestMarkdown(manifest), manifest)
 	if err != nil {
 		return "", fmt.Errorf("failed to format manifest: %w", err)
 	}
-	return string(result), nil
+	return env, nil
+}
+
+// renderManifestMarkdown renders a manifest as a markdown block. Optional
+// fields are omitted rather than left as an empty bullet. Username and project
+// are query scope, not manifest data, so they never appear.
+func renderManifestMarkdown(manifest storage.ForgeManifest) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Manifest `%s`** — status: %s\n\n", manifest.ManifestID, manifest.Status)
+
+	fmt.Fprintf(&b, "- **file**: %s\n", manifest.FilePath)
+	if manifest.FuncName != "" {
+		fmt.Fprintf(&b, "- **func**: %s\n", manifest.FuncName)
+	}
+	var scope []string
+	if manifest.EdictID != 0 {
+		scope = append(scope, fmt.Sprintf("**edict**: %d", manifest.EdictID))
+	}
+	if manifest.LingID != "" {
+		scope = append(scope, fmt.Sprintf("ling: %s", manifest.LingID))
+	}
+	if len(scope) > 0 {
+		fmt.Fprintf(&b, "- %s\n", strings.Join(scope, " · "))
+	}
+	if manifest.CommitHash != "" {
+		fmt.Fprintf(&b, "- **commit**: %s\n", manifest.CommitHash)
+	}
+	if manifest.VerdictID != "" {
+		fmt.Fprintf(&b, "- **verdict**: %s\n", manifest.VerdictID)
+	}
+	if manifest.ContentSHA != "" {
+		fmt.Fprintf(&b, "- **content sha**: %s\n", manifest.ContentSHA)
+	}
+	fmt.Fprintf(&b, "- **created**: %s\n", manifest.CreatedAt.Format("2006-01-02 15:04"))
+	return b.String()
 }
 
 func (t GetManifestByCommitTool) ParameterSchema() map[string]any {
@@ -486,8 +521,25 @@ func (t GetManifestByCommitTool) ParameterSchema() map[string]any {
 }
 
 func (t GetManifestByCommitTool) Format(input, result string, err error) string {
+	var params struct {
+		CommitHash string `json:"commit_hash"`
+	}
+	json.Unmarshal([]byte(input), &params)
+
 	if err != nil {
 		return fmt.Sprintf("Get Manifest By Commit: Error: %v\n", err)
 	}
-	return fmt.Sprintf("Get Manifest By Commit: %s\n", result)
+	if scopeMsg, ok := scopeReportMessage(result); ok {
+		return fmt.Sprintf("Get Manifest By Commit: %s\n", scopeMsg)
+	}
+	// A populated lookup carries a markdown envelope; report the id it was
+	// fetched under rather than echoing the envelope's JSON.
+	if _, ok := isMarkdownEnvelope(result); ok {
+		var payload struct {
+			Raw storage.ForgeManifest `json:"raw"`
+		}
+		json.Unmarshal([]byte(result), &payload)
+		return fmt.Sprintf("Get Manifest %s by commit %s\n", payload.Raw.ManifestID, params.CommitHash)
+	}
+	return fmt.Sprintf("Get Manifest by commit %s\n", params.CommitHash)
 }
