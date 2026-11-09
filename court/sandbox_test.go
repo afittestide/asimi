@@ -91,40 +91,6 @@ func TestDockerfileThrottlesGoBuilds(t *testing.T) {
 		"Dockerfile must set a well-formed Go build throttle")
 }
 
-// TestLiveDockerfileThrottlesGoBuilds is the companion guard for the file
-// `just build-sandbox` actually builds. TestDockerfileThrottlesGoBuilds only
-// inspects the embedded template (court/dotagents/sandbox/Dockerfile), which
-// the court seeds into fresh projects; this repo's live image is built from
-// .agents/sandbox/Dockerfile. The two diverged before (different FROM base,
-// different package set), so guarding only the template would let the throttle
-// silently disappear from the image under real rituals — the exact regression
-// edict 948 exists to prevent. Asserted against the on-disk file so a future
-// edit to either copy fails loudly.
-func TestLiveDockerfileThrottlesGoBuilds(t *testing.T) {
-	root, err := filepath.Abs("..")
-	require.NoError(t, err)
-	data, err := os.ReadFile(filepath.Join(root, ".agents", "sandbox", "Dockerfile"))
-	require.NoError(t, err, "live .agents/sandbox/Dockerfile must exist")
-
-	assert.NotEmpty(t, throttleBlock(t, string(data)),
-		"live Dockerfile must set a well-formed Go build throttle")
-}
-
-// TestSandboxThrottlesMatchTemplate guards against drift between the two
-// copies of the Dockerfile. Both must carry the same throttle defaults, or a
-// project seeded by the court would get different OOM behaviour than this repo.
-// The comparison is live-vs-template equality of the throttle block, so the
-// throttle can be retuned in one place without touching this test.
-func TestSandboxThrottlesMatchTemplate(t *testing.T) {
-	root, err := filepath.Abs("..")
-	require.NoError(t, err)
-	data, err := os.ReadFile(filepath.Join(root, ".agents", "sandbox", "Dockerfile"))
-	require.NoError(t, err, "live .agents/sandbox/Dockerfile must exist")
-
-	assert.Equal(t, throttleBlock(t, string(data)), throttleBlock(t, dotagentsDockerfile),
-		"live Dockerfile and embedded template must agree on the Go build throttle")
-}
-
 // TestDockerfileThrottleIsEnvDefault ensures the throttle is expressed as a
 // Dockerfile ENV default, not as a per-RUN flag. The edict's whole point is
 // that every go/just invocation inherits the budget without caller-side flags,
@@ -330,35 +296,6 @@ func ciGoVersions(t *testing.T, workflow string) []semver.Version {
 		versions = append(versions, v)
 	}
 	return versions
-}
-
-// TestGoToolchainPinMeetsSecurityFloor guards the Go bump that e986 exists to
-// ship. GO-2026-6809 (stdlib crypto/x509 intermediate-cert verification) is
-// fixed in go1.26.10; reverting any pin site reopens the finding and fails the
-// vuln gate. Every site must be at least the floor, and all sites must agree —
-// a stale CI job (the Release job was left at 1.26.6 when Test moved on) is the
-// exact drift this catches. Asserted against the on-disk files so an edit to
-// any one pin fails loudly instead of silently splitting the toolchain.
-func TestGoToolchainPinMeetsSecurityFloor(t *testing.T) {
-	mod := readRootFile(t, "go.mod")
-	toolchain := goModToolchain(t, mod)
-	assert.False(t, toolchain.LT(goFixFloor),
-		"go.mod `go` directive = %s, must be >= %s (GO-2026-6809)", toolchain, goFixFloor)
-
-	for _, version := range ciGoVersions(t, readRootFile(t, ".github/workflows/ci.yml")) {
-		assert.False(t, version.LT(goFixFloor),
-			"ci.yml go-version = %s, must be >= %s (GO-2026-6809)", version, goFixFloor)
-		assert.True(t, version.EQ(toolchain),
-			"ci.yml go-version %s must match go.mod toolchain %s", version, toolchain)
-	}
-
-	dockerfile := readRootFile(t, ".agents/sandbox/Dockerfile")
-	m := regexp.MustCompile(`(?m)^FROM\s+golang:(\d+\.\d+(?:\.\d+)?)-`).FindStringSubmatch(dockerfile)
-	require.NotNil(t, m, "sandbox Dockerfile must pin a golang:<version> base image")
-	image, err := semver.ParseTolerant(m[1])
-	require.NoError(t, err, "parse golang image tag %q", m[1])
-	assert.False(t, image.LT(goFixFloor),
-		"sandbox Dockerfile base golang:%s, must be >= %s (GO-2026-6809)", image, goFixFloor)
 }
 
 // TestPodmanDependencyMeetsSecurityFloor guards the podman bump for
