@@ -138,7 +138,6 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	r.Register(RecordPrecedentTool{
 		Ctx: opts.Ctx,
 	}, intentExec)
-	r.Register(ApproveDocTool{}, intentExec)
 }
 
 // registerExtraTools registers static and factory-based extra tools.

@@ -821,7 +821,7 @@ func TestHeadlessSink_SuggestedEdictPrints(t *testing.T) {
 // TestHeadlessSink_EditorRequest_HandsoffAutoApproves verifies that the
 // headless sink handles tools.EditorRequest by auto-approving the content
 // unchanged. In handsoff mode, it must NOT print the document. Without this
-// handler, approve_doc blocks forever on ResultChan and suggest_edict hangs.
+// handler, the suggest_edict editor review blocks forever on ResultChan.
 func TestHeadlessSink_EditorRequest_HandsoffAutoApproves(t *testing.T) {
 	sink := newHeadlessSink(nil)
 	sink.handsoff = true
@@ -837,10 +837,10 @@ func TestHeadlessSink_EditorRequest_HandsoffAutoApproves(t *testing.T) {
 
 	select {
 	case res := <-resultChan:
-		assert.True(t, res.Saved, "editor result should be Saved in handsoff mode")
+		assert.Equal(t, tools.EditorUnchanged, res.Outcome, "handsoff must report the content reviewed unchanged")
 		assert.Equal(t, "large document content >500 chars...", res.Content, "content should be unchanged")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for EditorResult — ApproveDocTool would hang")
+		t.Fatal("timed out waiting for EditorResult — the review helper would hang")
 	}
 
 	// In handsoff mode the document is not printed to stdout.
@@ -868,7 +868,7 @@ func TestHeadlessSink_EditorRequest_NonHandsoffPrints(t *testing.T) {
 
 	select {
 	case res := <-resultCh:
-		assert.True(t, res.Saved, "should auto-approve even when not handsoff")
+		assert.Equal(t, tools.EditorUnchanged, res.Outcome, "headless must report the content reviewed unchanged")
 		assert.Equal(t, "Some document body", res.Content)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for EditorResult")

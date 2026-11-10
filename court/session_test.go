@@ -306,42 +306,42 @@ func TestSession_RegisterCourtTools(t *testing.T) {
 }
 
 // Re-registering a tool must replace its catalog entry and def in place so a
-// session refreshed after late-bound config (e.g. SetNotify repairing
-// approve_doc) never accumulates duplicate definitions.
+// session handed a refreshed tool set never accumulates duplicate definitions.
 func TestSession_RegisterCourtTools_ReplacesInPlace(t *testing.T) {
 	t.Parallel()
 
 	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
 
-	sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{}})
+	sess.RegisterCourtTools([]Tool{&mockTool{name: "runtime_tool", output: "stale"}})
 	before := len(sess.toolDefs)
 
-	sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{Notify: func(any) {}}})
+	refreshed := &mockTool{name: "runtime_tool", output: "fresh"}
+	sess.RegisterCourtTools([]Tool{refreshed})
 
 	assert.Equal(t, before, len(sess.toolDefs), "re-registration must not append a duplicate def")
-	tool, ok := sess.toolCatalog["approve_doc"].(tools.ApproveDocTool)
+	tool, ok := sess.toolCatalog["runtime_tool"].(*mockTool)
 	require.True(t, ok)
-	assert.NotNil(t, tool.Notify, "catalog entry must hold the refreshed instance")
+	assert.Same(t, refreshed, tool, "catalog entry must hold the refreshed instance")
 }
 
-// A runtime refresh (Court.SetNotify re-registering approve_doc) runs
-// concurrently with the streaming goroutine reading toolDefs/toolCatalog.
-// This exercises both sides under -race; it must not report a race.
+// A runtime re-registration runs concurrently with the streaming goroutine
+// reading toolDefs/toolCatalog. This exercises both sides under -race; it must
+// not report a race.
 func TestSession_RegisterCourtTools_ConcurrentWithReaders(t *testing.T) {
 	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
-	sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{}})
+	sess.RegisterCourtTools([]Tool{&mockTool{name: "runtime_tool"}})
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 
-	// Writer: stands in for the SetNotify refresh loop.
+	// Writer: stands in for any late-bound tool refresh.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 200; i++ {
-			sess.RegisterCourtTools([]Tool{tools.ApproveDocTool{Notify: func(any) {}}})
+			sess.RegisterCourtTools([]Tool{&mockTool{name: "runtime_tool", output: "fresh"}})
 		}
 		close(stop)
 	}()
@@ -359,7 +359,7 @@ func TestSession_RegisterCourtTools_ConcurrentWithReaders(t *testing.T) {
 			}
 			sess.toolDefsSnapshot()
 			sess.updateTokenCounts()
-			_, _ = sess.lookupTool("approve_doc")
+			_, _ = sess.lookupTool("runtime_tool")
 		}
 	}()
 

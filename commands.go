@@ -87,6 +87,7 @@ func NewCommandRegistry() CommandRegistry {
 	registry.RegisterCommand("edicts", "Manage edicts: read, enact, seal, resume, or cancel (usage: :edict [id] [enact|seal|resume|cancel])", handleEdictCommand)
 	registry.RegisterCommand("continue", "Resume a paused ritual on the current tab", handleContinueCommand)
 	registry.RegisterCommand("abort", "Abort a paused ritual on the current tab", handleAbortCommand)
+	registry.RegisterCommand("gates", "List the Ruler requests awaiting an answer", handleGatesCommand)
 	registry.RegisterCommand("switch", "Switch to a branch or edict worktree (usage: :switch <main|e123|branch>)", handleSwitchCommand)
 
 	return registry
@@ -1065,6 +1066,68 @@ func handleAbortCommand(model *TUIModel, args []string) tea.Cmd {
 	return nil
 }
 
+// handleGatesCommand lists the Ruler gates the TUI is holding open. It answers
+// "what is still waiting for me?" without relying on a single prompt slot: it
+// reports every gate held by each tab's prompt — active or queued — plus any
+// request the Court persisted as pending that this session never surfaced
+// (e.g. a suggestion raised while the TUI was reconnecting). The prompt is the
+// authoritative record: a gate open on a minister tab is listed even though no
+// ritual channel ever registered it.
+//
+// Nothing is marked answered here — a pending request stays pending until the
+// Ruler acts on it or the Court dismisses it with a named reason.
+func handleGatesCommand(model *TUIModel, args []string) tea.Cmd {
+	if model.court == nil {
+		model.commandLine.AddToast("Court not active", "error", 3*time.Second)
+		return nil
+	}
+
+	var b strings.Builder
+	b.WriteString(systemPrefix + "Ruler requests awaiting an answer:")
+	b.WriteString("\n")
+
+	// Gates held in the UI, per tab's prompt.
+	open := 0
+	listed := make(map[string]bool)
+	for target, p := range model.prompts {
+		if p == nil {
+			continue
+		}
+		active := p.ActiveAnsweringRequest()
+		for _, requestID := range p.OpenRulerRequests() {
+			if listed[requestID] {
+				continue
+			}
+			listed[requestID] = true
+			open++
+			marker := "  "
+			if requestID == active {
+				marker = "▶ "
+			}
+			b.WriteString(fmt.Sprintf("  %s%s  (channel %s)", marker, requestID, target))
+			b.WriteString("\n")
+		}
+	}
+
+	// Requests the Court still holds as pending that no prompt is showing.
+	if snap := model.court.TakeSnapshot(); len(snap.Zhengming) > 0 {
+		for _, z := range snap.Zhengming {
+			if listed[z.RequestID] {
+				continue
+			}
+			listed[z.RequestID] = true
+			open++
+			b.WriteString(fmt.Sprintf("  · %s  %s asks: %s", z.RequestID, z.MinisterID, strings.Join(z.Questions, "; ")))
+			b.WriteString("\n")
+		}
+	}
+
+	if open == 0 {
+		return func() tea.Msg { return showSystemMsg("No Ruler requests awaiting an answer.") }
+	}
+	return func() tea.Msg { return showSystemMsg(b.String()) }
+}
+
 // resolveSwitchTarget maps a `:switch` target to its branch and worktree.
 // It is a variable so tests can drive the handler without invoking git.
 var resolveSwitchTarget = func(ctx context.Context, root, target string) (worktree.ResolvedTarget, error) {
@@ -1277,7 +1340,10 @@ func showEdictActionMenu(model *TUIModel, edictID uint) tea.Cmd {
 		},
 		Answers: []string{""},
 	}
-	model.prompt().EnterAnsweringMode(state)
+	// The menu is a local affordance, not a Ruler request: ShowMenu keeps it in
+	// its own slot so opening it can neither retire a pending request nor be
+	// counted, listed, or switched to as one.
+	model.prompt().ShowMenu(state)
 	return nil
 }
 

@@ -433,11 +433,12 @@ type Session struct {
 
 	// Tool execution.
 	//
-	// toolMu guards toolCatalog and toolDefs. Sessions are normally
-	// constructed on a single goroutine, but Court.SetNotify can re-register
-	// approve_doc at runtime (daemon reconnect / mid-session subscribe) while
-	// the streaming goroutine reads the same state, so both the read sites
-	// below and RegisterCourtTools must hold the lock.
+	// toolMu guards toolCatalog and toolDefs. In production the catalog is
+	// built once in NewSession, so the lock is defensive: RegisterCourtTools is
+	// the only writer and exposes an in-place refresh, and the streaming paths
+	// below read the same state. Holding the lock keeps that contract honest for
+	// any caller that re-registers a tool set after construction instead of
+	// relying on construction order.
 	toolMu      sync.RWMutex
 	toolCatalog map[string]Tool
 	toolDefs    []schemas.ChatTool
@@ -692,11 +693,11 @@ func (s *Session) AddMessage(role schemas.ChatMessageRole, content string) {
 
 // RegisterCourtTools adds court-specific tools to the session's tool catalog.
 // Re-registering a tool with the same name replaces it in place (catalog entry
-// and tool definition) instead of appending a duplicate def, so a session
-// refreshed after late-bound configuration (e.g. SetNotify) stays consistent.
+// and tool definition) instead of appending a duplicate def, so a session that
+// is handed a refreshed tool set stays consistent.
 //
 // Safe for concurrent use with the streaming goroutine: holds toolMu so a
-// live refresh from Court.SetNotify cannot race the readers below.
+// live re-registration cannot race the readers below.
 func (s *Session) RegisterCourtTools(tools []Tool) {
 	s.toolMu.Lock()
 	defer s.toolMu.Unlock()
@@ -738,12 +739,6 @@ func (s *Session) lookupTool(name string) (Tool, bool) {
 	defer s.toolMu.RUnlock()
 	tool, ok := s.toolCatalog[name]
 	return tool, ok
-}
-
-// hasTool reports whether the session exposes a tool with the given name.
-func (s *Session) hasTool(name string) bool {
-	_, ok := s.lookupTool(name)
-	return ok
 }
 
 // toolDef builds the LLM-facing definition for a tool.

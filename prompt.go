@@ -32,19 +32,27 @@ const (
 
 // PromptComponent represents the user input text area
 type PromptComponent struct {
-	TextArea       textarea.Model
-	Placeholder    string
-	Height         int
-	Width          int
-	MaxHeight      int // Maximum height (50% of screen height)
-	ScreenHeight   int // Total screen height
-	ExpandedHeight int // Height to grow to when multiline (default: 10)
-	Style          lipgloss.Style
-	ViCurrentMode  string // Current vi mode: insert, normal, or command
-	viPendingOp    string // Track pending operation (e.g., "d" or "c")
-	viNormalKeyMap textarea.KeyMap
-	viInsertKeyMap textarea.KeyMap
-	answering      *AnsweringState // non-nil when in answering mode
+	TextArea         textarea.Model
+	Placeholder      string
+	Height           int
+	Width            int
+	MaxHeight        int // Maximum height (50% of screen height)
+	ScreenHeight     int // Total screen height
+	ExpandedHeight   int // Height to grow to when multiline (default: 10)
+	Style            lipgloss.Style
+	ViCurrentMode    string // Current vi mode: insert, normal, or command
+	viPendingOp      string // Track pending operation (e.g., "d" or "c")
+	viNormalKeyMap   textarea.KeyMap
+	viInsertKeyMap   textarea.KeyMap
+	answering        *AnsweringState   // currently rendered answering state
+	pendingAnswering []*AnsweringState // Ruler requests waiting to be rendered
+	// pendingMenu holds at most one local UI affordance (the edict action
+	// menu) that is not on screen. It lives in its own slot, never in the
+	// Ruler-request queue: a menu is not a decision awaiting an answer, so it
+	// must not be counted, listed, or selected as one — and it must not be able
+	// to strand the request set. At most one is kept, so reopening the menu
+	// refreshes it instead of stacking duplicates.
+	pendingMenu *AnsweringState
 }
 
 // SubmitPromptMsg is a message sent when the user submits a prompt
@@ -70,7 +78,6 @@ type AnsweringChatMsg struct {
 	RequestID string
 }
 
-// TODO: replace the next couple of messages with tools.ApproveDocTool
 // AnsweringEditMsg is emitted when the user selects "Edit" to edit a question in $EDITOR
 type AnsweringEditMsg struct {
 	RequestID string
@@ -91,6 +98,12 @@ type AnsweringState struct {
 	Questions []AnsweringQuestion
 	Answers   []string // collected answers
 	Current   int      // index of current question being answered
+	// NotARequest marks a local answering state that is not a Court
+	// zhengming request (the edict action menu): it is a UI affordance, not a
+	// decision awaiting the Ruler's answer. Such states are shown but never
+	// counted or listed as open Ruler requests, and answering them is not an
+	// answer to any request.
+	NotARequest bool
 }
 
 // AnsweringQuestion holds a single question with selectable options
@@ -290,7 +303,7 @@ func (p *PromptComponent) CalculateDesiredHeight() int {
 
 	// Return to minimum height (2 lines) when prompt is cleared (empty)
 	if value == "" {
-		return 2
+		return p.withParkedHint(2)
 	}
 
 	// Calculate the number of visual lines (accounting for word wrap)
@@ -312,7 +325,7 @@ func (p *PromptComponent) CalculateDesiredHeight() int {
 
 	// Return to minimum height (2 lines) when content fits in a single line
 	if visualLines <= 1 {
-		return 2
+		return p.withParkedHint(2)
 	}
 
 	// When content is more than one line, grow to ExpandedHeight
@@ -326,7 +339,20 @@ func (p *PromptComponent) CalculateDesiredHeight() int {
 		return p.MaxHeight
 	}
 
-	return expandedHeight
+	return p.withParkedHint(expandedHeight)
+}
+
+// withParkedHint grows a desired height by the rendered parked-gate hint line,
+// so the hint cannot push the layout past its allotted space.
+func (p PromptComponent) withParkedHint(height int) int {
+	if p.PendingAnsweringCount() == 0 {
+		return height
+	}
+	height++
+	if p.MaxHeight > 0 && height > p.MaxHeight {
+		return p.MaxHeight
+	}
+	return height
 }
 
 // SetValue sets the text value of the prompt
@@ -427,7 +453,13 @@ func (p PromptComponent) ViModeStatus() (enabled bool, mode string, pending stri
 	return true, p.ViCurrentMode, p.viPendingOp
 }
 
-// HandleZhengmingPending parses a ZhengmingPendingMsg and enters answering mode
+// HandleZhengmingPending parses a ZhengmingPendingMsg and states it in
+// answering mode.
+//
+// It never clobbers an unanswered request: if another gate is already open, the
+// new one is queued behind it and becomes active when the current one is
+// resolved. A Ruler gate may only be considered satisfied when the Ruler acted
+// on that specific request, so dropping one on the floor is not allowed.
 func (p *PromptComponent) HandleZhengmingPending(msg court.ZhengmingPendingMsg) {
 	aq := make([]AnsweringQuestion, len(msg.Questions))
 	for i, q := range msg.Questions {
@@ -438,17 +470,169 @@ func (p *PromptComponent) HandleZhengmingPending(msg court.ZhengmingPendingMsg) 
 		}
 	}
 
-	state := &AnsweringState{
+	p.ShowAnswering(&AnsweringState{
 		RequestID: msg.RequestID,
 		Title:     fmt.Sprintf("Zhengming: %s asks", msg.MinisterID),
 		Questions: aq,
 		Answers:   make([]string, len(aq)),
-	}
-	p.EnterAnsweringMode(state)
+	})
 }
 
-// EnterAnsweringMode switches to answering mode with the given state
+// hasPending reports whether requestID is already queued.
+func (p *PromptComponent) hasPending(requestID string) bool {
+	for _, st := range p.pendingAnswering {
+		if st.RequestID == requestID {
+			return true
+		}
+	}
+	return false
+}
+
+// PendingAnsweringCount returns how many Ruler requests are open behind the one
+// on screen. This is the number the Ruler is told is waiting. A local affordance
+// lives in its own slot and is never counted.
+func (p *PromptComponent) PendingAnsweringCount() int {
+	return len(p.pendingAnswering)
+}
+
+// RotateAnswering switches the screen to the next (or previous) open request,
+// sending the one on screen to the back of the queue. Every open request is
+// therefore selectable: a Ruler facing several pending decisions can choose
+// which to answer first instead of being forced through them in arrival order.
+// When no request is on screen (the Ruler parked the last one, or a local menu
+// is showing) rotation brings a request back. Reports whether anything changed.
+func (p *PromptComponent) RotateAnswering(forward bool) bool {
+	if p.answering == nil || p.answering.NotARequest {
+		if len(p.pendingAnswering) == 0 {
+			return false
+		}
+		p.pendingMenu = nil // a request takes the screen; the menu is regenerable
+		next := p.pendingAnswering[0]
+		p.pendingAnswering = p.pendingAnswering[1:]
+		p.activateAnswering(next)
+		return true
+	}
+	if len(p.pendingAnswering) == 0 {
+		return false
+	}
+	if forward {
+		p.pendingAnswering = append(p.pendingAnswering, p.answering)
+		p.answering = p.pendingAnswering[0]
+		p.pendingAnswering = p.pendingAnswering[1:]
+	} else {
+		last := p.pendingAnswering[len(p.pendingAnswering)-1]
+		p.pendingAnswering = p.pendingAnswering[:len(p.pendingAnswering)-1]
+		p.pendingAnswering = append([]*AnsweringState{p.answering}, p.pendingAnswering...)
+		p.answering = last
+	}
+	p.viPendingOp = ""
+	p.syncAnsweringMode()
+	return true
+}
+
+// ActiveAnsweringRequest returns the Ruler request on screen, or "" when none is
+// (nothing is open, a request is only parked, or a local menu is showing).
+func (p *PromptComponent) ActiveAnsweringRequest() string {
+	if p.answering == nil || p.answering.NotARequest {
+		return ""
+	}
+	return p.answering.RequestID
+}
+
+// OpenAnsweringRequests returns the IDs of every state this prompt holds — the
+// one on screen first, then queued requests, then a held local affordance. Used
+// to assert nothing was silently dropped.
+func (p *PromptComponent) OpenAnsweringRequests() []string {
+	var out []string
+	if p.answering != nil {
+		out = append(out, p.answering.RequestID)
+	}
+	for _, st := range p.pendingAnswering {
+		out = append(out, st.RequestID)
+	}
+	if p.pendingMenu != nil {
+		out = append(out, p.pendingMenu.RequestID)
+	}
+	return out
+}
+
+// OpenRulerRequests returns the IDs of the Ruler requests this prompt holds — on
+// screen or queued. This is what "awaiting the Ruler's answer" means; local UI
+// states are excluded by construction.
+func (p *PromptComponent) OpenRulerRequests() []string {
+	var out []string
+	if p.answering != nil && !p.answering.NotARequest {
+		out = append(out, p.answering.RequestID)
+	}
+	for _, st := range p.pendingAnswering {
+		out = append(out, st.RequestID)
+	}
+	return out
+}
+
+// ShowAnswering states a Ruler request without clobbering an open one. A request
+// always outranks a local affordance for the screen: the newcomer is shown and a
+// menu is moved to its own slot. If another request already owns the screen the
+// newcomer is queued behind it, so a new request can never retire an unanswered
+// one.
+func (p *PromptComponent) ShowAnswering(state *AnsweringState) {
+	if state == nil {
+		return
+	}
+	if p.answering == nil {
+		p.activateAnswering(state)
+		return
+	}
+	if p.answering.NotARequest {
+		p.pendingMenu = p.answering
+		p.activateAnswering(state)
+		return
+	}
+	if p.answering.RequestID == state.RequestID || p.hasPending(state.RequestID) {
+		return
+	}
+	p.pendingAnswering = append(p.pendingAnswering, state)
+}
+
+// EnterAnsweringMode displays a state. Local affordances (NotARequest) are
+// routed through ShowMenu so they can never masquerade as a request; real
+// requests go through ShowAnswering, which preserves anything already open.
 func (p *PromptComponent) EnterAnsweringMode(state *AnsweringState) {
+	if state == nil {
+		return
+	}
+	if state.NotARequest {
+		p.ShowMenu(state)
+		return
+	}
+	p.ShowAnswering(state)
+}
+
+// ShowMenu shows a local UI affordance (the edict action menu). It is not a
+// Ruler request: it lives in its own slot, is never counted, listed, or selected
+// as one, and can neither displace an open request nor be stranded by the
+// request set. A request always keeps the screen; the menu waits in the slot and
+// is dropped as soon as no request needs the screen (it is regenerable with
+// :edict). At most one menu is retained, so reopening refreshes it.
+func (p *PromptComponent) ShowMenu(state *AnsweringState) {
+	if state == nil {
+		return
+	}
+	state.NotARequest = true
+	if p.answering == nil {
+		p.activateAnswering(state)
+		return
+	}
+	if p.answering.NotARequest {
+		p.activateAnswering(state)
+		return
+	}
+	// A request owns the screen: hold the menu aside without displacing it.
+	p.pendingMenu = state
+}
+
+// activateAnswering makes state the one on screen.
+func (p *PromptComponent) activateAnswering(state *AnsweringState) {
 	p.answering = state
 	p.ViCurrentMode = ViModeAnswering
 	p.viPendingOp = ""
@@ -456,11 +640,115 @@ func (p *PromptComponent) EnterAnsweringMode(state *AnsweringState) {
 	p.Style = p.Style.BorderForeground(globalTheme.PromptOnBorder)
 }
 
-// ExitAnsweringMode leaves answering mode and returns to insert mode
-func (p *PromptComponent) ExitAnsweringMode() {
-	p.answering = nil
+// promoteNextAnswering brings the next queued request on screen when none is.
+// When no request remains the prompt returns to the typable state and any held
+// menu is discarded, so no state is ever held while nothing is shown.
+func (p *PromptComponent) promoteNextAnswering() {
+	if p.answering != nil {
+		return
+	}
+	if len(p.pendingAnswering) > 0 {
+		next := p.pendingAnswering[0]
+		p.pendingAnswering = p.pendingAnswering[1:]
+		p.pendingMenu = nil
+		p.activateAnswering(next)
+		return
+	}
+	p.pendingMenu = nil
 	p.EnterViInsertMode()
 	p.TextArea.Focus()
+}
+
+// syncAnsweringMode makes the prompt's vi mode match whether something is on
+// screen.
+func (p *PromptComponent) syncAnsweringMode() {
+	if p.answering != nil {
+		p.ViCurrentMode = ViModeAnswering
+		p.TextArea.Blur()
+		p.Style = p.Style.BorderForeground(globalTheme.PromptOnBorder)
+		return
+	}
+	p.EnterViInsertMode()
+	p.TextArea.Focus()
+}
+
+// ParkAnswering takes requestID off screen without retiring it: the Ruler chose
+// an intermediate action (Edit / Chat) and has not acted on the request yet. The
+// request stays open. If another request is queued it takes the screen so it
+// stays visible and reachable; the parked request goes to the back of the queue.
+// When it is the only open request, the typable prompt answers it.
+func (p *PromptComponent) ParkAnswering(requestID string) {
+	if p.answering == nil || p.answering.RequestID != requestID {
+		return
+	}
+	parked := p.answering
+	p.answering = nil
+	// The parked request must not be re-promoted onto the screen it just left:
+	// only a *different* waiting request may take over.
+	if len(p.pendingAnswering) > 0 {
+		next := p.pendingAnswering[0]
+		p.pendingAnswering = p.pendingAnswering[1:]
+		p.pendingAnswering = append(p.pendingAnswering, parked)
+		p.pendingMenu = nil
+		p.activateAnswering(next)
+		return
+	}
+	p.pendingAnswering = append(p.pendingAnswering, parked)
+	p.pendingMenu = nil
+	p.EnterViInsertMode()
+	p.TextArea.Focus()
+}
+
+// ResumeAnswering brings a parked request back on screen. It never clobbers a
+// request that arrived while the editor was open: if one is on screen, the
+// resumed request stays queued so both remain open.
+func (p *PromptComponent) ResumeAnswering(requestID string) {
+	idx := -1
+	for i, st := range p.pendingAnswering {
+		if st.RequestID == requestID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return // already on screen, or not ours to resume
+	}
+	resumed := p.pendingAnswering[idx]
+	p.pendingAnswering = append(p.pendingAnswering[:idx], p.pendingAnswering[idx+1:]...)
+	if p.answering == nil || p.answering.NotARequest {
+		p.pendingMenu = nil
+		p.activateAnswering(resumed)
+		return
+	}
+	p.pendingAnswering = append(p.pendingAnswering, resumed)
+}
+
+// ResolveAnswering retires requestID — the Ruler acted on it (answered,
+// cancelled, or rewrote it). If it was on screen and another request is queued,
+// that one takes the screen so it stays answerable; otherwise the prompt returns
+// to the typable state. A menu is discarded rather than revived, so nothing is
+// ever held while nothing is shown.
+func (p *PromptComponent) ResolveAnswering(requestID string) {
+	p.pendingAnswering = removeAnswering(p.pendingAnswering, requestID)
+	if p.pendingMenu != nil && p.pendingMenu.RequestID == requestID {
+		p.pendingMenu = nil
+	}
+	if p.answering == nil || p.answering.RequestID != requestID {
+		return
+	}
+	p.answering = nil
+	p.promoteNextAnswering()
+}
+
+// removeAnswering returns states without requestID.
+func removeAnswering(states []*AnsweringState, requestID string) []*AnsweringState {
+	out := states[:0]
+	for _, st := range states {
+		if st.RequestID != requestID {
+			out = append(out, st)
+		}
+	}
+	return out
 }
 
 // UpdateAnsweringQuestion updates the current question's text and resets selection
@@ -765,6 +1053,19 @@ func (p PromptComponent) Update(msg interface{}) (PromptComponent, tea.Cmd) {
 		if p.answering != nil {
 			return p.updateAnswering(keyMsg)
 		}
+		// No gate is on screen but some are parked (the Ruler chose Chat or
+		// Edit on the last one). Offer the same switch keys so those gates stay
+		// reachable instead of becoming invisible.
+		if p.PendingAnsweringCount() > 0 {
+			switch keyMsg.String() {
+			case "ctrl+n":
+				p.RotateAnswering(true)
+				return p, nil
+			case "ctrl+p":
+				p.RotateAnswering(false)
+				return p, nil
+			}
+		}
 		if p.IsViInsertMode() || p.IsViNormalMode() {
 			// Shift+Enter inserts a newline instead of submitting
 			if keyMsg.Type == tea.KeyEnter && keyMsg.Alt {
@@ -851,6 +1152,12 @@ func (p PromptComponent) View() string {
 		return p.viewAnswering()
 	}
 	content := p.TextArea.View()
+	// Parked gates are still open requests. Say so on the typable prompt so the
+	// Ruler knows a decision is outstanding and how to get back to it.
+	if n := p.PendingAnsweringCount(); n > 0 {
+		hint := fmt.Sprintf("⏳ %d Ruler request(s) awaiting an answer — ctrl+n to switch, :gates to list", n)
+		content = hint + "\n" + content
+	}
 	return p.Style.Render(wordwrap.String(content, p.Width))
 }
 
@@ -872,8 +1179,14 @@ func (p PromptComponent) viewAnswering() string {
 	}
 
 	var b strings.Builder
-	// Title
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render(a.Title))
+	// Title. A queued-request count keeps further open requests visible: they are
+	// not hidden behind the one on screen, they are simply answered in turn. The
+	// count speaks only of Ruler requests — a local affordance is never "waiting".
+	title := a.Title
+	if n := p.PendingAnsweringCount(); n > 0 {
+		title = fmt.Sprintf("%s (+%d waiting)", title, n)
+	}
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(title))
 	b.WriteByte('\n')
 	// Question text (prefer summary for compact display)
 	displayText := q.Text
@@ -935,6 +1248,13 @@ func (p PromptComponent) updateAnswering(keyMsg tea.KeyMsg) (PromptComponent, te
 		return p.advanceAnswer(q.Options[q.Selected])
 	case "esc":
 		return p, func() tea.Msg { return AnsweringCancelMsg{RequestID: a.RequestID} }
+	case "ctrl+n":
+		// Switch to the next open gate (see RotateAnswering).
+		p.RotateAnswering(true)
+		return p, nil
+	case "ctrl+p":
+		p.RotateAnswering(false)
+		return p, nil
 	}
 	return p, nil
 }

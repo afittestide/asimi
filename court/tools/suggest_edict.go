@@ -11,7 +11,7 @@ import (
 
 // SuggestEdictTool routes an edict suggestion to the Ruler via Zhengming.
 // For suggestions over 500 chars, the Ruler reviews them in $EDITOR first
-// (via ApproveDocTool); shorter ones go straight to a Zhengming prompt.
+// (via reviewInEditor); shorter ones go straight to a Zhengming prompt.
 //
 // Sage never creates edicts directly — only the Ruler does.
 //
@@ -73,42 +73,30 @@ func (t SuggestEdictTool) Call(ctx context.Context, input string) (string, error
 		questionText = fmt.Sprintf("%s\n\nEvidence: %s", params.Suggestion, params.Evidence)
 	}
 
-	// Large suggestions get an $EDITOR review pass via approve_doc before they
-	// hit Zhengming. The Ruler can :wq to forward as-is, edit and :wq to bounce
-	// it back to the Sage, or :q! to reject outright.
+	// Large suggestions get an $EDITOR review pass before they hit Zhengming.
+	// The Ruler can :wq to forward as-is, edit and :wq to bounce it back to
+	// the Sage, or — when the host can establish it — :q! to reject outright.
+	// An unchanged document is a reviewed document: it falls through to
+	// Zhengming exactly as before.
 	var notify func(any)
 	if t.NotifyFn != nil {
 		notify = t.NotifyFn()
 	}
 	if len(questionText) > 500 && notify != nil {
-		approveTool := ApproveDocTool{Notify: notify}
-		approveInput := map[string]any{
-			"content":     questionText,
-			"description": "Review edict suggestion before submission",
-		}
-		approveInputJSON, _ := json.Marshal(approveInput)
-		approveResult, err := approveTool.Call(ctx, string(approveInputJSON))
+		review, err := reviewInEditor(ctx, notify, questionText, "edict_suggestion.md")
 		if err != nil {
-			return "", fmt.Errorf("approve_doc failed: %w", err)
+			return "", fmt.Errorf("editor review failed: %w", err)
 		}
 
-		var approveRes struct {
-			Status  string `json:"status"`
-			Diff    string `json:"diff,omitempty"`
-			Content string `json:"content,omitempty"`
-		}
-		if err := json.Unmarshal([]byte(approveResult), &approveRes); err != nil {
-			return "", fmt.Errorf("failed to parse approve_doc result: %w", err)
-		}
-
-		if approveRes.Status == "modified" {
+		if review.Status == reviewModified {
 			originalJSON, _ := json.Marshal(questionText)
-			modifiedJSON, _ := json.Marshal(approveRes.Content)
-			diffJSON, _ := json.Marshal(approveRes.Diff)
+			modifiedJSON, _ := json.Marshal(review.Content)
+			diffJSON, _ := json.Marshal(review.Diff)
 			return fmt.Sprintf(`{"status":"ruler_modified","original":%s,"modified":%s,"diff":%s}`,
 				originalJSON, modifiedJSON, diffJSON), nil
 		}
-		// approved or rejected → fall through to zhengming with the original text
+		// approved, or a deliberate rejection → fall through to zhengming with
+		// the original text. The Court records the Ruler's answer.
 	}
 
 	questions := storage.ZhengmingQuestions{{

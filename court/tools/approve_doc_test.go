@@ -5,212 +5,271 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/afittestide/asimi/storage"
 )
 
-func TestApproveDocTool(t *testing.T) {
-	t.Run("validates content is required", func(t *testing.T) {
-		tool := ApproveDocTool{Notify: func(any) {}}
-		_, err := tool.Call(context.Background(), `{}`)
-		if err == nil {
-			t.Fatal("expected error when content is missing")
+// reviewWith runs reviewInEditor with a fake notify that replies with res.
+func reviewWith(t *testing.T, content string, res EditorResult) (editorReview, error) {
+	t.Helper()
+	notify := func(msg any) {
+		req, ok := msg.(EditorRequest)
+		if !ok {
+			return
 		}
-		if err.Error() != "content is required" {
-			t.Fatalf("expected 'content is required' error, got: %v", err)
-		}
-	})
+		req.ResultChan <- res
+	}
+	return reviewInEditor(context.Background(), notify, content, "doc.md")
+}
 
-	t.Run("rejects when user quits without saving", func(t *testing.T) {
-		tool := ApproveDocTool{Notify: func(msg any) {
-			req, ok := msg.(EditorRequest)
-			if !ok {
-				return
-			}
-			req.ResultChan <- EditorResult{Saved: false}
-		}}
-
-		input := map[string]any{"content": "untouched", "description": "Test review"}
-		inputJSON, _ := json.Marshal(input)
-		result, err := tool.Call(context.Background(), string(inputJSON))
+func TestReviewInEditor(t *testing.T) {
+	t.Run("unchanged content is reviewed, not rejected", func(t *testing.T) {
+		// Regression guard for incident bf31225394b5997b: an editor that exits
+		// without writing (lost tty, non-interactive $EDITOR, :q!) leaves the
+		// bytes untouched. That is not a decision the Ruler made.
+		review, err := reviewWith(t, "untouched", EditorResult{Outcome: EditorUnchanged})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		var res struct {
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal([]byte(result), &res); err != nil {
-			t.Fatalf("failed to parse result: %v", err)
-		}
-		if res.Status != "rejected" {
-			t.Fatalf("expected status 'rejected', got: %s", res.Status)
+		if review.Status != reviewApproved {
+			t.Fatalf("expected status %q, got %q", reviewApproved, review.Status)
 		}
 	})
 
-	t.Run("approves when saved without changes", func(t *testing.T) {
-		original := "This is test content that will not be modified"
-		tool := ApproveDocTool{Notify: func(msg any) {
-			req, ok := msg.(EditorRequest)
-			if !ok {
-				return
-			}
-			req.ResultChan <- EditorResult{Content: req.Content, Saved: true}
-		}}
-
-		input := map[string]any{"content": original, "description": "Test review"}
-		inputJSON, _ := json.Marshal(input)
-		result, err := tool.Call(context.Background(), string(inputJSON))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		var res struct {
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal([]byte(result), &res); err != nil {
-			t.Fatalf("failed to parse result: %v", err)
-		}
-		if res.Status != "approved" {
-			t.Fatalf("expected status 'approved', got: %s", res.Status)
-		}
-	})
-
-	t.Run("returns modified content and diff when edited", func(t *testing.T) {
+	t.Run("modified content returns the diff", func(t *testing.T) {
 		original := "alpha\nbeta\ngamma\n"
 		edited := "alpha\nBETA\ngamma\n"
-		tool := ApproveDocTool{Notify: func(msg any) {
-			req, ok := msg.(EditorRequest)
-			if !ok {
-				return
-			}
-			req.ResultChan <- EditorResult{Content: edited, Saved: true}
-		}}
-
-		input := map[string]any{"content": original}
-		inputJSON, _ := json.Marshal(input)
-		result, err := tool.Call(context.Background(), string(inputJSON))
+		review, err := reviewWith(t, original, EditorResult{Content: edited, Outcome: EditorModified})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		var res struct {
-			Status  string `json:"status"`
-			Diff    string `json:"diff"`
-			Content string `json:"content"`
+		if review.Status != reviewModified {
+			t.Fatalf("expected status %q, got %q", reviewModified, review.Status)
 		}
-		if err := json.Unmarshal([]byte(result), &res); err != nil {
-			t.Fatalf("failed to parse result: %v", err)
+		if review.Content != edited {
+			t.Fatalf("expected modified content roundtrip, got: %q", review.Content)
 		}
-		if res.Status != "modified" {
-			t.Fatalf("expected status 'modified', got: %s", res.Status)
+		if !strings.Contains(review.Diff, "BETA") {
+			t.Fatalf("expected diff to contain BETA, got: %s", review.Diff)
 		}
-		if res.Content != edited {
-			t.Fatalf("expected modified content roundtrip, got: %q", res.Content)
+	})
+
+	t.Run("modified outcome with identical bytes is approved", func(t *testing.T) {
+		// An editor that rewrites the file byte-for-byte changed nothing.
+		review, err := reviewWith(t, "same", EditorResult{Content: "same", Outcome: EditorModified})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
-		if !strings.Contains(res.Diff, "BETA") {
-			t.Fatalf("expected diff to contain BETA, got: %s", res.Diff)
+		if review.Status != reviewApproved {
+			t.Fatalf("expected status %q, got %q", reviewApproved, review.Status)
+		}
+	})
+
+	t.Run("deliberate discard is a rejection", func(t *testing.T) {
+		review, err := reviewWith(t, "untouched", EditorResult{Outcome: EditorDiscarded})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if review.Status != reviewRejected {
+			t.Fatalf("expected status %q, got %q", reviewRejected, review.Status)
+		}
+	})
+
+	t.Run("editor launch failure is an error, not a status", func(t *testing.T) {
+		_, err := reviewWith(t, "x", EditorResult{Outcome: EditorFailed, Err: assertError("exec: vi: not found")})
+		if err == nil {
+			t.Fatal("expected error when the editor fails to launch")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("expected the launch failure to survive, got: %v", err)
+		}
+	})
+
+	t.Run("no outcome is an error, never an approval", func(t *testing.T) {
+		if _, err := reviewWith(t, "x", EditorResult{}); err == nil {
+			t.Fatal("expected an error when the host reports no outcome")
 		}
 	})
 
 	t.Run("requires notify", func(t *testing.T) {
-		noNotify := ApproveDocTool{}
-		_, err := noNotify.Call(context.Background(), `{"content":"test"}`)
-		if err == nil {
+		if _, err := reviewInEditor(context.Background(), nil, "test", ""); err == nil {
 			t.Fatal("expected error when notify is nil")
 		}
 	})
 
-	t.Run("works when notify is installed after construction", func(t *testing.T) {
-		// Mirrors the Court's late binding: the tool is constructed as a
-		// zero-value placeholder, then the live callback is set once known.
-		tool := ApproveDocTool{}
-		tool.Notify = func(msg any) {
-			req, ok := msg.(EditorRequest)
-			if !ok {
-				return
-			}
-			req.ResultChan <- EditorResult{Content: req.Content, Saved: true}
-		}
-
-		input := map[string]any{"content": "late-bound notify"}
-		inputJSON, _ := json.Marshal(input)
-		result, err := tool.Call(context.Background(), string(inputJSON))
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		var res struct {
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal([]byte(result), &res); err != nil {
-			t.Fatalf("failed to parse result: %v", err)
-		}
-		if res.Status != "approved" {
-			t.Fatalf("expected status 'approved', got: %s", res.Status)
-		}
-	})
-
-	t.Run("parameter schema is valid", func(t *testing.T) {
-		tool := ApproveDocTool{Notify: func(any) {}}
-		schema := tool.ParameterSchema()
-		if schema == nil {
-			t.Fatal("expected non-nil schema")
-		}
-
-		props, ok := schema["properties"].(map[string]any)
-		if !ok {
-			t.Fatal("expected properties to be a map")
-		}
-
-		if _, ok := props["content"]; !ok {
-			t.Error("expected 'content' property in schema")
-		}
-		if _, ok := props["filename"]; !ok {
-			t.Error("expected 'filename' property in schema")
-		}
-		if _, ok := props["description"]; !ok {
-			t.Error("expected 'description' property in schema")
-		}
-
-		required, ok := schema["required"].([]string)
-		if !ok {
-			t.Fatal("expected required to be a slice of strings")
-		}
-		if len(required) != 1 || required[0] != "content" {
-			t.Fatalf("expected ['content'] as required, got: %v", required)
+	t.Run("context cancellation aborts the review", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := reviewInEditor(ctx, func(any) {}, "test", "")
+		if err == nil {
+			t.Fatal("expected ctx cancellation error")
 		}
 	})
 }
 
-func TestApproveDocToolFormat(t *testing.T) {
-	tool := ApproveDocTool{}
+// reviewRequester records the zhengming requests raised after the review pass.
+type reviewRequester struct {
+	asked []storage.ZhengmingQuestions
+}
 
-	t.Run("formats approved result", func(t *testing.T) {
-		input := `{"content": "test", "description": "Test review"}`
-		result := `{"status": "approved"}`
+func (r *reviewRequester) RequestZhengming(ctx context.Context, key storage.EdictKey, questions storage.ZhengmingQuestions, priority storage.ZhengmingPriority, callerMinisterID string) (string, error) {
+	r.asked = append(r.asked, questions)
+	return "req-1", nil
+}
 
-		output := tool.Format(input, result, nil)
-		if output == "" {
-			t.Fatal("expected non-empty output")
-		}
-	})
+// TestSuggestEdictLargePayloadUnchangedFallsThrough verifies that an unchanged
+// review still reaches the Ruler as a zhengming prompt: no phantom rejection,
+// no skipped review, and suggest_edict's three-way contract is unchanged.
+func TestSuggestEdictLargePayloadUnchangedFallsThrough(t *testing.T) {
+	body := strings.Repeat("evidence line\n", 50) // >500 chars
+	requester := &reviewRequester{}
+	tool := SuggestEdictTool{
+		Ctx:       testCtx(),
+		Requester: requester,
+		NotifyFn: func() func(any) {
+			return func(msg any) {
+				req, ok := msg.(EditorRequest)
+				if !ok {
+					return
+				}
+				req.ResultChan <- EditorResult{Outcome: EditorUnchanged}
+			}
+		},
+	}
 
-	t.Run("formats rejected result", func(t *testing.T) {
-		input := `{"content": "test", "description": "Test review"}`
-		result := `{"status": "rejected"}`
+	input, _ := json.Marshal(map[string]any{"suggestion": body, "summary": "large suggestion"})
+	result, err := tool.Call(context.Background(), string(input))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var res struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(result), &res); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if res.Status != "suggested" {
+		t.Fatalf("expected unchanged review to fall through to zhengming, got %q", res.Status)
+	}
+	if len(requester.asked) != 1 {
+		t.Fatalf("expected exactly one zhengming request, got %d", len(requester.asked))
+	}
+}
 
-		output := tool.Format(input, result, nil)
-		if output == "" {
-			t.Fatal("expected non-empty output")
-		}
-		if !strings.Contains(output, "Rejected") {
-			t.Fatalf("expected 'Rejected' in output, got: %s", output)
-		}
-	})
+// TestSuggestEdictLargePayloadEditorFailure verifies a real editor failure is
+// surfaced as an error rather than being reported as a rejection.
+func TestSuggestEdictLargePayloadEditorFailure(t *testing.T) {
+	body := strings.Repeat("evidence line\n", 50)
+	requester := &reviewRequester{}
+	tool := SuggestEdictTool{
+		Ctx:       testCtx(),
+		Requester: requester,
+		NotifyFn: func() func(any) {
+			return func(msg any) {
+				req, ok := msg.(EditorRequest)
+				if !ok {
+					return
+				}
+				req.ResultChan <- EditorResult{Outcome: EditorFailed, Err: assertError("no tty")}
+			}
+		},
+	}
 
-	t.Run("formats error result", func(t *testing.T) {
-		input := `{"content": "test"}`
-		output := tool.Format(input, "", assertError("test error"))
+	input, _ := json.Marshal(map[string]any{"suggestion": body, "summary": "large suggestion"})
+	if _, err := tool.Call(context.Background(), string(input)); err == nil {
+		t.Fatal("expected editor failure to surface as an error")
+	}
+	if len(requester.asked) != 0 {
+		t.Fatalf("a failed review must not raise a zhengming request")
+	}
+}
 
-		if output == "" {
-			t.Fatal("expected non-empty output")
-		}
-	})
+// TestSuggestEdictLargePayloadModifiedBouncesBack verifies the ruler_modified
+// contract survives the refactor: an edited suggestion returns the diff and
+// never reaches zhengming.
+func TestSuggestEdictLargePayloadModifiedBouncesBack(t *testing.T) {
+	original := strings.Repeat("original line\n", 50)
+	edited := strings.Repeat("edited line\n", 50)
+	requester := &reviewRequester{}
+	tool := SuggestEdictTool{
+		Ctx:       testCtx(),
+		Requester: requester,
+		NotifyFn: func() func(any) {
+			return func(msg any) {
+				req, ok := msg.(EditorRequest)
+				if !ok {
+					return
+				}
+				req.ResultChan <- EditorResult{Content: edited, Outcome: EditorModified}
+			}
+		},
+	}
+
+	input, _ := json.Marshal(map[string]any{"suggestion": original, "summary": "large suggestion"})
+	result, err := tool.Call(context.Background(), string(input))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var res struct {
+		Status   string `json:"status"`
+		Modified string `json:"modified"`
+		Diff     string `json:"diff"`
+	}
+	if err := json.Unmarshal([]byte(result), &res); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if res.Status != "ruler_modified" {
+		t.Fatalf("expected status 'ruler_modified', got %q", res.Status)
+	}
+	if res.Modified != edited {
+		t.Fatal("modified content must round-trip")
+	}
+	if !strings.Contains(res.Diff, "edited line") {
+		t.Fatalf("expected the diff to carry the edit, got: %s", res.Diff)
+	}
+	if len(requester.asked) != 0 {
+		t.Fatalf("a modified suggestion must bounce back to the Sage, not reach zhengming")
+	}
+}
+
+// TestSuggestEdictLargePayloadDiscardStillReachesZhengming verifies a
+// deliberate discard keeps its meaning: the review reports a rejection and
+// suggest_edict's three-way branch is unchanged (it still falls through to
+// zhengming with the original text, and the Court records the Ruler's answer).
+func TestSuggestEdictLargePayloadDiscardStillReachesZhengming(t *testing.T) {
+	body := strings.Repeat("evidence line\n", 50)
+	requester := &reviewRequester{}
+	tool := SuggestEdictTool{
+		Ctx:       testCtx(),
+		Requester: requester,
+		NotifyFn: func() func(any) {
+			return func(msg any) {
+				req, ok := msg.(EditorRequest)
+				if !ok {
+					return
+				}
+				req.ResultChan <- EditorResult{Outcome: EditorDiscarded}
+			}
+		},
+	}
+
+	input, _ := json.Marshal(map[string]any{"suggestion": body, "summary": "large suggestion"})
+	result, err := tool.Call(context.Background(), string(input))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var res struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(result), &res); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+	if res.Status != "suggested" {
+		t.Fatalf("discard must fall through to zhengming, got %q", res.Status)
+	}
+	if len(requester.asked) != 1 || requester.asked[0][0].Text != body {
+		t.Fatal("zhengming must carry the original suggestion text")
+	}
 }
 
 // assertError is a helper for tests

@@ -3305,7 +3305,7 @@ func TestInitRitualWithLLM_E2E(t *testing.T) {
 	tm := teatest.NewTestModel(t, tuiModel, teatest.WithInitialTermSize(200, 50))
 	// Intercept EditorRequest messages before they reach the TUI — teatest's
 	// tea.ExecProcess does not run external commands, so any tool that sends an
-	// EditorRequest (e.g. sage.suggest_edict → approve_doc for large payloads)
+	// EditorRequest (e.g. sage.suggest_edict → editor review for large payloads)
 	// would otherwise block forever waiting on ResultChan.
 	c.SetNotify(func(msg any) {
 		if req, ok := msg.(tools.EditorRequest); ok {
@@ -3898,6 +3898,7 @@ type mockCourtClient struct {
 	ensuredWorktreeIDs []uint
 
 	setIntentFn             func(uint, string) error
+	snapshot                court.Snapshot
 	submitPromptTarget      string
 	submitPromptMsg         string
 	submitPromptChanID      string
@@ -4025,6 +4026,10 @@ func (m *mockCourtClient) CancelTab(channelID string) {
 
 func (m *mockCourtClient) SessionState(target string) court.SessionState {
 	return court.SessionState{}
+}
+
+func (m *mockCourtClient) TakeSnapshot() court.Snapshot {
+	return m.snapshot
 }
 
 // repoSwitchedMsgRefresh verifies the TUI swallows the switch completion
@@ -5215,6 +5220,394 @@ func TestAnsweringChatMsg_ArmsCaptureThenSubmitsAsAnswer(t *testing.T) {
 	resp := mock.zhengmingResponses[0]
 	assert.Equal(t, "req-capture-1", resp.requestID)
 	assert.Equal(t, "my typed reply", resp.answer)
+}
+
+// TestAnsweringChatMsg_KeepsGateOpenVerifies choosing Chat is not an answer:
+// the request stays open and answerable, and submitting the typed text retires
+// it.
+func TestAnsweringChatMsg_KeepsGateOpen(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.SwitchToTabType("ritual")
+	model.setPendingZhengming("e42", "gate-chat")
+
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-chat",
+		ChannelID:  "e42",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "Which?", Summary: "Which?", Options: []string{"A", "B"}}},
+	})
+
+	newModel, _ := model.handleCustomMessages(AnsweringChatMsg{RequestID: "gate-chat"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	assert.Contains(t, updated.prompt().OpenAnsweringRequests(), "gate-chat",
+		"choosing Chat must not retire the gate")
+	assert.Equal(t, []string{"gate-chat"}, updated.pendingZhengmingOn("e42"),
+		"the request must still be recorded as awaiting an answer")
+
+	newModel, _ = updated.handleCustomMessages(SubmitPromptMsg{Prompt: "here is my answer"})
+	updated, ok = newModel.(TUIModel)
+	require.True(t, ok)
+
+	assert.NotContains(t, updated.prompt().OpenAnsweringRequests(), "gate-chat",
+		"submitting the chat answer retires the gate")
+	assert.Empty(t, updated.pendingZhengmingOn("e42"))
+	require.Len(t, mock.zhengmingResponses, 1)
+	assert.Equal(t, "here is my answer", mock.zhengmingResponses[0].answer)
+}
+
+// TestAnsweringReplyGoesToTheActiveGate verifies a typed reply is delivered to
+// the gate the Ruler is actually looking at. With two requests open, the channel
+// map orders them by arrival, so routing a reply by "oldest open" answers a
+// request the Ruler never acted on and leaves the one they were reading open.
+func TestAnsweringReplyGoesToTheActiveGate(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.SwitchToTabType("ritual")
+
+	for _, id := range []string{"gate-1", "gate-2"} {
+		msg := court.ZhengmingPendingMsg{
+			RequestID:  id,
+			ChannelID:  "e42",
+			MinisterID: "secretary",
+			Questions:  storage.ZhengmingQuestions{{Text: id, Summary: id, Options: []string{"Approve edict", "Reject"}}},
+		}
+		newModel, _ := model.handleCustomMessages(msg)
+		updated, ok := newModel.(TUIModel)
+		require.True(t, ok)
+		model = &updated
+	}
+
+	// The Ruler switches to the second gate (ctrl+n) and types a reply.
+	require.True(t, model.prompt().RotateAnswering(true))
+	require.Equal(t, "gate-2", model.prompt().ActiveAnsweringRequest())
+
+	newModel, _ := model.handleCustomMessages(SubmitPromptMsg{Prompt: "answer about gate-2"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	require.Len(t, mock.zhengmingResponses, 1)
+	assert.Equal(t, "gate-2", mock.zhengmingResponses[0].requestID,
+		"the reply belongs to the gate the Ruler was answering, not the oldest open one")
+	assert.Contains(t, updated.prompt().OpenAnsweringRequests(), "gate-1",
+		"the untouched gate must still be open")
+	assert.Equal(t, []string{"gate-1"}, updated.pendingZhengmingOn("e42"))
+}
+
+// TestAnsweringChatReplyGoesToTheChattedGate verifies the Chat-capture sentinel
+// wins over the arrival-order channel map. Choosing Chat on the second of two
+// open gates and then typing must answer *that* gate, not the oldest one.
+func TestAnsweringChatReplyGoesToTheChattedGate(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.SwitchToTabType("ritual")
+
+	for _, id := range []string{"gate-1", "gate-2"} {
+		newModel, _ := model.handleCustomMessages(court.ZhengmingPendingMsg{
+			RequestID:  id,
+			ChannelID:  "e42",
+			MinisterID: "secretary",
+			Questions:  storage.ZhengmingQuestions{{Text: id, Summary: id, Options: []string{"Approve edict", "Reject"}}},
+		})
+		updated, ok := newModel.(TUIModel)
+		require.True(t, ok)
+		model = &updated
+	}
+
+	require.True(t, model.prompt().RotateAnswering(true))
+	newModel, _ := model.handleCustomMessages(AnsweringChatMsg{RequestID: "gate-2"})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	newModel, _ = updated.handleCustomMessages(SubmitPromptMsg{Prompt: "a remark about gate-2"})
+	updated, ok = newModel.(TUIModel)
+	require.True(t, ok)
+
+	require.Len(t, mock.zhengmingResponses, 1)
+	assert.Equal(t, "gate-2", mock.zhengmingResponses[0].requestID,
+		"the chat reply must answer the gate the Ruler chatted about")
+	assert.Equal(t, []string{"gate-1"}, updated.pendingZhengmingOn("e42"),
+		"answering gate-2 must not retire gate-1")
+	assert.Contains(t, updated.prompt().OpenAnsweringRequests(), "gate-1",
+		"gate-1 must remain answerable after the chat reply retires gate-2")
+}
+
+// TestChatSentinelRetiredWithItsGate verifies the Chat-capture sentinel dies
+// with the request it points at. Choosing Chat arms the sentinel so the next
+// submission answers that gate. If the Ruler then returns to the gate (ctrl+n)
+// and answers it with an option, the sentinel must be retired too — otherwise the
+// Ruler's *next* prompt is silently swallowed and recorded as another answer to a
+// request that is already resolved, appending a fresh instruction to that edict's
+// intent (court/minister.go HandleZhengmingResponse → AppendToIntent).
+func TestChatSentinelRetiredWithItsGate(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.SwitchToTabType("ritual")
+
+	newModel, _ := model.handleCustomMessages(court.ZhengmingPendingMsg{
+		RequestID:  "gate-1",
+		ChannelID:  "e42",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "q", Summary: "q", Options: []string{"Approve edict", "Reject"}}},
+	})
+	current, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	// 1. The Ruler chooses Chat: the sentinel is armed for gate-1.
+	newModel, _ = current.handleCustomMessages(AnsweringChatMsg{RequestID: "gate-1"})
+	current, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	require.Equal(t, "gate-1", current.pendingZhengmingChatRequestID,
+		"choosing Chat must arm the sentinel")
+
+	// 2. The Ruler comes back to the gate with ctrl+n and answers it.
+	ci := current.prompt()
+	updated, _ := ci.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+	*current.prompt() = updated
+	require.Equal(t, "gate-1", current.prompt().ActiveAnsweringRequest(),
+		"ctrl+n must return to the parked gate")
+
+	newModel, _ = current.handleCustomMessages(AnsweredMsg{RequestID: "gate-1", Answers: []string{"Approve edict"}})
+	current, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	require.Empty(t, current.prompt().OpenAnsweringRequests(), "the answer retires the gate")
+
+	assert.Empty(t, current.pendingZhengmingChatRequestID,
+		"the Chat sentinel must not outlive the gate it was armed for: a stale sentinel answers a resolved request with the Ruler's next prompt")
+
+	// 3. A brand-new instruction must reach the Court as a prompt, not vanish
+	//    into an already-resolved request.
+	newModel, _ = current.handleCustomMessages(SubmitPromptMsg{Prompt: "start a brand new task"})
+	current, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	for _, r := range mock.zhengmingResponses {
+		assert.NotEqual(t, "start a brand new task", r.answer,
+			"an unrelated prompt must not be delivered as an answer to %q", r.requestID)
+	}
+}
+
+// TestMinisterTabGateIsAnswerableByTyping verifies a gate routed to a minister
+// tab behaves like a ritual-tab gate: it is recorded against that tab and a typed
+// reply is delivered as its answer rather than starting a new turn.
+func TestMinisterTabGateIsAnswerableByTyping(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Secretary", "minister", "secretary")
+	model.tabs.SwitchToTabType("minister")
+
+	newModel, _ := model.handleCustomMessages(court.ZhengmingPendingMsg{
+		RequestID:  "gate-min",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "q", Summary: "q", Options: []string{"A", "B"}}},
+	})
+	current, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Equal(t, []string{"gate-min"}, current.pendingZhengmingOn("secretary"),
+		"a minister-tab gate must be recorded against its tab")
+
+	newModel, _ = current.handleCustomMessages(SubmitPromptMsg{Prompt: "my answer"})
+	current, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	require.Len(t, mock.zhengmingResponses, 1)
+	assert.Equal(t, "gate-min", mock.zhengmingResponses[0].requestID)
+	assert.Equal(t, "my answer", mock.zhengmingResponses[0].answer)
+	assert.Empty(t, current.prompt().OpenAnsweringRequests(),
+		"answering the gate retires it")
+}
+
+// TestGatesCommandDeduplicatesSnapshot verifies a gate the session already holds
+// is listed once even when the Court also reports it as pending. Double-counting
+// would overstate what is waiting for the Ruler.
+func TestGatesCommandDeduplicatesSnapshot(t *testing.T) {
+	model := newTestModel(t)
+	model.court = &mockCourtClient{
+		snapshot: court.Snapshot{
+			Zhengming: []court.ZhengmingEntry{
+				{RequestID: "gate-known", MinisterID: "secretary"},
+				{RequestID: "gate-daemon-only", MinisterID: "secretary"},
+			},
+		},
+	}
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Secretary", "minister", "secretary")
+	model.tabs.SwitchToTabType("minister")
+	model.setPendingZhengming("secretary", "gate-known")
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-known",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "q", Summary: "q", Options: []string{"A"}}},
+	})
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(showContextMsg)
+	require.True(t, ok)
+	assert.Equal(t, 1, strings.Count(msg.content, "gate-known"),
+		"a gate held by the session must be listed once, not twice: %s", msg.content)
+	assert.Contains(t, msg.content, "gate-daemon-only",
+		"a request only the Court knows about must still be listed")
+}
+
+// TestGatesCommandListsNonRitualChannelGates verifies :gates reports every open
+// gate, not only those recorded in the ritual-channel map. An ask_ruler gate on
+// a minister tab is open in the prompt too; a list that omits it answers "what
+// is still waiting for me?" wrongly.
+func TestGatesCommandListsNonRitualChannelGates(t *testing.T) {
+	model := newTestModel(t)
+	model.court = &mockCourtClient{}
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Secretary", "minister", "secretary")
+	model.tabs.SwitchToTabType("minister")
+
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-ask-ruler",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "Which?", Summary: "Which?", Options: []string{"A", "B"}}},
+	})
+	require.Equal(t, []string{"gate-ask-ruler"}, model.prompt().OpenAnsweringRequests())
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(showContextMsg)
+	require.True(t, ok)
+	assert.Contains(t, msg.content, "gate-ask-ruler",
+		"a gate open in the prompt must be listed even when it is not on a ritual channel")
+	assert.Contains(t, model.prompt().OpenAnsweringRequests(), "gate-ask-ruler",
+		"listing gates must not answer anything")
+}
+
+// TestEdictActionMenuDoesNotClobberOpenGate verifies that opening the edict
+// action menu cannot silently retire a pending Ruler request. The menu is an
+// action on an edict, not an answer to a zhengming.
+func TestEdictActionMenuDoesNotClobberOpenGate(t *testing.T) {
+	model := newTestModel(t)
+	model.court = &mockCourtClient{}
+	model.tabs.DismissWelcome()
+
+	// A Ruler gate is open and being answered.
+	model.setPendingZhengming("secretary", "gate-open")
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-open",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "Proceed?", Summary: "Proceed?", Options: []string{"Yes", "No"}}},
+	})
+	require.Equal(t, "gate-open", model.prompt().ActiveAnsweringRequest())
+
+	// The Ruler opens the edict action menu.
+	showEdictActionMenu(model, 42)
+
+	open := model.prompt().OpenAnsweringRequests()
+	assert.Contains(t, open, "gate-open", "the menu must not retire an open gate")
+	assert.Len(t, open, 2, "both the gate and the menu must be open: %v", open)
+}
+
+// TestEdictMenuNeverStrandsTheRulerRequestSet is the guard for the debris the
+// non-clobbering menu introduced: a menu is held as an AnsweringState beside real
+// requests, so retiring the gate it was queued behind can leave the menu as the
+// only remaining state with no active gate — an invisible, unreachable screen
+// while the typable prompt invites input. The Ruler-request set must never be
+// stranded by a local affordance, and a gate arriving afterwards must still be
+// the one on screen.
+func TestEdictMenuNeverStrandsTheRulerRequestSet(t *testing.T) {
+	model := newTestModel(t)
+	model.court = &mockCourtClient{}
+	model.tabs.DismissWelcome()
+
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-1",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "q", Summary: "q", Options: []string{"A", "B"}}},
+	})
+	// Reachable sequence: park the gate (Chat), open the edict menu over it,
+	// switch back to the gate, then answer it.
+	model.prompt().ParkAnswering("gate-1")
+	showEdictActionMenu(model, 42)
+	require.True(t, model.prompt().RotateAnswering(true))
+	require.Equal(t, "gate-1", model.prompt().ActiveAnsweringRequest())
+
+	newModel, _ := model.handleCustomMessages(AnsweredMsg{RequestID: "gate-1", Answers: []string{"A"}})
+	current, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	if left := current.prompt().OpenAnsweringRequests(); len(left) > 0 {
+		assert.NotEmpty(t, current.prompt().ActiveAnsweringRequest(),
+			"no state may be held while none is shown: left=%v", left)
+	}
+	assert.Empty(t, current.prompt().OpenAnsweringRequests(),
+		"the menu was a local affordance queued behind the gate; it must not outlive it invisibly")
+
+	// A Ruler request arriving now must still take the screen.
+	newModel, _ = current.handleCustomMessages(court.ZhengmingPendingMsg{
+		RequestID:  "gate-2",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "q2", Summary: "q2", Options: []string{"A", "B"}}},
+	})
+	current, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Equal(t, "gate-2", current.prompt().ActiveAnsweringRequest(),
+		"a new Ruler request must be the gate on screen")
+	assert.Equal(t, []string{"gate-2"}, current.prompt().OpenRulerRequests())
+}
+
+// TestGatesCountNeverCountsTheEdictMenu verifies the visible waiting count speaks
+// only of Ruler requests. The menu queued beside a real gate must not be added to
+// "(+N waiting)"; overstating the number of decisions pending is the same class of
+// error as understating it.
+func TestGatesCountNeverCountsTheEdictMenu(t *testing.T) {
+	prompt := NewPromptComponent(80, 10)
+	prompt.HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-1",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "q", Summary: "q", Options: []string{"A", "B"}}},
+	})
+	prompt.EnterAnsweringMode(&AnsweringState{
+		RequestID:   "edict-42",
+		Title:       "Edict 42",
+		Questions:   []AnsweringQuestion{{Text: "Choose", Summary: "Choose", Options: []string{"Status"}}},
+		Answers:     []string{""},
+		NotARequest: true,
+	})
+
+	// gate-1 is active and the menu is queued: nothing is *waiting*.
+	require.Equal(t, "gate-1", prompt.ActiveAnsweringRequest())
+	renderTitle := func() string {
+		for _, line := range strings.Split(stripANSI(prompt.View()), "\n") {
+			line = strings.Trim(line, "│ ")
+			if strings.Contains(line, "Edict") || strings.Contains(line, "Zhengming") {
+				return line
+			}
+		}
+		return ""
+	}
+	if got := prompt.PendingAnsweringCount(); got != 0 {
+		t.Fatalf("nothing is waiting behind the active gate; count=%d", got)
+	}
+	title := renderTitle()
+	require.Contains(t, title, "Zhengming", "title line must be found: view=%q", stripANSI(prompt.View()))
+	assert.NotContains(t, title, "waiting",
+		"the title must not claim a waiting request when only the menu is queued")
 }
 
 // TestAnsweringChatMsg_EdictMenu_DispatchesChatAction verifies that selecting
@@ -7555,19 +7948,240 @@ func TestZhengmingPendingMsg_ChannelFallsBackToMinister(t *testing.T) {
 		"missing channel tab should fall back to the minister's tab")
 }
 
+// TestZhengmingPendingMsg_SecondGateDoesNotEraseFirst is defect B's end-to-end
+// regression guard: when the Secretary suggests two documents in a row, both
+// gates must exist on the same channel and both must remain answerable. The
+// second must not overwrite the first in either the prompt or the channel map.
+func TestZhengmingPendingMsg_SecondGateDoesNotEraseFirst(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.SwitchToTabType("ritual")
+
+	first := court.ZhengmingPendingMsg{
+		RequestID:  "zhengming-first",
+		ChannelID:  "e42",
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "First suggestion", Summary: "First?", Options: []string{"Approve edict", "Reject"}},
+		},
+	}
+	second := court.ZhengmingPendingMsg{
+		RequestID:  "zhengming-second",
+		ChannelID:  "e42",
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{
+			{Text: "Second suggestion", Summary: "Second?", Options: []string{"Approve edict", "Reject"}},
+		},
+	}
+
+	m1, _ := model.handleCustomMessages(first)
+	afterFirst, ok := m1.(TUIModel)
+	require.True(t, ok)
+	m2, _ := afterFirst.handleCustomMessages(second)
+	afterSecond, ok := m2.(TUIModel)
+	require.True(t, ok)
+	model = &afterSecond
+
+	prompt := model.prompt()
+	require.NotNil(t, prompt.answering, "a gate should be active")
+	assert.Equal(t, "zhengming-first", prompt.answering.RequestID,
+		"the first gate must not be displaced by the second")
+	assert.Equal(t, 1, prompt.PendingAnsweringCount(),
+		"the second gate must be held, not dropped")
+
+	// Both are still recorded as awaiting an answer on the channel.
+	assert.Equal(t, []string{"zhengming-first", "zhengming-second"}, model.pendingZhengmingOn("e42"))
+
+	// Answering the first surfaces the second, and only the answered one is
+	// cleared from the channel map.
+	m3, _ := model.handleCustomMessages(AnsweredMsg{RequestID: "zhengming-first", Answers: []string{"Approve edict"}})
+	afterAnswer, ok := m3.(TUIModel)
+	require.True(t, ok)
+	model = &afterAnswer
+
+	require.NotNil(t, model.prompt().answering, "the second gate must still be answerable")
+	assert.Equal(t, "zhengming-second", model.prompt().answering.RequestID)
+	assert.Equal(t, []string{"zhengming-second"}, model.pendingZhengmingOn("e42"))
+}
+
+// TestEditorResultMsg_UnchangedBytesIsUnchanged is the incident's regression
+// guard at the TUI boundary: an editor that exits without writing leaves the
+// bytes intact, and that must be reported as unchanged — never as a discard.
+func TestEditorResultMsg_UnchangedBytesIsUnchanged(t *testing.T) {
+	model := newTestModel(t)
+
+	path := filepath.Join(t.TempDir(), "review.md")
+	content := []byte("the document the ruler was shown")
+	require.NoError(t, os.WriteFile(path, content, 0o644))
+
+	resultChan := make(chan tools.EditorResult, 1)
+	msg := editorResultMsg{
+		ResultChan: resultChan,
+		TmpPath:    path,
+		OrigBytes:  content,
+	}
+
+	_, _ = model.handleCustomMessages(msg)
+	select {
+	case res := <-resultChan:
+		assert.Equal(t, tools.EditorUnchanged, res.Outcome, "unchanged bytes are an unchanged review")
+		assert.Nil(t, res.Err)
+	case <-time.After(time.Second):
+		t.Fatal("no editor result delivered")
+	}
+}
+
+// TestEditorResultMsg_ModifiedBytesIsModified verifies an edited-and-saved
+// document still yields its new content.
+func TestEditorResultMsg_ModifiedBytesIsModified(t *testing.T) {
+	model := newTestModel(t)
+
+	path := filepath.Join(t.TempDir(), "review.md")
+	require.NoError(t, os.WriteFile(path, []byte("alpha\nBETA\n"), 0o644))
+
+	resultChan := make(chan tools.EditorResult, 1)
+	msg := editorResultMsg{
+		ResultChan: resultChan,
+		TmpPath:    path,
+		OrigBytes:  []byte("alpha\nbeta\n"),
+	}
+
+	_, _ = model.handleCustomMessages(msg)
+	select {
+	case res := <-resultChan:
+		assert.Equal(t, tools.EditorModified, res.Outcome)
+		assert.Equal(t, "alpha\nBETA\n", res.Content)
+	case <-time.After(time.Second):
+		t.Fatal("no editor result delivered")
+	}
+}
+
+// TestEditorResultMsg_EditorFailureIsError verifies a real editor failure
+// (missing binary, failed tea.ExecProcess, sandbox death) stays an error and is
+// never reported as a status.
+func TestEditorResultMsg_EditorFailureIsError(t *testing.T) {
+	model := newTestModel(t)
+
+	resultChan := make(chan tools.EditorResult, 1)
+	msg := editorResultMsg{
+		ResultChan: resultChan,
+		TmpPath:    filepath.Join(t.TempDir(), "review.md"),
+		OrigBytes:  []byte("whatever"),
+		Err:        errors.New("exec: vi: not found"),
+	}
+
+	_, _ = model.handleCustomMessages(msg)
+	select {
+	case res := <-resultChan:
+		assert.Equal(t, tools.EditorFailed, res.Outcome)
+		require.Error(t, res.Err, "a launch failure must stay an error")
+	case <-time.After(time.Second):
+		t.Fatal("no editor result delivered")
+	}
+}
+
+// TestGatesCommandSurfacesEveryOpenRequest verifies the Ruler can ask "what is
+// still waiting for me?" and see every gate — the active one, the queued ones,
+// and any request the Court persisted that this session never surfaced.
+func TestGatesCommandSurfacesEveryOpenRequest(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{
+		snapshot: court.Snapshot{
+			Zhengming: []court.ZhengmingEntry{
+				{RequestID: "daemon-only-gate", MinisterID: "secretary", Questions: []string{"Persisted while reconnecting"}},
+			},
+		},
+	}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("Ritual:e42", "ritual", "e42")
+	model.tabs.SwitchToTabType("ritual")
+
+	for _, id := range []string{"gate-1", "gate-2"} {
+		model.setPendingZhengming("e42", id)
+	}
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-1",
+		ChannelID:  "e42",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "First", Summary: "First?", Options: []string{"Approve edict"}}},
+	})
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-2",
+		ChannelID:  "e42",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "Second", Summary: "Second?", Options: []string{"Approve edict"}}},
+	})
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(showContextMsg)
+	require.True(t, ok, "expected the gate list to render as a system message")
+	for _, want := range []string{"gate-1", "gate-2", "daemon-only-gate"} {
+		assert.Contains(t, msg.content, want, "every open gate must be listed")
+	}
+
+	// Listing must not answer anything: both gates remain open.
+	assert.Equal(t, []string{"gate-1", "gate-2"}, model.pendingZhengmingOn("e42"))
+	assert.Equal(t, "gate-1", model.prompt().ActiveAnsweringRequest(),
+		"listing gates must not change which gate is active")
+}
+
+// TestGatesCommandReportsNonePending covers the clean case.
+func TestGatesCommandReportsNonePending(t *testing.T) {
+	model := newTestModel(t)
+	model.court = &mockCourtClient{}
+	model.tabs.DismissWelcome()
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(showContextMsg)
+	require.True(t, ok)
+	assert.Contains(t, msg.content, "No Ruler requests awaiting an answer")
+}
+
+// TestAnsweringEditDone_UnchangedKeepsGateOpen verifies an editor round-trip
+// that changed nothing does not retire a gate the Ruler never acted on.
+func TestAnsweringEditDone_UnchangedKeepsGateOpen(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+
+	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+		RequestID:  "gate-1",
+		ChannelID:  "secretary",
+		MinisterID: "secretary",
+		Questions:  storage.ZhengmingQuestions{{Text: "Proceed?", Summary: "Proceed?", Options: []string{"Yes", "No"}}},
+	})
+
+	newModel, _ := model.handleCustomMessages(AnsweringEditDoneMsg{
+		RequestID:        "gate-1",
+		Question:         "Proceed?",
+		OriginalQuestion: "Proceed?",
+	})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	require.NotNil(t, updated.prompt().answering, "an unchanged edit must not close the gate")
+	assert.Equal(t, "gate-1", updated.prompt().ActiveAnsweringRequest())
+	assert.Empty(t, mock.zhengmingResponses, "no answer was given, so nothing may be recorded")
+}
+
 // --- Handsoff mode tests ---
 
 // TestHandsoff_EditorRequest_AutoApproves verifies that in handsoff mode an
 // EditorRequest is auto-approved without opening $EDITOR. Without this guard
 // the TUI would spawn $EDITOR even in handsoff, blocking on interactive input
-// while approve_doc (→ suggest_edict for large payloads) waits on ResultChan.
+// while the suggest_edict editor review waits on ResultChan.
 func TestHandsoff_EditorRequest_AutoApproves(t *testing.T) {
 	model := newTestModel(t)
 	model.handsoff = true
 
 	resultChan := make(chan tools.EditorResult, 1)
 	msg := tools.EditorRequest{
-		Content:    "Proposed edict content exceeding 500 characters so it routes through approve_doc instead of the direct zhengming path...",
+		Content:    "Proposed edict content exceeding 500 characters so it routes through the editor review instead of the direct zhengming path...",
 		Filename:   "suggested_edict.md",
 		ResultChan: resultChan,
 	}
@@ -7579,10 +8193,10 @@ func TestHandsoff_EditorRequest_AutoApproves(t *testing.T) {
 
 	select {
 	case res := <-resultChan:
-		assert.True(t, res.Saved, "editor result should be Saved in handsoff mode")
+		assert.Equal(t, tools.EditorUnchanged, res.Outcome, "handsoff must report the content reviewed unchanged")
 		assert.Equal(t, msg.Content, res.Content, "content should be returned unchanged")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for EditorResult — ApproveDocTool would hang")
+		t.Fatal("timed out waiting for EditorResult — the review helper would hang")
 	}
 
 	// The TUI model is unchanged (no editor state to update in handsoff).

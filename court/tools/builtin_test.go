@@ -223,8 +223,11 @@ func TestRegisterBuiltinToolsIntentExecute(t *testing.T) {
 	tools := r.ForPermissions(sagePerm)
 	names := toolNames(tools)
 
-	// approve_doc is always registered
-	assertHas(t, names, "approve_doc")
+	// record_precedent is the remaining intent-execute builtin.
+	assertHas(t, names, "record_precedent")
+	// approve_doc is demoted to an unexported helper of suggest_edict: it is
+	// no longer a registered tool, so nothing can dispatch it.
+	assertNotHas(t, names, "approve_doc")
 }
 
 func TestRegisterBuiltinToolsExtraChancellor(t *testing.T) {
@@ -472,8 +475,8 @@ func TestRegisterBuiltinToolsEmptyOpts(t *testing.T) {
 	assertNotHas(t, names, "asimisql")
 	assertNotHas(t, toolNames(r.ExtraTools("secretary", []string{"asimisql"})), "asimisql")
 
-	// approve_doc is always registered (no dependencies)
-	assertHas(t, names, "approve_doc")
+	// approve_doc is not a tool at all — it is an unexported review helper.
+	assertNotHas(t, names, "approve_doc")
 }
 
 // TestConsultMinisterTool_FactoryProducesPerMinisterInstances verifies that

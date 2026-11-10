@@ -2,24 +2,49 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
-	"github.com/afittestide/asimi/internal/utils"
 	"github.com/pmezard/go-difflib/difflib"
 )
 
-// ApproveDocInput is the input for the ApproveDocTool
-type ApproveDocInput struct {
-	Content     string `json:"content"`
-	Filename    string `json:"filename,omitempty"`
-	Description string `json:"description,omitempty"`
-}
+// This file holds the $EDITOR review pass used by suggest_edict for large
+// documents. It is deliberately not a Tool: nothing ever dispatched it as one,
+// and registering it cost a bespoke repair path (a placeholder in the registry
+// plus a SetNotify re-registration of live sessions) for a hook no minister
+// could reach.
+
+// EditorOutcome is what the host established about the review. It replaces the
+// old Saved bool, which collapsed two different facts: "the bytes on disk were
+// not rewritten" and "the Ruler declined". An absence of evidence is not a
+// decision, so the outcome is explicit and the caller maps it honestly.
+type EditorOutcome string
+
+const (
+	// EditorUnchanged means the editor exited and the document's bytes are
+	// exactly what the caller sent: the document was reviewed, nothing changed.
+	//
+	// A deliberate `:q!` is NOT distinguishable from an editor that never
+	// really ran (no tty after a sandbox/daemon restart, a non-interactive
+	// $EDITOR, a `vi` fallback that cannot attach a terminal, or `:wq` on an
+	// unmodified buffer): every one of them leaves the bytes untouched. A host
+	// that cannot establish a discard must report unchanged rather than invent
+	// a rejection the Ruler never made.
+	EditorUnchanged EditorOutcome = "unchanged"
+	// EditorModified means the Ruler edited and saved; Content carries the new
+	// bytes.
+	EditorModified EditorOutcome = "modified"
+	// EditorDiscarded means the host has positive evidence that the Ruler quit
+	// without saving. Only a host that can establish that may report it.
+	EditorDiscarded EditorOutcome = "discarded"
+	// EditorFailed means the editor never produced a usable answer. It always
+	// reaches the caller as an error, never as a status.
+	EditorFailed EditorOutcome = "failed"
+)
 
 // EditorRequest is sent via Notify to ask the host (TUI or RPC client) to open
 // content in $EDITOR. The receiver owns the temp-file lifecycle: it writes the
-// content, runs the editor, and returns the modified bytes on ResultChan.
+// content, runs the editor, and returns the outcome on ResultChan.
 //
 // This shape is intentionally serialization-friendly (no *exec.Cmd) so a daemon
 // can bridge it to a remote TUI over RPC.
@@ -29,135 +54,87 @@ type EditorRequest struct {
 	ResultChan chan EditorResult
 }
 
-// EditorResult carries the post-edit content back to the tool, or an error if
-// the editor failed to launch.
+// EditorResult carries the post-edit content and the outcome back to the
+// caller. Content is only meaningful for EditorModified.
 type EditorResult struct {
-	Content string // modified bytes; empty if Saved == false
-	Saved   bool   // false when the user quit without writing (vi :q!)
+	Content string
+	Outcome EditorOutcome
 	Err     error
 }
 
-// ApproveDocTool opens documents in $EDITOR for review. Returns status='approved'
-// when content is unchanged, status='modified' with a diff when edited, or
-// status='rejected' when the user quit without saving.
-//
-// Notify must be set to send an EditorRequest to the host that owns the terminal.
-type ApproveDocTool struct {
-	Notify func(any)
+// Review statuses. approved means the document was reviewed and left as it
+// was; modified means the Ruler edited and saved; rejected means the Ruler
+// deliberately discarded it.
+const (
+	reviewApproved = "approved"
+	reviewModified = "modified"
+	reviewRejected = "rejected"
+)
+
+// editorReview is the outcome of reviewInEditor.
+type editorReview struct {
+	Status  string
+	Diff    string
+	Content string
 }
 
-func (t ApproveDocTool) Name() string {
-	return "approve_doc"
-}
-
-func (t ApproveDocTool) Description() string {
-	return "Opens a document in $EDITOR for review. If the content is unchanged after editing, returns status='approved'. If modified, returns status='modified' with the diff. Use this for reviewing large documents (edict suggestions, strategic plans) that cannot be properly viewed in the TUI."
-}
-
-func (t ApproveDocTool) Call(ctx context.Context, input string) (string, error) {
-	var params ApproveDocInput
-	if err := json.Unmarshal([]byte(input), &params); err != nil {
-		return "", fmt.Errorf("invalid input: %w", err)
-	}
-
-	if params.Content == "" {
-		return "", fmt.Errorf("content is required")
-	}
-
-	if t.Notify == nil {
-		return "", fmt.Errorf("approve_doc requires TUI notify to open editor")
+// reviewInEditor opens content in $EDITOR for the Ruler to review. The
+// returned status is reviewApproved (bytes unchanged), reviewModified (edited,
+// with a Diff) or reviewRejected (a deliberate discard). Editor failures — and
+// outcomes the host could not establish — are returned as errors, never as a
+// status the Ruler did not make.
+func reviewInEditor(ctx context.Context, notify func(any), content, filename string) (editorReview, error) {
+	if notify == nil {
+		return editorReview{}, fmt.Errorf("editor review requires a notify callback")
 	}
 
 	resultChan := make(chan EditorResult, 1)
-	t.Notify(EditorRequest{
-		Content:    params.Content,
-		Filename:   params.Filename,
+	notify(EditorRequest{
+		Content:    content,
+		Filename:   filename,
 		ResultChan: resultChan,
 	})
 
 	var res EditorResult
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return editorReview{}, ctx.Err()
 	case res = <-resultChan:
 	}
+
 	if res.Err != nil {
-		return "", fmt.Errorf("editor failed: %w", res.Err)
+		return editorReview{}, fmt.Errorf("editor failed: %w", res.Err)
 	}
 
-	if !res.Saved {
-		return `{"status":"rejected"}`, nil
-	}
-
-	if strings.TrimRight(res.Content, " \t\n\r") == strings.TrimRight(params.Content, " \t\n\r") {
-		return `{"status":"approved"}`, nil
-	}
-
-	diffOutput, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
-		A:        difflib.SplitLines(params.Content),
-		B:        difflib.SplitLines(res.Content),
-		FromFile: "original",
-		ToFile:   "modified",
-		Context:  3,
-	})
-
-	result := map[string]any{
-		"status":  "modified",
-		"diff":    diffOutput,
-		"content": res.Content,
-	}
-	resultJSON, _ := json.Marshal(result)
-	return string(resultJSON), nil
-}
-
-func (t ApproveDocTool) ParameterSchema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"content": map[string]any{
-				"type":        "string",
-				"description": "Document content to review, formatted as markdown",
-			},
-			"filename": map[string]any{
-				"type":        "string",
-				"description": "Suggested filename (optional)",
-			},
-			"description": map[string]any{
-				"type":        "string",
-				"description": "Context for the review (optional)",
-			},
-		},
-		"required": []string{"content"},
+	switch res.Outcome {
+	case EditorUnchanged:
+		return editorReview{Status: reviewApproved}, nil
+	case EditorDiscarded:
+		return editorReview{Status: reviewRejected}, nil
+	case EditorModified:
+		if trimmedEqual(res.Content, content) {
+			return editorReview{Status: reviewApproved}, nil
+		}
+		diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+			A:        difflib.SplitLines(content),
+			B:        difflib.SplitLines(res.Content),
+			FromFile: "original",
+			ToFile:   "modified",
+			Context:  3,
+		})
+		return editorReview{Status: reviewModified, Diff: diff, Content: res.Content}, nil
+	case EditorFailed:
+		return editorReview{}, fmt.Errorf("editor reported a failure with no error")
+	default:
+		// No outcome is neither an approval nor a rejection: refuse to invent a
+		// decision the Ruler never made.
+		return editorReview{}, fmt.Errorf("editor reported no outcome")
 	}
 }
 
-// Format formats an approve_doc tool call for display
-func (t ApproveDocTool) Format(input, result string, err error) string {
-	var params ApproveDocInput
-	json.Unmarshal([]byte(input), &params)
-
-	msg := utils.NewMsgBlockBuilder("ApproveDoc")
-	if params.Description != "" {
-		msg.Writef(" %s", params.Description)
-	}
-	msg.WriteLn()
-
-	if err != nil {
-		msg.Writef("Error: %v", err)
-	} else {
-		var res struct {
-			Status string `json:"status"`
-		}
-		json.Unmarshal([]byte(result), &res)
-		switch res.Status {
-		case "approved":
-			msg.WriteString("Approved (no changes)")
-		case "rejected":
-			msg.WriteString("Rejected (quit without saving)")
-		default:
-			msg.WriteString("Modified (diff returned)")
-		}
-	}
-
-	return msg.String() + "\n"
+// trimmedEqual reports whether two documents are equal ignoring trailing
+// whitespace, so an editor that only normalizes the final newline does not
+// register as an edit.
+func trimmedEqual(a, b string) bool {
+	return strings.TrimRight(a, " \t\n\r") == strings.TrimRight(b, " \t\n\r")
 }

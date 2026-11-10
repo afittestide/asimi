@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -107,10 +108,10 @@ type TUIModel struct {
 	// zhengming answer to this request instead of starting a new turn.
 	pendingZhengmingChatRequestID string
 	// pendingZhengmingByChannel maps a zhengming request's routing channel
-	// (e.g. a ritual tab "e892") to its request ID. A prompt submitted on that
-	// channel is delivered as the zhengming answer rather than being treated
-	// as a ritual interjection (which would pause/abort the ritual step).
-	pendingZhengmingByChannel map[string]string
+	// (e.g. a ritual tab "e892") to the request IDs awaiting an answer on it.
+	// It is a list, not a single ID: a second request on the same channel must
+	// not erase the first, or the Ruler loses a gate it was never shown.
+	pendingZhengmingByChannel map[string][]string
 	// Pending API key input: set when user selects a login_required non-OpenAI provider
 	pendingAPIKeyProvider string
 	// Pending model name entry: set when user selects a manual_entry model
@@ -272,11 +273,12 @@ type shellCommandResultMsg struct {
 type commandTimerTickMsg struct{}
 
 // editorResultMsg is sent after tea.ExecProcess finishes running the editor.
+// OrigBytes is the pre-edit content: the outcome is decided by comparing it to
+// what the editor left on disk, never by file mtime.
 type editorResultMsg struct {
 	ResultChan chan tools.EditorResult
 	TmpPath    string
 	OrigBytes  []byte
-	OrigMtime  time.Time
 	Err        error
 }
 
@@ -1734,23 +1736,41 @@ func ritualTabLabel(channelID string) string {
 }
 
 // setPendingZhengming records that a zhengming request is awaiting an answer
-// on the given routing channel (e.g. a ritual tab "e892").
+// on the given routing channel (e.g. a ritual tab "e892"). Multiple requests can
+// be open on one channel; adding one never evicts another.
 func (m *TUIModel) setPendingZhengming(channelID, requestID string) {
 	if channelID == "" || requestID == "" {
 		return
 	}
 	if m.pendingZhengmingByChannel == nil {
-		m.pendingZhengmingByChannel = make(map[string]string)
+		m.pendingZhengmingByChannel = make(map[string][]string)
 	}
-	m.pendingZhengmingByChannel[channelID] = requestID
+	for _, id := range m.pendingZhengmingByChannel[channelID] {
+		if id == requestID {
+			return
+		}
+	}
+	m.pendingZhengmingByChannel[channelID] = append(m.pendingZhengmingByChannel[channelID], requestID)
 }
 
-// clearPendingZhengming forgets any pending zhengming registered for channelID.
-func (m *TUIModel) clearPendingZhengming(channelID string) {
+// clearPendingZhengming forgets requestID for channelID, leaving any other
+// request open on that channel untouched.
+func (m *TUIModel) clearPendingZhengming(channelID, requestID string) {
 	if channelID == "" || m.pendingZhengmingByChannel == nil {
 		return
 	}
-	delete(m.pendingZhengmingByChannel, channelID)
+	ids := m.pendingZhengmingByChannel[channelID]
+	for i, id := range ids {
+		if id == requestID {
+			ids = append(ids[:i], ids[i+1:]...)
+			break
+		}
+	}
+	if len(ids) == 0 {
+		delete(m.pendingZhengmingByChannel, channelID)
+		return
+	}
+	m.pendingZhengmingByChannel[channelID] = ids
 }
 
 // clearPendingZhengmingByRequest forgets any channel mapping pointing at
@@ -1759,20 +1779,90 @@ func (m *TUIModel) clearPendingZhengmingByRequest(requestID string) {
 	if requestID == "" {
 		return
 	}
-	for channelID, id := range m.pendingZhengmingByChannel {
-		if id == requestID {
-			delete(m.pendingZhengmingByChannel, channelID)
-		}
+	for channelID := range m.pendingZhengmingByChannel {
+		m.clearPendingZhengming(channelID, requestID)
 	}
 }
 
-// pendingZhengmingFor returns the request ID awaiting an answer on channelID,
-// or "" when no zhengming is pending for that channel.
+// pendingZhengmingFor returns the oldest request ID awaiting an answer on
+// channelID, or "" when no zhengming is pending for that channel.
 func (m *TUIModel) pendingZhengmingFor(channelID string) string {
 	if channelID == "" {
 		return ""
 	}
-	return m.pendingZhengmingByChannel[channelID]
+	ids := m.pendingZhengmingByChannel[channelID]
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
+// pendingZhengmingOn returns every request ID awaiting an answer on channelID.
+func (m *TUIModel) pendingZhengmingOn(channelID string) []string {
+	if channelID == "" {
+		return nil
+	}
+	return append([]string(nil), m.pendingZhengmingByChannel[channelID]...)
+}
+
+// isZhengmingRequestID reports whether id names a real Court zhengming request.
+// Synthetic answering states (the edict action menu, "edict-<n>") are not
+// requests and must never be answered through the zhengming path.
+func isZhengmingRequestID(id string) bool {
+	if id == "" {
+		return false
+	}
+	_, isMenu := parseEdictActionRequestID(id)
+	return !isMenu
+}
+
+// answerableGateOn returns the request a typed reply on target belongs to: the
+// gate that prompt is actively showing, else the oldest request recorded for a
+// ritual channel. The active gate wins because that is the one the Ruler is
+// looking at — answering by arrival order delivers a decision to a request they
+// never acted on.
+func (m *TUIModel) answerableGateOn(target string) string {
+	if target == "" {
+		return ""
+	}
+	if p, ok := m.prompts[target]; ok && p != nil {
+		if id := p.ActiveAnsweringRequest(); isZhengmingRequestID(id) {
+			return id
+		}
+		// A request is open on this tab but none is active (the Ruler is
+		// parking or editing), so the typed text is not an answer to any of
+		// them. Falling back to arrival order here would answer a request they
+		// are not on.
+		if len(p.OpenRulerRequests()) > 0 {
+			return ""
+		}
+	}
+	if isRitualChannel(target) {
+		if id := m.pendingZhengmingFor(target); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// retireAnsweredGate retires requestID everywhere it is still held open: the
+// channel maps, every tab's prompt, and the Chat-capture sentinel if it points
+// at this request. The Ruler acted on this request, so it must not stay listed
+// as awaiting an answer anywhere — and no later prompt may be delivered as an
+// answer to a decision already made.
+func (m *TUIModel) retireAnsweredGate(requestID string) {
+	if requestID == "" {
+		return
+	}
+	if m.pendingZhengmingChatRequestID == requestID {
+		m.pendingZhengmingChatRequestID = ""
+	}
+	for _, p := range m.prompts {
+		if p != nil {
+			p.ResolveAnswering(requestID)
+		}
+	}
+	m.clearPendingZhengmingByRequest(requestID)
 }
 
 // friendlyConnError converts a raw RPC connection error string into a
@@ -1901,8 +1991,9 @@ func (m *TUIModel) submitToCourt(ctx context.Context, prompt string, contextFile
 		// the Ruler's answer on this channel. Deliver the typed text as that
 		// answer instead of pausing the ritual — pausing cancels the blocked
 		// step's context and aborts the ritual (incident 75f262766657b094).
-		if requestID := m.pendingZhengmingFor(tab.Target); requestID != "" {
-			m.clearPendingZhengming(tab.Target)
+		// The gate the Ruler is looking at wins over arrival order.
+		if requestID := m.answerableGateOn(tab.Target); requestID != "" {
+			m.retireAnsweredGate(requestID)
 			go m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{prompt}})
 			return nil
 		}
@@ -2313,31 +2404,32 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		content := msg.Prompt
 
+		// Chat-capture wins: the Ruler chose "Chat" on a specific gate, so the
+		// next submitted prompt belongs to *that* request. Checked before the
+		// channel map so a two-gate session cannot answer the older one.
+		if m.pendingZhengmingChatRequestID != "" {
+			requestID := m.pendingZhengmingChatRequestID
+			m.pendingZhengmingChatRequestID = ""
+			m.retireAnsweredGate(requestID)
+			m.tabs.Content().Chat.AddUserMessage(content)
+			m.tabs.Content().Chat.AddToRawHistory("USER", content)
+			m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{content}})
+			return m, nil
+		}
+
 		// A zhengming is pending on the active ritual tab: deliver the typed
 		// text as the answer before anything else. Do not pause the ritual,
 		// load a session, or submit a prompt — the blocked ask_ruler resumes
-		// when answered. Checked ahead of the chat-capture sentinel so a
-		// stale sentinel cannot bind the reply to the wrong request.
-		if tab := m.tabs.ActiveTab(); tab != nil && isRitualChannel(tab.Target) {
-			if requestID := m.pendingZhengmingFor(tab.Target); requestID != "" {
-				m.clearPendingZhengming(tab.Target)
-				m.pendingZhengmingChatRequestID = ""
+		// when answered. The active gate wins over arrival order, so a reply is
+		// never delivered to a request the Ruler was not looking at.
+		if tab := m.tabs.ActiveTab(); tab != nil {
+			if requestID := m.answerableGateOn(tab.Target); requestID != "" {
+				m.retireAnsweredGate(requestID)
 				m.tabs.ChatByTab(tab.Target).AddUserMessage(content)
 				m.tabs.ChatByTab(tab.Target).AddToRawHistory("USER", content)
 				m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{content}})
 				return m, nil
 			}
-		}
-
-		// Chat-capture armed: the Ruler selected "Chat" in a zhengming prompt,
-		if m.pendingZhengmingChatRequestID != "" {
-			requestID := m.pendingZhengmingChatRequestID
-			m.pendingZhengmingChatRequestID = ""
-			m.clearPendingZhengmingByRequest(requestID)
-			m.tabs.Content().Chat.AddUserMessage(content)
-			m.tabs.Content().Chat.AddToRawHistory("USER", content)
-			m.handleAnsweringComplete(AnsweredMsg{RequestID: requestID, Answers: []string{content}})
-			return m, nil
 		}
 
 		// Guard: block session start if not fully configured — show YES/NO
@@ -3080,23 +3172,30 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A zhengming halts the court — route to the tab the question
 		// belongs to. Ritual work routes by channel ("e<N>") first, then
 		// falls back to the minister's own tab, else the active tab stays.
-		if target := m.tabs.SwitchToZhengmingTarget(msg.ChannelID, msg.MinisterID); target != "" {
+		target := m.tabs.SwitchToZhengmingTarget(msg.ChannelID, msg.MinisterID)
+		if target != "" {
 			if chat := m.tabs.ChatByTab(target); chat != nil {
 				chat.ScrollToBottom()
 			}
-			// Remember the request against the ritual tab so a typed reply
-			// is delivered as the answer instead of being treated as a
-			// ritual interjection (which would pause/abort the step).
-			if isRitualChannel(target) {
-				m.setPendingZhengming(target, msg.RequestID)
-			}
+		}
+		// Record the request against the tab it was routed to, whatever its
+		// kind, so a typed reply is delivered as the answer instead of being
+		// treated as a ritual interjection (which would pause/abort the step).
+		// The map is keyed by tab target, so recording non-ritual tabs too is
+		// what lets an ask_ruler gate on a minister tab stay answerable.
+		if target != "" {
+			m.setPendingZhengming(target, msg.RequestID)
 		}
 		m.prompt().HandleZhengmingPending(msg)
+		if n := m.prompt().PendingAnsweringCount(); n > 0 && m.commandLine != nil {
+			m.commandLine.AddToast(
+				fmt.Sprintf("%d more Ruler request(s) awaiting an answer (ctrl+n/ctrl+p to switch, :gates to list)", n),
+				"info", 5*time.Second)
+		}
 		return m, nil
 
 	case AnsweredMsg:
-		m.prompt().ExitAnsweringMode()
-		m.clearPendingZhengmingByRequest(msg.RequestID)
+		m.retireAnsweredGate(msg.RequestID)
 		// Check if this is an edict action menu response
 		if edictID, ok := parseEdictActionRequestID(msg.RequestID); ok {
 			return m, dispatchEdictAction(&m, edictID, msg.Answers)
@@ -3105,33 +3204,38 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case AnsweringCancelMsg:
-		m.prompt().ExitAnsweringMode()
+		m.retireAnsweredGate(msg.RequestID)
 		// Edict action menu cancel — return to edicts list
 		if _, ok := parseEdictActionRequestID(msg.RequestID); ok {
 			return m, reloadEdictsListCmd(&m)
 		}
-		m.clearPendingZhengmingByRequest(msg.RequestID)
 		go m.handleAnsweringComplete(AnsweredMsg{RequestID: msg.RequestID, Answers: []string{tools.AnswerChat}})
 		return m, nil
 
 	case AnsweringChatMsg:
-		m.prompt().ExitAnsweringMode()
 		// Edict action menu "Chat" — open the edict's session, not a
-		// zhengming reply capture.
+		// zhengming reply capture. The menu is retired: choosing an action is
+		// the Ruler acting on it.
 		if edictID, ok := parseEdictActionRequestID(msg.RequestID); ok {
+			m.retireAnsweredGate(msg.RequestID)
 			return m, dispatchEdictAction(&m, edictID, []string{"Chat"})
 		}
-		// Arm chat-capture: the next submitted prompt is delivered as the
-		// zhengming answer for this request.
+		// A zhengming request is not answered by choosing Chat: park it so it
+		// stays open and answerable while the conversation happens. The next
+		// submitted prompt is delivered as its answer, retiring it then.
+		m.prompt().ParkAnswering(msg.RequestID)
 		m.pendingZhengmingChatRequestID = msg.RequestID
 		return m, nil
 
 	case AnsweringEditMsg:
 		// Check if this is an edict action menu edit
 		if edictID, ok := parseEdictActionRequestID(msg.RequestID); ok {
-			m.prompt().ExitAnsweringMode()
+			m.retireAnsweredGate(msg.RequestID)
 			return m, editEdictIntentCmd(&m, edictID)
 		}
+		// Editing the question does not answer the gate; park it so it stays
+		// open (and answerable) while the editor runs.
+		m.prompt().ParkAnswering(msg.RequestID)
 
 		// Open the question text in $EDITOR and update it if modified
 		originalText := msg.Question
@@ -3187,15 +3291,14 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case AnsweringEditDoneMsg:
-		// Exit answering mode
-		m.prompt().ExitAnsweringMode()
-
 		// Check if content was modified
 		modified := strings.TrimRight(msg.Question, " \t\n\r")
 		original := strings.TrimRight(msg.OriginalQuestion, " \t\n\r")
 
 		if modified != original {
-			// Content was modified - send it back to the Sage as a chat message
+			// The Ruler rewrote the question: that is an action on the gate, so
+			// retire it and send the new text back to the Sage.
+			m.retireAnsweredGate(msg.RequestID)
 			if m.court != nil {
 				_ = m.court.AddSessionMessage(m.currentTabTarget(), "human", msg.Question)
 			}
@@ -3203,15 +3306,19 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.court != nil {
 				m.court.CancelZhengming(msg.RequestID)
 			}
+			return m, nil
 		}
+		// Unmodified: the Ruler did not act on the gate. Put it back without
+		// evicting anything that arrived while the editor was open.
+		m.prompt().ResumeAnswering(msg.RequestID)
 		return m, nil
 
 	case tools.EditorRequest:
-		// In handsoff mode, auto-approve without opening $EDITOR. The tool
-		// (e.g. approve_doc → suggest_edict for large payloads) blocks on
-		// ResultChan, so we must reply or the call hangs forever.
+		// In handsoff mode, auto-approve without opening $EDITOR. The review
+		// helper (suggest_edict for large payloads) blocks on ResultChan, so we
+		// must reply or the call hangs forever.
 		if m.handsoff {
-			msg.ResultChan <- tools.EditorResult{Content: msg.Content, Saved: true}
+			msg.ResultChan <- tools.EditorResult{Content: msg.Content, Outcome: tools.EditorUnchanged}
 			return m, nil
 		}
 		// A tool wants to open content in $EDITOR — TUI owns the temp-file
@@ -3227,9 +3334,9 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ext = msg.Filename[i:]
 			}
 		}
-		f, err := os.CreateTemp("", "approve_doc_*"+ext)
+		f, err := os.CreateTemp("", "editor_review_*"+ext)
 		if err != nil {
-			msg.ResultChan <- tools.EditorResult{Err: fmt.Errorf("create temp file: %w", err)}
+			msg.ResultChan <- tools.EditorResult{Outcome: tools.EditorFailed, Err: fmt.Errorf("create temp file: %w", err)}
 			return m, nil
 		}
 		tmpPath := f.Name()
@@ -3237,13 +3344,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		orig := []byte(msg.Content)
 		if err := os.WriteFile(tmpPath, orig, 0644); err != nil {
 			os.Remove(tmpPath)
-			msg.ResultChan <- tools.EditorResult{Err: fmt.Errorf("write temp file: %w", err)}
-			return m, nil
-		}
-		stat, err := os.Stat(tmpPath)
-		if err != nil {
-			os.Remove(tmpPath)
-			msg.ResultChan <- tools.EditorResult{Err: fmt.Errorf("stat temp file: %w", err)}
+			msg.ResultChan <- tools.EditorResult{Outcome: tools.EditorFailed, Err: fmt.Errorf("write temp file: %w", err)}
 			return m, nil
 		}
 		cmd := exec.Command(editor, tmpPath)
@@ -3253,7 +3354,6 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ResultChan: resultChan,
 				TmpPath:    tmpPath,
 				OrigBytes:  orig,
-				OrigMtime:  stat.ModTime(),
 				Err:        err,
 			}
 		})
@@ -3261,25 +3361,30 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case editorResultMsg:
 		defer os.Remove(msg.TmpPath)
 		if msg.Err != nil {
-			msg.ResultChan <- tools.EditorResult{Err: msg.Err}
+			msg.ResultChan <- tools.EditorResult{Outcome: tools.EditorFailed, Err: msg.Err}
 			return m, nil
 		}
-		stat, err := os.Stat(msg.TmpPath)
-		if err != nil {
-			msg.ResultChan <- tools.EditorResult{Err: fmt.Errorf("stat after edit: %w", err)}
-			return m, nil
-		}
-		// mtime unchanged → user quit without saving (vi :q!).
-		if stat.ModTime().Equal(msg.OrigMtime) {
-			msg.ResultChan <- tools.EditorResult{Saved: false}
-			return m, nil
-		}
+		// Always read the file: the outcome is whether the bytes changed, not
+		// whether an mtime moved. An unmoved mtime only means the bytes were
+		// not rewritten — true for a deliberate :q! *and* for an editor that
+		// never really attached a terminal (lost tty after a sandbox/daemon
+		// restart, non-interactive $EDITOR, vi fallback quitting). Inferring a
+		// rejection from it invents a decision the Ruler never made, so a
+		// no-write exit is reported as unchanged.
 		content, err := os.ReadFile(msg.TmpPath)
 		if err != nil {
-			msg.ResultChan <- tools.EditorResult{Err: fmt.Errorf("read after edit: %w", err)}
+			msg.ResultChan <- tools.EditorResult{Outcome: tools.EditorFailed, Err: fmt.Errorf("read after edit: %w", err)}
 			return m, nil
 		}
-		msg.ResultChan <- tools.EditorResult{Content: string(content), Saved: true}
+		if bytes.Equal(content, msg.OrigBytes) {
+			// No positive evidence of a deliberate discard exists here: a
+			// `:q!` and a tty-less editor exit look identical from the
+			// filesystem. Report the honest thing (reviewed, unchanged) rather
+			// than inventing EditorDiscarded and thereby a rejection.
+			msg.ResultChan <- tools.EditorResult{Outcome: tools.EditorUnchanged}
+			return m, nil
+		}
+		msg.ResultChan <- tools.EditorResult{Content: string(content), Outcome: tools.EditorModified}
 		return m, nil
 
 	case showHelpMsg:

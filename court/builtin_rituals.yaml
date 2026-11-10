@@ -404,7 +404,7 @@
         seal the review. Then return a one-sentence confirmation — that is the
         end of this step.
 
-        Do NOT call suggest_edict, ask_ruler, approve_doc, or any other
+        Do NOT call suggest_edict, ask_ruler, or any other
         tool after record_precedent. Project-init is not the place to propose
         new edicts or conventions — the ritual only needs your seal to move on.
       on_failure: goto

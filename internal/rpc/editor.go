@@ -19,10 +19,12 @@ type RunEditorParams struct {
 }
 
 // RunEditorResult carries the post-edit content back to the daemon. Err is
-// transported as a string because errors aren't serializable.
+// transported as a string because errors aren't serializable. Outcome crosses
+// the wire explicitly so a daemon-hosted TUI cannot reintroduce the ambiguity
+// an implicit "saved" boolean had (see tools.EditorOutcome).
 type RunEditorResult struct {
 	Content string `msgpack:"content"`
-	Saved   bool   `msgpack:"saved"`
+	Outcome string `msgpack:"outcome"`
 	Err     string `msgpack:"err,omitempty"`
 }
 
@@ -44,7 +46,7 @@ func RegisterEditorHandler(conn *Conn, program ProgramSender) {
 		})
 		select {
 		case res := <-respCh:
-			out := RunEditorResult{Content: res.Content, Saved: res.Saved}
+			out := RunEditorResult{Content: res.Content, Outcome: string(res.Outcome)}
 			if res.Err != nil {
 				out.Err = res.Err.Error()
 			}
@@ -66,7 +68,7 @@ func RequestEditor(ctx context.Context, conn *Conn, content, filename string) (t
 	if err := wire.Decode(raw, &r); err != nil {
 		return tools.EditorResult{}, err
 	}
-	res := tools.EditorResult{Content: r.Content, Saved: r.Saved}
+	res := tools.EditorResult{Content: r.Content, Outcome: tools.EditorOutcome(r.Outcome)}
 	if r.Err != "" {
 		res.Err = errors.New(r.Err)
 	}
@@ -83,7 +85,7 @@ func interceptEditor(ctx context.Context, conn *Conn, msg any) bool {
 	go func() {
 		res, err := RequestEditor(ctx, conn, req.Content, req.Filename)
 		if err != nil {
-			res = tools.EditorResult{Err: err}
+			res = tools.EditorResult{Outcome: tools.EditorFailed, Err: err}
 		}
 		if req.ResultChan != nil {
 			select {

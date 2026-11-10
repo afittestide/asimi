@@ -274,14 +274,14 @@ func (s *headlessSink) handle(msg any) {
 		}
 
 	case tools.EditorRequest:
-		// An approve_doc request (e.g. from suggest_edict for payloads >500
+		// An editor review request (e.g. from suggest_edict for payloads >500
 		// chars) blocks on ResultChan. Headless has no interactive editor, so
-		// always auto-approve the content unchanged. Print it to stdout so
+		// always report the content as reviewed unchanged. Print it to stdout so
 		// the ruler still sees what was proposed.
 		if !s.handsoff {
 			fmt.Fprintf(s.stdout, "\n--- Document for review ---\n%s\n--- End ---\n", m.Content)
 		}
-		m.ResultChan <- tools.EditorResult{Content: m.Content, Saved: true}
+		m.ResultChan <- tools.EditorResult{Content: m.Content, Outcome: tools.EditorUnchanged}
 
 	case court.EventNotificationMsg:
 		s.handleEvent(m)
