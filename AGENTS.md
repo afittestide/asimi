@@ -22,27 +22,29 @@ This ensures system operations have proper audit trails and prevents edict_id=0 
 
 ## Common Commands
 
-```bash
-# Development
-just run              # Run with debug logging (writes to ./asimi.log)
-just build            # Build binary
-just test             # Run all tests
-just test-coverage    # Run tests with coverage report
-just lint             # Run go vet
-just fmt              # Format code
+Use `just <recipe>` to manage the project:
 
-# Infrastructure
-just bootstrap        # Install dev tools (goimports, govulncheck)
-just build-sandbox    # Build container image for sandboxed execution
-just clean-sandbox    # Clean up container image
-
-# Performance analysis
-just measure          # Profile startup performance
-
-# Run single test
-go test -v -run TestName ./...
-```
-
-## Architecture Overview
-
-Asimi is a vi-inspired, terminal-based AI coding agent with containerized shell execution.
+- bootstrap                      # Install development tools
+- build                          # Build the binary
+- build-sandbox                  # Build the sandbox container.
+- clean                          # Clean build artifacts
+- clean-sandbox                  # Clean up the sandbox container
+- default                        # List all available recipes
+- fmt                            # Format code
+- freeze-logs                    # Freeze the log files to `./heaven/logs/asimi[-deamon]-<datetime>.log`
+- get-runs                       # Fetch failed CI runs since the last success, with their entire logs, to heaven/runs.
+- get-threats                    # Run vulnerability scanning, save output to ./heaven/threats/<tool>-<datetime>.out
+- hello-harbor *args             # Recipe: build the latest asimi for linux, then hand it to Harbor
+- init-podman                    # Init and start the podman machine
+- install                        # Install dependencies
+- lint                           # Run linting
+- measure                        # Measure run_shell_command tool performance
+- nvim                           # Start neovim with the asimi plugin loaded (interactive dev session)
+- prune-branches                 # Li 礼), so resolve those by hand.
+- run                            # Run with debug logging
+- test                           # Run the test suite, tee-ing output to `./heaven/tests/test-<datetime>.out`
+- test-atif                      # ASIMI_PROVIDER) — the test does not force a model.
+- test-coverage                  # Run tests with coverage
+- test-intent                    # Run intent/gherkin BDD scenarios
+- test-performance               # Run performance benchmarks and guardrail tests
+- test-race *packages="./court/" # Run tests under the race detector, tee-ing output to `./heaven/tests/test-race-<datetime>.out`

@@ -239,8 +239,13 @@ func TestGetIncidentTool(t *testing.T) {
 	if err := json.Unmarshal(raw, &fetched); err != nil {
 		t.Fatalf("raw is not a storage.Incident: %v\n%s", err, raw)
 	}
-	if fetched != incident {
-		t.Errorf("raw = %+v, want the identical incident %+v", fetched, incident)
+	// time.Time struct equality is location-pointer sensitive: the DB scan gives
+	// CreatedAt a fixed-offset zone while the JSON round-trip resolves it into
+	// time.Local, so `fetched != incident` fails in every non-UTC zone. Compare
+	// the instants; the field assertions below cover the data.
+	if !fetched.CreatedAt.Equal(incident.CreatedAt) || !fetched.UpdatedAt.Equal(incident.UpdatedAt) {
+		t.Errorf("raw times = (%v,%v), want the identical instants (%v,%v)",
+			fetched.CreatedAt, fetched.UpdatedAt, incident.CreatedAt, incident.UpdatedAt)
 	}
 	if fetched.Description != "memory leak" {
 		t.Errorf("Description = %q, want %q", fetched.Description, "memory leak")
