@@ -1,6 +1,7 @@
 package court
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -542,4 +543,263 @@ func TestDependabotIgnoresOnlyUnsatisfiableDependency(t *testing.T) {
 			unsatisfiable + "/registry/api/v2",
 		}, line, "unexpected vendored package %q — the ignore rule assumes only API types are built", line)
 	}
+}
+
+// vulnScanFixFloors maps each module bumped for edict 1032 to the release that
+// fixes the advisory the 0.16.0 threat scan reported (GO-2026-6865 for
+// klauspost/compress, GO-2026-6888 for andybalholm/brotli). Pinning below a
+// floor reopens the finding and reddens `just get-threats`.
+var vulnScanFixFloors = map[string]semver.Version{
+	"github.com/klauspost/compress": semver.MustParse("1.20.2"),
+	"github.com/andybalholm/brotli": semver.MustParse("1.2.7"),
+}
+
+// justRecipes returns every recipe name defined in a Justfile. A recipe header
+// is an unindented line whose first word is the name and which carries a ':'
+// (possibly with arguments after the name, or dependencies after the colon).
+// Assignments (':='), comments and indented body lines are not recipes.
+func justRecipes(justfile string) map[string]bool {
+	recipes := map[string]bool{}
+	for _, line := range strings.Split(justfile, "\n") {
+		if line == "" || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") ||
+			strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.Index(line, ":")
+		if i <= 0 || strings.HasPrefix(line[i:], ":=") {
+			continue
+		}
+		if fields := strings.Fields(line[:i]); len(fields) > 0 {
+			recipes[fields[0]] = true
+		}
+	}
+	return recipes
+}
+
+// recipeInvocations returns the recipe name of every `just <recipe>` mention in
+// text. Only command-context mentions count — a leading `!` (a ritual given
+// step), a backtick (a documented command) or a line-leading invocation — so
+// English prose such as "just the recipe" cannot trip the guard.
+func recipeInvocations(text string) []string {
+	re := regexp.MustCompile("[!`]just\\s+([a-z][a-z0-9_-]*)|^just\\s+([a-z][a-z0-9_-]*)")
+	var names []string
+	for _, line := range strings.Split(text, "\n") {
+		for _, m := range re.FindAllStringSubmatch(line, -1) {
+			names = append(names, m[1]+m[2])
+		}
+	}
+	return names
+}
+
+// TestRitualAndDocInvocationsNameExistingRecipes guards the first defect of
+// edict 1032: `0e6f61f15` renamed `vuln:` to `get-threats:` and the release
+// ritual kept invoking the dead name. A `!`-prefixed given step that exits
+// non-zero hard-fails the step, and `verify-release-readiness` loops back to
+// `prepare-changelog`, so the ritual could never reach `commit-and-tag`. Every
+// `just` invocation in the project rituals and in the release/security docs must
+// therefore name a recipe the Justfile actually defines.
+func TestRitualAndDocInvocationsNameExistingRecipes(t *testing.T) {
+	recipes := justRecipes(readRootFile(t, "Justfile"))
+	require.True(t, recipes["test"], "could not parse the `test` recipe out of Justfile")
+
+	rituals := readRootFile(t, ".agents/rituals.yaml")
+	for _, name := range recipeInvocations(rituals) {
+		assert.True(t, recipes[name],
+			".agents/rituals.yaml invokes `just %s`, which no Justfile recipe defines — the given step hard-fails and the ritual loops", name)
+	}
+
+	// Parse rather than grep: a file-wide Contains stays green if the gate
+	// migrates to another step while verify-release-readiness loses it — the
+	// exact regression acceptance #5 guards.
+	var defs Rituals
+	require.NoError(t, yaml.Unmarshal([]byte(rituals), &defs), "parse .agents/rituals.yaml")
+	readiness := findStep(defs, "release-version", "verify-release-readiness")
+	require.NotNil(t, readiness, "release-version has no verify-release-readiness step")
+	assert.Contains(t, strings.Join(readiness.Given, "\n"), "!just get-threats",
+		"verify-release-readiness must invoke the real `just get-threats` gate (edict 1032)")
+
+	for _, doc := range []string{"docs/release-management.md", "docs/security.md"} {
+		for _, name := range recipeInvocations(readRootFile(t, doc)) {
+			assert.True(t, recipes[name],
+				"%s names `just %s`, which no Justfile recipe defines", doc, name)
+		}
+	}
+}
+
+// findStep returns the step named stepName in the ritual named ritualName, or
+// nil when either is absent.
+func findStep(rituals Rituals, ritualName, stepName string) *RitualStep {
+	for _, r := range rituals {
+		if r.Name != ritualName {
+			continue
+		}
+		for i := range r.Steps {
+			if r.Steps[i].Name == stepName {
+				return &r.Steps[i]
+			}
+		}
+	}
+	return nil
+}
+
+// TestSecurityDocNamesTheThreatReportPath guards the Chancellor's B1 finding:
+// docs/security.md claimed scan reports land in heaven/security/*.txt while the
+// recipe writes heaven/threats/*.out, sending a reader hunting release evidence
+// to a directory that does not exist. Derive both facts from the recipe itself so
+// the doc cannot drift from it again.
+func TestSecurityDocNamesTheThreatReportPath(t *testing.T) {
+	body := recipeBody(readRootFile(t, "Justfile"), "get-threats:")
+	require.NotEmpty(t, body, "could not read the get-threats recipe body")
+
+	dir := regexp.MustCompile(`(?m)^\s*report_dir="([^"]+)"`).FindStringSubmatch(body)
+	require.Len(t, dir, 2, "get-threats defines no report_dir=\"...\" — update this guard")
+	dirName := dir[1]
+
+	require.Regexp(t, `report="\$report_dir/\$\{tool\}-\{\{now\}\}\.out"`, body,
+		"get-threats uses a report filename other than ${tool}-{{now}}.out — update this guard")
+
+	doc := readRootFile(t, "docs/security.md")
+	assert.Contains(t, doc, dirName+"/",
+		"docs/security.md must name the real report directory %q the get-threats recipe writes", dirName)
+	assert.Contains(t, doc, "<tool>-<datetime>.out",
+		"docs/security.md must give the real report extension (.out), not the old .txt")
+}
+
+// moduleVersions returns every version recorded for module in one file. go.mod
+// carries it as a require line, vendor/modules.txt as a `# module vX` header,
+// and go.sum as one or more hash lines.
+func moduleVersions(t *testing.T, file, module string) []semver.Version {
+	t.Helper()
+	pattern := regexp.MustCompile(`(?m)^[ \t#]*` + regexp.QuoteMeta(module) + ` v([0-9][0-9.]*)`)
+	var versions []semver.Version
+	for _, m := range pattern.FindAllStringSubmatch(readRootFile(t, file), -1) {
+		v, err := semver.ParseTolerant(m[1])
+		require.NoError(t, err, "parse %s version %q in %s", module, m[1], file)
+		versions = append(versions, v)
+	}
+	return versions
+}
+
+// TestThreatScanModulesMeetFixFloor guards the second defect of edict 1032: the
+// scan reported reachable advisories in two indirect modules that had fixes
+// available. Because the repository vendors, go.mod, go.sum and the vendored
+// module list must move together — a bump that skips the vendor tree leaves the
+// binary-mode scan complaining about the old code while the build uses the new.
+func TestThreatScanModulesMeetFixFloor(t *testing.T) {
+	for module, floor := range vulnScanFixFloors {
+		mod := moduleVersions(t, "go.mod", module)
+		require.Len(t, mod, 1, "go.mod must carry exactly one require line for %s", module)
+		pinned := mod[0]
+		assert.False(t, pinned.LT(floor),
+			"go.mod pins %s v%s, must be >= v%s (the finding is fixed there and the gate stays red below it)",
+			module, pinned, floor)
+
+		vendored := moduleVersions(t, "vendor/modules.txt", module)
+		require.Len(t, vendored, 1, "vendor/modules.txt must list %s exactly once", module)
+		assert.True(t, vendored[0].EQ(pinned),
+			"vendor/modules.txt pins %s v%s but go.mod pins v%s — run `go mod vendor`",
+			module, vendored[0], pinned)
+
+		sum := moduleVersions(t, "go.sum", module)
+		require.NotEmpty(t, sum, "go.sum must record %s", module)
+		assert.Contains(t, sum, pinned,
+			"go.sum has no hash for %s v%s — run `go mod tidy`", module, pinned)
+	}
+}
+
+// TestAllowlistEntriesAreJustifiedAndLive enforces the contract that
+// `just get-threats` and docs/security.md promise: the allowlist carries only
+// govulncheck IDs, each ID has a written justification section, and an ID whose
+// section is marked retired is no longer listed. Edict 1032 retired
+// GO-2026-5932 exactly this way rather than leaving a stale entry behind.
+func TestAllowlistEntriesAreJustifiedAndLive(t *testing.T) {
+	doc := readRootFile(t, "docs/security.md")
+
+	var accepted []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(readRootFile(t, "security/vuln-allowlist.txt"), "\n") {
+		id := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		if id == "" {
+			continue
+		}
+		assert.Regexp(t, `^GO-\d{4}-\d+$`, id, "allowlist line %q is not a govulncheck ID", line)
+		assert.False(t, seen[id], "%s is listed twice in security/vuln-allowlist.txt", id)
+		seen[id] = true
+		accepted = append(accepted, id)
+	}
+
+	for _, id := range accepted {
+		assert.Contains(t, doc, "### "+id,
+			"%s is on the allowlist with no `### %s` justification in docs/security.md", id, id)
+	}
+
+	retired := regexp.MustCompile(`(?m)^### (GO-\d{4}-\d+) — retired`)
+	for _, m := range retired.FindAllStringSubmatch(doc, -1) {
+		assert.NotContains(t, accepted, m[1],
+			"%s is retired in docs/security.md but still on the allowlist — remove it or reinstate the acceptance", m[1])
+	}
+}
+
+// nonVendorGoFiles lists the repository's non-test Go files, relative to the
+// repo root, skipping the vendored tree and dot-directories (worktrees, agent
+// state) so a guard sees only code Asimi itself compiles.
+func nonVendorGoFiles(t *testing.T) []string {
+	t.Helper()
+	root, err := filepath.Abs("..")
+	require.NoError(t, err)
+	var files []string
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != "." && (name == "vendor" || strings.HasPrefix(name, ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
+			rel, relErr := filepath.Rel(root, path)
+			require.NoError(t, relErr)
+			files = append(files, rel)
+		}
+		return nil
+	})
+	require.NoError(t, err, "walk the non-vendor Go tree")
+	return files
+}
+
+// TestGO20266911AcceptanceBasisStillHolds guards the premise the
+// GO-2026-6911 acceptance rests on. The finding has no upstream fix, so it is
+// accepted on the claim that Asimi's configuration never exercises bifrost's
+// MCP client: InitBifrost supplies only Account and Logger, leaving MCPConfig
+// nil, so no MCPManager and no StreamableHTTP transport is ever built. That is a
+// property of production code, not of this test — the moment Asimi configures
+// MCP the acceptance is void and the allowlist entry must be re-reviewed, so
+// this test fails loudly rather than letting a stale acceptance stand.
+func TestGO20266911AcceptanceBasisStillHolds(t *testing.T) {
+	accepted := false
+	for _, line := range strings.Split(readRootFile(t, "security/vuln-allowlist.txt"), "\n") {
+		if strings.TrimSpace(strings.SplitN(line, "#", 2)[0]) == "GO-2026-6911" {
+			accepted = true
+		}
+	}
+	if !accepted {
+		t.Skip("GO-2026-6911 is no longer accepted — nothing to guard")
+	}
+
+	// Scan the whole non-vendor tree rather than one file: a second BifrostConfig
+	// construction elsewhere would otherwise slip through while the single-site
+	// claim this acceptance rests on quietly stops being true.
+	for _, file := range nonVendorGoFiles(t) {
+		body := readRootFile(t, file)
+		if strings.Contains(body, "BifrostConfig") && strings.Contains(body, "MCPConfig") {
+			t.Errorf("%s wires MCPConfig into a BifrostConfig — bifrost would build an MCPManager "+
+				"and the StreamableHTTP symbols GO-2026-6911 is accepted for become exercised; "+
+				"re-review the acceptance", file)
+		}
+	}
+	assert.NotContains(t, readRootFile(t, "internal/config/default.conf"), "[mcp]",
+		"default.conf gained an [mcp] section — MCP is now configurable and the GO-2026-6911 acceptance must be re-reviewed")
 }

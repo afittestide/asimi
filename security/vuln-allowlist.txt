@@ -1,9 +1,11 @@
 # Accepted govulncheck findings — see docs/security.md for the justification.
-# One vulnerability ID per line. The `just vuln` gate fails on any finding
-# NOT listed here, and on any entry here that no longer matches a finding.
+# One vulnerability ID per line. The `just get-threats` gate fails on any finding
+# NOT listed here; it also notes (does not block) any entry here that no longer
+# matches a finding, since a stale entry needs re-review.
 #
-# GO-2026-5932: x/crypto/openpgp is unmaintained (Fixed in: N/A) but is
-# linked-not-reachable — pulled in transitively by ocicrypt via the Podman
-# client; only ocicrypt's gpg-encrypted-image flow calls it, which Asimi does
-# not use.
-GO-2026-5932
+# GO-2026-6911: mark3labs/mcp-go has no fixed release (Fixed in: N/A). The
+# vulnerable StreamableHTTP transport symbols are pulled in transitively by
+# bifrost's schemas package, but Asimi never configures an MCPConfig, so
+# bifrost never constructs its MCPManager and that transport path is never
+# exercised. Re-review when bifrost bumps mcp-go.
+GO-2026-6911

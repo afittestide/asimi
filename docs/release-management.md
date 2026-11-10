@@ -49,24 +49,25 @@ var AsimiVersion = "0.2.1" // Update this before each release
 Run the vulnerability scan before committing:
 
 ```bash
-just vuln
+just get-threats
 ```
 
-This gate is **mandatory**: `just vuln` builds the binary and runs
+This gate is **mandatory**: `just get-threats` builds the binary and runs
 `govulncheck -mode=binary` against it. It fails if any reported vulnerability is
 not on the reviewed allowlist at `security/vuln-allowlist.txt` (see
 [docs/security.md](security.md) for the accepted findings and their
 justifications). A non-zero exit means the release MUST NOT proceed.
 
-Note that `just test` runs `just vuln` only when the `CI` environment variable
-is set (see `justfile`). Local runs — including the `release-version` ritual's
-judge step — have `CI` unset, so the scan must be invoked explicitly. Run
+Note that `just test` does not run the vulnerability scan: it runs only
+`just test-race` when the `CI` environment variable is set (see `Justfile`), and
+never invokes `get-threats`. The scan must therefore be invoked explicitly; CI
+does not run it today, so local releases must run it themselves. Run
 `just bootstrap` once to install `govulncheck`.
 
 ### 5. Commit the Release
 
 ```bash
-git add CHANGELOG.md internal/utils/asimi_version.go README.md
+git add CHANGELOG.md internal/utils/asimi_version.go docs/roadmap.md
 git commit -m "chore: releasing 0.2.1"
 ```
 
@@ -115,9 +116,9 @@ curl -fsSL https://raw.githubusercontent.com/afittestide/asimi/main/scripts/inst
 # Full release flow
 vim CHANGELOG.md                                                   # Polish changelog
 sed -i 's/var AsimiVersion = .*/var AsimiVersion = "0.2.1"/' internal/utils/asimi_version.go  # Update version
-vim README.md                                                      # Update roadmap
-just vuln                                                          # Release gate: no reachable vulns
-git add CHANGELOG.md internal/utils/asimi_version.go README.md && git commit -m "chore: releasing 0.2.1"
+vim docs/roadmap.md                                                # Update roadmap
+just get-threats                                                   # Release gate: no reachable vulns
+git add CHANGELOG.md internal/utils/asimi_version.go docs/roadmap.md && git commit -m "chore: releasing 0.2.1"
 git tag -a v0.2.1 -m "Release 0.2.1"
 git push origin main --tags
 ```
@@ -165,11 +166,11 @@ ASIMI_VERSION=v0.2.0 ASIMI_INSTALL_DIR=~/bin curl -fsSL https://asimi.dev/instal
 The `release-version` ritual (defined in `.agents/rituals.yaml`) automates this
 process end-to-end. The Chancellor enacts it via `enact_ritual` with a target
 version (e.g. `0.9.0`). The ritual runs through changelog preparation, version
-bump, roadmap update, verification (including the `just vuln` vulnerability
-gate), sage review, commit-and-tag, and finally asks the Ruler to confirm the
-push via zhengming.
+bump, roadmap update, verification (including the `just get-threats` vulnerability
+gate), chancellor review, commit-and-tag, and finally asks the Ruler to confirm
+the push via zhengming.
 
 ## See Also
 
-- [RELEASE_CHECKLIST.md](../RELEASE_CHECKLIST.md) - Detailed Homebrew release checklist
+- [docs/roadmap.md](roadmap.md) - Planned and in-flight work
 - [CHANGELOG.md](../CHANGELOG.md) - Version history
