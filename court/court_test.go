@@ -1530,6 +1530,18 @@ func TestCourt_StartRitual_UnknownRitual(t *testing.T) {
 	require.Empty(t, events, "unknown ritual must not emit a ritual_enacted event")
 }
 
+// TestCourt_StartRitual_NilRegistry verifies that Court.StartRitual returns an
+// error (rather than panicking) when the court has no ritual registry.
+func TestCourt_StartRitual_NilRegistry(t *testing.T) {
+	s := &Court{}
+	require.Nil(t, s.GetRitualRegistry())
+
+	key := storage.EdictKey{ID: 44, Username: config.OSUsername(), Project: "testproject"}
+	err := s.StartRitual("swift-strike", key, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown ritual")
+}
+
 // TestCourt_StartRitual_OrphanReconcileUnblocksReenactment verifies e1012
 // acceptance criterion 2: an edict whose ritual was orphaned by a restart can be
 // re-enacted without a human clearing a stale prompt. Before the reconcile the

@@ -2205,6 +2205,30 @@ func TestInvokeRitualTool_RequestedEvenForBadRitual(t *testing.T) {
 	}
 }
 
+// failingLauncher is a tools.RitualLauncher whose StartRitual always fails,
+// used to verify InvokeRitualTool surfaces the launcher's error (edict 841).
+type failingLauncher struct{ err error }
+
+func (l failingLauncher) StartRitual(name string, key storage.EdictKey, inputs map[string]string) error {
+	return l.err
+}
+
+// TestInvokeRitualTool_SurfacesLaunchError verifies that enact_ritual propagates
+// the launcher's error instead of reporting "requested" when StartRitual fails
+// (e.g. an unknown ritual name).
+func TestInvokeRitualTool_SurfacesLaunchError(t *testing.T) {
+	wantErr := fmt.Errorf("unknown ritual %q; available rituals: swift-strike", "swift_strike")
+	tool := tools.InvokeRitualTool{
+		Ctx:      tools.ToolContext{Username: "testuser", Project: "testproject"},
+		Launcher: failingLauncher{err: wantErr},
+	}
+
+	result, err := tool.Call(context.Background(), `{"ritual_name":"swift_strike","edict_id":1}`)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, wantErr)
+	assert.Empty(t, result, "no success payload must be returned on launch failure")
+}
+
 // mockCmdRunner implements runners.Runner for testing
 type mockCmdRunner struct {
 	output   string
