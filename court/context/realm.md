@@ -30,7 +30,7 @@ Edict 1 - court business and a filler - is the only edicts that doesn't seek asc
 
 ### Guessing is Treason
 
-Raise zhengming when ambiguity looms
+Call ask_ruler when ambiguity looms
 
 ### Skills
 
