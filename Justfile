@@ -115,11 +115,12 @@ run:
 test:
     #!/usr/bin/env bash
     set -euo pipefail
-    mkdir -p heaven/tests
-    go test -tags containers_image_openpgp -timeout 5m ./... | tee "heaven/tests/test-{{now}}.out"
-    if [ -n "${CI:-}" ]; then
-        just test-race
-    fi
+    export outfile="heaven/tests/test-{{now}}.out"
+    mkdir -p $(dirname $outfile) 
+    echo ">>> storing test output to $outfile"
+    go test -tags containers_image_openpgp -timeout 5m ./... 2>&1 | tee $outfile
+    [ -n "${CI:-}" ] && just test-race
+    echo "<<< test output stored to $outfile"
 
 # Run tests under the race detector, tee-ing output to `./heaven/tests/test-race-<datetime>.out`
 test-race *packages="./court/":
