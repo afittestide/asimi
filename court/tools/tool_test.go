@@ -397,6 +397,11 @@ func TestMarkdownEnvelope(t *testing.T) {
 	if _, ok := isMarkdownEnvelope(`{"legacy":true}`); ok {
 		t.Errorf("a bare record must not be detected as a markdown envelope")
 	}
+
+	// An unencodable raw must surface as an error, not a silent empty envelope.
+	if _, err := newMarkdownEnvelope("x", func() {}); err == nil {
+		t.Errorf("newMarkdownEnvelope succeeded on an unencodable raw, want an error")
+	}
 }
 
 // TestTableCell covers cell collapsing and truncation.

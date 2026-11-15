@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -241,11 +242,16 @@ func TestGetIncidentTool(t *testing.T) {
 	}
 	// time.Time struct equality is location-pointer sensitive: the DB scan gives
 	// CreatedAt a fixed-offset zone while the JSON round-trip resolves it into
-	// time.Local, so `fetched != incident` fails in every non-UTC zone. Compare
-	// the instants; the field assertions below cover the data.
+	// time.Local, so a bare `fetched != incident` fails in every non-UTC zone.
+	// Compare the instants, then adopt them so the whole-record comparison below
+	// still pins fidelity of every other field of raw (edict 1031).
 	if !fetched.CreatedAt.Equal(incident.CreatedAt) || !fetched.UpdatedAt.Equal(incident.UpdatedAt) {
 		t.Errorf("raw times = (%v,%v), want the identical instants (%v,%v)",
 			fetched.CreatedAt, fetched.UpdatedAt, incident.CreatedAt, incident.UpdatedAt)
+	}
+	fetched.CreatedAt, fetched.UpdatedAt = incident.CreatedAt, incident.UpdatedAt
+	if fetched != incident {
+		t.Errorf("raw = %+v, want the identical incident %+v", fetched, incident)
 	}
 	if fetched.Description != "memory leak" {
 		t.Errorf("Description = %q, want %q", fetched.Description, "memory leak")
@@ -327,6 +333,12 @@ func TestGetIncidentTool_FormatScopeReport(t *testing.T) {
 	}
 	if strings.Contains(got, "{") || strings.Contains(got, `"rows"`) {
 		t.Errorf("Format = %q must not echo the scope report JSON", got)
+	}
+
+	// The error form still names the tool and the failure (edict 1031).
+	errGot := GetIncidentTool{}.Format(`{"incident_id":"inc-9"}`, "", errors.New("boom"))
+	if !strings.Contains(errGot, "Get Incident: Error: boom") {
+		t.Errorf("Format = %q, want the error form", errGot)
 	}
 }
 

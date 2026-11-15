@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -227,8 +228,16 @@ func TestGetManifestByCommitTool_PopulatedReturnsMarkdownEnvelope(t *testing.T) 
 	if err := json.Unmarshal(raw, &rawManifest); err != nil {
 		t.Fatalf("raw is not a storage.ForgeManifest: %v\n%s", err, raw)
 	}
-	if rawManifest.ManifestID != "m1" || rawManifest.FilePath != "a.go" {
-		t.Errorf("raw = %+v, want the manifest", rawManifest)
+	// time.Time struct equality is location-pointer sensitive (the DB scan yields
+	// a fixed-offset zone, the JSON round-trip resolves into time.Local), so
+	// compare the instants and adopt them before pinning the whole record.
+	if !rawManifest.CreatedAt.Equal(manifest.CreatedAt) || !rawManifest.UpdatedAt.Equal(manifest.UpdatedAt) {
+		t.Errorf("raw times = (%v,%v), want the identical instants (%v,%v)",
+			rawManifest.CreatedAt, rawManifest.UpdatedAt, manifest.CreatedAt, manifest.UpdatedAt)
+	}
+	rawManifest.CreatedAt, rawManifest.UpdatedAt = manifest.CreatedAt, manifest.UpdatedAt
+	if rawManifest != manifest {
+		t.Errorf("raw = %+v, want the identical manifest %+v", rawManifest, manifest)
 	}
 
 	if strings.Contains(env.Content, "{") || strings.Contains(env.Content, `"file_path"`) {
@@ -322,6 +331,17 @@ func TestGetManifestByCommitTool_FormatScopeReport(t *testing.T) {
 	}
 	if strings.Contains(got, `"rows"`) {
 		t.Errorf("Format = %q must not echo the scope report JSON", got)
+	}
+
+	// Non-envelope, non-scope results fall back to naming the commit, and the
+	// error form names the tool and the failure — neither may echo JSON.
+	plain := GetManifestByCommitTool{}.Format(`{"commit_hash":"abc123"}`, `{"legacy":true}`, nil)
+	if !strings.Contains(plain, "by commit abc123") || strings.Contains(plain, "{") {
+		t.Errorf("Format = %q, want a plain by-commit line", plain)
+	}
+	errGot := GetManifestByCommitTool{}.Format(`{"commit_hash":"abc123"}`, "", errors.New("boom"))
+	if !strings.Contains(errGot, "Get Manifest By Commit: Error: boom") {
+		t.Errorf("Format = %q, want the error form", errGot)
 	}
 }
 
