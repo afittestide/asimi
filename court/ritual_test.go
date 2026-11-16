@@ -707,6 +707,18 @@ func containsString(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
 
+// hasThen reports whether steps contains want, guarding against indexing a
+// short or empty slice so a yaml shape mismatch fails the test instead of
+// panicking.
+func hasThen(steps []string, want string) bool {
+	for _, s := range steps {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRitualStreamMessages tests that ritual execution sends all expected
 // typed messages through the notify callback.
 func TestRitualStreamMessages(t *testing.T) {
@@ -1274,6 +1286,10 @@ func TestLoadBuiltinRituals(t *testing.T) {
 	// Verify swift-strike uses ritual-level background given
 	for _, r := range rituals {
 		if r.Name == "swift-strike" {
+			if len(r.Steps) < 2 {
+				t.Errorf("swift-strike: expected at least 2 steps, got %d", len(r.Steps))
+				continue
+			}
 			// Background given at ritual level
 			if len(r.Background) < 2 || r.Background[0] != "an edict's worktree" || r.Background[1] != "the edict details" {
 				t.Errorf("swift-strike: expected background given ['an edict's worktree' 'the edict details'], got %v", r.Background)
@@ -1282,11 +1298,13 @@ func TestLoadBuiltinRituals(t *testing.T) {
 			if len(r.Steps[0].Given) != 0 {
 				t.Errorf("swift-strike forge: expected no step-level given, got %v", r.Steps[0].Given)
 			}
-			if len(r.Steps[1].Given) == 0 {
-				t.Error("swift-strike judge step: expected given entries")
+			// The test gate lives on the forging step's then clause.
+			if !hasThen(r.Steps[0].Then, "!just test") {
+				t.Errorf("swift-strike forge: expected then to contain '!just test', got %v", r.Steps[0].Then)
 			}
-			if r.Steps[1].Given[0] != "!just test" {
-				t.Errorf("swift-strike judge given: expected '!just test', got %q", r.Steps[1].Given[0])
+			// The judging step must not declare the gate, or the suite would run twice.
+			if len(r.Steps[1].Given) != 0 {
+				t.Errorf("swift-strike judge: expected no given entries, got %v", r.Steps[1].Given)
 			}
 		}
 	}

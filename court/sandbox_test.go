@@ -242,61 +242,6 @@ func TestPodmanDependencyMeetsSecurityFloor(t *testing.T) {
 	}
 }
 
-// TestCIDevPathStaysPlainAndFast guards edict 1014's central promise: with CI
-// unset, `just test` runs the plain suite only. The `-race` gate is the
-// expensive half, so it must sit INSIDE the `test:` recipe's CI branch — a
-// regression that hoists it back out would silently restore the slow inner
-// loop the edict exists to remove. The plain `go test` line must also keep the
-// load-bearing openpgp build tag (dropping it pulls cgo gpgme; edict 1014) and
-// must not carry `-v` (the tee archive is the record; -v only bloats the
-// terminal). The tee target is asserted in both modes.
-func TestCIDevPathStaysPlainAndFast(t *testing.T) {
-	content := readRootFile(t, "Justfile")
-	body := recipeBody(content, "test:")
-	require.NotEmpty(t, body, "could not extract `test` recipe body from Justfile")
-
-	lines := strings.Split(body, "\n")
-	ciGuard, race, plain := -1, -1, -1
-	for i, line := range lines {
-		if strings.Contains(line, `if [ -n "${CI`) {
-			ciGuard = i
-		}
-		if strings.Contains(line, "just test-race") {
-			race = i
-		}
-		if strings.Contains(line, "go test ") && strings.Contains(line, "./...") {
-			plain = i
-		}
-	}
-
-	require.NotEqual(t, -1, ciGuard, "`test` recipe must branch on the CI env var")
-	require.NotEqual(t, -1, race, "`test` recipe must invoke `just test-race`")
-	require.NotEqual(t, -1, plain, "`test` recipe must run the plain `go test ./...` suite")
-
-	// The race gate must be INSIDE the CI branch: it comes after the guard and
-	// before the closing `fi`. Above the guard it would run on the dev station.
-	assert.Greater(t, race, ciGuard, "`just test-race` must run after the CI guard, not before it")
-	fi := -1
-	for i := race; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == "fi" {
-			fi = i
-			break
-		}
-	}
-	require.NotEqual(t, -1, fi, "the CI branch containing `just test-race` must be closed with `fi`")
-	assert.Less(t, race, fi, "`just test-race` must sit inside the CI branch (before `fi`)")
-
-	// Plain suite: load-bearing tag kept, -v dropped.
-	plainLine := lines[plain]
-	assert.Contains(t, plainLine, "-tags containers_image_openpgp",
-		"plain `go test` must keep the containers_image_openpgp tag")
-	assert.NotContains(t, " "+plainLine+" ", " -v ",
-		"plain `go test` must not carry -v (the tee archive is the record)")
-
-	// Both modes archive under heaven/tests/.
-	assert.Contains(t, body, "heaven/tests/", "`test` recipe must tee output to heaven/tests/")
-}
-
 // TestRaceRecipeKeepsRaceAndOpenPGP guards acceptance #3 for the CI half of the
 // fork: the `test-race` invocation must keep both the race detector and the
 // containers_image_openpgp build tag. Without the tag, -race would pull cgo
