@@ -387,6 +387,11 @@ type Session struct {
 	// "use the tool's registered (Court-wide) runner".
 	runner runners.Runner `json:"-"`
 
+	// bindMu guards RepoInfo and runner once the session is live: the Court
+	// re-binds unbound sessions when it is re-rooted (a `:switch`), which can
+	// race a tool dispatch on the streaming goroutine.
+	bindMu sync.RWMutex
+
 	// ReasoningEffort, when non-empty, sets the reasoning.effort parameter on
 	// outgoing chat requests ("low" | "medium" | "high"). Set by ritual steps
 	// via their `effort:` key. Cleared automatically is not done here — callers
@@ -623,6 +628,29 @@ func (s *Session) UpdateModel(provider, modelID string) {
 		s.ctxSizeSet = false
 		s.atifModelChanged(provider, modelID)
 	}
+}
+
+// binding returns the session's tree binding (RepoInfo and runner) under the
+// lock that re-binding takes.
+func (s *Session) binding() (repo.RepoInfo, runners.Runner) {
+	s.bindMu.RLock()
+	defer s.bindMu.RUnlock()
+	return s.RepoInfo, s.runner
+}
+
+// bindToTree points the session at the Court's current tree. It is called when
+// the Court is re-rooted (a `:switch`) on interactive minister sessions only:
+// those hold no tree of their own, and a session cached before the switch
+// would otherwise keep dispatching file tools against the previous tree.
+// Ritual-step and ling sessions are never re-bound — their binding is the
+// edict's worktree, deliberately narrower than the Court's.
+func (s *Session) bindToTree(repoInfo repo.RepoInfo) {
+	if s == nil || repoInfo.ProjectRoot == "" {
+		return
+	}
+	s.bindMu.Lock()
+	defer s.bindMu.Unlock()
+	s.RepoInfo = repoInfo
 }
 
 // UpdateReasoningEffort sets the session's reasoning-effort level and
@@ -2215,11 +2243,12 @@ func hasToolCallResponse(toolMessages []schemas.ChatMessage, toolCallID string) 
 func (s *Session) executeToolCall(ctx context.Context, tool Tool, toolCallID, toolName, argsJSON string) schemas.ChatMessage {
 	ctx = context.WithValue(ctx, tools.SessionIDKey{}, s.ID)
 	ctx = context.WithValue(ctx, tools.ChannelIDKey{}, s.channelID)
-	if s.RepoInfo.ProjectRoot != "" {
-		ctx = context.WithValue(ctx, tools.RepoInfoKey{}, s.RepoInfo)
+	repoInfo, runner := s.binding()
+	if repoInfo.ProjectRoot != "" {
+		ctx = context.WithValue(ctx, tools.RepoInfoKey{}, repoInfo)
 	}
-	if s.runner != nil {
-		ctx = context.WithValue(ctx, tools.RunnerKey{}, s.runner)
+	if runner != nil {
+		ctx = context.WithValue(ctx, tools.RunnerKey{}, runner)
 	}
 	var out string
 	var callErr error

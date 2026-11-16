@@ -172,6 +172,12 @@ func reconfigureModel(ctx context.Context, ct *court.Court, hp types.SetContextP
 		RunShellCommand: projectCfg.RunShellCommand,
 		AgentsFile:      projectCfg.Session.AgentsFile,
 		WorkingDir:      hp.ProjectRoot,
+		// Interactive Ministers build their sessions from this config, so the
+		// authoritative RepoInfo must ride on it. This runs on every handshake
+		// including every `:switch`; leaving it off made those sessions
+		// dispatch their file tools unbound, so reads came from the registry's
+		// fallback root while writes landed in the worktree (edict 1051).
+		RepoInfo: repoInfo,
 	}
 
 	ct.ConfigureModel(bifrostClient, sessionCfg, repoInfo)

@@ -4102,6 +4102,262 @@ func TestSetRepoInfo_NoWorktreeEndsAtProjectRoot(t *testing.T) {
 	assert.Equal(t, "/proj", runner.last.ProjectRoot)
 }
 
+// registeredReadFileRoot returns the project root the registry's read_file
+// fallback resolves against, or "" when the tool is not registered.
+func registeredReadFileRoot(s *Court) string {
+	for _, tp := range s.toolRegistry.Tools() {
+		switch rf := tp.Tool.(type) {
+		case *tools.ReadFileTool:
+			return rf.ProjectRoot
+		case tools.ReadFileTool:
+			return rf.ProjectRoot
+		}
+	}
+	return ""
+}
+
+// writeProbe writes content to name under dir, creating dir first.
+func writeProbe(t *testing.T, dir, name, content string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+}
+
+// TestSetContext_InteractiveSessionResolvesWorktree is the e1051 regression
+// test: a file tool is only as worktree-aware as the session that dispatches
+// it. Two interactive construction paths (the daemon's reconfigureModel and
+// Court.SetContext) hand ConfigureModel a SessionConfig without a RepoInfo, so
+// an interactive Minister session dispatched with a zero binding and its
+// read_file fell back to whatever root the registry happened to hold.
+//
+// It covers the whole seam: a Court that never received SetRepoInfo (the
+// daemon's second-handshake shape), a SetContext that must re-root the
+// registry, and a second SetContext (the `:switch` shape) that must move both
+// the registry and the Court runner.
+func TestSetContext_InteractiveSessionResolvesWorktree(t *testing.T) {
+	mainRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(mainRoot, ".agents"), 0o755))
+	writeProbe(t, mainRoot, "probe.txt", "MAIN")
+
+	wt1 := filepath.Join(".agents", "worktrees", "e1051")
+	writeProbe(t, filepath.Join(mainRoot, wt1), "probe.txt", "WORKTREE")
+	wt2 := filepath.Join(".agents", "worktrees", "e1052")
+	writeProbe(t, filepath.Join(mainRoot, wt2), "probe.txt", "WORKTREE2")
+
+	db := setupCourtTestDB(t)
+	runner := &repoInfoRecordingRunner{}
+	s := NewCourt(db, config.DefaultCourtConfig(), runner, nil)
+	require.NotNil(t, s)
+	// Deliberately no SetRepoInfo: this is the daemon's second-handshake shape,
+	// where createCourt (the only SetRepoInfo caller) never runs again.
+
+	setCtx := func(worktreePath string) {
+		t.Helper()
+		err := s.SetContext(context.Background(), types.SetContextParams{
+			ProjectRoot:  mainRoot,
+			WorktreePath: worktreePath,
+			Branch:       "asimi/e1051",
+			Project:      "proj",
+			Username:     "test-user",
+			APIKeys:      map[string]string{"openai": "sk-test"},
+		})
+		require.NoError(t, err)
+	}
+
+	setCtx(wt1)
+
+	// (2) SetContext alone must be enough to give the registry a root: the
+	// "project root not set" error is unreachable after a successful SetContext.
+	wantRoot := filepath.Join(mainRoot, wt1)
+	assert.Equal(t, wantRoot, registeredReadFileRoot(s),
+		"registered file tools must resolve against EffectiveRoot after SetContext")
+	require.True(t, runner.set, "the Court runner must be re-targeted by SetContext")
+	assert.Equal(t, wantRoot, runner.last.EffectiveRoot(),
+		"the Court runner must execute in the worktree after SetContext")
+
+	// (1) A real interactive Minister session — built the way the interactive
+	// paths build it, from the Court's session config — must dispatch its file
+	// tool with the worktree binding.
+	cfg := s.sessionCfg
+	require.NotNil(t, cfg, "SetContext must leave a session config behind")
+	require.Equal(t, wantRoot, cfg.RepoInfo.EffectiveRoot(),
+		"the interactive session config must carry the authoritative RepoInfo")
+
+	forge := s.GetMinister("forge")
+	require.NotNil(t, forge)
+	sess, err := CreateSession(forge, mocks.NewLLMProvider(), cfg, func(any) {}, "forge")
+	require.NoError(t, err)
+
+	var readFile Tool = tools.NewReadFileTool(mainRoot)
+	for _, tl := range sess.tools {
+		if tl.Name() == "read_file" {
+			readFile = tl
+			break
+		}
+	}
+	resp := sess.executeToolCall(context.Background(), readFile, "call-1", "read_file", `{"path":"probe.txt"}`)
+	assert.Equal(t, "WORKTREE", msgContentStr(resp),
+		"an interactive Minister session must read the worktree, not the main tree")
+
+	// (3) A second SetContext — the `:switch` shape — must move the registry
+	// and the Court runner again, not pin them to the first handshake's root.
+	setCtx(wt2)
+
+	wantRoot2 := filepath.Join(mainRoot, wt2)
+	assert.Equal(t, wantRoot2, registeredReadFileRoot(s),
+		"registered file tools must follow a second SetContext")
+	assert.Equal(t, wantRoot2, runner.last.EffectiveRoot(),
+		"the Court runner must follow a second SetContext")
+
+	sess2, err := CreateSession(forge, mocks.NewLLMProvider(), s.sessionCfg, func(any) {}, "forge")
+	require.NoError(t, err)
+	resp2 := sess2.executeToolCall(context.Background(), readFile, "call-1", "read_file", `{"path":"probe.txt"}`)
+	assert.Equal(t, "WORKTREE2", msgContentStr(resp2),
+		"a session created after the switch must read the new worktree")
+}
+
+// TestSetContext_RebindsCachedInteractiveSession covers the session that is
+// already cached when the Court re-roots: `:switch` does not recreate live
+// Minister sessions, so a stale binding would make it keep reading the old
+// tree. Ritual-step and ling sessions must keep their own narrower binding.
+func TestSetContext_RebindsCachedInteractiveSession(t *testing.T) {
+	mainRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(mainRoot, ".agents"), 0o755))
+	writeProbe(t, mainRoot, "probe.txt", "MAIN")
+	wt := filepath.Join(".agents", "worktrees", "e7")
+	writeProbe(t, filepath.Join(mainRoot, wt), "probe.txt", "WORKTREE")
+
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	forge := s.GetMinister("forge")
+	require.NotNil(t, forge)
+	// An interactive session created before the Court has any repo info, i.e.
+	// with a zero binding — the pre-fix shape.
+	cached, err := CreateSession(forge, mocks.NewLLMProvider(), &SessionConfig{}, func(any) {}, "forge")
+	require.NoError(t, err)
+	forge.(interface{ SetSession(*Session, ...string) }).SetSession(cached, "forge")
+
+	// A ritual-channel session must NOT be touched by the re-root.
+	ritualSess, err := CreateSession(forge, mocks.NewLLMProvider(), &SessionConfig{}, func(any) {}, "e7")
+	require.NoError(t, err)
+	forge.(interface{ SetSession(*Session, ...string) }).SetSession(ritualSess, "e7")
+
+	err = s.SetContext(context.Background(), types.SetContextParams{
+		ProjectRoot:  mainRoot,
+		WorktreePath: wt,
+		Branch:       "asimi/e7",
+		Project:      "proj",
+		Username:     "test-user",
+		APIKeys:      map[string]string{"openai": "sk-test"},
+	})
+	require.NoError(t, err)
+
+	want := filepath.Join(mainRoot, wt)
+	assert.Equal(t, want, cached.RepoInfo.EffectiveRoot(),
+		"the cached interactive session must follow the re-root")
+	assert.Equal(t, repo.RepoInfo{}, ritualSess.RepoInfo,
+		"a ritual-channel session must keep its own binding")
+}
+
+// TestConfigureModel_RerootsWithoutSetRepoInfo pins the daemon path directly:
+// reconfigureModel calls ConfigureModel on every handshake after the first, and
+// SetRepoInfo runs only inside `if ct == nil`. ConfigureModel alone must
+// therefore re-root the registry and the runner.
+func TestConfigureModel_RerootsWithoutSetRepoInfo(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	runner := &repoInfoRecordingRunner{}
+	s := NewCourt(db, config.DefaultCourtConfig(), runner, nil)
+	require.NotNil(t, s)
+
+	s.ConfigureModel(nil, &SessionConfig{}, repo.RepoInfo{
+		ProjectRoot:  "/proj",
+		WorktreePath: filepath.Join(".agents", "worktrees", "e42"),
+		IsWorktree:   true,
+	})
+
+	want := filepath.Join("/proj", ".agents", "worktrees", "e42")
+	assert.Equal(t, want, registeredReadFileRoot(s),
+		"ConfigureModel must re-root the registered file tools")
+	require.True(t, runner.set, "ConfigureModel must re-target the Court runner")
+	assert.Equal(t, want, runner.last.EffectiveRoot())
+	assert.Equal(t, "/proj", runner.last.ProjectRoot, "ProjectRoot must stay the main tree")
+}
+
+// TestConfigureModel_StampsRepoInfoOnSessionConfig pins the authority rule of
+// edict 1051: exactly one value wins, and it is the one ConfigureModel was
+// handed. Interactive sessions are built from s.sessionCfg, so a config that
+// arrives without a RepoInfo must not be stored as-is — the caller does not
+// know the tree, the Court does. Without this the daemon's reconfigureModel
+// hands over a config whose RepoInfo happened to be set by luck, and any other
+// caller (tui.go's SetSession path builds a bare SessionConfig) re-opens the
+// defect silently.
+func TestConfigureModel_StampsRepoInfoOnSessionConfig(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), &repoInfoRecordingRunner{}, nil)
+	require.NotNil(t, s)
+
+	ri := repo.RepoInfo{
+		ProjectRoot:  "/proj",
+		WorktreePath: filepath.Join(".agents", "worktrees", "e42"),
+		IsWorktree:   true,
+	}
+
+	// A caller that knows nothing about the tree.
+	callerCfg := &SessionConfig{WorkingDir: "/proj"}
+	s.ConfigureModel(nil, callerCfg, ri)
+
+	require.NotNil(t, s.sessionCfg)
+	assert.Equal(t, ri, s.sessionCfg.RepoInfo,
+		"the authoritative RepoInfo must be stamped onto the stored session config")
+	assert.Equal(t, filepath.Join("/proj", ".agents", "worktrees", "e42"),
+		s.sessionCfg.RepoInfo.EffectiveRoot())
+	assert.Equal(t, repo.RepoInfo{}, callerCfg.RepoInfo,
+		"the caller's config must not be mutated: sessions may already hold it")
+	assert.Equal(t, "/proj", callerCfg.WorkingDir, "other fields must ride through unchanged")
+
+	// A session built from the stored config must therefore dispatch bound.
+	forge := s.GetMinister("forge")
+	require.NotNil(t, forge)
+	sess, err := CreateSession(forge, mocks.NewLLMProvider(), s.sessionCfg, func(any) {}, "forge")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("/proj", ".agents", "worktrees", "e42"),
+		sess.RepoInfo.EffectiveRoot(),
+		"a session built from the stored config must be bound to the worktree")
+}
+
+// TestConfigureModel_ZeroRepoInfoKeepsExistingRoot guards the eraser: a caller
+// that passes no repoInfo (an LLM-only reconfigure) must leave the Court's
+// root alone. Erasing it would re-open edict 1051's symptom from the other
+// direction — tools resolve against an empty root and every read falls back.
+func TestConfigureModel_ZeroRepoInfoKeepsExistingRoot(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	runner := &repoInfoRecordingRunner{}
+	s := NewCourt(db, config.DefaultCourtConfig(), runner, nil)
+	require.NotNil(t, s)
+
+	want := filepath.Join("/proj", ".agents", "worktrees", "e42")
+	s.ConfigureModel(nil, &SessionConfig{}, repo.RepoInfo{
+		ProjectRoot:  "/proj",
+		WorktreePath: filepath.Join(".agents", "worktrees", "e42"),
+		IsWorktree:   true,
+	})
+	require.Equal(t, want, registeredReadFileRoot(s))
+
+	// An LLM-only reconfigure: no tree information at all.
+	s.ConfigureModel(nil, &SessionConfig{}, repo.RepoInfo{})
+
+	assert.Equal(t, want, registeredReadFileRoot(s),
+		"a zero repoInfo must not erase the registered root")
+	assert.Equal(t, want, runner.last.EffectiveRoot(),
+		"a zero repoInfo must not re-point the runner at nothing")
+	// A session config handed to this call must not be stamped with a zero
+	// binding either — that would push an empty binding onto new sessions.
+	require.NotNil(t, s.sessionCfg)
+	assert.Equal(t, repo.RepoInfo{}, s.sessionCfg.RepoInfo,
+		"a zero repoInfo is not stamped onto the session config")
+}
+
 // ---------------------------------------------------------------------------
 // Per-edict runners (edict 934)
 // ---------------------------------------------------------------------------

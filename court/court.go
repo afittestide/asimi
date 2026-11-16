@@ -605,6 +605,22 @@ func (s *Court) SetRepoInfo(repoInfo repo.RepoInfo) {
 	if s.ritualGuard != nil {
 		s.ritualGuard.repoInfo = repoInfo
 	}
+	s.rerootToolsAndRunner(repoInfo)
+}
+
+// rerootToolsAndRunner re-points everything that resolves against the Court's
+// working root at repoInfo: the shared ToolContext RepoInfo, the Court-wide
+// shell runner, and the registered project-root-dependent tools.
+//
+// It exists as one helper because there are two authorities that hand the
+// Court a new root — SetRepoInfo (daemon first handshake, single-process) and
+// ConfigureModel (every subsequent handshake, i.e. every `:switch`). Copying
+// this sequence into both is how the two drifted apart in the first place
+// (edict 1051): after `:switch` the registry kept the first handshake's root.
+func (s *Court) rerootToolsAndRunner(repoInfo repo.RepoInfo) {
+	if s == nil {
+		return
+	}
 	// Update the shared ToolContext RepoInfo so all tools see the new root
 	if s.toolCtxRepoInfo != nil {
 		*s.toolCtxRepoInfo = repoInfo
@@ -614,9 +630,25 @@ func (s *Court) SetRepoInfo(repoInfo repo.RepoInfo) {
 	if setter, ok := s.runner.(runners.RepoInfoSetter); ok {
 		setter.SetRepoInfo(repoInfo)
 	}
-	// Update project-root-dependent tools when the effective root is available
+	// Update project-root-dependent tools when the effective root is available.
+	// This is also what stops the "project root not set" error being reachable
+	// after a successful SetContext: the registered fallback root becomes
+	// EffectiveRoot(), never the empty construction-time value.
 	if root := repoInfo.EffectiveRoot(); root != "" {
 		s.updateProjectRootTools(root)
+	}
+	// Live interactive sessions must follow the re-root too: a session cached
+	// before a `:switch` would otherwise keep dispatching file tools against
+	// the previous tree. Ritual-step and ling sessions ("e<N>") keep their own
+	// binding — their tree is deliberately narrower than the Court's.
+	for _, m := range s.ministers {
+		if gs, ok := m.(interface{ GetSessions() map[string]*Session }); ok {
+			for _, sess := range gs.GetSessions() {
+				if sess != nil && !isRitualChannelID(sess.ChannelID()) {
+					sess.bindToTree(repoInfo)
+				}
+			}
+		}
 	}
 }
 
@@ -719,6 +751,18 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 		return
 	}
 	s.llmClient = client
+	// Stamp the authoritative repoInfo onto the session config before anyone
+	// can create a session from it. Interactive sessions are built from
+	// s.sessionCfg, so a zero RepoInfo here means every interactive Minister
+	// dispatches its file tools with no binding at all and they silently fall
+	// back to a registered root (edict 1051). ConfigureModel is the one funnel
+	// both interactive construction sites go through, so the value it was
+	// handed wins — never a re-derivation.
+	if config != nil && repoInfo.ProjectRoot != "" {
+		cloned := *config
+		cloned.RepoInfo = repoInfo
+		config = &cloned
+	}
 	s.sessionCfg = config
 	if config != nil {
 		// Re-broadcast the resolved provider/model to live sessions so they
@@ -726,6 +770,14 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 		// recorder lives on the session, not the court), and propagate the
 		// reasoning-effort level as a thinking_level_change.
 		s.propagateModelToSessions(config)
+	}
+	// Re-root the tools and the Court runner here as well as in SetRepoInfo:
+	// on the daemon path SetRepoInfo runs only for the first handshake, so
+	// every later `:switch` lands in this function alone and the registry
+	// would otherwise keep the first handshake's root forever. A caller that
+	// passes no repoInfo leaves the existing root alone rather than erasing it.
+	if repoInfo.ProjectRoot != "" {
+		s.rerootToolsAndRunner(repoInfo)
 	}
 	for _, minister := range s.Ministers() {
 		if base, ok := minister.(interface {
@@ -903,6 +955,11 @@ func (s *Court) SetContext(ctx context.Context, params types.SetContextParams) e
 		AgentsFile:      projectCfg.Session.AgentsFile,
 		WorkingDir:      params.ProjectRoot,
 		AtifAgentName:   params.AtifAgentName,
+		// Interactive Ministers build their sessions from this config, so the
+		// authoritative RepoInfo must ride on it. Without it an interactive
+		// session dispatches its file tools unbound and they fall back to the
+		// registry root — a tree the Court may no longer be in (edict 1051).
+		RepoInfo: repoInfo,
 	}
 
 	s.ConfigureModel(bifrostClient, sessionCfg, repoInfo)
