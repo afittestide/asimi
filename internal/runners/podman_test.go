@@ -455,6 +455,58 @@ func TestInitializeReestablishesDeadConnection(t *testing.T) {
 	runner.mu.Unlock()
 }
 
+// TestHealthcheckRejectsEmptyOutputWithZeroExit covers the letter 0006
+// signature: an exec attach path that returns no stream bytes and exit 0 must
+// not be reported as healthy, because initialize() would reuse the container.
+func TestHealthcheckRejectsEmptyOutputWithZeroExit(t *testing.T) {
+	mock := newMockPodmanServer(mockInspectJSON(true), http.StatusOK)
+	mock.execStdout = []byte{} // no frame at all
+	mock.execExitCode = 0
+	defer mock.close()
+	host := mock.start(t)
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/hc-empty"}, "0", nil)
+	runner.establishConn = func(_ context.Context) (context.Context, error) {
+		return bindings.NewConnection(context.Background(), "tcp://"+host)
+	}
+
+	conn, err := runner.establishConn(context.Background())
+	require.NoError(t, err)
+
+	runner.mu.Lock()
+	runner.conn = conn
+	runner.containerStarted = true
+	runner.mu.Unlock()
+
+	require.Error(t, runner.healthcheck(context.Background()),
+		"healthcheck must reject an empty probe response with exit status 0")
+}
+
+// TestHealthcheckRejectsNonZeroExit asserts the probe's exit status is honored
+// even when the sentinel is present.
+func TestHealthcheckRejectsNonZeroExit(t *testing.T) {
+	mock := newMockPodmanServer(mockInspectJSON(true), http.StatusOK)
+	mock.execExitCode = 7
+	defer mock.close()
+	host := mock.start(t)
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "test/hc-exit"}, "0", nil)
+	runner.establishConn = func(_ context.Context) (context.Context, error) {
+		return bindings.NewConnection(context.Background(), "tcp://"+host)
+	}
+
+	conn, err := runner.establishConn(context.Background())
+	require.NoError(t, err)
+
+	runner.mu.Lock()
+	runner.conn = conn
+	runner.containerStarted = true
+	runner.mu.Unlock()
+
+	require.Error(t, runner.healthcheck(context.Background()),
+		"healthcheck must reject a probe that exited non-zero")
+}
+
 // mockPodmanServer is a minimal HTTP test server that emulates the subset of
 // the podman REST API needed by initialize(): /_ping, /containers/{name}/json
 // (Inspect), /containers/{name}/start (Start), /containers/create (Create),
@@ -473,6 +525,12 @@ type mockPodmanServer struct {
 	lastCreateBody      []byte
 	lastRemoveQuery     string
 	lastCreateSpec      string
+	// execStdout is the frame body sent on fd=1 by /exec/{id}/start; nil
+	// means the default "__ASIMI_HEALTHY\n". execExitCode is served by
+	// /exec/{id}/json; the zero value keeps the current behaviour, so the
+	// many existing newMockPodmanServer call sites are unaffected.
+	execStdout   []byte
+	execExitCode int
 	// containersJSON is served for GET /containers/json (janitor listing);
 	// infoJSON for GET /info (free-space); pruneCount counts POST
 	// /images/prune (artifact reclamation).
@@ -681,20 +739,33 @@ func handleExecRequest(w http.ResponseWriter, r *http.Request, parts []string, m
 		body, _ := io.ReadAll(r.Body)
 		_ = body
 
-		// Send a multiplexed frame on fd=1 (stdout): "__ASIMI_HEALTHY\n"
-		msg := []byte("__ASIMI_HEALTHY\n")
-		header := make([]byte, 8)
-		header[0] = 1 // fd=1 (stdout)
-		binary.BigEndian.PutUint32(header[4:8], uint32(len(msg)))
-		bufrw.Write(header)
-		bufrw.Write(msg)
-		bufrw.Flush()
+		// Send a multiplexed frame on fd=1 (stdout), defaulting to
+		// "__ASIMI_HEALTHY\n"; execStdout==nil keeps that behaviour.
+		m.mu.Lock()
+		var msg []byte
+		if m.execStdout != nil {
+			msg = m.execStdout
+		} else {
+			msg = []byte("__ASIMI_HEALTHY\n")
+		}
+		m.mu.Unlock()
+		if len(msg) > 0 {
+			header := make([]byte, 8)
+			header[0] = 1 // fd=1 (stdout)
+			binary.BigEndian.PutUint32(header[4:8], uint32(len(msg)))
+			bufrw.Write(header)
+			bufrw.Write(msg)
+			bufrw.Flush()
+		}
 
 	case "json":
 		// GET /exec/{id}/json → ExecInspect
+		m.mu.Lock()
+		code := m.execExitCode
+		m.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"ExitCode":0,"ID":"mock-exec-id","Running":false,"CanRemove":true}`)
+		fmt.Fprintf(w, `{"ExitCode":%d,"ID":"mock-exec-id","Running":false,"CanRemove":true}`, code)
 
 	case "remove":
 		// POST /exec/{id}/remove → ExecRemove

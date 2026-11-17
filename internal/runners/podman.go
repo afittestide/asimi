@@ -380,9 +380,19 @@ func (r *PodmanRunner) healthcheck(ctx context.Context) error {
 		}
 	}()
 
-	_, _, err := r.execCommand(hcCtx, "echo __ASIMI_HEALTHY")
+	// A probe that asserts nothing is not a probe. The sentinel exists so it
+	// can be asserted, and a zero exit status with no output is worse than a
+	// failure: initialize() treats a nil error as "existing container is
+	// healthy" and reuses it, so the whole court would run on a dead shell.
+	output, exitCode, err := r.execCommand(hcCtx, "echo __ASIMI_HEALTHY")
 	if err != nil {
 		return fmt.Errorf("healthcheck: exec failed: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("healthcheck: probe exited with status %d", exitCode)
+	}
+	if !strings.Contains(output, "__ASIMI_HEALTHY") {
+		return fmt.Errorf("healthcheck: probe produced no sentinel (exit 0, output %q) — the exec attach path may be silently discarding streams", output)
 	}
 	slog.Info("healthcheck passed")
 	return nil
