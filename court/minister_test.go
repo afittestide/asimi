@@ -2218,6 +2218,7 @@ func TestMinisterImpl_Tools_IncludesCommonTools(t *testing.T) {
 	})
 	registry.RegisterExtra("enact_ritual", tools.InvokeRitualTool{})
 	registry.RegisterExtra("tian_ledger", tools.TianLedgerTool{})
+	registry.RegisterExtra("create_incident", tools.CreateIncidentTool{})
 	registry.RegisterExtraFactory("ask_ruler", func(mid string) tools.Tool {
 		return tools.AskRulerTool{MinisterID: mid}
 	})
@@ -2238,11 +2239,13 @@ func TestMinisterImpl_Tools_IncludesCommonTools(t *testing.T) {
 				names[tool.Name()] = true
 			}
 
-			// Every minister should have ask_ruler and tian_ledger via commonTools
+			// Every minister should have the following tools via commonTools
 			assert.True(t, names["ask_ruler"],
 				"%s should have ask_ruler via commonTools", def.ID)
 			assert.True(t, names["tian_ledger"],
 				"%s should have tian_ledger via commonTools", def.ID)
+			assert.True(t, names["create_incident"],
+				"%s should have create_incident via commonTools", def.ID)
 
 			// Only the secretary should have consult_minister (via extra_tools)
 			if def.ID == "secretary" {

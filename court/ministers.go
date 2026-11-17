@@ -25,9 +25,11 @@ func LoadAllMinisters(projectDir string) ([]MinisterDef, error) {
 // their extra_tools definition. These are resolved via the tool registry's
 // ExtraTools mechanism (the minister ID is passed for factory tools).
 // tian_ledger is common — the Tian ledger is open to all ministers.
+// create_incident is common — any minister may file what it observes; a court
+// that cannot record an incident loses the observation.
 // consult_minister is NOT included here — only the secretary needs it,
 // and it is provided via the secretary's extra_tools list.
-var commonTools = []string{"ask_ruler", "tian_ledger"}
+var commonTools = []string{"ask_ruler", "tian_ledger", "create_incident"}
 
 // ministerImpl is the generic, YAML-driven minister type. It replaces the
 // five hand-coded minister structs (Secretary, Forge, Judge, Chancellor,

@@ -125,7 +125,6 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	if opts.ZhengmingDisposer != nil {
 		r.Register(DismissZhengmingTool{Ctx: opts.Ctx, Disposer: opts.ZhengmingDisposer}, intentWrite)
 	}
-	r.Register(CreateIncidentTool{Ctx: opts.Ctx}, intentWrite)
 	r.Register(ResolveIncidentTool{Ctx: opts.Ctx}, intentWrite)
 
 	if opts.ZhengmingRequester != nil && opts.NotifyFn != nil {
@@ -157,6 +156,10 @@ func registerExtraTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 		r.RegisterExtra("enact_ritual", InvokeRitualTool{Ctx: opts.Ctx, Launcher: opts.RitualLauncher})
 	}
 	r.RegisterExtra("tian_ledger", TianLedgerTool{Ctx: opts.Ctx})
+	// Incidents are recordable by every minister: a court that cannot file what
+	// it observes loses the observation. Registered as an extra so the grant
+	// does not depend on the intent-Write permission bit.
+	r.RegisterExtra("create_incident", CreateIncidentTool{Ctx: opts.Ctx})
 	// Raw SQL is not ambient: only the minister whose def names asimisql in
 	// extra_tools receives it (today, the secretary). No DB handle, no tool.
 	if opts.DBPath != "" {

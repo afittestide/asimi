@@ -208,7 +208,6 @@ func TestRegisterBuiltinToolsIntentWrite(t *testing.T) {
 	assertHas(t, names, "insert_ling")
 	assertHas(t, names, "update_ling_status")
 	assertHas(t, names, "transition_edict")
-	assertHas(t, names, "create_incident")
 	assertHas(t, names, "resolve_incident")
 }
 
