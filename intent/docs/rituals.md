@@ -406,7 +406,7 @@ Here's `swift-strike`, one of the built-in rituals — a tight forge/judge/sage 
 
 ## Built-in Rituals
 
-Asimi ships with seven built-in rituals in [`builtin_rituals.yaml`](../court/builtin_rituals.yaml).
+Asimi ships with seven built-in rituals in [`builtin_rituals.yaml`](../../court/builtin_rituals.yaml).
 
 ### swift-strike
 
@@ -448,6 +448,6 @@ Initializes a project for Asimi. The forge customizes infrastructure templates (
 
 ## See Also
 
-- [builtin_rituals.yaml](../court/builtin_rituals.yaml) — Reference implementation of all built-in rituals
-- [Edicts](./edicts.md) — How edicts flow through the seal chain
-- [The Three Realms](./three-realms.md) — Understanding 天, 地, and 人
+- [builtin_rituals.yaml](../../court/builtin_rituals.yaml) — Reference implementation of all built-in rituals
+- [Edicts](./court_guide.md#edicts) — How edicts flow through the seal chain
+- [The Three Realms](./the_three_realms.md) — Understanding 天, 地, and 人

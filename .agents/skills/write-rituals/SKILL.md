@@ -10,7 +10,7 @@ Author or edit ritual YAML that Asimi executes as a workflow of ministerial
 steps. Rituals live in `.agents/rituals.yaml`; the shipped reference
 implementation is [`court/builtin_rituals.yaml`](../../../court/builtin_rituals.yaml).
 
-The authoritative field-by-field reference is [`docs/rituals.md`](../../../docs/rituals.md).
+The authoritative field-by-field reference is [`intent/docs/rituals.md`](../../../intent/docs/rituals.md).
 Read it when a detail is not covered here and defer to it if this guide drifts.
 
 ## When to use
@@ -21,7 +21,7 @@ Use this skill to:
 - edit the triggers, steps, inputs, or failure handling of an existing ritual
 - diagnose a ritual that fails validation or loops unexpectedly
 
-Do not restate or duplicate `docs/rituals.md`; link to it instead.
+Do not restate or duplicate `intent/docs/rituals.md`; link to it instead.
 
 ## Ritual structure
 
@@ -126,7 +126,7 @@ Reference built-ins with `{{ .variable }}`. Key variables:
 | `the infrastructure templates` | Project-init templates |
 | `Asimi's versions` | Current and latest version info |
 
-See `docs/rituals.md` for the full list.
+See `intent/docs/rituals.md` for the full list.
 
 **Shell injection** — prefix a `given` entry with `!` to run a command and
 inject its output as context:
@@ -221,5 +221,5 @@ summary in via `{{ .priorStep }}`.
 
 ## See also
 
-- [`docs/rituals.md`](../../../docs/rituals.md) — authoritative reference
+- [`intent/docs/rituals.md`](../../../intent/docs/rituals.md) — authoritative reference
 - [`court/builtin_rituals.yaml`](../../../court/builtin_rituals.yaml) — reference implementations

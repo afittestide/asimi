@@ -9,6 +9,7 @@ const (
 	Judge      = "judge"
 	Chancellor = "chancellor"
 	War        = "war"
+	Rites      = "rites"
 	Ruler      = "ruler"
 )
 

@@ -41,7 +41,7 @@ Edit line 17 in `internal/utils/asimi_version.go`:
 var AsimiVersion = "0.2.1" // Update this before each release
 ```
 
-### 3. Update docs/roadmap.md
+### 3. Update intent/docs/roadmap.md
 
 
 ### 4. Vulnerability Scan (Release Gate)
@@ -55,7 +55,7 @@ just get-threats
 This gate is **mandatory**: `just get-threats` builds the binary and runs
 `govulncheck -mode=binary` against it. It fails if any reported vulnerability is
 not on the reviewed allowlist at `security/vuln-allowlist.txt` (see
-[docs/security.md](security.md) for the accepted findings and their
+[intent/docs/security.md](security.md) for the accepted findings and their
 justifications). A non-zero exit means the release MUST NOT proceed.
 
 Note that `just test` does not run the vulnerability scan: it runs only
@@ -67,7 +67,7 @@ does not run it today, so local releases must run it themselves. Run
 ### 5. Commit the Release
 
 ```bash
-git add CHANGELOG.md internal/utils/asimi_version.go docs/roadmap.md
+git add CHANGELOG.md internal/utils/asimi_version.go intent/docs/roadmap.md
 git commit -m "chore: releasing 0.2.1"
 ```
 
@@ -116,9 +116,9 @@ curl -fsSL https://raw.githubusercontent.com/afittestide/asimi/main/scripts/inst
 # Full release flow
 vim CHANGELOG.md                                                   # Polish changelog
 sed -i 's/var AsimiVersion = .*/var AsimiVersion = "0.2.1"/' internal/utils/asimi_version.go  # Update version
-vim docs/roadmap.md                                                # Update roadmap
+vim intent/docs/roadmap.md                                                # Update roadmap
 just get-threats                                                   # Release gate: no reachable vulns
-git add CHANGELOG.md internal/utils/asimi_version.go docs/roadmap.md && git commit -m "chore: releasing 0.2.1"
+git add CHANGELOG.md internal/utils/asimi_version.go intent/docs/roadmap.md && git commit -m "chore: releasing 0.2.1"
 git tag -a v0.2.1 -m "Release 0.2.1"
 git push origin main --tags
 ```
@@ -175,5 +175,6 @@ edict per release); do not use edict 1.
 
 ## See Also
 
-- [docs/roadmap.md](roadmap.md) - Planned and in-flight work
+- [roadmap.md](roadmap.md) - Planned and in-flight work
 - [CHANGELOG.md](../CHANGELOG.md) - Version history
+story

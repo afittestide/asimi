@@ -469,7 +469,7 @@ func TestRitualAndDocInvocationsNameExistingRecipes(t *testing.T) {
 	assert.Contains(t, strings.Join(readiness.Given, "\n"), "!just get-threats",
 		"verify-release-readiness must invoke the real `just get-threats` gate (edict 1032)")
 
-	for _, doc := range []string{"docs/release-management.md", "docs/security.md"} {
+	for _, doc := range []string{"intent/docs/release-management.md", "intent/docs/security.md"} {
 		for _, name := range recipeInvocations(readRootFile(t, doc)) {
 			assert.True(t, recipes[name],
 				"%s names `just %s`, which no Justfile recipe defines", doc, name)
@@ -494,7 +494,7 @@ func findStep(rituals Rituals, ritualName, stepName string) *RitualStep {
 }
 
 // TestSecurityDocNamesTheThreatReportPath guards the Chancellor's B1 finding:
-// docs/security.md claimed scan reports land in heaven/security/*.txt while the
+// intent/docs/security.md claimed scan reports land in heaven/security/*.txt while the
 // recipe writes heaven/threats/*.out, sending a reader hunting release evidence
 // to a directory that does not exist. Derive both facts from the recipe itself so
 // the doc cannot drift from it again.
@@ -509,21 +509,21 @@ func TestSecurityDocNamesTheThreatReportPath(t *testing.T) {
 	require.Regexp(t, `report="\$report_dir/\$\{tool\}-\{\{now\}\}\.out"`, body,
 		"get-threats uses a report filename other than ${tool}-{{now}}.out — update this guard")
 
-	doc := readRootFile(t, "docs/security.md")
+	doc := readRootFile(t, "intent/docs/security.md")
 	assert.Contains(t, doc, dirName+"/",
-		"docs/security.md must name the real report directory %q the get-threats recipe writes", dirName)
+		"intent/docs/security.md must name the real report directory %q the get-threats recipe writes", dirName)
 	assert.Contains(t, doc, "<tool>-<datetime>.out",
-		"docs/security.md must give the real report extension (.out), not the old .txt")
+		"intent/docs/security.md must give the real report extension (.out), not the old .txt")
 }
 
 // TestRPCProtocolDocContractCitationsAreReal guards the proofread requirement of
 // the Channel↔Tab contract (e1058): every file:line reference cited in
-// docs/rpc-protocol.md's contract section must name a real symbol in the cited
+// intent/docs/rpc-protocol.md's contract section must name a real symbol in the cited
 // file. The first forged revision cited `ritualChannelID (court/court.go)` —
 // the function lives in court/ritual_manager.go — and the claim passed because
 // nothing checked it.
 func TestRPCProtocolDocContractCitationsAreReal(t *testing.T) {
-	doc := readRootFile(t, "docs/rpc-protocol.md")
+	doc := readRootFile(t, "intent/docs/rpc-protocol.md")
 
 	// The contract section must exist and must cite the right defining file for
 	// each named symbol. A symbol moving files without the doc following is the
@@ -533,9 +533,9 @@ func TestRPCProtocolDocContractCitationsAreReal(t *testing.T) {
 	} {
 		// The cited file must exist and must define the symbol.
 		body, err := os.ReadFile(filepath.Join("..", tc.wantFile))
-		require.NoError(t, err, "docs/rpc-protocol.md cites %s; that file must exist", tc.wantFile)
+		require.NoError(t, err, "intent/docs/rpc-protocol.md cites %s; that file must exist", tc.wantFile)
 		assert.Contains(t, string(body), "func "+tc.symbol,
-			"docs/rpc-protocol.md's contract cites %s in %s, which no longer defines it — fix the citation",
+			"intent/docs/rpc-protocol.md's contract cites %s in %s, which no longer defines it — fix the citation",
 			tc.symbol, tc.wantFile)
 
 		// The contract must pair the symbol with the correct file.
@@ -548,18 +548,18 @@ func TestRPCProtocolDocContractCitationsAreReal(t *testing.T) {
 // forged revision of e1058 introduced: the contract section was inserted as an
 // unnumbered ### while sections 6-11 were renumbered to 7-12, leaving no ## 6.
 func TestRPCProtocolDocSectionsAreSequential(t *testing.T) {
-	doc := readRootFile(t, "docs/rpc-protocol.md")
+	doc := readRootFile(t, "intent/docs/rpc-protocol.md")
 
 	re := regexp.MustCompile(`(?m)^## (\d+)\. `)
 	matches := re.FindAllStringSubmatch(doc, -1)
-	require.NotEmpty(t, matches, "docs/rpc-protocol.md must have numbered sections")
+	require.NotEmpty(t, matches, "intent/docs/rpc-protocol.md must have numbered sections")
 
 	want := 1
 	for _, m := range matches {
 		got, err := strconv.Atoi(m[1])
 		require.NoError(t, err, "parse section number %q", m[1])
 		assert.Equal(t, want, got,
-			"docs/rpc-protocol.md section numbering breaks at ## %d: sections must run 1,2,3,... with no gaps (a section inserted or removed must renumber the rest)", got)
+			"intent/docs/rpc-protocol.md section numbering breaks at ## %d: sections must run 1,2,3,... with no gaps (a section inserted or removed must renumber the rest)", got)
 		want++
 	}
 }
@@ -570,7 +570,7 @@ func TestRPCProtocolDocSectionsAreSequential(t *testing.T) {
 // it lives in. Every `§ N` cross-reference must name an existing section and
 // must not point at the section it appears in.
 func TestRPCProtocolDocSectionRefsResolve(t *testing.T) {
-	doc := readRootFile(t, "docs/rpc-protocol.md")
+	doc := readRootFile(t, "intent/docs/rpc-protocol.md")
 
 	sections := map[int]string{} // number -> title, for messages
 	re := regexp.MustCompile(`(?m)^## (\d+)\. (.+)$`)
@@ -579,7 +579,7 @@ func TestRPCProtocolDocSectionRefsResolve(t *testing.T) {
 		require.NoError(t, err, "parse section number %q", m[1])
 		sections[n] = m[2]
 	}
-	require.NotEmpty(t, sections, "docs/rpc-protocol.md must have numbered sections")
+	require.NotEmpty(t, sections, "intent/docs/rpc-protocol.md must have numbered sections")
 
 	type ref struct {
 		n    int
@@ -601,15 +601,15 @@ func TestRPCProtocolDocSectionRefsResolve(t *testing.T) {
 			refs = append(refs, ref{n: n, in: current, line: i + 1})
 		}
 	}
-	require.NotEmpty(t, refs, "docs/rpc-protocol.md must reference at least one section by § — if the last § pointer was removed intentionally, update this guard")
+	require.NotEmpty(t, refs, "intent/docs/rpc-protocol.md must reference at least one section by § — if the last § pointer was removed intentionally, update this guard")
 
 	for _, r := range refs {
 		_, exists := sections[r.n]
 		assert.True(t, exists,
-			"docs/rpc-protocol.md line %d references § %d, which does not exist (sections: %v) — renumbering must sweep every § pointer in the same commit",
+			"intent/docs/rpc-protocol.md line %d references § %d, which does not exist (sections: %v) — renumbering must sweep every § pointer in the same commit",
 			r.line, r.n, sectionKeys(sections))
 		assert.NotEqual(t, r.in, r.n,
-			"docs/rpc-protocol.md line %d references § %d from inside § %d — a self-referencing pointer is a broken cross-reference",
+			"intent/docs/rpc-protocol.md line %d references § %d from inside § %d — a self-referencing pointer is a broken cross-reference",
 			r.line, r.n, r.in)
 	}
 }
@@ -667,12 +667,12 @@ func TestThreatScanModulesMeetFixFloor(t *testing.T) {
 }
 
 // TestAllowlistEntriesAreJustifiedAndLive enforces the contract that
-// `just get-threats` and docs/security.md promise: the allowlist carries only
+// `just get-threats` and intent/docs/security.md promise: the allowlist carries only
 // govulncheck IDs, each ID has a written justification section, and an ID whose
 // section is marked retired is no longer listed. Edict 1032 retired
 // GO-2026-5932 exactly this way rather than leaving a stale entry behind.
 func TestAllowlistEntriesAreJustifiedAndLive(t *testing.T) {
-	doc := readRootFile(t, "docs/security.md")
+	doc := readRootFile(t, "intent/docs/security.md")
 
 	var accepted []string
 	seen := map[string]bool{}
@@ -689,13 +689,13 @@ func TestAllowlistEntriesAreJustifiedAndLive(t *testing.T) {
 
 	for _, id := range accepted {
 		assert.Contains(t, doc, "### "+id,
-			"%s is on the allowlist with no `### %s` justification in docs/security.md", id, id)
+			"%s is on the allowlist with no `### %s` justification in intent/docs/security.md", id, id)
 	}
 
 	retired := regexp.MustCompile(`(?m)^### (GO-\d{4}-\d+) — retired`)
 	for _, m := range retired.FindAllStringSubmatch(doc, -1) {
 		assert.NotContains(t, accepted, m[1],
-			"%s is retired in docs/security.md but still on the allowlist — remove it or reinstate the acceptance", m[1])
+			"%s is retired in intent/docs/security.md but still on the allowlist — remove it or reinstate the acceptance", m[1])
 	}
 }
 

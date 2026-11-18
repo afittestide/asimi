@@ -2,7 +2,7 @@
 
 ## Vulnerability scanning
 
-The release gate runs `just get-threats` (see `docs/release-management.md`), which
+The release gate runs `just get-threats` (see `intent/docs/release-management.md`), which
 builds the binary and runs `govulncheck -mode=binary` against it. The gate fails
 the release if the scan reports any *new* reachable vulnerability.
 

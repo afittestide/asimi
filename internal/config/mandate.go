@@ -26,7 +26,7 @@ import (
 // this concept.
 
 // SeamKind classifies a host-asset seam presented to the Ruler. The concrete
-// seams are enumerated in docs/sandbox-seams.md; only the requested-by-config
+// seams are enumerated in intent/docs/sandbox-seams.md; only the requested-by-config
 // seams (mounts and env) are grantable here, because the working-tree bind and
 // the cache/overlay volumes are structural, and host network / host-runner /
 // isolated-host are not represented in the dialog at all.
@@ -127,7 +127,7 @@ type Selections struct {
 // bind (always rw, structural) and the cache/overlay volumes are not listed
 // here; neither is HostBypassFlag, which is not a grantable seam — no committed
 // file can request it and the dialog never implies it is covered. See
-// docs/sandbox-seams.md.
+// intent/docs/sandbox-seams.md.
 func SessionSeams(cfg *Config) []Seam {
 	if cfg == nil {
 		return nil
@@ -172,7 +172,7 @@ func SessionSeams(cfg *Config) []Seam {
 //
 // The copy is deliberately SHALLOW beyond the two replaced slices:
 // PlatformOverlays, CacheVolumes and IgnoreCopyGlobs stay shared with the
-// requested config. Seams 4-5 are structural (see docs/sandbox-seams.md): the
+// requested config. Seams 4-5 are structural (see intent/docs/sandbox-seams.md): the
 // mandate narrows what the Ruler chooses, not the project's own toolchain
 // plumbing. Do not "fix" this into a deep copy — an emptied CacheVolumes would
 // silently rebuild a cold container and an emptied IgnoreCopyGlobs would change

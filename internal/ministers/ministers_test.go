@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLoadMinisters_BuiltinHasAllFive(t *testing.T) {
+func TestLoadMinisters_BuiltinHasAllExpected(t *testing.T) {
 	defs, err := LoadMinisters()
 	require.NoError(t, err)
 
@@ -15,7 +15,7 @@ func TestLoadMinisters_BuiltinHasAllFive(t *testing.T) {
 	for _, d := range defs {
 		ids[d.ID] = true
 	}
-	for _, expected := range []string{Secretary, Forge, Judge, Chancellor, War} {
+	for _, expected := range []string{Secretary, Forge, Judge, Chancellor, War, Rites} {
 		assert.True(t, ids[expected], "builtin ministers must include %s", expected)
 	}
 }

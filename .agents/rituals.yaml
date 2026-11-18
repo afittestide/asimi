@@ -61,7 +61,7 @@
     - name: update-roadmap
       minister: forge
       act: |
-        Review docs/roadmap.md entry for {{ .version }}.
+        Review intent/docs/roadmap.md entry for {{ .version }}.
         Move all lines that weren't done in the version to the next version.
         Lastly, completly remove the roadmap entry for {{ .version }}
         in this release ({{ .version }}). Move completed items out of the
@@ -124,7 +124,7 @@
       given:
         - the earth status
       act: |
-        Stage CHANGELOG.md, internal/utils/asimi_version.go, docs/roadmap.md,
+        Stage CHANGELOG.md, internal/utils/asimi_version.go, intent/docs/roadmap.md,
         and any other modified release files. Commit with message
         "chore: releasing v{{ .version }}". Then create an annotated git tag:
         git tag -a v{{ .version }} -m "Release v{{ .version }}".

@@ -1,4 +1,4 @@
-# Accepted govulncheck findings — see docs/security.md for the justification.
+# Accepted govulncheck findings — see intent/docs/security.md for the justification.
 # One vulnerability ID per line. The `just get-threats` gate fails on any finding
 # NOT listed here; it also notes (does not block) any entry here that no longer
 # matches a finding, since a stale entry needs re-review.

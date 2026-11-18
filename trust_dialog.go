@@ -17,7 +17,7 @@ import (
 // The dialog deliberately lists only the config-requested seams (mounts and
 // passthrough env). The working-tree bind, the overlay/cache volumes, the host
 // network namespace and run_on_host are NOT represented: the dialog must never
-// imply a boundary it does not hold (see docs/sandbox-seams.md).
+// imply a boundary it does not hold (see intent/docs/sandbox-seams.md).
 //
 // --isolated-host (seam 8) is the sharpest case: when the operator passes it
 // the sandbox is bypassed entirely, so the dialog must not read as if a sandbox
@@ -306,14 +306,14 @@ func (d *TrustDialog) Render(width int) string {
 	// must not read as if its answers were the whole boundary. The working
 	// tree bind is stated as the one true fact whether or not a sandbox is in
 	// force; --isolated-host is an operator choice on the command line and no
-	// dialog answer turns it on or off (edict 1036, seam 8; docs/sandbox-seams.md).
+	// dialog answer turns it on or off (edict 1036, seam 8; intent/docs/sandbox-seams.md).
 	b.WriteString(hintStyle.Render("Not covered here (always as configured):"))
 	b.WriteString("\n")
 	b.WriteString(hintStyle.Render("  project directory stays read-write, host network,"))
 	b.WriteString("\n")
 	b.WriteString(hintStyle.Render(fmt.Sprintf("  run_on_host, %s (operator choice on the command line;", config.HostBypassFlag)))
 	b.WriteString("\n")
-	b.WriteString(hintStyle.Render("  no dialog answer turns it on or off). See docs/sandbox-seams.md"))
+	b.WriteString(hintStyle.Render("  no dialog answer turns it on or off). See intent/docs/sandbox-seams.md"))
 	b.WriteString("\n")
 
 	b.WriteString("\n")

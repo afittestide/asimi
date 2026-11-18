@@ -5,6 +5,12 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Minister of Rites (禮部)** — a new minister owns all documentation, and the docs tree moves to `intent/docs/` (e1017)
+
 ## [0.16.1] - 2026-11-10
 
 ### Added

@@ -320,7 +320,7 @@ get-threats:
     echo
     if [ -n "$unaccepted" ]; then
         echo "VULN GATE FAILED: unaccepted vulnerabilities:$unaccepted"
-        echo "Fix them, or add a justified entry to $allowlist (see docs/security.md)."
+        echo "Fix them, or add a justified entry to $allowlist (see intent/docs/security.md)."
         echo "report saved to $report"
         exit 1
     fi

@@ -248,7 +248,7 @@ As Confucius taught:
 1. **Try a small edict** — Fix a typo, add a log statement
 2. **Explore the Hunting tab** — Ask the Chancellor about the codebase
 3. **Watch a ritual execute** — See how ministers coordinate
-4. **Read the full guide** — `docs/court_guide.md` for deep dives
+4. **Read the full guide** — `intent/docs/court_guide.md` for deep dives
 
 Welcome to the Court, Ruler. The court awaits your command.
 
