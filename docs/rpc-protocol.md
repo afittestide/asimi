@@ -27,7 +27,7 @@ falling back to `/tmp/asimi-$UID.sock` on macOS, honouring the 104-byte
 `sun_path` cap.
 
 Socket permissions: directory `0700`, socket `0600` — user-scoped v1.
-(Multi-user daemon deployments would change these; see § 7.)
+(Multi-user daemon deployments would change these; out of scope for user-scoped v1.)
 
 ## 2. Frame envelope
 
@@ -187,7 +187,8 @@ in `internal/rpc/notifications.go`.
 **Ling attribution rider.** `ling_id` / `minister_id` are set on the stream
 notifications of a *ling* session (an edict's work item, run under a minister).
 Several lings of one edict stream into the same `e<N>` channel, so these fields
-are what let the TUI tell their output apart. They are `omitempty` and empty for
+are what let the TUI tell their output apart — see the Channel↔Tab contract
+below for cardinality. They are `omitempty` and empty for
 every other stream (interactive minister tabs, ritual steps, single-ling
 edicts), which keeps old decoders working and unattributed rendering unchanged.
 `stream.chunk` is the only notification that carries `minister_id`; the terminal
@@ -198,7 +199,36 @@ run on a single dispatcher goroutine). Drop on slow consumer: if the
 outbound chan is full, the writer logs `notification queue full,
 dropping` and discards the frame. No replay on reconnect in v1.
 
-## 6. Bidirectional: the approval round-trip
+## 6. Channel↔Tab contract
+
+Every notification above carries a `channel_id`; prompts and session
+restores carry one back. The naming split is deliberate and ratified:
+
+1. **Daemon owns "Channel"; client owns "Tab."** The daemon never speaks
+   of tabs; the client never invents routing keys. The sole join rule:
+   `tab.Target == channel_id` (`tui.go`).
+2. **Channel vocabulary**: a channel id is either a minister id
+   (`forge`, `judge`, `chancellor`, …) for interactive sessions, or a
+   ritual channel `"e<N>"` (edict N) produced by `ritualChannelID`
+   (`court/ritual_manager.go`).
+3. **Cardinality**: one channel carries many concurrent streams — an
+   edict's lings interleave on the shared `"e<N>"` channel, and
+   `ling_id` on stream events is the per-stream attribution key, not the
+   routing key. A tab is a view of exactly one channel. Tabs may exist
+   with no live stream (e.g. the welcome tab); a channel with no tab
+   materializes one lazily on the first stream event — the daemon never
+   assumes the client pre-created a tab (`tui.go`, `addTab`).
+4. **Persistence**: `channel_id` rides on prompts and persisted session
+   state (`court/minister.go`), so a restored session resumes on the
+   same channel it started on.
+5. **Stability note**: the Go identifier is `ChannelID` and the wire tag
+   is `"channel_id"`; the Ruler ratified these names on 2026-11-18.
+   Renames of either are explicit ruling-requiring changes, not cleanup.
+   (The name intentionally coexists with Go's `chan` semantics used
+   elsewhere, e.g. `SetMessageChannel`; that collision was reviewed and
+   accepted.)
+
+## 7. Bidirectional: the approval round-trip
 
 Host-command approval is the only daemon-initiated request today. It
 uses the same `Call` / `Handle` machinery as the rest:
@@ -229,7 +259,7 @@ hanging forever. A live-but-stuck TUI is bounded by the ctx the daemon
 passes to `RequestApproval` — wrap it in `context.WithTimeout` at the
 call site for a hard ceiling.
 
-## 7. Neovim compatibility
+## 8. Neovim compatibility
 
 Because the protocol is standard msgpack-RPC, a Neovim Lua script can
 talk to the daemon directly over the unix socket:
@@ -250,7 +280,7 @@ Notes for Neovim callers:
 * Params and results are plain msgpack maps — tagged Go structs and Lua
 tables are fully compatible.
 
-## 8. Environment variables
+## 9. Environment variables
 
 The TUI picks its transport mode from env vars; precedence in
 `runInteractiveMode`. The default is now autostart daemon:
@@ -270,14 +300,14 @@ The autostart timeout is `autostartReadyTimeout = 10s` (in
 `autostart.go`). Raise it if you're seeing spurious timeouts on cold
 macOS machines with `podman machine start`.
 
-## 9. Cookbook: add a new method
+## 10. Cookbook: add a new method
 
 Wire a new `Client` method in five files:
 
 1. **Interface** — add the method signature to
    `internal/courtapi/client.go`. Wire-safe params/return types
    only (primitives, tagged structs, no closures, no `context.Context`
-   as a param, no channels). Kept in-process only? See § 10.
+   as a param, no channels). Kept in-process only? See § 11.
 2. **Server implementation** — implement on `*court.Court` (or
    whichever type satisfies `Client`). Keep it in
    `court/court.go` alongside siblings, or add a new file if
@@ -332,7 +362,7 @@ Wire a new `Client` method in five files:
 5. **Consume** on the client: the `SubscribeAll` handler will decode
    and deliver it on the shared `<-chan any`.
 
-## 10. The non-wire-safe holdouts
+## 11. The non-wire-safe holdouts
 
 One method on `courtapi.Client` is deliberately in-process only:
 
@@ -347,7 +377,7 @@ needs to invoke it directly. Once `GetMinister` is migrated to a
 wire-safe shape, `LoopbackCourt` collapses into the plain
 `*CourtClient` and the TUI becomes truly stateless.
 
-## 11. Files at a glance
+## 12. Files at a glance
 
 ```
 internal/wire/
@@ -369,4 +399,6 @@ internal/courtapi/
 daemon.go         `asimi daemon` subcommand
 autostart.go      autostart
 loopback.go       ASIMI_LOOPBACK / ASIMI_DAEMON_SOCKET wiring
+```
+EMON_SOCKET wiring
 ```

@@ -683,7 +683,7 @@ return m, m.tabs.Content().ShowHelp(msg.topic)  // Returns ChangeModeMsg
 
 ## Streaming AI Responses
 
-The TUI handles streaming responses from the AI through the Court's message types. Streaming chunks are routed to the correct tab based on `ChannelID`.
+The TUI handles streaming responses from the AI through the Court's message types. Streaming chunks are routed to the correct tab based on `ChannelID` (see the Channel↔Tab contract in `rpc-protocol.md`).
 
 ### Message Types
 

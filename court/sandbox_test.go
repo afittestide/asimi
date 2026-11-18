@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -512,6 +514,114 @@ func TestSecurityDocNamesTheThreatReportPath(t *testing.T) {
 		"docs/security.md must name the real report directory %q the get-threats recipe writes", dirName)
 	assert.Contains(t, doc, "<tool>-<datetime>.out",
 		"docs/security.md must give the real report extension (.out), not the old .txt")
+}
+
+// TestRPCProtocolDocContractCitationsAreReal guards the proofread requirement of
+// the Channel↔Tab contract (e1058): every file:line reference cited in
+// docs/rpc-protocol.md's contract section must name a real symbol in the cited
+// file. The first forged revision cited `ritualChannelID (court/court.go)` —
+// the function lives in court/ritual_manager.go — and the claim passed because
+// nothing checked it.
+func TestRPCProtocolDocContractCitationsAreReal(t *testing.T) {
+	doc := readRootFile(t, "docs/rpc-protocol.md")
+
+	// The contract section must exist and must cite the right defining file for
+	// each named symbol. A symbol moving files without the doc following is the
+	// exact regression this guards.
+	for _, tc := range []struct{ symbol, wantFile string }{
+		{"ritualChannelID", "court/ritual_manager.go"},
+	} {
+		// The cited file must exist and must define the symbol.
+		body, err := os.ReadFile(filepath.Join("..", tc.wantFile))
+		require.NoError(t, err, "docs/rpc-protocol.md cites %s; that file must exist", tc.wantFile)
+		assert.Contains(t, string(body), "func "+tc.symbol,
+			"docs/rpc-protocol.md's contract cites %s in %s, which no longer defines it — fix the citation",
+			tc.symbol, tc.wantFile)
+
+		// The contract must pair the symbol with the correct file.
+		assert.Regexp(t, regexp.MustCompile("`"+tc.symbol+"`\\s*\\n\\s*\\(`"+regexp.QuoteMeta(tc.wantFile)+"`\\)"),
+			doc, "contract section must cite %s with (%s)", tc.symbol, tc.wantFile)
+	}
+}
+
+// TestRPCProtocolDocSectionsAreSequential guards the numbering gap the first
+// forged revision of e1058 introduced: the contract section was inserted as an
+// unnumbered ### while sections 6-11 were renumbered to 7-12, leaving no ## 6.
+func TestRPCProtocolDocSectionsAreSequential(t *testing.T) {
+	doc := readRootFile(t, "docs/rpc-protocol.md")
+
+	re := regexp.MustCompile(`(?m)^## (\d+)\. `)
+	matches := re.FindAllStringSubmatch(doc, -1)
+	require.NotEmpty(t, matches, "docs/rpc-protocol.md must have numbered sections")
+
+	want := 1
+	for _, m := range matches {
+		got, err := strconv.Atoi(m[1])
+		require.NoError(t, err, "parse section number %q", m[1])
+		assert.Equal(t, want, got,
+			"docs/rpc-protocol.md section numbering breaks at ## %d: sections must run 1,2,3,... with no gaps (a section inserted or removed must renumber the rest)", got)
+		want++
+	}
+}
+
+// TestRPCProtocolDocSectionRefsResolve guards the regression the chancellor
+// caught in e1058's second revision: inserting the contract as § 6 renumbered
+// every later section but left a `§ 10` pointer self-referencing the Cookbook
+// it lives in. Every `§ N` cross-reference must name an existing section and
+// must not point at the section it appears in.
+func TestRPCProtocolDocSectionRefsResolve(t *testing.T) {
+	doc := readRootFile(t, "docs/rpc-protocol.md")
+
+	sections := map[int]string{} // number -> title, for messages
+	re := regexp.MustCompile(`(?m)^## (\d+)\. (.+)$`)
+	for _, m := range re.FindAllStringSubmatch(doc, -1) {
+		n, err := strconv.Atoi(m[1])
+		require.NoError(t, err, "parse section number %q", m[1])
+		sections[n] = m[2]
+	}
+	require.NotEmpty(t, sections, "docs/rpc-protocol.md must have numbered sections")
+
+	type ref struct {
+		n    int
+		in   int
+		line int
+	}
+	var refs []ref
+	lines := strings.Split(doc, "\n")
+	current := 0
+	for i, line := range lines {
+		if m := re.FindStringSubmatch(line); m != nil {
+			n, _ := strconv.Atoi(m[1])
+			current = n
+			continue
+		}
+		for _, m := range regexp.MustCompile(`§ (\d+)`).FindAllStringSubmatch(line, -1) {
+			n, err := strconv.Atoi(m[1])
+			require.NoError(t, err, "parse § reference %q on line %d", m[1], i+1)
+			refs = append(refs, ref{n: n, in: current, line: i + 1})
+		}
+	}
+	require.NotEmpty(t, refs, "docs/rpc-protocol.md must reference at least one section by § — if the last § pointer was removed intentionally, update this guard")
+
+	for _, r := range refs {
+		_, exists := sections[r.n]
+		assert.True(t, exists,
+			"docs/rpc-protocol.md line %d references § %d, which does not exist (sections: %v) — renumbering must sweep every § pointer in the same commit",
+			r.line, r.n, sectionKeys(sections))
+		assert.NotEqual(t, r.in, r.n,
+			"docs/rpc-protocol.md line %d references § %d from inside § %d — a self-referencing pointer is a broken cross-reference",
+			r.line, r.n, r.in)
+	}
+}
+
+// sectionKeys returns the sorted section numbers, for failure messages.
+func sectionKeys(sections map[int]string) []int {
+	keys := make([]int, 0, len(sections))
+	for n := range sections {
+		keys = append(keys, n)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 // moduleVersions returns every version recorded for module in one file. go.mod
