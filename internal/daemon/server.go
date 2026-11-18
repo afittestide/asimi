@@ -22,6 +22,7 @@ import (
 	"github.com/afittestide/asimi/internal/rpc"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
+	"github.com/afittestide/asimi/internal/utils"
 	"github.com/afittestide/asimi/internal/wire"
 )
 
@@ -142,7 +143,12 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 
 	rpcConn := rpc.New(conn, rpc.Options{})
 	rpcConn.Handle(rpc.MethodPing, func(ctx context.Context, _ []byte) ([]byte, error) {
-		return wire.Encode(rpc.PingResult{Ok: true, InstanceID: shared.InstanceID})
+		return wire.Encode(rpc.PingResult{
+			Ok:         true,
+			InstanceID: shared.InstanceID,
+			Protocol:   rpc.CurrentProtocol,
+			Version:    utils.AsimiVersion,
+		})
 	})
 
 	var ct *court.Court

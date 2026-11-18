@@ -89,15 +89,13 @@ func (rc *ReconnectingClient) Start() error {
 	return nil
 }
 
-// probeInstanceID asks a freshly connected server to identify its process.
-// A failure to probe is not fatal — the id simply stays unknown (""), and
-// liveness (InstanceKnown) then honestly reports it can't attribute events
-// rather than guessing. No ping is sent when the factory handed back a
-// dead conn.
-func (rc *ReconnectingClient) probeInstanceID(conn *Conn) string {
+// probeProtocol pings a freshly connected server and reports its full
+// identity (instance, protocol, version). ok=false means the probe
+// failed or the server did not answer; nothing may be assumed then.
+func probeProtocol(conn *Conn) (PingResult, bool) {
 	select {
 	case <-conn.Done():
-		return ""
+		return PingResult{}, false
 	default:
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), instanceProbeTimeout)
@@ -105,6 +103,19 @@ func (rc *ReconnectingClient) probeInstanceID(conn *Conn) string {
 	res, err := NewCourtClient(conn).Ping(ctx)
 	if err != nil || !res.Ok {
 		slog.Debug("reconnecting: instance probe failed", "err", err)
+		return PingResult{}, false
+	}
+	return res, true
+}
+
+// probeInstanceID asks a freshly connected server to identify its process.
+// A failure to probe is not fatal — the id simply stays unknown (""), and
+// liveness (InstanceKnown) then honestly reports it can't attribute events
+// rather than guessing. No ping is sent when the factory handed back a
+// dead conn.
+func (rc *ReconnectingClient) probeInstanceID(conn *Conn) string {
+	res, ok := probeProtocol(conn)
+	if !ok {
 		return ""
 	}
 	return res.InstanceID
@@ -202,7 +213,18 @@ func (rc *ReconnectingClient) reconnect() error {
 
 		// Probe the new server before publishing the conn: a differing
 		// instance id means the daemon restarted and lost in-flight state.
-		newInstanceID := rc.probeInstanceID(conn)
+		probe, ok := probeProtocol(conn)
+		if ok && !ProtocolCompatible(probe) {
+			// The factory landed us on a daemon that answers but speaks
+			// a different protocol. Swapping it in would turn every
+			// method call into a permanent CodeUnknownMethod failure
+			// (edict 1056) — refuse and surface the mismatch instead.
+			err := &ProtocolMismatchError{Got: probe.Protocol, Want: CurrentProtocol, Version: probe.Version, Instance: probe.InstanceID}
+			slog.Error("reconnecting: refused incompatible daemon", "err", err)
+			conn.Close()
+			return err
+		}
+		newInstanceID := probe.InstanceID
 
 		rc.mu.Lock()
 		prevInstanceID := rc.instanceID

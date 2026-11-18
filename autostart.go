@@ -19,6 +19,7 @@ import (
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/rpc"
 	"github.com/afittestide/asimi/internal/types"
+	"github.com/afittestide/asimi/internal/wire"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -51,7 +52,29 @@ func connectOrStartDaemon(ctx context.Context) (*rpc.Conn, string, error) {
 				slog.Warn("autostart: conn.Serve error (fast path)", "err", err)
 			}
 		}()
-		if daemonResponds(ctx, conn) {
+		res := daemonResponds(ctx, conn)
+		if res.Err == nil && !rpc.ProtocolCompatible(res.Result) {
+			// Alive but speaks a different protocol — every method this
+			// build calls could fail with CodeUnknownMethod for the life
+			// of the session. Refuse rather than adopt: evict and respawn
+			// from this binary (edict 1056).
+			mismatch := &rpc.ProtocolMismatchError{
+				Got:      res.Result.Protocol,
+				Want:     rpc.CurrentProtocol,
+				Version:  res.Result.Version,
+				Instance: res.Result.InstanceID,
+			}
+			slog.Warn("autostart: evicting incompatible daemon", "socket", path, "reason", mismatch)
+			_ = conn.Close()
+			evictWedgedDaemon(path)
+			// Fall through to spawn. If the respawn fails, the error
+			// still names the stale daemon that was refused.
+			if spawnErr := spawnDaemonAndWait(ctx, path); spawnErr != nil {
+				return nil, path, fmt.Errorf("%w; respawn also failed: %v", mismatch, spawnErr)
+			}
+			return dialFreshDaemon(path)
+		}
+		if res.Err == nil {
 			return conn, path, nil
 		}
 		// Dialed but unresponsive — frozen or wedged. Evict and respawn.
@@ -68,7 +91,12 @@ func connectOrStartDaemon(ctx context.Context) (*rpc.Conn, string, error) {
 	if err := spawnDaemonAndWait(ctx, path); err != nil {
 		return nil, path, err
 	}
+	return dialFreshDaemon(path)
+}
 
+// dialFreshDaemon dials the (just-respawned) daemon and returns a
+// serving conn. Called after a spawn or eviction-respawn.
+func dialFreshDaemon(path string) (*rpc.Conn, string, error) {
 	c, err := rpc.Dial(path)
 	if err != nil {
 		return nil, path, fmt.Errorf("dial after spawn: %w", err)
@@ -94,13 +122,29 @@ func isSocketAbsent(err error) bool {
 // is frozen or wedged.
 const daemonProbeTimeout = 2 * time.Second
 
-// daemonResponds reports whether the daemon behind conn answers a cheap
-// request before daemonProbeTimeout elapses.
-func daemonResponds(ctx context.Context, conn *rpc.Conn) bool {
+// probeResult carries the outcome of the liveness probe: the decoded
+// PingResult when the daemon answered, or the error when it did not.
+type probeResult struct {
+	Result rpc.PingResult
+	Err    error
+}
+
+// daemonResponds probes the daemon behind conn with a cheap request
+// before daemonProbeTimeout elapses. It reports both the liveness
+// verdict (Err) and the identity the daemon declared, so the caller
+// can also check protocol compatibility (edict 1056).
+func daemonResponds(ctx context.Context, conn *rpc.Conn) probeResult {
 	probeCtx, cancel := context.WithTimeout(ctx, daemonProbeTimeout)
 	defer cancel()
-	_, err := conn.Call(probeCtx, rpc.MethodPing, nil)
-	return err == nil
+	raw, err := conn.Call(probeCtx, rpc.MethodPing, nil)
+	if err != nil {
+		return probeResult{Err: err}
+	}
+	var res rpc.PingResult
+	if err := wire.Decode(raw, &res); err != nil {
+		return probeResult{Err: fmt.Errorf("decode ping: %w", err)}
+	}
+	return probeResult{Result: res}
 }
 
 // evictWedgedDaemon clears a daemon that owns the socket at path but

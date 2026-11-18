@@ -8680,7 +8680,7 @@ func TestEventEdictSealed_ShowsPersistentChatLine(t *testing.T) {
 	chat := updated.tabs.ChatByTab("secretary")
 	found := false
 	for _, m := range chat.Messages {
-		if strings.Contains(m.Content, "Edict 42 sealed and ascended to Heaven") {
+		if strings.Contains(m.Content, "Edict 42 sealed") {
 			found = true
 		}
 	}

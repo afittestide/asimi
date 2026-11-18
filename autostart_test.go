@@ -6,13 +6,17 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/afittestide/asimi/internal/rpc"
+	"github.com/afittestide/asimi/internal/utils"
+	"github.com/afittestide/asimi/internal/wire"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -22,6 +26,13 @@ import (
 // No fx, no bifrost, no TUI — just the readiness handshake and a dial
 // target.
 func startFakeDaemon(t *testing.T, socketPath string) (stop func()) {
+	return startFakeDaemonOf(t, socketPath, utils.AsimiVersion)
+}
+
+// startFakeDaemonOf is startFakeDaemon with a configurable advertised
+// version — the protocol advertised is always rpc.CurrentProtocol so a
+// "rebuilt binary" (version bump) stays adoptable (edict 1056).
+func startFakeDaemonOf(t *testing.T, socketPath, daemonVersion string) (stop func()) {
 	t.Helper()
 	l, err := rpc.Listen(socketPath)
 	if err != nil {
@@ -49,9 +60,14 @@ func startFakeDaemon(t *testing.T, socketPath string) (stop func()) {
 			go func(nc net.Conn) {
 				conn := rpc.New(nc, rpc.Options{})
 				// connectOrStartDaemon probes liveness with Ping;
-				// a fake daemon must answer it or be evicted.
+				// a fake daemon must answer it (advertising a protocol,
+				// edict 1056) or be evicted.
 				conn.Handle(rpc.MethodPing, func(ctx context.Context, params []byte) ([]byte, error) {
-					return nil, nil
+					return wire.Encode(rpc.PingResult{
+						Ok:       true,
+						Protocol: rpc.CurrentProtocol,
+						Version:  daemonVersion,
+					})
 				})
 				// A client factory (installDaemonAutostart /
 				// newDaemonConn) runs the SetContext handshake on
@@ -535,5 +551,216 @@ func TestInstallDaemonAutostartUsesReconnectingClient(t *testing.T) {
 
 	if rc.Conn() == first {
 		t.Fatal("ConnDone channel was not swapped: rc.Conn() is still the dead conn")
+	}
+}
+
+// --- Daemon protocol compatibility (edict 1056) ---
+
+// protoFakeDaemon binds the resolved socket and answers Ping with a
+// configurable PingResult, without any process spawning. The returned
+// stopped channel closes once its listener is down, so a test can prove
+// an eviction actually killed it.
+func protoFakeDaemon(t *testing.T, socketPath string, ping rpc.PingResult) (stopped chan struct{}) {
+	t.Helper()
+	l, err := rpc.Listen(socketPath)
+	if err != nil {
+		t.Fatalf("proto daemon listen: %v", err)
+	}
+	stopped = make(chan struct{})
+	go func() {
+		defer close(stopped)
+		defer l.Close()
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(nc net.Conn) {
+				conn := rpc.New(nc, rpc.Options{})
+				conn.Handle(rpc.MethodPing, func(ctx context.Context, params []byte) ([]byte, error) {
+					return wire.Encode(ping)
+				})
+				conn.Handle(rpc.MethodSetContext, func(ctx context.Context, params []byte) ([]byte, error) {
+					return nil, nil
+				})
+				_ = conn.Serve()
+			}(c)
+		}
+	}()
+	return stopped
+}
+
+// evictedFakeDaemon is a protoFakeDaemon plus a real pidfile pointing at
+// a disposable child process, so a test can prove evictWedgedDaemon
+// ran: the child is SIGKILLed. The child holds nothing; it exists only
+// to be killed by the eviction.
+func evictedFakeDaemon(t *testing.T, socketPath string, ping rpc.PingResult) (killed chan struct{}) {
+	t.Helper()
+	protoFakeDaemon(t, socketPath, ping)
+
+	child := exec.Command("sleep", "300")
+	if err := child.Start(); err != nil {
+		t.Fatalf("spawn eviction canary: %v", err)
+	}
+	if err := os.WriteFile(socketPath+".pid", []byte(strconv.Itoa(child.Process.Pid)), 0644); err != nil {
+		t.Fatalf("write pidfile: %v", err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill() })
+
+	killed = make(chan struct{})
+	go func() {
+		defer close(killed)
+		_ = child.Wait()
+	}()
+	return killed
+}
+
+// protoTestEnv points XDG_RUNTIME_DIR at a fresh dir and returns the
+// socket path rpc.SocketPath() will resolve to. It skips when the
+func protoTestEnv(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if len(filepath.Join(dir, rpc.DefaultSocketName)) >= 104 {
+		t.Skip("tmp path too long for unix socket")
+	}
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("ASIMI_READY_FD", "")
+	resolved, err := rpc.SocketPath()
+	if err != nil {
+		t.Fatalf("SocketPath: %v", err)
+	}
+	return resolved
+}
+
+// TestConnectOrStartDaemonRefusesMismatchedProtocol proves a daemon
+// advertising a foreign protocol is never adopted: it is evicted (its
+// listener dies) and the failure surfaces as an actionable error naming
+// the stale daemon. In unit tests the respawn cannot succeed (the test
+// binary re-runs the suite, not a daemon), so the expected outcome is
+// exactly the "evicted + respawn failed + error names the daemon" arm
+// of edict 1056 — never a silent adoption (edict 1056).
+func TestConnectOrStartDaemonRefusesMismatchedProtocol(t *testing.T) {
+	resolved := protoTestEnv(t)
+
+	stopped := evictedFakeDaemon(t, resolved, rpc.PingResult{
+		Ok:         true,
+		InstanceID: "stale-daemon",
+		Protocol:   rpc.CurrentProtocol + 1,
+		Version:    "9.9.9-from-the-future",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), autostartReadyTimeout+5*time.Second)
+	defer cancel()
+	c, _, err := connectOrStartDaemon(ctx)
+	if err == nil {
+		// A unit-test environment cannot spawn a daemon; an err == nil
+		// here means the spawn somehow worked — still verify adoption
+		// did not happen on the stale daemon.
+		c.Close()
+	} else if !strings.Contains(err.Error(), "9.9.9-from-the-future") {
+		t.Fatalf("err = %v, want the stale daemon named", err)
+	}
+
+	// The eviction must have SIGKILLed the daemon's pidfile target.
+	select {
+	case <-stopped:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stale daemon was adopted or never evicted")
+	}
+	// ...and removed the socket file, so a fresh daemon can bind.
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		t.Fatalf("socket %s still present after eviction: %v", resolved, err)
+	}
+}
+
+// TestConnectOrStartDaemonRefusesVersionlessDaemon pins that a daemon
+// advertising no protocol (an older build) is incompatible — "absent"
+// must never read as "allow" (edict 1056). It is evicted exactly like a
+// mismatched one.
+func TestConnectOrStartDaemonRefusesVersionlessDaemon(t *testing.T) {
+	resolved := protoTestEnv(t)
+
+	stopped := evictedFakeDaemon(t, resolved, rpc.PingResult{Ok: true, InstanceID: "old-daemon"})
+
+	ctx, cancel := context.WithTimeout(context.Background(), autostartReadyTimeout+5*time.Second)
+	defer cancel()
+	_, _, err := connectOrStartDaemon(ctx)
+	if err == nil {
+		t.Fatal("a versionless daemon was adopted (or a daemon spawned in a unit test)")
+	}
+	if !strings.Contains(err.Error(), "older daemon") {
+		t.Fatalf("err = %v, want the older daemon named", err)
+	}
+
+	select {
+	case <-stopped:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("versionless daemon was adopted or never evicted")
+	}
+}
+
+// TestConnectOrStartDaemonAdoptsSameProtocolDifferentBuild pins the
+// rebuild rule: a healthy daemon with the same protocol but a different
+// build version must be adopted, or every rebuild would churn daemons.
+func TestConnectOrStartDaemonAdoptsSameProtocolDifferentBuild(t *testing.T) {
+	resolved := protoTestEnv(t)
+
+	want := "0.0.1-some-old-build"
+	stopped := protoFakeDaemon(t, resolved, rpc.PingResult{
+		Ok:       true,
+		Protocol: rpc.CurrentProtocol,
+		Version:  want,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := connectOrStartDaemon(ctx)
+	if err != nil {
+		t.Fatalf("connectOrStartDaemon: %v", err)
+	}
+	defer c.Close()
+
+	// The daemon must be the running one (still alive), and the conn
+	// we hold must talk to it — same version proves no respawn.
+	res := daemonResponds(ctx, c)
+	if res.Err != nil {
+		t.Fatalf("adopted daemon does not answer Ping: %v", res.Err)
+	}
+	if res.Result.Version != want {
+		t.Fatalf("adopted daemon version = %q, want the running one (%q)", res.Result.Version, want)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("a same-protocol daemon was evicted; rebuilds must not churn daemons")
+	default:
+	}
+}
+
+// TestNewDaemonConnRefusesIncompatibleProtocol pins the
+// ASIMI_DAEMON_SOCKET path: an operator-named socket may lead to any
+// vintage, and a mismatch must surface as an actionable error naming
+// the daemon, never a silent adoption (edict 1056).
+func TestNewDaemonConnRefusesIncompatibleProtocol(t *testing.T) {
+	resolved := protoTestEnv(t)
+	stopped := protoFakeDaemon(t, resolved, rpc.PingResult{
+		Ok:       true,
+		Protocol: rpc.CurrentProtocol - 1,
+		Version:  "0.0.1-ancient",
+	})
+	// No eviction is expected on the operator-named socket path — the
+	// daemon may outlive this test. Dropping the stopped channel is
+	// enough; the daemon leaks only its own goroutine until test exit.
+	_ = stopped
+
+	_, err := newDaemonConn(context.Background(), resolved)
+	if err == nil {
+		t.Fatal("newDaemonConn adopted a daemon speaking a foreign protocol")
+	}
+	var mismatch *rpc.ProtocolMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("err = %v, want *rpc.ProtocolMismatchError", err)
+	}
+	if !strings.Contains(err.Error(), "0.0.1-ancient") {
+		t.Errorf("err = %v, want the stale daemon named", err)
 	}
 }

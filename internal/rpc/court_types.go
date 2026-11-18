@@ -1,6 +1,8 @@
 package rpc
 
 import (
+	"fmt"
+
 	"github.com/afittestide/asimi/court"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/runners"
@@ -19,6 +21,48 @@ type PingResult struct {
 	// restart (new process, all in-flight state lost). Empty for an
 	// in-process Court, which has no process restart to distinguish.
 	InstanceID string `msgpack:"instance_id,omitempty"`
+	// Protocol is the RPC protocol the answering build speaks. Zero
+	// means the daemon is older than protocol declarations (edict 1056)
+	// and cannot be assumed compatible.
+	Protocol int `msgpack:"protocol"`
+	// Version is the answering build's AsimiVersion — informational;
+	// a different version alone is not a compatibility break.
+	Version string `msgpack:"version,omitempty"`
+}
+
+// CurrentProtocol is the version of the Court RPC method surface this
+// build speaks. Bump it whenever a method is added, removed, or its
+// wire types change. A client refuses to adopt a daemon whose protocol
+// differs — adopting it would turn every new method call into a
+// permanent CodeUnknownMethod failure (edict 1056). A pure build
+// difference (same protocol, different version) is fine.
+const CurrentProtocol = 1
+
+// ProtocolCompatible reports whether a PingResult describes a daemon
+// this build can talk to: same protocol, and one was declared at all.
+// Unknown (0) is incompatible — "absent" must never read as "allow".
+func ProtocolCompatible(res PingResult) bool {
+	return res.Protocol == CurrentProtocol
+}
+
+// ProtocolMismatchError describes a daemon that answers Ping but speaks
+// a protocol this build does not.
+type ProtocolMismatchError struct {
+	Got      int
+	Want     int
+	Version  string
+	Instance string
+}
+
+func (e *ProtocolMismatchError) Error() string {
+	who := "an older daemon"
+	if e.Version != "" {
+		who = "daemon " + e.Version
+	}
+	if e.Got == 0 {
+		return fmt.Sprintf("%s at the socket predates protocol declaration (this build speaks protocol %d); refusing to adopt it", who, e.Want)
+	}
+	return fmt.Sprintf("%s speaks protocol %d, this build speaks %d; refusing to adopt it", who, e.Got, e.Want)
 }
 
 type HasMinisterParams struct {

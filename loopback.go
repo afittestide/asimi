@@ -100,8 +100,10 @@ func installDaemonSocket(ctx context.Context, model *TUIModel, socketPath string
 }
 
 // newDaemonConn dials the daemon socket, creates an rpc.Conn, starts
-// conn.Serve in a goroutine, and sends the SetContext handshake
-// required before any other RPC call.
+// conn.Serve in a goroutine, verifies the daemon speaks this build's
+// protocol (an operator-named ASIMI_DAEMON_SOCKET may point at any
+// vintage — edict 1056), and sends the SetContext handshake required
+// before any other RPC call.
 func newDaemonConn(ctx context.Context, socketPath string) (*rpc.Conn, error) {
 	c, err := rpc.Dial(socketPath)
 	if err != nil {
@@ -113,6 +115,16 @@ func newDaemonConn(ctx context.Context, socketPath string) (*rpc.Conn, error) {
 			slog.Debug("daemon rpc client terminated", "err", err)
 		}
 	}()
+
+	if res := daemonResponds(ctx, conn); res.Err == nil && !rpc.ProtocolCompatible(res.Result) {
+		conn.Close()
+		return nil, &rpc.ProtocolMismatchError{
+			Got:      res.Result.Protocol,
+			Want:     rpc.CurrentProtocol,
+			Version:  res.Result.Version,
+			Instance: res.Result.InstanceID,
+		}
+	}
 
 	if err := daemonSetContext(ctx, conn); err != nil {
 		c.Close()

@@ -798,15 +798,18 @@ func TestLoopbackCourt_ConnDone(t *testing.T) {
 
 // fakeDaemon mints fresh connected client Conns whose server answers Ping with
 // a mutable instance id, so a test can simulate both a transient drop (same id)
-// and a daemon restart (new id).
+// and a daemon restart (new id), plus a mutable advertised protocol for the
+// compatibility check (edict 1056).
 type fakeDaemon struct {
 	mu         sync.Mutex
 	instanceID string
+	protocol   int
+	version    string
 	conns      []*Conn
 }
 
 func newFakeDaemon(instanceID string) *fakeDaemon {
-	return &fakeDaemon{instanceID: instanceID}
+	return &fakeDaemon{instanceID: instanceID, protocol: CurrentProtocol}
 }
 
 func (d *fakeDaemon) instance() string {
@@ -819,6 +822,21 @@ func (d *fakeDaemon) setInstance(id string) {
 	d.mu.Lock()
 	d.instanceID = id
 	d.mu.Unlock()
+}
+
+// setProtocol changes the protocol the daemon advertises, simulating a
+// reconnect landing on a daemon of a different vintage (edict 1056).
+func (d *fakeDaemon) setProtocol(p int, version string) {
+	d.mu.Lock()
+	d.protocol = p
+	d.version = version
+	d.mu.Unlock()
+}
+
+func (d *fakeDaemon) pingResult() PingResult {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return PingResult{Ok: true, InstanceID: d.instanceID, Protocol: d.protocol, Version: d.version}
 }
 
 func (d *fakeDaemon) track(conns ...*Conn) {
@@ -841,7 +859,7 @@ func (d *fakeDaemon) dial() (*Conn, error) {
 	server := New(pa, Options{})
 	client := New(pb, Options{})
 	server.Handle(MethodPing, func(context.Context, []byte) ([]byte, error) {
-		return wire.Encode(PingResult{Ok: true, InstanceID: d.instance()})
+		return wire.Encode(d.pingResult())
 	})
 	go func() { _ = server.Serve() }()
 	go func() { _ = client.Serve() }()
@@ -922,6 +940,70 @@ func TestReconnectingClient_ReconnectDifferentInstanceIsRestart(t *testing.T) {
 	}
 	if !restarted {
 		t.Fatal("a reconnect to a different instance must report a restart")
+	}
+}
+
+// TestReconnectingClient_ReconnectRefusesIncompatibleDaemon pins that a
+// reconnect landing on a daemon speaking a foreign protocol is refused and
+// surfaced — never silently swapped in (edict 1056).
+func TestReconnectingClient_ReconnectRefusesIncompatibleDaemon(t *testing.T) {
+	d := newFakeDaemon("instance-a")
+	defer d.closeAll()
+
+	rc := NewReconnectingClient(d.dial, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	// The daemon is replaced mid-session by an incompatible vintage.
+	d.setInstance("instance-b")
+	d.setProtocol(CurrentProtocol+2, "9.9.9-future")
+	if err := rc.Conn().Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	err := rc.reconnect()
+	if err == nil {
+		t.Fatal("reconnect adopted an incompatible daemon")
+	}
+	var mismatch *ProtocolMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("err = %v, want *ProtocolMismatchError", err)
+	}
+	if !strings.Contains(err.Error(), "9.9.9-future") {
+		t.Errorf("err = %v, want the stale daemon named", err)
+	}
+}
+
+// TestReconnectingClient_ReconnectAdoptsSameProtocolDifferentBuild pins the
+// rebuild rule on the reconnecting path too: a version-only difference with the
+// same protocol is adopted, not refused (edict 1056).
+func TestReconnectingClient_ReconnectAdoptsSameProtocolDifferentBuild(t *testing.T) {
+	d := newFakeDaemon("instance-a")
+	defer d.closeAll()
+
+	rc := NewReconnectingClient(d.dial, nil)
+	if err := rc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer rc.Close()
+
+	// Same protocol, rebuilt daemon: adopted, reported as a restart.
+	d.setInstance("instance-b")
+	d.setProtocol(CurrentProtocol, "0.0.1-rebuilt")
+	if err := rc.Conn().Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := rc.reconnect(); err != nil {
+		t.Fatalf("reconnect refused a same-protocol daemon: %v", err)
+	}
+
+	id, restarted := rc.SessionInfo()
+	if id != "instance-b" || !restarted {
+		t.Fatalf("SessionInfo = (%q, %v), want (instance-b, true)", id, restarted)
 	}
 }
 
