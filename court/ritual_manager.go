@@ -417,16 +417,22 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 					"merged":      merged,
 				})
 			}
-			// Run is the single owner of terminal Tian events; emit only the
-			// notification here to avoid a duplicate ritual_failed event.
-			rg.notify(RitualStepMsg{
-				ChannelID:   ritualChannelID(key.ID),
-				RitualName:  ritualName,
-				ExecutionID: exec.ID,
-				EdictID:     key.ID,
-				Status:      "ritual_failed",
-				Message:     describeFailure(err, ctx),
-			})
+			// Run is the single owner of terminal Tian events AND of the
+			// terminal ritual_failed notification — it notifies on every
+			// path that emits EventRitualFailed (step failure, background
+			// given failure, def-not-found), marking exec so a second line
+			// is never sent. Only notify here when Run errored before its
+			// own notification could go out (e1060's duplicate shrimp).
+			if !exec.failureNotified {
+				rg.notify(RitualStepMsg{
+					ChannelID:   ritualChannelID(key.ID),
+					RitualName:  ritualName,
+					ExecutionID: exec.ID,
+					EdictID:     key.ID,
+					Status:      "ritual_failed",
+					Message:     describeFailure(err, ctx),
+				})
+			}
 		}
 	}()
 }

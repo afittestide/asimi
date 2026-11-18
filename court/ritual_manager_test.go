@@ -347,12 +347,132 @@ func TestStartRitualFailureNotifies(t *testing.T) {
 		t.Errorf("expected ChannelID 'e99' for ritual_failed message, got %q", failedMsg.ChannelID)
 	}
 
+	// Wait for the startRitual goroutine to finish: it holds the edict lock
+	// for the whole run and only unlocks after its own (now gated) catch-all
+	// path, so a free lock means every notification has been sent.
+	deadline = time.Now().Add(5 * time.Second)
+	for !rg.edictLockFree(99) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the startRitual goroutine to finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// e1060: exactly one ritual_failed notification per terminal failure —
+	// Run owns it, the caller's catch-all must not duplicate it (the shrimp
+	// must not appear twice in the TUI).
+	mu.Lock()
+	failedCount := 0
+	for i := range notified {
+		if notified[i].Status == "ritual_failed" {
+			failedCount++
+		}
+	}
+	mu.Unlock()
+	if failedCount != 1 {
+		t.Errorf("expected exactly 1 ritual_failed notification, got %d: %+v", failedCount, notified)
+	}
+
 	// Verify EventRitualFailed was persisted to DB exactly once — Run owns
 	// terminal events; startRitual must not add a duplicate.
 	var events []storage.TianEvent
 	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
 	if len(events) != 1 {
 		t.Fatalf("expected exactly 1 EventRitualFailed in DB, got %d", len(events))
+	}
+}
+
+// TestStartRitualIdleTimeoutSingleFailedNotification is e1060's
+// idle-timeout companion to TestStartRitualFailureNotifies: a cancellation
+// whose cause is the step idle-timeout sentinel (the "step cancelled: idle
+// timeout exceeded" failure) is a genuine failure, and it must yield exactly
+// one ritual_failed notification end-to-end through startRitual — one from
+// Run, none from the caller's catch-all.
+func TestStartRitualIdleTimeoutSingleFailedNotification(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	ritual := &RitualDef{
+		Name:       "idle-timeout-test",
+		Background: []string{"!sleep 30"},
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work"},
+		},
+	}
+
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	defer cancelCause(nil)
+
+	rg := &RitualGuard{
+		MinisterBase:   base,
+		ritualRegistry: registry,
+		ritualRunner: NewRitualRunner(
+			registry,
+			func(id string) Minister { return nil },
+			nil,
+			db, &blockingRunner{}, slog.Default(), repo.RepoInfo{},
+		),
+		streamingCtx: func(string) context.Context { return ctx },
+	}
+
+	var notified []RitualStepMsg
+	var mu sync.Mutex
+	rg.SetNotify(func(msg any) {
+		if stepMsg, ok := msg.(RitualStepMsg); ok {
+			mu.Lock()
+			notified = append(notified, stepMsg)
+			mu.Unlock()
+		}
+	})
+
+	key := storage.EdictKey{ID: 98, Username: "testuser", Project: "testproject"}
+	rg.startRitual("idle-timeout-test", key, nil)
+
+	// Let the ritual reach the blocking background given, then cancel with
+	// the idle-timeout cause — the same sentinel the step idle timer attaches.
+	time.Sleep(100 * time.Millisecond)
+	cancelCause(errStepIdleTimeout)
+
+	// Wait for the startRitual goroutine to unwind: a free edict lock means
+	// every notification has been sent.
+	deadline := time.Now().Add(5 * time.Second)
+	for !rg.edictLockFree(98) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the startRitual goroutine to finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	failedCount := 0
+	var failedMsg *RitualStepMsg
+	for i := range notified {
+		if notified[i].Status == "ritual_failed" {
+			failedCount++
+			failedMsg = &notified[i]
+		}
+	}
+	if failedMsg == nil {
+		t.Fatalf("expected a ritual_failed notification for the idle timeout, got: %+v", notified)
+	}
+	if !strings.Contains(failedMsg.Message, "idle timeout exceeded") {
+		t.Errorf("expected the idle-timeout reason, got %q", failedMsg.Message)
+	}
+	if failedCount != 1 {
+		t.Errorf("expected exactly 1 ritual_failed notification, got %d: %+v", failedCount, notified)
+	}
+
+	// Exactly one terminal Tian event as well.
+	var events []storage.TianEvent
+	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
+	if len(events) != 1 {
+		t.Errorf("expected exactly 1 EventRitualFailed for the idle timeout, got %d", len(events))
 	}
 }
 
@@ -1803,6 +1923,9 @@ func TestRun_FailedStep_EmitsExactlyOneRitualFailed(t *testing.T) {
 	db.Where("event_type = ?", storage.EventRitualFailed).Find(&events)
 	if len(events) != 1 {
 		t.Fatalf("expected exactly 1 EventRitualFailed, got %d", len(events))
+	}
+	if !exec.failureNotified {
+		t.Error("expected Run to mark exec.failureNotified on the terminal ritual_failed path")
 	}
 }
 

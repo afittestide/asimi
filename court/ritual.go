@@ -819,6 +819,12 @@ type RitualExecution struct {
 	PreviousExecutionID string `gorm:"-"` // ID of the aborted execution being recovered
 	RecoveryMode        bool   `gorm:"-"` // True if this execution is a recovery
 
+	// failureNotified records that Run already sent the terminal
+	// ritual_failed notification for this execution, so its caller
+	// (RitualGuard.startRitual) does not send a second one. See
+	// markFailureNotified.
+	failureNotified bool
+
 	// Fork execution context (not persisted)
 	forkItemLabel string // e.g. "1/3" — set by executeForkItem, read by Notify
 	forkWorkIndex int    // index of current work step within the fork
@@ -912,6 +918,15 @@ func (e *RitualExecution) Notify(msg RitualStepMsg) {
 		}
 		e.notify(msg)
 	}
+}
+
+// markFailureNotified stamps the execution so its caller knows the terminal
+// ritual_failed notification has already been sent. Run calls it on every
+// path that notifies a ritual_failed (background given failure, step
+// failure); the guard's catch-all in startRitual checks it to avoid the
+// duplicate "🦐 Ritual <name> failed" line in the TUI (e1060).
+func (e *RitualExecution) markFailureNotified() {
+	e.failureNotified = true
 }
 
 // notifyAny sends an arbitrary message via the notify function.
@@ -1124,6 +1139,7 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 				Status:   "ritual_failed",
 				Message:  describeFailure(err, ctx),
 			})
+			exec.markFailureNotified()
 			r.emitEvent(execKey, storage.EventRitualFailed, storage.JSON{
 				"ritual":       exec.RitualName,
 				"execution_id": exec.ID,
@@ -1168,6 +1184,7 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 				Status:   "ritual_failed",
 				Message:  describeFailure(err, ctx),
 			})
+			exec.markFailureNotified()
 			r.emitEvent(execKey, storage.EventRitualFailed, storage.JSON{
 				"ritual":       exec.RitualName,
 				"execution_id": exec.ID,
@@ -1301,6 +1318,7 @@ func (r *RitualRunner) Run(ctx context.Context, exec *RitualExecution) error {
 					Status:    "ritual_failed",
 					Message:   describeFailure(err, ctx),
 				})
+				exec.markFailureNotified()
 				// Emit ritual_failed Tian event
 				lastStepOutput := getLastStepOutput(exec)
 				r.emitEvent(execKey, storage.EventRitualFailed, storage.JSON{
