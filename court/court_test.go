@@ -1493,13 +1493,19 @@ func TestBuildToolRegistry_WiresHostChecker(t *testing.T) {
 	// hostChecker should be non-nil after buildToolRegistry
 	require.NotNil(t, s.hostChecker, "hostChecker should be wired from chancellor's CheckHostCommand")
 
-	// Verify it actually matches patterns from the config
-	runOnHost, needsApproval := s.hostChecker("gh issue list")
-	assert.True(t, runOnHost, "command matching RunOnHost should return runOnHost=true")
-	assert.True(t, needsApproval, "RunOnHost patterns require approval")
+	// Verify it matches patterns from the config. A matching command is refused
+	// until the mandate grants host execution (seam 7), so this asserts the
+	// refusal rather than a routing decision.
+	runOnHost, needsApproval, err := s.hostChecker("gh issue list")
+	assert.False(t, runOnHost, "an ungranted host command must not be routed to the host")
+	assert.False(t, needsApproval)
+	assert.IsType(t, HostExecRefusedError{}, err,
+		"a pattern match without a mandate grant must be refused, not routed")
 
-	runOnHost, needsApproval = s.hostChecker("ls -la")
+	runOnHost, needsApproval, err = s.hostChecker("ls -la")
 	assert.False(t, runOnHost, "non-matching command should return runOnHost=false")
+	assert.False(t, needsApproval)
+	require.NoError(t, err, "a command with no host pattern is an ordinary sandbox command")
 }
 
 // TestCourt_ImplementsRuntimeDispatchInterfaces verifies the Court directly
@@ -1703,9 +1709,10 @@ func TestCourt_CheckHostCommand_NoConfig(t *testing.T) {
 	s := NewCourt(db, cfg, nil, nil)
 	require.NotNil(t, s)
 
-	runOnHost, needsApproval := s.CheckHostCommand("gh issue list")
+	runOnHost, needsApproval, err := s.CheckHostCommand("gh issue list")
 	assert.False(t, runOnHost)
 	assert.False(t, needsApproval)
+	require.NoError(t, err, "with no session config there are no host patterns to refuse")
 }
 
 // TestCourt_CheckHostCommand_IsolatedHost verifies that in isolated-host
@@ -1717,9 +1724,11 @@ func TestCourt_CheckHostCommand_IsolatedHost(t *testing.T) {
 	s := NewCourt(db, cfg, nil, nil)
 	require.NotNil(t, s)
 
-	runOnHost, needsApproval := s.CheckHostCommand("git status")
+	runOnHost, needsApproval, err := s.CheckHostCommand("git status")
 	assert.True(t, runOnHost, "isolated-host should route to host")
 	assert.False(t, needsApproval, "isolated-host should not require approval")
+	require.NoError(t, err,
+		"isolated-host is the operator's CLI bypass (seam 8), not a mandate question: never refused")
 }
 
 // TestCourt_AppendToIntent_InvalidatesSeals verifies that appending to an
@@ -2706,8 +2715,17 @@ func TestCourt_ConsultMinister_SelfConsultationRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "cannot consult itself")
 }
 
-// TestCourt_CheckHostCommand_SafeRunOnHost verifies that a command matching
-// SafeRunOnHost returns (true, false) — run on host without approval.
+// TestCourt_CheckHostCommand_SafeRunOnHost is seal 7's core guarantee: a
+// pattern match alone does NOT let a command reach the host.
+//
+// The edict inventory said this seam was "pattern-matched; approval for
+// run_on_host, none for safe_run_on_host". That is confirmed by the code and is
+// exactly the hole: the only thing separating the two classes was whether an
+// interaction happened, and safe_run_on_host skipped it entirely. Host
+// execution is strictly more authority than the sandbox, so both classes now
+// require the mandate's affirmative host-execution grant, and neither arrives
+// by default. RunOnHost keeps its extra per-command approval; SafeRunOnHost
+// never becomes a silent bypass.
 func TestCourt_CheckHostCommand_SafeRunOnHost(t *testing.T) {
 	db := setupMinisterTestDB(t)
 	cfg := config.DefaultCourtConfig()
@@ -2721,20 +2739,103 @@ func TestCourt_CheckHostCommand_SafeRunOnHost(t *testing.T) {
 		},
 	}, repo.RepoInfo{})
 
-	// SafeRunOnHost match — no approval needed
-	runOnHost, needsApproval := s.CheckHostCommand("gh issue list")
-	assert.True(t, runOnHost, "SafeRunOnHost match should return runOnHost=true")
-	assert.False(t, needsApproval, "SafeRunOnHost match should return needsApproval=false")
+	// ConfigureModel binds the restrictive mandate (no dialog), so BOTH classes
+	// are refused: a pattern is a request, not a grant.
+	runOnHost, needsApproval, err := s.CheckHostCommand("gh issue list")
+	assert.False(t, runOnHost, "safe_run_on_host must not route to the host without a grant")
+	assert.False(t, needsApproval)
+	assert.IsType(t, HostExecRefusedError{}, err, "safe_run_on_host without a grant must be refused")
 
-	// RunOnHost match — approval needed
-	runOnHost, needsApproval = s.CheckHostCommand("docker build .")
-	assert.True(t, runOnHost, "RunOnHost match should return runOnHost=true")
-	assert.True(t, needsApproval, "RunOnHost match should return needsApproval=true")
+	runOnHost, needsApproval, err = s.CheckHostCommand("docker build .")
+	assert.False(t, runOnHost, "run_on_host must not route to the host without a grant")
+	assert.False(t, needsApproval)
+	assert.IsType(t, HostExecRefusedError{}, err, "run_on_host without a grant must be refused")
 
-	// No match — sandbox
-	runOnHost, needsApproval = s.CheckHostCommand("ls -la")
+	// No match — ordinary sandbox command, never a refusal.
+	runOnHost, needsApproval, err = s.CheckHostCommand("ls -la")
 	assert.False(t, runOnHost, "non-matching command should return runOnHost=false")
 	assert.False(t, needsApproval, "non-matching command should return needsApproval=false")
+	require.NoError(t, err)
+
+	// With the Ruler's explicit grant, both classes are permitted and their
+	// approval difference (the only distinction that ever existed) is preserved.
+	require.NoError(t, s.ApplyMandate(config.Selections{HostExec: true}))
+
+	runOnHost, needsApproval, err = s.CheckHostCommand("gh issue list")
+	assert.True(t, runOnHost, "a granted safe_run_on_host match runs on the host")
+	assert.False(t, needsApproval, "safe_run_on_host still needs no per-command approval")
+	require.NoError(t, err)
+
+	runOnHost, needsApproval, err = s.CheckHostCommand("docker build .")
+	assert.True(t, runOnHost, "a granted run_on_host match runs on the host")
+	assert.True(t, needsApproval, "run_on_host keeps its per-command approval")
+	require.NoError(t, err)
+}
+
+// TestCourt_CheckHostCommand_HostExecFailsClosed pins the failure direction of
+// seam 7: without a dialog the mandate is RestrictiveMandate, and host
+// execution is REFUSED with a typed error rather than silently downgraded to
+// the sandbox or silently run on the host (edict 1036).
+func TestCourt_CheckHostCommand_HostExecFailsClosed(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+	require.NotNil(t, s)
+
+	// No ConfigureModel at all: no mandate bound yet.
+	_, _, err := s.CheckHostCommand("echo hi")
+	require.NoError(t, err, "without host patterns nothing is routed, so nothing is refused")
+
+	// The no-dialog path: ConfigureModel records the request and binds the
+	// restrictive mandate.
+	s.ConfigureModel(nil, &SessionConfig{
+		Sandbox: config.SandboxConfig{SafeRunOnHost: []string{"^echo "}},
+	}, repo.RepoInfo{})
+
+	require.NotNil(t, s.Mandate())
+	grant, ok := s.Mandate().GrantFor(config.SeamHostExec, config.SeamHostRunner)
+	require.True(t, ok, "the restrictive mandate must record its host-execution decision")
+	assert.False(t, grant.Granted, "the no-dialog mandate grants no host execution")
+
+	runOnHost, _, err := s.CheckHostCommand("echo hi")
+	assert.False(t, runOnHost, "fail closed: the command must not run on the host")
+	var refused HostExecRefusedError
+	require.ErrorAs(t, err, &refused, "the refusal must be a typed, actionable error")
+	assert.Equal(t, "echo hi", refused.Command)
+	assert.Contains(t, err.Error(), "affirmative grant")
+
+	// A repository cannot grant itself the seam: re-recording the requested
+	// config (a config reload) must not widen the mandate.
+	s.SetRequestedConfig(&config.Config{Sandbox: config.SandboxConfig{SafeRunOnHost: []string{"^echo "}}})
+	_, _, err = s.CheckHostCommand("echo hi")
+	require.ErrorAs(t, err, &refused, "a config request is not a grant")
+}
+
+// TestCourt_HostExecGrantIsNotAllowAll proves "Allow all" cannot reach the host
+// seam: it grants every requested *asset* inside the sandbox, and host
+// execution is unsandboxed authority, so it needs the Ruler's own row.
+func TestCourt_HostExecGrantIsNotAllowAll(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.SafeRunOnHost = []string{"^gh "}
+	s.SetRequestedConfig(requested)
+
+	require.NoError(t, s.ApplyMandate(config.Selections{AllowAll: true}))
+	grant, ok := s.Mandate().GrantFor(config.SeamHostExec, config.SeamHostRunner)
+	require.True(t, ok)
+	assert.False(t, grant.Granted, "Allow all must not grant unsandboxed host execution")
+
+	_, _, err := s.CheckHostCommand("gh issue list")
+	var refused HostExecRefusedError
+	require.ErrorAs(t, err, &refused, "with no explicit host grant the host seam stays shut")
+
+	// The Ruler's own row opens it.
+	require.NoError(t, s.ApplyMandate(config.Selections{HostExec: true}))
+	runOnHost, _, err := s.CheckHostCommand("gh issue list")
+	require.NoError(t, err)
+	assert.True(t, runOnHost)
 }
 
 // TestBuildToolRegistry_LazyTimeouts asserts that the shell tool's timeout
@@ -5645,5 +5746,437 @@ func TestCourt_DisposeZhengming_RefusedWriteDoesNotReleaseOrAnnounce(t *testing.
 		t.Fatalf("refused write published event %q, want none", ev.Type)
 	default:
 		// Good — the ledger never claims a retirement that did not happen.
+	}
+}
+
+// TestCourt_SessionOwnerPID_DefaultsToProcess verifies an in-process Court (the
+// TUI loopback and headless paths) owns its session's authority with its own
+// PID: there is no separate client process to track (edict 1036).
+func TestCourt_SessionOwnerPID_DefaultsToProcess(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	assert.Equal(t, os.Getpid(), s.SessionOwnerPID(),
+		"an in-process Court is itself the client that obtained the mandate")
+}
+
+// TestCourt_SetClientPID_OwnsMandateWithClientProcess is the daemon-mode
+// guarantee: the Court lives inside the daemon, so owning a mandate with its
+// own PID would outlive the client that granted it. The transport-supplied
+// client PID must be the owner, and must re-stamp an already-bound mandate
+// without disturbing the grant record (edict 1036).
+func TestCourt_SetClientPID_OwnsMandateWithClientProcess(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	s.SetRequestedConfig(requested)
+
+	// A stale in-process mandate (daemon PID) exists first, as ConfigureModel
+	// would leave it.
+	s.ApplyRestrictiveMandate()
+	require.NotNil(t, s.Mandate())
+	assert.Equal(t, os.Getpid(), s.Mandate().OwnerPID)
+
+	// The transport learns the real client PID on the handshake.
+	s.SetClientPID(424242)
+	assert.Equal(t, 424242, s.SessionOwnerPID())
+	assert.Equal(t, 424242, s.Mandate().OwnerPID,
+		"a rebound client must own the mandate, or it outlives the granting process")
+
+	// A later grant is owned by the client too, not the daemon.
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		Mounts: map[string]bool{"/host/gcloud": false},
+		Env:    map[string]bool{},
+	}))
+	assert.Equal(t, 424242, s.Mandate().OwnerPID)
+	require.Len(t, s.Mandate().EffectiveSandbox().AdditionalMounts, 1,
+		"rebinding the owner must not disturb the grant record")
+}
+
+// TestCourt_ApplyMandate_StripsRequestedConfig proves the mandate IS the
+// stripped config: a declined seam is absent, an accepted one is present, and
+// the grant record is auditable (edict 1036).
+func TestCourt_ApplyMandate_StripsRequestedConfig(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/declined", Destination: "/d", ReadOnly: true},
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	requested.Sandbox.PassthroughEnv = []string{"GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT"}
+	s.SetRequestedConfig(requested)
+
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		Mounts: map[string]bool{"/host/gcloud": false},
+		Env:    map[string]bool{"GOOGLE_CLOUD_PROJECT": true},
+	}))
+
+	sb := s.Mandate().EffectiveSandbox()
+	require.Len(t, sb.AdditionalMounts, 1)
+	assert.Equal(t, "/host/gcloud", sb.AdditionalMounts[0].Source)
+	assert.True(t, sb.AdditionalMounts[0].ReadOnly, "an accepted mount is read-only unless opened")
+	assert.Equal(t, []string{"GOOGLE_CLOUD_PROJECT"}, sb.PassthroughEnv,
+		"a declined env var must be stripped from the mandate")
+
+	declined, ok := s.Mandate().GrantFor(config.SeamMount, "/host/declined")
+	require.True(t, ok, "a declined seam must still be recorded")
+	assert.False(t, declined.Granted)
+}
+
+// TestCourt_ApplyRestrictiveMandate_IsTheNoDialogDefault pins the no-dialog
+// answer: headless/daemon sessions hold no additional host authority at all.
+func TestCourt_ApplyRestrictiveMandate_IsTheNoDialogDefault(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{{Source: "/host/gcloud", Destination: "/root/.config/gcloud"}}
+	requested.Sandbox.PassthroughEnv = []string{"GOOGLE_APPLICATION_CREDENTIALS"}
+	s.SetRequestedConfig(requested)
+
+	m := s.ApplyRestrictiveMandate()
+	require.NotNil(t, m)
+	assert.Empty(t, m.EffectiveSandbox().AdditionalMounts, "no dialog means no additional host mounts")
+	assert.Empty(t, m.EffectiveSandbox().PassthroughEnv, "no dialog means no passthrough env")
+}
+
+// TestCourt_SessionSeams_EnumeratesTheRequestedAssets pins the dialog's input:
+// the Court hands the TUI exactly the concrete seams the committed config
+// *requests* — every additional mount and passthrough env var, and nothing
+// else. An empty or unreachable request yields an empty list, which the dialog
+// presents as "no host assets requested" (edict 1036).
+func TestCourt_SessionSeams_EnumeratesTheRequestedAssets(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	emptySeams, err := s.SessionSeams()
+	require.NoError(t, err, "an empty request is not a read failure")
+	assert.Empty(t, emptySeams, "no recorded request means no seams to grant")
+	assert.Nil(t, s.RequestedConfig())
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gh", Destination: "/root/.config/gh", ReadOnly: true},
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	requested.Sandbox.PassthroughEnv = []string{"GOOGLE_APPLICATION_CREDENTIALS"}
+	s.SetRequestedConfig(requested)
+
+	seams, err := s.SessionSeams()
+	require.NoError(t, err)
+	require.Len(t, seams, 3)
+
+	var mounts, envs int
+	for _, seam := range seams {
+		switch seam.Kind {
+		case config.SeamMount:
+			mounts++
+			assert.NotEmpty(t, seam.Label, "a seam must be human-identifiable in the dialog")
+		case config.SeamEnv:
+			envs++
+			assert.Equal(t, "GOOGLE_APPLICATION_CREDENTIALS", seam.EnvName)
+		}
+	}
+	assert.Equal(t, 2, mounts)
+	assert.Equal(t, 1, envs)
+}
+
+// TestCourt_ApplyMandate_AllowAllKeepsMountsReadOnly proves the "Allow all"
+// choice grants reach but not write: every requested seam is granted and every
+// mount stays read-only unless individually opened. This is the difference
+// between "the sandbox can see my credentials" and "the sandbox can rewrite
+// them" (edict 1036).
+//
+// The repo-requested-writable mount is the case that matters: a request with
+// read_only = false must still land read-only under Allow all, because the
+// dialog promises "read-only unless you open it".
+func TestCourt_ApplyMandate_AllowAllKeepsMountsReadOnly(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+		{Source: "/host/writable-request", Destination: "/root/.config/writable", ReadOnly: false},
+	}
+	requested.Sandbox.PassthroughEnv = []string{"GOOGLE_APPLICATION_CREDENTIALS"}
+	s.SetRequestedConfig(requested)
+
+	require.NoError(t, s.ApplyMandate(config.Selections{AllowAll: true}))
+
+	sb := s.Mandate().EffectiveSandbox()
+	require.Len(t, sb.AdditionalMounts, 2)
+	for _, m := range sb.AdditionalMounts {
+		assert.True(t, m.ReadOnly,
+			"Allow all must not open %s for writing, even when the request asked for it", m.Source)
+	}
+	assert.Equal(t, []string{"GOOGLE_APPLICATION_CREDENTIALS"}, sb.PassthroughEnv)
+
+	grant, ok := s.Mandate().GrantFor(config.SeamMount, "/host/gcloud")
+	require.True(t, ok)
+	assert.True(t, grant.Granted)
+	assert.False(t, grant.Writable)
+
+	writableReq, ok := s.Mandate().GrantFor(config.SeamMount, "/host/writable-request")
+	require.True(t, ok)
+	assert.True(t, writableReq.Granted)
+	assert.False(t, writableReq.Writable,
+		"Allow all must not honor a repository's writable request: only an explicit per-mount grant opens a mount")
+}
+
+// TestCourt_PerEdictRunnerInheritsTheMandate proves the session's authority is
+// not escaped by the per-edict path: a runner created for a new edict must be
+// built from the mandate's granted config and carry the mandate itself, and it
+// must be born read-only. Concurrent edicts get their own containers, but they
+// must not get their own, wider authority (edict 1036).
+func TestCourt_PerEdictRunnerInheritsTheMandate(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	s.SetRequestedConfig(requested)
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		Mounts: map[string]bool{"/host/gcloud": false},
+		Env:    map[string]bool{},
+	}))
+	m := s.Mandate()
+	require.NotNil(t, m)
+
+	// Wire the factory exactly as ConfigureModel does, then hand out a runner.
+	projectRoot := t.TempDir()
+	s.ConfigureModel(nil, &SessionConfig{Sandbox: requested.Sandbox}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "test/project"})
+
+	r, err := s.RunnerForEdict(42)
+	require.NoError(t, err)
+	require.NotNil(t, r)
+
+	pr, ok := r.(*runners.PodmanRunner)
+	require.True(t, ok, "an unsandboxed session must hand out a podman runner, got %T", r)
+	assert.Same(t, m, pr.Mandate(),
+		"a per-edict runner must carry the session mandate, not merely the requested config")
+	assert.True(t, pr.Mandate().EffectiveSandbox().AdditionalMounts[0].ReadOnly,
+		"an edict's container must be built read-only")
+}
+
+// TestCourt_MandateBindingIsRaceFree covers the Court side of the re-bind: the
+// trust dialog's answer (ApplyMandate) writes the session mandate while the
+// Court's own readers — the per-edict runner factory (effectiveSandboxConfig)
+// and Mandate() — may be serving an edict that is already running. The
+// Ruler answering the chooser and a wakeup/edict runner being built are not
+// serialized by anything: internal/rpc dispatches every request in its own
+// goroutine, so the two can overlap. Run under -race to see the regression
+// (edict 1036).
+//
+// This is the Court-side twin of the runners' TestMandateRebindIsRaceFree: the
+// runner guards the POINTER it holds, but the pointer's owner and the Court's
+// own binding need their own guard.
+func TestCourt_MandateBindingIsRaceFree(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	requested.Sandbox.PassthroughEnv = []string{"GOOGLE_APPLICATION_CREDENTIALS"}
+	s.SetRequestedConfig(requested)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// The Ruler answering the dialog, and the daemon re-stamping the owner.
+		for i := 0; i < 200; i++ {
+			_ = s.ApplyMandate(config.Selections{
+				Mounts: map[string]bool{"/host/gcloud": false},
+				Env:    map[string]bool{"GOOGLE_APPLICATION_CREDENTIALS": true},
+			})
+			s.SetClientPID(2000 + i)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// What the runner factory and the RPC surface read concurrently.
+		for i := 0; i < 200; i++ {
+			_ = s.Mandate()
+			_ = s.effectiveSandboxConfig()
+			_, _ = s.SessionSeams()
+			_ = s.SessionOwnerPID()
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestCourt_MandateOwnerRebindCrossesRunner is the cross-object half of the
+// re-bind race, and the reason the owner is re-bound by REPLACING the mandate
+// rather than mutating it. The Court and the runner guard different mutexes, so
+// a written-in-place OwnerPID is read here by the runner (stamping a container)
+// while the Court writes it there (a daemon reconnect). Only immutable
+// ownership — a fresh mandate for the new owner — is race-free (edict 1036).
+func TestCourt_MandateOwnerRebindCrossesRunner(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	s.SetRequestedConfig(requested)
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		Mounts: map[string]bool{"/host/gcloud": false},
+		Env:    map[string]bool{},
+	}))
+	require.NotNil(t, s.Mandate())
+
+	// The runner is a separate object with its own mandate mutex; it reads the
+	// owner while building a container.
+	runner := runners.NewPodmanRunner(&runners.Config{}, repo.RepoInfo{ProjectRoot: t.TempDir(), Slug: "Owner/Repo"}, "0", nil)
+	runner.SetMandate(s.Mandate())
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			s.SetClientPID(3000 + i)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			// What createContainer does: it reads the bound mandate's owner to
+			// stamp the container label. Reading the FIELD (not just the
+			// pointer) is what exposes an in-place write.
+			if m := runner.Mandate(); m != nil {
+				_ = m.OwnerPID
+			}
+			runner.SetMandate(s.Mandate())
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestRitualRunner_InjectedConfigIsRaceFree covers the gap the Judge recorded
+// against court/ritual.go: SetConfig and SetMandate push injected session state
+// while a ritual step reads it (verifySandboxReady rebuilding the connection
+// runner). The fields are guarded together so a step never pairs a config from
+// before a re-injection with a mandate from after it (edict 1036).
+func TestRitualRunner_InjectedConfigIsRaceFree(t *testing.T) {
+	rr := &RitualRunner{}
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	cfg := config.SandboxConfig{}
+	m1 := config.BuildMandate(11, requested, config.Selections{Mounts: map[string]bool{"/host/gcloud": false}, Env: map[string]bool{}})
+	m2 := config.BuildMandate(22, requested, config.Selections{Mounts: map[string]bool{"/host/gcloud": true}, Env: map[string]bool{}})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			rr.SetConfig(&cfg, "proj", repo.RepoInfo{ProjectRoot: "/p"}, nil)
+			rr.SetMandate(m1)
+			rr.SetMandate(m2)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 300; i++ {
+			// What verifySandboxReady does: one consistent snapshot.
+			sandboxCfg, mandate, target := rr.sessionConfig()
+			_ = sandboxCfg
+			_ = target
+			if mandate != nil {
+				_ = mandate.OwnerPID
+			}
+			_ = rr.Mandate()
+			_ = rr.ignoreCopyGlobs()
+			// ensureExecContext seeds from the Court-wide repoInfo; this is
+			// reached from verifySandboxReady's first line.
+			exec := &RitualExecution{}
+			rr.ensureExecContext(exec)
+			_ = exec.repoInfo
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestCourt_IsolatedHostIsNotADialogSeam pins seam 8's ruling (edict 1036):
+// --isolated-host bypasses the sandbox entirely, and it is NOT GATED — it is a
+// deliberate operator CLI choice, not a repository-requested seam and not
+// something the trust dialog can grant or deny.
+//
+// The guarantee is asserted here rather than commented, because a comment
+// cannot fail. Two directions are checked:
+//
+//  1. No seam row corresponds to it. The dialog's rows come from
+//     config.SessionSeams, which has no SeamKind for a flag, so even a config
+//     that requests every grantable seam yields a seam set the dialog does not
+//     govern --isolated-host by. Should anyone later add a SeamKind for the
+//     flag, this fails.
+//  2. The rendered text never implies the sandbox is in force. The footer must
+//     name the flag and say it is an operator choice outside the dialog's
+//     answers, and must not claim a sandbox is protecting the session.
+func TestCourt_IsolatedHostIsNotADialogSeam(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, config.DefaultCourtConfig(), nil, nil)
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	requested.Sandbox.PassthroughEnv = []string{"GOOGLE_APPLICATION_CREDENTIALS"}
+	s.SetRequestedConfig(requested)
+
+	// The Court has no seam to hand the dialog for the flag, even "Allow all"
+	// cannot reach it, and the seam list is exactly the requested mounts+env.
+	seams, err := s.SessionSeams()
+	require.NoError(t, err)
+	require.Len(t, seams, 2, "only the requested mount and env var are sessions seams")
+	for _, seam := range seams {
+		assert.NotEqual(t, config.HostBypassFlag, seam.Label,
+			"the operator's CLI flag must never be presented as a grantable seam")
+		assert.NotEqual(t, config.HostBypassFlag, seam.EnvName)
+		assert.NotEqual(t, config.HostBypassFlag, seam.Mount.Source)
+	}
+
+	// The rendered dialog must not claim to govern it either. The TUI dialog is
+	// package main, so this package pins the Court's half: what it hands over
+	// is a seam list the flag cannot appear in, under every answer.
+	for _, sel := range []config.Selections{
+		{},
+		{AllowAll: true},
+		{Mounts: map[string]bool{"/host/gcloud": true}, Env: map[string]bool{"GOOGLE_APPLICATION_CREDENTIALS": true}},
+	} {
+		s.SetRequestedConfig(requested)
+		require.NoError(t, s.ApplyMandate(sel))
+		answered, seenErr := s.SessionSeams()
+		require.NoError(t, seenErr)
+		for _, seam := range answered {
+			assert.NotEqual(t, config.HostBypassFlag, seam.Label,
+				"no dialog answer may turn the operator's flag into a granted seam")
+		}
+		_, granted := s.Mandate().GrantFor(config.SeamKind(config.HostBypassFlag), config.HostBypassFlag)
+		assert.False(t, granted, "a grant record for the CLI flag must be impossible")
 	}
 }

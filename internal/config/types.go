@@ -91,10 +91,23 @@ type SessionConfig struct {
 	AgentsFile   string `koanf:"agents_file"` // Project context file name (default: AGENTS.md, can be CLAUDE.md)
 }
 
-// Mount represents a volume mount for the sandbox container
+// Mount represents a volume mount for the sandbox container.
+//
+// ReadOnly is a first-class property: an additional_mounts entry is read-only
+// unless its source sets read_only = false, and the Ruler's grant can pin it
+// writable. cache_volumes reuse this type but ReadOnly has no meaning there
+// (named volumes are the container's own storage, not host assets).
+//
+// The koanf tag is a plain bool so the config surface stays simple; the
+// read-only default for additional_mounts is applied by the loader, which sees
+// which entries explicitly set the key (edict 1036).
 type Mount struct {
 	Source      string `koanf:"source"`
 	Destination string `koanf:"destination"`
+	// ReadOnly mounts the host path with Options: ["ro"]. It defaults to true
+	// for additional_mounts; set read_only = false in the config to request a
+	// writable bind (which the Ruler must still grant at the trust dialog).
+	ReadOnly bool `koanf:"read_only"`
 }
 
 // SandboxConfig holds configuration for the sandboxed execution environment

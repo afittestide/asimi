@@ -111,9 +111,10 @@ type Court struct {
 	persister SessionPersister
 
 	// hostChecker determines whether a command should run on the host
-	// (from config run_on_host/safe_run_on_host patterns). Owned by the
-	// Court and passed into ToolRegistrationOpts.
-	hostChecker func(string) (bool, bool)
+	// (from config run_on_host/safe_run_on_host patterns, gated on the
+	// mandate's host-execution grant). A non-nil error refuses the command.
+	// Owned by the Court and passed into ToolRegistrationOpts.
+	hostChecker func(string) (bool, bool, error)
 
 	// zhengming holds the Court-owned pending zhengming dispatch state,
 	// replacing the per-MinisterBase map that was previously accessed
@@ -172,6 +173,81 @@ type Court struct {
 	// repoMutationRunner hands out a fresh host runner; tests inject a runner
 	// to observe the commands a mutation would run.
 	mutationRunner runners.Runner
+
+	// mandateMu guards mandate, clientPID and requestedConfig. The Court's
+	// mandate is read while an edict's container is being built and written
+	// when the Ruler answers the trust dialog or a daemon client reconnects;
+	// internal/rpc dispatches every request in its own goroutine, so the two
+	// genuinely overlap (edict 1036).
+	mandateMu sync.RWMutex
+
+	// requestedConfig is the session config exactly as the committed files
+	// request it — the *request*, never a grant. The mandate strips it.
+	requestedConfig *config.Config
+
+	// mandate is the single session-authority concept: the requested config
+	// narrowed to what the Ruler granted, plus the grant record (edict 1036).
+	// It is a *reference* held here and on the runner; nil means a mandate has
+	// not yet been bound and the runner falls back to its own config.
+	//
+	// A published mandate is IMMUTABLE: re-binding (a reconnect) replaces the
+	// pointer with a new mandate rather than writing through the old one, so a
+	// reader that snapshotted it never sees a half-updated grant.
+	mandate *config.Mandate
+
+	// clientPID is the PID of the client process that established this
+	// session — the process that got the mandate. In daemon mode the Court
+	// lives inside the daemon, so os.Getpid() would name the daemon: a
+	// mandate owned by that PID would outlive the client that granted it.
+	// Set by the transport (the daemon's socket peer); 0 falls back to
+	// os.Getpid() for in-process courts (edict 1036).
+	clientPID int
+}
+
+// SetClientPID records the PID of the client process that established the
+// session. The mandate is owned by this PID and dies with it (edict 1036).
+//
+// An already-bound mandate is REPLACED with an owner-corrected copy rather than
+// mutated in place: a published mandate is immutable, so a reader that
+// snapshotted it (the container builder stamping the owner label) never sees a
+// half-updated struct. The grant record and the granted config are carried over
+// untouched — a reconnect moves the owner, it never re-widens or narrows the
+// authority the Ruler granted.
+func (s *Court) SetClientPID(pid int) {
+	if s == nil || pid <= 0 {
+		return
+	}
+	s.mandateMu.Lock()
+	prev := s.mandate
+	s.clientPID = pid
+	rebind := prev != nil && prev.OwnerPID != pid
+	var next *config.Mandate
+	if rebind {
+		next = prev.WithOwner(pid)
+		s.mandate = next
+	}
+	s.mandateMu.Unlock()
+
+	if rebind {
+		s.propagateMandate(next)
+	}
+}
+
+// SessionOwnerPID returns the PID that owns this session's authority: the
+// client process's PID when the transport supplied it (daemon mode), else this
+// process's PID (in-process/loopback courts). It is the PID stamped on the
+// session's sandbox containers and on the mandate (edict 1036).
+func (s *Court) SessionOwnerPID() int {
+	if s == nil {
+		return 0
+	}
+	s.mandateMu.RLock()
+	pid := s.clientPID
+	s.mandateMu.RUnlock()
+	if pid > 0 {
+		return pid
+	}
+	return os.Getpid()
 }
 
 // NewCourt creates a new Court coordinator.
@@ -245,7 +321,13 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 		DeliverZhengming: s.DeliverZhengmingAnswer,
 		FlatlineRunners:  s.flatlineIdleRunners,
 	})
-	// TODO - move the next block to NewRitualGuard
+	// These seams are set from the OUTSIDE on the guard the Court just built,
+	// deliberately and permanently: two of them are the guard's OWN
+	// blessed-branch lease (blessedBranchLock, blessedWaiters), which cannot be
+	// handed to NewRitualGuard because the guard that owns them does not exist
+	// until it returns. The rest reach Court methods and fields that only exist
+	// once the Court is fully constructed. This wiring is the Court's, not the
+	// guard's — do not move it into the constructor.
 	s.ritualGuard.ritualRunner.isolatedHost = s.isolatedHost
 	// Rituals resolve their own per-edict runner and stamp last-used on
 	// completion so an idle container is never flatlined mid-ritual.
@@ -773,6 +855,20 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 		// reasoning-effort level as a thinking_level_change.
 		s.propagateModelToSessions(config)
 	}
+	// Record the requested config so the trust dialog can enumerate the
+	// concrete seams the committed files request. This is a request only; the
+	// Ruler's grant (ApplyMandate) strips it into the mandate. The SessionConfig
+	// carries the sandbox section, which is where every grantable seam lives.
+	s.recordRequestedConfigFromSession(config)
+
+	// Bind the most-restrictive mandate first. A mandate is only ever widened
+	// by an explicit Ruler grant (ApplyMandate) — never by a repository file —
+	// so between this point and the trust dialog's answer the session holds no
+	// additional host authority. Guarded on nil: a later ConfigureModel (model
+	// switch) must not clobber a mandate the Ruler already granted.
+	if s.Mandate() == nil {
+		s.ApplyRestrictiveMandate()
+	}
 	// Re-root the tools and the Court runner here as well as in SetRepoInfo:
 	// on the daemon path SetRepoInfo runs only for the first handshake, so
 	// every later `:switch` lands in this function alone and the registry
@@ -809,7 +905,6 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 	// concurrent edicts never share the container or the mutable repoInfo that
 	// routes commands into the edict's worktree.
 	if config != nil && repoInfo.ProjectRoot != "" {
-		sandboxCfg := config.Sandbox
 		s.newEdictRunner = func(edictID uint, base repo.RepoInfo) (runners.Runner, error) {
 			if base.ProjectRoot == "" {
 				base = repoInfo
@@ -819,8 +914,9 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 				host.SetTimeouts(s.hostTimeouts())
 				return host, nil
 			}
-			r := runners.NewPodmanRunner(&sandboxCfg, base, fmt.Sprintf("e%d", edictID), nil)
+			r := runners.NewPodmanRunner(s.effectiveSandboxConfig(), base, fmt.Sprintf("e%d", edictID), nil)
 			r.SetMessageChannel(s.msgChan)
+			r.SetMandate(s.Mandate())
 			return r, nil
 		}
 	}
@@ -1054,7 +1150,12 @@ func (s *Court) nextEdictID() uint {
 
 // CreateEdict creates a new active edict record in the database and publishes storage.EventEdictCreated.
 // sessionID links the edict to the chat session that suggested it (empty for direct ruler-created edicts).
-// TODO: Add a "summary" parameter which is already in the Edict
+//
+// The summary is NOT a parameter: the one caller that has one (approved
+// suggest_edict) writes it with a follow-up Update, so adding the parameter
+// would mean threading it through the RPC CreateEdict contract and every test
+// fixture for a single write. That remains the shape until a second caller
+// needs it.
 func (s *Court) CreateEdict(issueRef, intent, sessionID string) (*storage.Edict, error) {
 	edict, err := s.createEdict(issueRef, intent, sessionID)
 	if err != nil {

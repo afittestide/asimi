@@ -142,19 +142,12 @@ func (r *RitualRunner) execRunner(exec *RitualExecution) runners.Runner {
 	return r.runner
 }
 
-// execRepoInfo returns the repoInfo an execution is routed with. It falls back
-// to the runner's own repoInfo for directly-constructed executions.
-func (r *RitualRunner) execRepoInfo(exec *RitualExecution) repo.RepoInfo {
-	if exec != nil && exec.repoInfo.ProjectRoot != "" {
-		return exec.repoInfo
-	}
-	return r.repoInfo
-}
-
 // ensureExecContext seeds an execution's runner/repoInfo from the runner's
 // Court-wide defaults when they were not resolved by Start. It keeps direct
 // runGiven/runThen invocations (tests, recovery) working without reading
-// shared fields during a run.
+// shared fields during a run. The Court-wide repoInfo is read under cfgMu so a
+// concurrent SetConfig (a model switch or reconnect) cannot race the seed
+// (edict 1036).
 func (r *RitualRunner) ensureExecContext(exec *RitualExecution) {
 	if exec == nil {
 		return
@@ -163,7 +156,8 @@ func (r *RitualRunner) ensureExecContext(exec *RitualExecution) {
 		exec.runner = r.runner
 	}
 	if exec.repoInfo.ProjectRoot == "" {
-		exec.repoInfo = r.repoInfo
+		_, _, repoTarget := r.sessionConfig()
+		exec.repoInfo = repoTarget
 	}
 }
 
@@ -453,8 +447,11 @@ func (r *RitualRunner) mutationRunnerFor(root string) runners.Runner {
 // defaults when no sandbox config was injected, so a worktree always gets
 // local config and never an unbounded ignored-file sweep.
 func (r *RitualRunner) ignoreCopyGlobs() []string {
-	if r.sandboxConfig != nil && r.sandboxConfig.IgnoreCopyGlobs != nil {
-		return r.sandboxConfig.IgnoreCopyGlobs
+	r.cfgMu.RLock()
+	globs := r.sandboxConfig
+	r.cfgMu.RUnlock()
+	if globs != nil && globs.IgnoreCopyGlobs != nil {
+		return globs.IgnoreCopyGlobs
 	}
 	return config.DefaultIgnoreCopyGlobs()
 }
@@ -1020,7 +1017,9 @@ func (r *RitualRunner) getInfrastructureTemplates(ctx context.Context, exec *Rit
 	// via the :init prompt or the project's asimi.conf) → git remote slug →
 	// "local" as a last-ditch fallback. The config value is the source of truth
 	// because the user may have set it before any git remote was configured.
+	r.cfgMu.RLock()
 	slug := r.projectSlug
+	r.cfgMu.RUnlock()
 	if slug == "" {
 		slug = exec.repoInfo.Slug
 	}
@@ -1085,11 +1084,12 @@ func (r *RitualRunner) buildSandbox(ctx context.Context, exec *RitualExecution) 
 	if exec != nil && exec.repoInfo.IsWorktree {
 		return map[string]string{"status": "skipped", "output": "inside an edict worktree: sandbox image is managed by the Court runner"}, nil
 	}
+	_, _, buildTarget := r.sessionConfig()
 	output, err := runners.HostRun(ctx, runners.Input{
 		Command:        "just build-sandbox",
 		Description:    "build the sandbox",
 		BypassApproval: true,
-	}, r.repoInfo.ProjectRoot)
+	}, buildTarget.ProjectRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build the sandbox image: %w", err)
 	}
@@ -1155,7 +1155,8 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context, exec *RitualExecu
 	}
 	// Step 1: Reload the runner to pick up the newly built sandbox image.
 	// Use the injected sandbox config instead of reloading from disk.
-	if r.sandboxConfig == nil {
+	sandboxCfg, mandate, repoTarget := r.sessionConfig()
+	if sandboxCfg == nil {
 		return map[string]string{
 			"status": "failed",
 			"output": "sandbox configuration not available",
@@ -1172,8 +1173,14 @@ func (r *RitualRunner) verifySandboxReady(ctx context.Context, exec *RitualExecu
 	if !inWorktree {
 		// Recreate the Court's main runner with the same container-naming
 		// identifier the initial InitShellRunner used (the process ID), so the
-		// rebuilt container keeps the connection runner's name.
-		runner = runners.InitShellRunner(r.sandboxConfig, r.repoInfo, strconv.FormatUint(uint64(os.Getpid()), 10))
+		// rebuilt container keeps the connection runner's name. The injected
+		// config, mandate and repoInfo came from one snapshot above, so a
+		// concurrent re-injection cannot pair a narrowed mandate with a
+		// stale config (edict 1036).
+		runner = runners.InitShellRunner(sandboxCfg, repoTarget, strconv.FormatUint(uint64(os.Getpid()), 10))
+		if setter, ok := runner.(interface{ SetMandate(*config.Mandate) }); ok {
+			setter.SetMandate(mandate)
+		}
 		r.runner = runner
 		if exec != nil {
 			exec.runner = runner
@@ -1526,7 +1533,13 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			}
 		}
 
-		// TODO: Raise event - awaiting ruler's seat
+		// The edict now waits on the Ruler. Nothing is published here on
+		// purpose: the Ruler's pending seal is already a first-class fact of
+		// the ledger (the judge/chancellor seals exist and the ruler's does
+		// not), the TUI renders it as an open [○ Ruler] link in the seal
+		// chain, and publishing an event with no consumer would add a second,
+		// weaker source of truth for the same state. When a consumer exists
+		// (a nudge, a digest), it reads the seals — not a new event type.
 		return nil
 	case "merge_edict_worktree":
 		return r.mergeEdictWorktree(ctx, exec, thenKey)

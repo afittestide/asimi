@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	koanf "github.com/knadh/koanf/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1883,4 +1884,248 @@ destination = "/container/path"
 		"the container destination must not be home-expanded")
 	assert.Equal(t, "/abs/host/path", cfg.Sandbox.AdditionalMounts[1].Source,
 		"an absolute source must be passed through unchanged")
+}
+
+// TestLoadProjectConfig_DropsBlankMountEntries pins the "empty header =
+// active" rule: a `[[sandbox.additional_mounts]]` header with only commented
+// keys (the gcloud stanza someone toggled off) parses as a zero-value entry —
+// both source and destination are "". Left in, it renders as a label-less
+// trust-dialog row the user is invited to tick, and it always fails the
+// runner's os.Stat check. Such entries are dropped at load (edict 1036).
+func TestLoadProjectConfig_DropsBlankMountEntries(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := `[[sandbox.additional_mounts]]
+source = "~/.config/gh"
+destination = "/root/.config/gh"
+
+[[sandbox.additional_mounts]]
+# source = "~/.config/gcloud"
+# destination = "/root/.config/gcloud"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.Len(t, cfg.Sandbox.AdditionalMounts, 1,
+		"a blank entry (an empty header with every key commented out) must be dropped")
+	assert.Equal(t, filepath.Join(tempHome, ".config", "gh"), cfg.Sandbox.AdditionalMounts[0].Source)
+}
+
+// TestLoadProjectConfig_AdditionalMountsReadOnlyByDefault is edict 1036's safe
+// default: a host path in additional_mounts is mounted read-only unless the
+// entry explicitly asks for read_only = false. Before this edict every
+// additional mount was an unconditional read-write bind of a host path — the
+// gcloud hole.
+func TestLoadProjectConfig_AdditionalMountsReadOnlyByDefault(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := `[[sandbox.additional_mounts]]
+source = "~/.config/gcloud"
+destination = "/root/.config/gcloud"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.Len(t, cfg.Sandbox.AdditionalMounts, 1)
+	assert.True(t, cfg.Sandbox.AdditionalMounts[0].ReadOnly,
+		"an additional_mounts entry that omits read_only must default to read-only")
+}
+
+// TestLoadProjectConfig_AdditionalMountsExplicitWrite proves the escape hatch:
+// only an explicit read_only = false yields a writable bind, and an explicit
+// read_only = true is honoured. A bool cannot distinguish absent from false, so
+// the loader consults which entries actually set the key.
+func TestLoadProjectConfig_AdditionalMountsExplicitWrite(t *testing.T) {
+	tempHome := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempHome)
+	defer os.Setenv("HOME", originalHome)
+
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := `[[sandbox.additional_mounts]]
+source = "~/.config/gh"
+destination = "/root/.config/gh"
+read_only = false
+
+[[sandbox.additional_mounts]]
+source = "~/.cache/pinned"
+destination = "/root/.cache/pinned"
+read_only = true
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.Len(t, cfg.Sandbox.AdditionalMounts, 2)
+	assert.False(t, cfg.Sandbox.AdditionalMounts[0].ReadOnly,
+		"read_only = false must be the only way to request a writable bind")
+	assert.True(t, cfg.Sandbox.AdditionalMounts[1].ReadOnly,
+		"an explicit read_only = true must be honoured")
+}
+
+// TestApplyMountReadOnlyDefaults_FailsClosed proves the defaulting fails
+// closed when the raw config value is not the shape it expects: an entry is
+// only opened for writing when the merged view positively shows
+// read_only = false. A parse surprise must never produce a writable host bind
+// (edict 1036).
+func TestApplyMountReadOnlyDefaults_FailsClosed(t *testing.T) {
+	newCfg := func() *Config {
+		cfg := &Config{}
+		cfg.Sandbox.AdditionalMounts = []Mount{
+			{Source: "/host/a", Destination: "/a"},
+			{Source: "/host/b", Destination: "/b"},
+		}
+		return cfg
+	}
+
+	tests := []struct {
+		name string
+		raw  any
+
+		wantReadOnly []bool
+	}{
+		{
+			name:         "absent array leaves every mount read-only",
+			raw:          nil,
+			wantReadOnly: []bool{true, true},
+		},
+		{
+			name:         "unrecognised slice shape leaves every mount read-only",
+			raw:          []map[string]any{{"read_only": false}, {"read_only": false}},
+			wantReadOnly: []bool{true, true},
+		},
+		{
+			name:         "unrecognised entry shape leaves that mount read-only",
+			raw:          []any{"not-a-map"},
+			wantReadOnly: []bool{true, true},
+		},
+		{
+			name:         "only an explicit false opens a mount",
+			raw:          []any{map[string]any{"read_only": false}},
+			wantReadOnly: []bool{false, true},
+		},
+		{
+			name:         "explicit true keeps a mount read-only",
+			raw:          []any{map[string]any{"read_only": true}},
+			wantReadOnly: []bool{true, true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k := koanf.New(".")
+			if tt.raw != nil {
+				require.NoError(t, k.Set("sandbox.additional_mounts", tt.raw))
+			}
+			cfg := newCfg()
+			applyMountReadOnlyDefaults(k, cfg)
+			for i, want := range tt.wantReadOnly {
+				assert.Equal(t, want, cfg.Sandbox.AdditionalMounts[i].ReadOnly,
+					"mount %d (%s)", i, cfg.Sandbox.AdditionalMounts[i].Source)
+			}
+		})
+	}
+}
+
+// TestMandateHostExecGrant_FailsClosed pins seam 7's vocabulary at the config
+// layer (edict 1036): host execution requires an affirmative Selections.HostExec
+// grant, and nothing else in the answer can supply it. The checked cases are the
+// ones that could widen authority by accident — a repository's requested
+// run_on_host patterns, and "Allow all".
+func TestMandateHostExecGrant_FailsClosed(t *testing.T) {
+	requested := &Config{}
+	requested.Sandbox.RunOnHost = []string{"^docker "}
+	requested.Sandbox.SafeRunOnHost = []string{"^gh "}
+
+	tests := []struct {
+		name       string
+		selections Selections
+		want       bool
+	}{
+		{
+			name:       "no dialog (restrictive mandate) grants nothing",
+			selections: Selections{},
+			want:       false,
+		},
+		{
+			name:       "allow all grants reach into the sandbox, never the host",
+			selections: Selections{AllowAll: true},
+			want:       false,
+		},
+		{
+			name:       "granting every mount and env var still is not host execution",
+			selections: Selections{Mounts: map[string]bool{}, Env: map[string]bool{}},
+			want:       false,
+		},
+		{
+			name:       "the explicit host grant is the only way in",
+			selections: Selections{HostExec: true},
+			want:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := BuildMandate(4242, requested, tt.selections)
+			grant, ok := m.GrantFor(SeamHostExec, SeamHostRunner)
+			require.True(t, ok, "the host-execution decision must always be recorded")
+			assert.Equal(t, tt.want, grant.Granted)
+		})
+	}
+}
+
+// TestSessionSeams_OffersHostExecOnlyWhenRequested proves the dialog is offered
+// the host seam only when the repository actually asks for host execution: a
+// row for a seam the config never requested would claim authority the session
+// cannot use, and would read as if host execution were part of the normal
+// asset list.
+func TestSessionSeams_OffersHostExecOnlyWhenRequested(t *testing.T) {
+	quiet := &Config{}
+	for _, seam := range SessionSeams(quiet) {
+		assert.NotEqual(t, SeamHostExec, seam.Kind,
+			"a config with no host pattern must not offer the host seam")
+	}
+
+	requested := &Config{}
+	requested.Sandbox.SafeRunOnHost = []string{"^gh "}
+	seams := SessionSeams(requested)
+	require.Len(t, seams, 1)
+	assert.Equal(t, SeamHostExec, seams[0].Kind)
+	assert.Equal(t, SeamHostRunner, seams[0].Label,
+		"the seam must be named after the seam the operator is granting")
+}
+
+// TestSessionSeams_SkipsBlankMountSources is the dialog-side half of the
+// blank-entry defense: even if a hand-built Config (not one loaded from
+// committed files) carries an additional_mounts entry with an empty source —
+// the shape the loader now drops — no seam row is emitted for it. The row such
+// an entry would produce renders with an empty label (a checkbox that names
+// nothing), and a granted mount with an empty source is unmountable, so the
+// guarantee must hold at the dialog too (edict 1036).
+func TestSessionSeams_SkipsBlankMountSources(t *testing.T) {
+	cfg := &Config{}
+	cfg.Sandbox.AdditionalMounts = []Mount{
+		{Source: "", Destination: "/root/.config/gcloud"},
+		{Source: "  ", Destination: "/root/.config/gh"},
+		{Source: "/home/u/.config/gh", Destination: "/root/.config/gh"},
+	}
+	seams := SessionSeams(cfg)
+	require.Len(t, seams, 1, "a blank or whitespace source must yield no seam row")
+	assert.Equal(t, "/home/u/.config/gh", seams[0].Label)
 }

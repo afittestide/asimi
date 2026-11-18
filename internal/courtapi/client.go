@@ -8,6 +8,7 @@ import (
 	"context"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
@@ -69,6 +70,20 @@ type Client interface {
 	// Shell runner.
 	AllowRunnerFallback(allow bool)
 	RunShellCommand(ctx context.Context, input runners.Input) (runners.Output, error)
+
+	// Mandate (edict 1036, gh #180). SessionSeams enumerates the concrete
+	// host-asset seams the committed config requests (a request, never a
+	// grant). ApplyMandate binds the Ruler's trust-dialog answer: the
+	// requested config is stripped to the granted set and the mandate is
+	// owned by the client process's PID. Both are wire-safe.
+	//
+	// SessionSeams returns an error when the request could not be read: an
+	// unreachable Court is NOT an empty request. The caller must not present
+	// a chooser that appears to have nothing to grant — a genuinely empty
+	// answer and a failed read are different facts and are reported
+	// differently (edict 1036).
+	SessionSeams() ([]config.Seam, error)
+	ApplyMandate(sel config.Selections) error
 
 	// SetContext sends client-side credentials and project context to
 	// the court. In daemon mode this travels over the wire; in

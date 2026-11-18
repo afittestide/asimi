@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/wire"
 	"github.com/afittestide/asimi/storage"
 )
@@ -943,5 +945,102 @@ func TestReconnectingClient_SessionInfoUnknownWithoutPingHandler(t *testing.T) {
 	id, restarted := rc.SessionInfo()
 	if id != "" || restarted {
 		t.Fatalf("unanswerable Ping should leave instance unknown, got id=%q restarted=%v", id, restarted)
+	}
+}
+
+// TestReconnectingClient_SessionSeams_EmptyIsNotAnError pins that the client the
+// production TUI actually holds (installDaemonAutostart / installDaemonSocket
+// both swap in a *ReconnectingClient) distinguishes an empty request from a
+// failed read. An empty successful answer must be (nil, nil); a nil client must
+// be ErrClosed, never an empty slice (edict 1036, ling 4158031f).
+func TestReconnectingClient_SessionSeams_EmptyIsNotAnError(t *testing.T) {
+	impl := newFakeCourt()
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	rc := NewReconnectingClient(nil, nil)
+	rc.mu.Lock()
+	rc.conn = client.conn
+	rc.client = client
+	rc.mu.Unlock()
+
+	seams, err := rc.SessionSeams()
+	if err != nil {
+		t.Fatalf("an empty successful answer is not a read failure: %v", err)
+	}
+	if len(seams) != 0 {
+		t.Fatalf("seams = %d, want none to grant", len(seams))
+	}
+}
+
+// TestReconnectingClient_SessionSeams_ReturnsTheRequestedAssets proves the seams
+// reach the ReconnectingClient caller, not just the bare CourtClient.
+func TestReconnectingClient_SessionSeams_ReturnsTheRequestedAssets(t *testing.T) {
+	impl := newFakeCourt()
+	impl.seams = []config.Seam{
+		{Kind: config.SeamEnv, Label: "GOOGLE_APPLICATION_CREDENTIALS", EnvName: "GOOGLE_APPLICATION_CREDENTIALS"},
+	}
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	rc := NewReconnectingClient(nil, nil)
+	rc.mu.Lock()
+	rc.conn = client.conn
+	rc.client = client
+	rc.mu.Unlock()
+
+	seams, err := rc.SessionSeams()
+	if err != nil {
+		t.Fatalf("SessionSeams: %v", err)
+	}
+	if len(seams) != 1 || seams[0].EnvName != "GOOGLE_APPLICATION_CREDENTIALS" {
+		t.Fatalf("seams = %+v, want the one requested env var", seams)
+	}
+}
+
+// TestReconnectingClient_SessionSeams_NilClientIsErrClosed pins that a missing
+// Court is a real error. Returning an empty slice here would tell the dialog
+// "the repository requested nothing" when the truth is that nothing answered.
+func TestReconnectingClient_SessionSeams_NilClientIsErrClosed(t *testing.T) {
+	rc := &ReconnectingClient{}
+
+	seams, err := rc.SessionSeams()
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("err = %v, want ErrClosed", err)
+	}
+	if len(seams) != 0 {
+		t.Errorf("seams = %v, want nothing to grant", seams)
+	}
+}
+
+// TestReconnectingClient_SessionSeams_NonTransportErrorIsNotRetried proves the
+// retry classification is narrow: a Court-side failure (no connection problem)
+// must be reported as it is, not turned into a reconnect-and-retry loop that
+// would hide the real cause behind a second failure.
+func TestReconnectingClient_SessionSeams_NonTransportErrorIsNotRetried(t *testing.T) {
+	impl := newFakeCourt()
+	impl.seamsErr = &wire.Error{Code: wire.CodeDecodeFailed, Message: "config read failed"}
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	var factoryCalls atomic.Int64
+	rc := NewReconnectingClient(func() (*Conn, error) {
+		factoryCalls.Add(1)
+		return client.conn, nil
+	}, nil)
+	rc.mu.Lock()
+	rc.conn = client.conn
+	rc.client = client
+	rc.mu.Unlock()
+
+	_, err := rc.SessionSeams()
+	if err == nil {
+		t.Fatal("a Court-side failure must surface")
+	}
+	if !strings.Contains(err.Error(), "config read failed") {
+		t.Errorf("err = %v, want the Court-side cause", err)
+	}
+	if got := factoryCalls.Load(); got != 0 {
+		t.Errorf("factory calls = %d, want 0: a non-transport error must not trigger a reconnect", got)
 	}
 }

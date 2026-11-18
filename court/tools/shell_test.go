@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +17,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// errHostExecRefused stands in for the Court's typed refusal
+// (court.HostExecRefusedError). The tools package does not import court, so the
+// tool-level contract is only that a non-nil error from the host checker is
+// propagated unchanged and stops execution.
+var errHostExecRefused = errors.New("refusing to run on the host: no host-execution grant")
 
 func TestRunShellCommandUsesLocalRunner(t *testing.T) {
 	// mockRunner is a per-court runner that records calls
@@ -67,7 +74,7 @@ func TestRunShellCommandHostOverride(t *testing.T) {
 	}
 
 	// hostChecker returns (runOnHost=true, needsApproval=false)
-	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	hostChecker := func(cmd string) (bool, bool, error) { return true, false, nil }
 
 	tool := NewRunShellCommand(hostChecker, mockRunner, nil, t.TempDir())
 	result, err := tool.Call(context.Background(), `{"command":"echo hello","description":"test"}`)
@@ -83,8 +90,15 @@ func TestRunShellCommandHostOverride(t *testing.T) {
 	assert.Equal(t, "0", output.ExitCode)
 }
 
+// TestRunShellCommandSandboxMissingFallback pins the failure direction of the
+// host fallback (edict 1036, seam 7). A missing sandbox used to mean "run it on
+// the host instead", which is host execution granted by nobody: the sandbox
+// being absent says nothing about whether the Ruler consented to the host.
+//
+// With no host-execution grant (here: no checker at all) the sandbox error is
+// returned unchanged, so the user sees the actionable "run :init" message
+// rather than a silent escape.
 func TestRunShellCommandSandboxMissingFallback(t *testing.T) {
-	// When the sandbox is missing, we fall back to host execution
 	var runnerCalls int
 	mockRunner := &mockRunner{
 		runFn: func(ctx context.Context, input runners.Input) (runners.Output, error) {
@@ -95,17 +109,11 @@ func TestRunShellCommandSandboxMissingFallback(t *testing.T) {
 
 	tool := NewRunShellCommand(nil, mockRunner, nil, t.TempDir())
 
-	result, err := tool.Call(context.Background(), `{"command":"echo hello","description":"test"}`)
-	require.NoError(t, err)
-
-	// The sandbox runner was called once
+	_, err := tool.Call(context.Background(), `{"command":"echo hello","description":"test"}`)
+	require.Error(t, err, "an unavailable sandbox must not become an unsandboxed run")
+	assert.IsType(t, runners.SandboxMissingError{}, err,
+		"the sandbox error must reach the user, not be swallowed by a host fallback")
 	assert.Equal(t, 1, runnerCalls)
-
-	// Output comes from host fallback
-	var output runners.Output
-	require.NoError(t, json.Unmarshal([]byte(result), &output))
-	assert.Contains(t, output.Output, "hello")
-	assert.Equal(t, "0", output.ExitCode)
 }
 
 func TestRunShellCommandHostOverrideWithMsgChan(t *testing.T) {
@@ -118,7 +126,7 @@ func TestRunShellCommandHostOverrideWithMsgChan(t *testing.T) {
 	}
 
 	// hostChecker returns (runOnHost=true, needsApproval=true)
-	hostChecker := func(cmd string) (bool, bool) { return true, true }
+	hostChecker := func(cmd string) (bool, bool, error) { return true, true, nil }
 
 	// Create a message channel to capture approval requests
 	ch := make(chan runners.Msg, 1)
@@ -152,18 +160,23 @@ func TestRunShellCommandHostOverrideWithMsgChan(t *testing.T) {
 	<-done
 }
 
+// TestRunShellCommandSandboxMissingFallbackWithMsgChan covers the granted case:
+// with an approval channel available AND a host-execution grant, the fallback
+// runs on the host, and it asks first. The approval channel is what makes the
+// host run consensual — it is no longer inferred from the channel's nilness.
 func TestRunShellCommandSandboxMissingFallbackWithMsgChan(t *testing.T) {
-	// When msgChan is provided and sandbox is missing,
-	// the fallback host runner requests approval via msgChan.
 	mockRunner := &mockRunner{
 		runFn: func(ctx context.Context, input runners.Input) (runners.Output, error) {
 			return runners.Output{}, runners.SandboxMissingError{}
 		},
 	}
 
+	// The grant: this command belongs on the host.
+	hostChecker := func(string) (bool, bool, error) { return true, true, nil }
+
 	ch := make(chan runners.Msg, 1)
 	var msgChan chan<- runners.Msg = ch
-	tool := NewRunShellCommand(nil, mockRunner, &msgChan, t.TempDir())
+	tool := NewRunShellCommand(hostChecker, mockRunner, &msgChan, t.TempDir())
 
 	done := make(chan struct{})
 	go func() {
@@ -189,11 +202,14 @@ func TestRunShellCommandSandboxMissingFallbackWithMsgChan(t *testing.T) {
 	<-done
 }
 
-// TestRunShellCommandSandboxMissingFallback_NonNilPointerNilChannel tests the
-// critical production path: buildToolRegistry passes &s.msgChan (non-nil pointer)
-// but before Subscribe(), s.msgChan is still nil. If a sandbox-missing fallback
-// fires in this state, bypassApproval must be true — the command must NOT block
-// waiting for approval on a nil channel.
+// TestRunShellCommandSandboxMissingFallback_NonNilPointerNilChannel covers the
+// state right after buildToolRegistry and before Subscribe(), where the pointer
+// to the approval channel is non-nil but the channel itself is nil.
+//
+// This is where the old code inferred a consent bypass from nilness: it treated
+// "nobody can be asked" as "nobody needs to be asked" and ran on the host with
+// bypassApproval=true. That is exactly the seam-7 hole, so the fallback now
+// refuses and returns the sandbox error — and it must not hang doing it.
 func TestRunShellCommandSandboxMissingFallback_NonNilPointerNilChannel(t *testing.T) {
 	mockRunner := &mockRunner{
 		runFn: func(ctx context.Context, input runners.Input) (runners.Output, error) {
@@ -201,28 +217,21 @@ func TestRunShellCommandSandboxMissingFallback_NonNilPointerNilChannel(t *testin
 		},
 	}
 
-	// Non-nil pointer to a nil channel — the exact state after buildToolRegistry
-	// but before Subscribe(). bypassApproval must be true so the host runner
-	// doesn't block on a nil channel.
 	var msgChan chan<- runners.Msg // nil channel
 	tool := NewRunShellCommand(nil, mockRunner, &msgChan, t.TempDir())
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		result, err := tool.Call(context.Background(), `{"command":"echo hello","description":"test"}`)
-		require.NoError(t, err)
-		var output runners.Output
-		require.NoError(t, json.Unmarshal([]byte(result), &output))
-		assert.Contains(t, output.Output, "hello")
-		assert.Equal(t, "0", output.ExitCode)
+		_, err := tool.Call(context.Background(), `{"command":"echo hello","description":"test"}`)
+		assert.IsType(t, runners.SandboxMissingError{}, err,
+			"with no one to ask, the fallback must refuse rather than bypass approval")
 	}()
 
 	select {
 	case <-done:
-		// Success — command ran on host with bypassApproval=true, no hang.
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out — command likely blocked waiting for approval on nil channel (bypassApproval was not set)")
+		t.Fatal("timed out — the refusal path must not block waiting for approval")
 	}
 }
 
@@ -236,7 +245,7 @@ func TestRunShellCommandHostOverride_NonNilPointerNilChannel(t *testing.T) {
 		},
 	}
 
-	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	hostChecker := func(cmd string) (bool, bool, error) { return true, false, nil }
 
 	var msgChan chan<- runners.Msg // nil channel
 	tool := NewRunShellCommand(hostChecker, mockRunner, &msgChan, t.TempDir())
@@ -299,7 +308,7 @@ func TestRunShellCommand_ContextRepoInfoRoutesHostToWorktree(t *testing.T) {
 	worktreeRel := filepath.Join(".agents", "worktrees", "e42")
 	require.NoError(t, os.MkdirAll(filepath.Join(root, worktreeRel), 0o755))
 
-	hostChecker := func(string) (bool, bool) { return true, false }
+	hostChecker := func(string) (bool, bool, error) { return true, false, nil }
 	tool := NewRunShellCommand(hostChecker, nil, nil, root)
 	ctx := context.WithValue(context.Background(), RepoInfoKey{}, repo.RepoInfo{
 		ProjectRoot:  root,
@@ -380,7 +389,7 @@ func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
 	getTimeouts := func() runners.HostTimeouts { return timeouts }
 
 	// hostChecker routes every command to the host without approval
-	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	hostChecker := func(cmd string) (bool, bool, error) { return true, false, nil }
 	hostTool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), getTimeouts)
 
 	// sleep 5, not `sleep infinity`: BSD sleep rejects `infinity`. 5s is
@@ -392,13 +401,15 @@ func TestRunShellCommandTimeoutsReachHostRunner(t *testing.T) {
 	assert.Equal(t, "124", output.ExitCode, "runOnHost path should hit the 100ms command deadline")
 	assert.Contains(t, output.Output, "Command timed out after")
 
-	// SandboxSetupMissingError fallback path (nil msgChan → bypass approval)
+	// SandboxSetupMissingError fallback path, reached only with a host-execution
+	// grant (seam 7). Timeouts must reach the ephemeral runner on this path too.
 	mockRunner := &mockRunner{
 		runFn: func(ctx context.Context, input runners.Input) (runners.Output, error) {
 			return runners.Output{}, runners.SandboxSetupMissingError{}
 		},
 	}
-	fallbackTool := NewRunShellCommand(nil, mockRunner, nil, t.TempDir(), getTimeouts)
+	grantHostExec := func(string) (bool, bool, error) { return true, false, nil }
+	fallbackTool := NewRunShellCommand(grantHostExec, mockRunner, nil, t.TempDir(), getTimeouts)
 	result, err = fallbackTool.Call(context.Background(), `{"command":"sleep 5","description":"test"}`)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal([]byte(result), &output))
@@ -419,7 +430,7 @@ func TestRunShellCommand_TimeoutsGetterInvokedAtCallTime(t *testing.T) {
 		}
 		return runners.HostTimeouts{Command: 100 * time.Millisecond}
 	}
-	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	hostChecker := func(cmd string) (bool, bool, error) { return true, false, nil }
 	tool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir(), getTimeouts)
 
 	// First call — no configured deadline, sleep runs to completion (or at
@@ -445,7 +456,7 @@ func TestRunShellCommand_TimeoutsGetterInvokedAtCallTime(t *testing.T) {
 // approval), and must not panic — newHostRunner guards SetTimeouts behind
 // a nil check, so invoking the getter under a nil guard would crash.
 func TestRunShellCommand_NilTimeoutsGetterKeepsRunnerDefaults(t *testing.T) {
-	hostChecker := func(cmd string) (bool, bool) { return true, false }
+	hostChecker := func(cmd string) (bool, bool, error) { return true, false, nil }
 	tool := NewRunShellCommand(hostChecker, nil, nil, t.TempDir())
 
 	hostRunner := tool.newHostRunner(t.TempDir())
@@ -471,4 +482,38 @@ func TestRunShellCommand_NilTimeoutsGetterKeepsRunnerDefaults(t *testing.T) {
 	var output runners.Output
 	require.NoError(t, json.Unmarshal([]byte(result), &output))
 	assert.Equal(t, "0", output.ExitCode, "command should run to completion under runner defaults")
+}
+
+// TestRunShellCommandRefusesHostWithoutGrant is seam 7's tool-level guarantee
+// (edict 1036): when the host checker refuses (the session's mandate carries no
+// host-execution grant), the command must not run anywhere. A refusal is not a
+// routing decision — falling through to the sandbox runner would silently
+// downgrade it, and running it on the host would be the very escape the gate
+// exists to stop.
+func TestRunShellCommandRefusesHostWithoutGrant(t *testing.T) {
+	// The sandbox reports itself missing, which is the state that makes
+	// shell.go re-run a command on the host. The refusal must happen before
+	// that: a refusal caught by a fallback path would be re-run with strictly
+	// more authority than the mandate granted — the same mistake the void
+	// mandate had to avoid.
+	var sandboxCalls int
+	sandboxRunner := &mockRunner{
+		runFn: func(context.Context, runners.Input) (runners.Output, error) {
+			sandboxCalls++
+			return runners.Output{}, runners.SandboxMissingError{}
+		},
+	}
+
+	hostChecker := func(cmd string) (bool, bool, error) {
+		return false, false, errHostExecRefused
+	}
+
+	tool := NewRunShellCommand(hostChecker, sandboxRunner, nil, t.TempDir())
+	result, err := tool.Call(context.Background(), `{"command":"echo hello","description":"test"}`)
+
+	require.Error(t, err, "an ungranted host command must be refused")
+	assert.ErrorIs(t, err, errHostExecRefused, "the typed refusal must reach the caller unchanged")
+	assert.Equal(t, "", result, "no command output may be produced for a refused command")
+	assert.Zero(t, sandboxCalls,
+		"the refusal must be decided before the sandbox runs, so no fallback can catch it")
 }

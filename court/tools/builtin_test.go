@@ -87,7 +87,7 @@ func TestRegisterBuiltinToolsEarthExecute(t *testing.T) {
 	RegisterBuiltinTools(r, ToolRegistrationOpts{
 		Ctx:         testCtx(),
 		Runner:      &noopRunner{},
-		HostChecker: func(string) (bool, bool) { return false, true },
+		HostChecker: func(string) (bool, bool, error) { return false, true, nil },
 	})
 
 	// Forge: rwxr---w- — has earth Execute
@@ -314,7 +314,7 @@ func TestRegisterBuiltinToolsAllMinisters(t *testing.T) {
 		Ctx:                testCtx(),
 		DBPath:             "/tmp/test.db",
 		Runner:             &noopRunner{},
-		HostChecker:        func(string) (bool, bool) { return false, true },
+		HostChecker:        func(string) (bool, bool, error) { return false, true, nil },
 		MinisterConsultant: mockConsultant{},
 		RitualLauncher:     mockLauncher{},
 	})

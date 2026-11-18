@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
 	"github.com/afittestide/asimi/internal/wire"
@@ -338,6 +339,27 @@ func (c *CourtClient) EnsureEdictWorktree(ctx context.Context, edictID uint) (st
 		return "", fmt.Errorf("rpc: decode EnsureEdictWorktree result: %w", err)
 	}
 	return r.WorktreeRel, nil
+}
+
+// SessionSeams asks the Court which host-asset seams the committed config
+// requests. A transport or decode failure is returned as an error rather than
+// collapsed to nil: "the request could not be read" and "the request is empty"
+// are different facts, and only the caller can tell the Ruler which happened
+// (edict 1036).
+func (c *CourtClient) SessionSeams() ([]config.Seam, error) {
+	raw, err := c.conn.Call(context.Background(), MethodSessionSeams, struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var r SessionSeamsResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return nil, fmt.Errorf("rpc: decode SessionSeams result: %w", err)
+	}
+	return r.Seams, nil
+}
+
+func (c *CourtClient) ApplyMandate(sel config.Selections) error {
+	return c.callVoid(context.Background(), MethodApplyMandate, ApplyMandateParams{Selections: sel})
 }
 
 func (c *CourtClient) GetSessionExport(tabTarget string) (*court.SessionExport, error) {

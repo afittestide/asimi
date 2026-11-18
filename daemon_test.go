@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,8 +106,13 @@ func TestPodmanRunnerHostFallbackMustNotLeak(t *testing.T) {
 }
 
 // TestShellCommandMustFailWithoutSandbox verifies that when the
-// RunShellCommand tool has a PodmanRunner with no sandbox files,
-// the tool falls back to host execution (permanent state, no restart).
+// RunShellCommand tool has a PodmanRunner with no sandbox files, the missing
+// sandbox must NOT become an unsandboxed run.
+//
+// This test used to require the opposite ("the tool falls back to host
+// execution"). That fallback was host execution granted by nobody — a missing
+// image is not consent — so it is now a refusal and the sandbox error reaches
+// the user (edict 1036, seam 7).
 func TestShellCommandMustFailWithoutSandbox(t *testing.T) {
 	cfg := &config.SandboxConfig{}
 	repoInfo := repo.RepoInfo{
@@ -126,21 +132,14 @@ func TestShellCommandMustFailWithoutSandbox(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// When sandbox is missing, the tool should fall back to host execution
-	result, err := shellTool.Call(ctx, `{"command":"echo hello","description":"test fallback to host"}`)
-	if err != nil {
-		t.Fatalf("expected successful fallback to host, got error: %v", err)
+	_, err := shellTool.Call(ctx, `{"command":"echo hello","description":"test fallback to host"}`)
+	if err == nil {
+		t.Fatal("a missing sandbox must not silently run the command on the host")
 	}
-	var output runners.Output
-	if err := json.Unmarshal([]byte(result), &output); err != nil {
-		t.Fatalf("failed to parse output: %v", err)
-	}
-
-	if !strings.Contains(output.Output, "hello") {
-		t.Errorf("output = %q, want to contain 'hello'", output.Output)
-	}
-	if output.ExitCode != "0" {
-		t.Errorf("exitCode = %q, want '0'", output.ExitCode)
+	var missing runners.SandboxMissingError
+	var setupMissing runners.SandboxSetupMissingError
+	if !errors.As(err, &missing) && !errors.As(err, &setupMissing) {
+		t.Fatalf("error = %T, want SandboxMissingError/SandboxSetupMissingError so the user sees the :init guidance", err)
 	}
 }
 
@@ -198,7 +197,7 @@ func TestDaemonSafeRunOnHostUsesClientProjectRoot(t *testing.T) {
 
 	// Also verify the full tool path: RunShellCommand with safe_run_on_host
 	// pattern uses the projectRoot passed to NewRunShellCommand.
-	hostChecker := func(cmd string) (bool, bool) { return true, false } // safe, no approval needed
+	hostChecker := func(cmd string) (bool, bool, error) { return true, false, nil } // safe, no approval needed
 	tool := courtTools.NewRunShellCommand(hostChecker, nil, nil, projectA)
 	result, err := tool.Call(context.Background(), `{"command":"cat whoami.txt","description":"verify project root"}`)
 	if err != nil {
@@ -249,9 +248,11 @@ func TestShellCommandPodmanUnavailablePropagatesError(t *testing.T) {
 	}
 }
 
-// TestShellCommandSandboxSetupMissingFallsBackToHost verifies that when
-// SandboxSetupMissingError is returned from the runner, shell.go falls
-// back to host execution (same as SandboxMissingError).
+// TestShellCommandSandboxSetupMissingFallsBackToHost pins the same failure
+// direction for SandboxSetupMissingError as for SandboxMissingError: without a
+// host-execution grant the sandbox error is returned and nothing runs on the
+// host (edict 1036, seam 7). The name is kept so the pair of fallback cases
+// stays greppable; the assertion is now the refusal.
 func TestShellCommandSandboxSetupMissingFallsBackToHost(t *testing.T) {
 	runner := &errorRunner{runErr: runners.SandboxSetupMissingError{}}
 	shellTool := courtTools.NewRunShellCommand(nil, runner, nil, t.TempDir())
@@ -259,20 +260,12 @@ func TestShellCommandSandboxSetupMissingFallsBackToHost(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := shellTool.Call(ctx, `{"command":"echo hello","description":"test setup missing fallback"}`)
-	if err != nil {
-		t.Fatalf("expected successful fallback to host, got error: %v", err)
+	_, err := shellTool.Call(ctx, `{"command":"echo hello","description":"test setup missing fallback"}`)
+	if err == nil {
+		t.Fatal("a missing sandbox setup must not silently run the command on the host")
 	}
-
-	var output runners.Output
-	if err := json.Unmarshal([]byte(result), &output); err != nil {
-		t.Fatalf("failed to parse output: %v", err)
-	}
-
-	if !strings.Contains(output.Output, "hello") {
-		t.Errorf("output = %q, want to contain 'hello'", output.Output)
-	}
-	if output.ExitCode != "0" {
-		t.Errorf("exitCode = %q, want '0'", output.ExitCode)
+	var setupMissing runners.SandboxSetupMissingError
+	if !errors.As(err, &setupMissing) {
+		t.Fatalf("error = %T, want SandboxSetupMissingError so the user sees the :init guidance", err)
 	}
 }

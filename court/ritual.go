@@ -206,6 +206,15 @@ func contextCause(err error, ctx context.Context) error {
 	return nil
 }
 
+// elide shortens s to at most n bytes for one-line display, marking the cut
+// with "...". It returns s unchanged when it already fits.
+func elide(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
 // describeFailure returns an honest, recorded failure reason for err.
 //
 // For a cancelled context it classifies by cause, never by the bare
@@ -579,17 +588,25 @@ func LoadRitualsFromDir(dir string) (Rituals, error) {
 
 // RitualRunner executes rituals
 type RitualRunner struct {
-	registry          *RitualRegistry
-	stepDefs          *StepDefRegistry
-	getMinister       func(id string) Minister
-	publishEvent      func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
-	onRunnerUpgrade   func(runners.Runner) // propagates runner changes back to court
-	db                *gorm.DB
-	runner            runners.Runner
-	logger            *slog.Logger
-	maxRetries        int
-	repoInfo          repo.RepoInfo
+	registry        *RitualRegistry
+	stepDefs        *StepDefRegistry
+	getMinister     func(id string) Minister
+	publishEvent    func(key storage.EdictKey, eventType storage.CourtEvent, payload storage.JSON) uint
+	onRunnerUpgrade func(runners.Runner) // propagates runner changes back to court
+	db              *gorm.DB
+	runner          runners.Runner
+	logger          *slog.Logger
+	maxRetries      int
+	repoInfo        repo.RepoInfo
+	// cfgMu guards the injected session configuration: sandboxConfig,
+	// mandate, projectSlug and repoInfo. ConfigureModel and SetMandate push
+	// these from the Court while a ritual step may be reading them (e.g.
+	// verifySandboxReady rebuilding the connection runner), and Court
+	// requests are dispatched concurrently. Guarding them together keeps a
+	// step's view consistent across the whole injected set (edict 1036).
+	cfgMu             sync.RWMutex
 	sandboxConfig     *config.SandboxConfig                                       // injected by ConfigureModel
+	mandate           *config.Mandate                                             // injected by SetMandate (edict 1036)
 	projectSlug       string                                                      // injected by ConfigureModel
 	idleTimeout       time.Duration                                               // max silence before a step is aborted (0 = default)
 	heartbeatInterval time.Duration                                               // liveness touch interval during a step (0 = default)
@@ -671,14 +688,47 @@ func NewRitualRunner(
 // SessionConfig. This is called by ConfigureModel so that the RitualRunner
 // never needs to reload config from disk.
 func (r *RitualRunner) SetConfig(sandboxCfg *config.SandboxConfig, projectSlug string, repoInfo repo.RepoInfo, courtCfg *config.CourtConfig) {
+	r.cfgMu.Lock()
 	r.sandboxConfig = sandboxCfg
 	r.projectSlug = projectSlug
 	if repoInfo.ProjectRoot != "" {
 		r.repoInfo = repoInfo
 	}
+	r.cfgMu.Unlock()
 	if courtCfg != nil && courtCfg.StepIdleTimeout > 0 {
 		r.idleTimeout = courtCfg.StepIdleTimeout
 	}
+}
+
+// SetMandate records the session mandate so the sandbox runner this RitualRunner
+// rebuilds (verifySandboxReady) carries the Ruler's granted authority rather
+// than the raw requested config (edict 1036).
+func (r *RitualRunner) SetMandate(m *config.Mandate) {
+	if r == nil {
+		return
+	}
+	r.cfgMu.Lock()
+	r.mandate = m
+	r.cfgMu.Unlock()
+}
+
+// Mandate returns the mandate recorded by SetMandate, or nil.
+func (r *RitualRunner) Mandate() *config.Mandate {
+	if r == nil {
+		return nil
+	}
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
+	return r.mandate
+}
+
+// sessionConfig returns the injected sandbox config, mandate and repoInfo as
+// one consistent snapshot, so a mid-ritual rebuild never pairs a config from
+// before a re-injection with a mandate from after it (edict 1036).
+func (r *RitualRunner) sessionConfig() (*config.SandboxConfig, *config.Mandate, repo.RepoInfo) {
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
+	return r.sandboxConfig, r.mandate, r.repoInfo
 }
 
 // SetRunnerResolver injects the per-edict runner resolver and the
@@ -911,6 +961,7 @@ func (r *RitualRunner) Start(ctx context.Context, ritualName string, key storage
 	}
 
 	// Create execution record
+	_, _, execRepoInfo := r.sessionConfig()
 	exec := &RitualExecution{
 		ID:          GenerateID("ritual", ritualName, fmt.Sprint(key.ID), time.Now().String()),
 		RitualName:  ritualName,
@@ -923,7 +974,7 @@ func (r *RitualRunner) Start(ctx context.Context, ritualName string, key storage
 		OwnerPID:    int64(os.Getpid()),
 		def:         def,
 		notify:      notify,
-		repoInfo:    r.repoInfo,
+		repoInfo:    execRepoInfo,
 	}
 
 	// Resolve this execution's runner. Per-edict runners give each edict its
@@ -1423,14 +1474,16 @@ func (r *RitualRunner) executeStep(ctx context.Context, exec *RitualExecution, s
 			})
 			result, err := r.runGivenStep(ctx, exec, entry)
 			if err != nil {
-				// TODO: trim `raw` to 60 chars
+				// The TUI shows `Formatted` in the chat line, so the raw given
+				// (which can be a whole heredoc) is elided there; Input keeps
+				// the full text for the raw history and the returned error.
 				exec.notifyAny(runners.ToolCallErrorMsg{
 					ChannelID: exec.ChannelID(),
 					CallID:    callID,
 					ToolName:  entry.Key,
 					Input:     raw,
 					Error:     err.Error(),
-					Formatted: raw,
+					Formatted: elide(raw, 60),
 				})
 				return "", fmt.Errorf("given %q failed: %w", raw, err)
 			}

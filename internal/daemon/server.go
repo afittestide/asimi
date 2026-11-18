@@ -149,6 +149,18 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 	var runner runners.Runner
 	firstHandshakeCh := make(chan struct{})
 	var firstHandshakeOnce sync.Once
+	var handlersOnce sync.Once
+
+	// registerCourtHandlers binds the Court RPC surface to this connection. It
+	// must run BEFORE the SetContext reply becomes observable: the client calls
+	// SessionSeams immediately after the handshake, and an unregistered method
+	// answers CodeUnknownMethod (edict 1036).
+	registerCourtHandlers := func() {
+		if ct == nil {
+			return
+		}
+		handlersOnce.Do(func() { rpc.RegisterCourtHandlers(rpcConn, ct) })
+	}
 
 	rpcConn.Handle(rpc.MethodSetContext, func(_ context.Context, params []byte) ([]byte, error) {
 		var p types.SetContextParams
@@ -173,6 +185,13 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 			return nil, wire.NewError(0, msg)
 		}
 
+		// The mandate is owned by the client process that established the
+		// session, not by this daemon. The Court lives in the daemon, so its
+		// own os.Getpid() would name the daemon — a mandate owned by that PID
+		// would outlive the client that granted it, violating the ruling that
+		// the mandate dies with the client (edict 1036).
+		peerPID := unixPeerPID(conn)
+
 		if ct == nil {
 			projectCfg, err := config.LoadProjectConfig(p.ProjectRoot, false)
 			if err != nil {
@@ -190,10 +209,20 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 			if err != nil {
 				return nil, wire.NewError(0, err.Error())
 			}
+			if peerPID > 0 {
+				ct.SetClientPID(peerPID)
+			}
+		} else if peerPID > 0 && ct.SessionOwnerPID() != peerPID {
+			// A reconnecting client may be a new process. Rebind the owner so
+			// the mandate continues to track the process that holds it.
+			ct.SetClientPID(peerPID)
 		}
 		if err := reconfigureModel(ctx, ct, p); err != nil {
 			return nil, wire.NewError(0, err.Error())
 		}
+		// Handlers first, then the reply. A client may call any Court method —
+		// SessionSeams in particular — as soon as SetContext returns.
+		registerCourtHandlers()
 		firstHandshakeOnce.Do(func() { close(firstHandshakeCh) })
 		return wire.Encode(struct{}{})
 	})
@@ -214,7 +243,9 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 		return
 	}
 
-	rpc.RegisterCourtHandlers(rpcConn, ct)
+	// Handlers were registered before the handshake reply; this is a no-op
+	// safety net for the (impossible) case the SetContext branch never ran.
+	registerCourtHandlers()
 
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()

@@ -101,6 +101,10 @@ type TUIModel struct {
 	pendingEdictCancel  *pendingEdictCancel
 	// Onboarding model selection confirmation state
 	pendingOnboarding bool
+	// trustDialog is the launch-time asset chooser (gh #180 / edict 1036).
+	// It is non-nil only while the Ruler is answering it; its answers become
+	// the session mandate.
+	trustDialog *TrustDialog
 	// Handsoff mode: auto-answer zhengming and YESNO prompts
 	handsoff bool
 	// pendingZhengmingChatRequestID is armed when the Ruler selects "Chat" in
@@ -938,6 +942,14 @@ func (m TUIModel) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		return m, nil
+	}
+
+	// The trust dialog owns the keyboard while it is up. It is presented once
+	// per client process, before any session work can run.
+	if m.trustDialog != nil {
+		if newModel, cmd, handled := m.handleTrustDialogKey(keyStr); handled {
+			return newModel, cmd
+		}
 	}
 
 	// Handle non-chat views (help, models, resume)
@@ -3920,6 +3932,11 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Present the launch-time trust dialog once per client process (gh #180,
+		// edict 1036). The requested seams only exist after SetContext loaded
+		// the project config, so they are fetched here rather than at Init.
+		seamsCmd := loadTrustSeams(m.court)
+
 		// Fire court_started event to trigger wakeup ritual and health checks
 		latest, hasUpdate, err := utils.CheckForUpdates(context.Background())
 		latestVersion := ""
@@ -3931,6 +3948,19 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			"has_update":      hasUpdate,
 			"current_version": utils.AsimiVersion})
 
+		if seamsCmd != nil {
+			return m, seamsCmd
+		}
+		return m, nil
+
+	case trustSeamsLoadedMsg:
+		return m, m.openTrustDialog(msg.seams, msg.err)
+
+	case mandateAppliedMsg:
+		if msg.err != nil {
+			slog.Warn("failed to apply mandate", "error", msg.err)
+			m.commandLine.AddToast(fmt.Sprintf("Trust: the mandate was not applied (%v)", msg.err), "error", 5*time.Second)
+		}
 		return m, nil
 
 	case llmInitErrorMsg:
@@ -4419,6 +4449,10 @@ func (m TUIModel) composeBaseView(mainContent, promptView, commandLineView strin
 	if m.modal != nil {
 		modalRender := m.modal.Render()
 		layoutParts = append(layoutParts, modalRender, "")
+	}
+
+	if m.trustDialog != nil {
+		layoutParts = append(layoutParts, m.renderTrustDialog(), "")
 	}
 
 	if promptView != "" {

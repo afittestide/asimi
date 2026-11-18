@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"go.podman.io/podman/v6/pkg/api/handlers"
 	"go.podman.io/podman/v6/pkg/bindings"
@@ -34,6 +36,9 @@ type PodmanRunner struct {
 	allowFallback    bool
 	noCleanup        bool
 	config           *Config
+	mandateMu        sync.RWMutex    // guards mandate (re-bound on client reconnect)
+	mandate          *config.Mandate // when non-nil, the granted authority that governs mounts/env
+	mandateAlive     func(int) bool  // liveness probe for the mandate owner; nil = processAlive
 	repoInfo         repo.RepoInfo
 	repoMu           sync.RWMutex // guards repoInfo (re-targeted on worktree entry)
 	msgChan          chan<- Msg
@@ -43,6 +48,17 @@ type PodmanRunner struct {
 	establishConn    func(ctx context.Context) (context.Context, error)
 	checkImage       func(ctx context.Context) error
 	containerStarted bool
+}
+
+// MandateVoidError is returned when a mandate's owner process is gone. A
+// mandate dies with the client that obtained it, so no new container may be
+// created under it (edict 1036).
+type MandateVoidError struct {
+	OwnerPID int
+}
+
+func (e MandateVoidError) Error() string {
+	return fmt.Sprintf("mandate is void: owner process %d is gone", e.OwnerPID)
 }
 
 // healthcheckTimeout is the maximum time to wait for a healthcheck command.
@@ -113,8 +129,112 @@ func (r *PodmanRunner) SetRepoInfo(repoInfo repo.RepoInfo) {
 	r.repoInfo = repoInfo
 }
 
+// SetMandate binds the granted authority to this runner. When set, the
+// container is built from mandate.Config (the Ruler's granted, stripped config)
+// rather than the raw requested config, and the mandate's owner PID is stamped
+// on the container. A nil mandate keeps the legacy behavior: the runner's
+// config is used as-is (tests and any pre-mandate path).
+//
+// It may be called on a runner that is already in use: the Court re-binds a
+// reconnected client's mandate onto live per-edict runners, so the binding is
+// guarded against concurrent reads (edict 1036).
+func (r *PodmanRunner) SetMandate(m *config.Mandate) {
+	r.mandateMu.Lock()
+	defer r.mandateMu.Unlock()
+	r.mandate = m
+}
+
+// Mandate returns the authority bound by SetMandate, or nil. It exists so the
+// Court can assert that every runner it hands out is under the session's
+// mandate rather than the raw requested config (edict 1036).
+func (r *PodmanRunner) Mandate() *config.Mandate {
+	if r == nil {
+		return nil
+	}
+	r.mandateMu.RLock()
+	defer r.mandateMu.RUnlock()
+	return r.mandate
+}
+
+// currentMandate returns the bound mandate under the read lock. Callers must
+// not retain the pointer across a re-bind; use the accessors below instead.
+func (r *PodmanRunner) currentMandate() *config.Mandate {
+	r.mandateMu.RLock()
+	defer r.mandateMu.RUnlock()
+	return r.mandate
+}
+
+// effectiveSandbox returns the sandbox config that governs container creation.
+// With a mandate bound it is the mandate's granted (stripped) config — the
+// single source of truth. Without one the runner's own config is used, so
+// non-mandate callers (and tests) are unaffected.
+func (r *PodmanRunner) effectiveSandbox() *Config {
+	if m := r.currentMandate(); m != nil && m.Config != nil {
+		sb := m.Config.Sandbox
+		return &sb
+	}
+	return r.config
+}
+
+// ownerPIDForContainer is the PID stamped as the container owner: the mandate's
+// owner when bound, else this process. A mandate whose owner is gone must never
+// reach here (see voidMandate).
+func (r *PodmanRunner) ownerPIDForContainer() int {
+	if m := r.currentMandate(); m != nil && m.OwnerPID > 0 {
+		return m.OwnerPID
+	}
+	return r.ownerPID
+}
+
+// voidMandate reports a bound mandate whose owner process is gone, or nil. A
+// mandate dies with the client that obtained it, so a void mandate must never
+// create a container (edict 1036). It takes one snapshot of the binding, so a
+// concurrent re-bind cannot make the check and the error disagree.
+func (r *PodmanRunner) voidMandate() *config.Mandate {
+	m := r.currentMandate()
+	if m == nil {
+		return nil
+	}
+	alive := r.mandateAlive
+	if alive == nil {
+		alive = processAlive
+	}
+	if m.OwnerAlive(alive) {
+		return nil
+	}
+	return m
+}
+
+// containerAuthorityMatches reports whether an existing container's labels
+// record the same owner authority as this runner would stamp. A container
+// created under a different owner (another client process, a dead session, or
+// before ownership was labelled) carries mounts baked in at create time, so it
+// must be recreated rather than reused — otherwise a declined grant would be
+// inherited from whoever created it (edict 1036).
+//
+// The comparison is against the mandate's owner when bound, else this process.
+// An unlabelled container (created before labels existed) never matches: it
+// cannot prove which authority it was built under, and recreating it is cheap
+// compared with silently enforcing an unknown grant.
+func (r *PodmanRunner) containerAuthorityMatches(labels map[string]string) bool {
+	recorded, err := strconv.Atoi(labels[SandboxLabelOwnerPID])
+	if err != nil {
+		return false
+	}
+	return recorded == r.ownerPIDForContainer()
+}
+
 func (r *PodmanRunner) initialize(ctx context.Context) error {
 	slog.Debug("initializing podman shell runner")
+
+	// A mandate whose owner is gone is void: it may not create a container AND
+	// it may not adopt an existing one. Mounts are baked into a container's
+	// spec at create time, so a reused container keeps whatever authority it
+	// was created with — gating only the create path would let a dead session's
+	// read-write bind outlive the grant that authorised it (edict 1036).
+	if m := r.voidMandate(); m != nil {
+		return MandateVoidError{OwnerPID: m.OwnerPID}
+	}
 
 	r.mu.Lock()
 	hasConnection := r.conn != nil
@@ -162,7 +282,30 @@ func (r *PodmanRunner) initialize(ctx context.Context) error {
 		slog.Debug("ensuring container for this instance", "containerName", r.containerName)
 
 		inspectData, err := containers.Inspect(r.conn, r.containerName, nil)
-		if err == nil {
+		// A container created under a different authority may not be adopted:
+		// its mounts were baked in at create time, so reusing it would enforce
+		// someone else's grant. Remove it and create a fresh one from THIS
+		// runner's mandate (edict 1036).
+		var recordedLabels map[string]string
+		if err == nil && inspectData.Config != nil {
+			recordedLabels = inspectData.Config.Labels
+		}
+		adoptable := err == nil && r.containerAuthorityMatches(recordedLabels)
+		if err == nil && !adoptable {
+			slog.Info("removing container created under a different authority",
+				"containerName", r.containerName,
+				"ownerLabel", recordedLabels[SandboxLabelOwnerPID],
+				"wantOwner", strconv.Itoa(r.ownerPIDForContainer()))
+			forceTrue := true
+			volumesTrue := true
+			if _, rmErr := containers.Remove(r.conn, r.containerName, &containers.RemoveOptions{Force: &forceTrue, Volumes: &volumesTrue}); rmErr != nil {
+				r.mu.Lock()
+				r.containerStarted = false
+				r.mu.Unlock()
+				return fmt.Errorf("failed to remove container created under a different authority: %w", rmErr)
+			}
+		}
+		if adoptable {
 			if inspectData.State.Running {
 				slog.Debug("container already running", "containerName", r.containerName)
 				existingRunning = true
@@ -484,6 +627,15 @@ func (r *PodmanRunner) establishConnection(ctx context.Context) (context.Context
 func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	slog.Debug("creating new container", "image", r.imageName, "containerName", r.containerName, "noCleanup", r.noCleanup)
 
+	// A mandate whose owner is gone is void: refuse to create a container under
+	// it. The owner is the client that obtained the mandate, and the mandate
+	// does not outlive it (edict 1036).
+	if m := r.voidMandate(); m != nil {
+		return "", MandateVoidError{OwnerPID: m.OwnerPID}
+	}
+
+	sandboxCfg := r.effectiveSandbox()
+
 	// Reclaim build artifacts first when the podman store is tight; a full VM
 	// makes `podman build`/create fail with ENOSPC.
 	r.ensureSandboxDiskHeadroom(ctx)
@@ -499,12 +651,12 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	terminal := false
 	s.Terminal = &terminal
 	s.Env = map[string]string{"TERM": "dumb"}
-	s.Labels = SandboxLabels(r.projectSlug, r.ownerPID, r.edictID)
+	s.Labels = SandboxLabels(r.projectSlug, r.ownerPIDForContainer(), r.edictID)
 	for _, kv := range NonInteractiveGitEnv() {
 		name, val, _ := strings.Cut(kv, "=")
 		s.Env[name] = val
 	}
-	for _, name := range r.config.PassthroughEnv {
+	for _, name := range sandboxCfg.PassthroughEnv {
 		if val, ok := os.LookupEnv(name); ok {
 			s.Env[name] = val
 		}
@@ -530,7 +682,7 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 		},
 	}
 
-	for _, m := range r.config.AdditionalMounts {
+	for _, m := range sandboxCfg.AdditionalMounts {
 		if _, err := os.Stat(m.Source); err != nil {
 			// Never hand podman a missing bind source: it silently creates an
 			// empty root-owned directory on the host, which then shadows the
@@ -539,15 +691,24 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 				"source", m.Source, "destination", m.Destination, "error", err)
 			continue
 		}
-		slog.Debug("adding additional mount", "source", m.Source, "destination", m.Destination)
-		mounts = append(mounts, spec.Mount{
+		slog.Debug("adding additional mount", "source", m.Source, "destination", m.Destination, "readOnly", m.ReadOnly)
+		mount := spec.Mount{
 			Type:        "bind",
 			Source:      m.Source,
 			Destination: m.Destination,
-		})
+		}
+		// A host path is read-only unless the Ruler's grant opened it for
+		// writing. This is the property that closes the gcloud hole: the repo
+		// can request a writable bind, but only an explicit grant emits one
+		// without "ro" (edict 1036). ReadOnly defaults to true for
+		// additional_mounts (see config.applyMountReadOnlyDefaults).
+		if m.ReadOnly {
+			mount.Options = []string{"ro"}
+		}
+		mounts = append(mounts, mount)
 	}
 
-	for _, relPath := range r.config.PlatformOverlays {
+	for _, relPath := range sandboxCfg.PlatformOverlays {
 		overlayDest := filepath.Join(absPath, relPath)
 		info, err := os.Stat(overlayDest)
 		if err != nil {
@@ -586,7 +747,7 @@ func (r *PodmanRunner) createContainer(ctx context.Context) (string, error) {
 	// path), so all edicts of a project share one cache and it survives
 	// container removal — Remove passes Volumes:true, which reaps only
 	// anonymous volumes.
-	for _, v := range namedCacheVolumes(r.config.CacheVolumes, r.repoSlug()) {
+	for _, v := range namedCacheVolumes(sandboxCfg.CacheVolumes, r.repoSlug()) {
 		slog.Debug("adding cache volume", "volume", v.Name, "destination", v.Dest)
 		s.Volumes = append(s.Volumes, v)
 	}
@@ -644,7 +805,7 @@ func (r *PodmanRunner) execCommand(ctx context.Context, command string) (string,
 	// Pin GOCACHE to the main project root (never the worktree) so every
 	// edict's worktree reuses one shared, bind-mounted Go build cache.
 	env = append(env, GoCacheEnv(r.projectCacheRoot())...)
-	for _, name := range r.config.PassthroughEnv {
+	for _, name := range r.effectiveSandbox().PassthroughEnv {
 		if name == "GOCACHE" {
 			// GOCACHE is pinned by the runner (shared worktree cache); a
 			// passthrough value would be a duplicate env key with
@@ -726,6 +887,13 @@ func (r *PodmanRunner) Run(ctx context.Context, input Input) (Output, error) {
 
 	if err := r.initialize(ctx); err != nil {
 		slog.Error("failed to initialize", "error", err)
+		// A void mandate is a REFUSAL, not an outage: the mandate granted no
+		// authority at all, so falling back to the host would grant strictly
+		// more than it allowed. Return it before the fallback check.
+		var voidErr MandateVoidError
+		if errors.As(err, &voidErr) {
+			return Output{}, voidErr
+		}
 		if r.allowFallback && r.fallback != nil {
 			slog.Warn("sandbox unavailable, falling back to host shell", "command", input.Command)
 			out, fallbackErr := r.fallback.Run(ctx, input)

@@ -364,6 +364,25 @@ func RegisterCourtHandlers(c *Conn, impl courtapi.Client) {
 		}
 		return wire.Encode(EnsureEdictWorktreeResult{WorktreeRel: rel})
 	})
+
+	c.Handle(MethodSessionSeams, func(ctx context.Context, params []byte) ([]byte, error) {
+		seams, err := impl.SessionSeams()
+		if err != nil {
+			return nil, err
+		}
+		return wire.Encode(SessionSeamsResult{Seams: seams})
+	})
+
+	c.Handle(MethodApplyMandate, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p ApplyMandateParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		if err := impl.ApplyMandate(p.Selections); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
 }
 
 // ServeCourtNotifications drives the server-side notification pump:

@@ -14,11 +14,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1133,7 +1135,9 @@ func TestPodmanRunnerRestartCarriesRunnerIdentity(t *testing.T) {
 // sent on all three initialize() paths where containerStarted transitions to true.
 func TestContainerLaunchedMsgAllPaths(t *testing.T) {
 	t.Run("path_a_already_running", func(t *testing.T) {
-		mock := newMockPodmanServer(mockInspectJSON(true), http.StatusOK)
+		// The container must record this process as its owner, or initialize()
+		// correctly refuses to adopt it and recreates instead (edict 1036).
+		mock := newMockPodmanServer(mockInspectJSONWithOwner(strconv.Itoa(os.Getpid())), http.StatusOK)
 		defer mock.close()
 		host := mock.start(t)
 		connCtx := makeConnCtx(t, host)
@@ -1161,7 +1165,8 @@ func TestContainerLaunchedMsgAllPaths(t *testing.T) {
 	})
 
 	t.Run("path_b_start_existing", func(t *testing.T) {
-		mock := newMockPodmanServer(mockInspectJSON(false), http.StatusOK)
+		// Stopped container under this process's ownership: adopted and started.
+		mock := newMockPodmanServer(mockInspectStoppedWithOwner(strconv.Itoa(os.Getpid())), http.StatusOK)
 		defer mock.close()
 		host := mock.start(t)
 		connCtx := makeConnCtx(t, host)
@@ -2222,4 +2227,537 @@ func TestPruneSandboxArtifacts_HitsPodman(t *testing.T) {
 	count := mock.pruneCount
 	mock.mu.Unlock()
 	assert.Equal(t, 1, count, "artifact reclamation must issue a podman prune")
+}
+
+// TestAdditionalMountEmitsReadOnlyByDefault is edict 1036's core acceptance:
+// an additional_mounts entry with no explicit write grant must reach podman as
+// Options:["ro"]. Before this edict every additional mount was a full read-write
+// bind of a host path (the gcloud hole).
+func TestAdditionalMountEmitsReadOnlyByDefault(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	source := t.TempDir()
+	// ReadOnly is the loader-applied default; construct it explicitly here so
+	// the runner's emission is what is under test.
+	cfg := &Config{
+		AdditionalMounts: []Mount{{Source: source, Destination: "/root/.config/gcloud", ReadOnly: true}},
+	}
+	runner := NewPodmanRunner(cfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body)
+
+	spec := decodeMountSpec(t, body)
+	m := findMount(t, spec, "/root/.config/gcloud")
+	assert.Equal(t, []string{"ro"}, m.Options,
+		"an additional mount must be read-only unless the Ruler's grant opened it for writing")
+}
+
+// TestAdditionalMountWritableGrantOmitsReadOnly proves the explicit-write path:
+// a mount opened for writing (ReadOnly=false) must NOT carry the "ro" option.
+func TestAdditionalMountWritableGrantOmitsReadOnly(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	source := t.TempDir()
+	cfg := &Config{
+		AdditionalMounts: []Mount{{Source: source, Destination: "/root/.config/gcloud", ReadOnly: false}},
+	}
+	runner := NewPodmanRunner(cfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+
+	spec := decodeMountSpec(t, body)
+	m := findMount(t, spec, "/root/.config/gcloud")
+	assert.NotContains(t, m.Options, "ro",
+		"a mount explicitly opened for writing must not be forced read-only")
+}
+
+// TestMandateStripsDeclinedMounts proves stripping IS the mandate: a mount the
+// Ruler declined is absent from the effective config; an accepted read-only
+// mount stays read-only; an accepted writable mount is writable.
+func TestMandateStripsDeclinedMounts(t *testing.T) {
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/host/declined", Destination: "/d", ReadOnly: true},
+		{Source: "/host/ro", Destination: "/ro", ReadOnly: true},
+		{Source: "/host/rw", Destination: "/rw", ReadOnly: true},
+	}
+
+	sel := config.Selections{
+		Mounts: map[string]bool{
+			"/host/ro": false,
+			"/host/rw": true,
+		},
+		Env: map[string]bool{},
+	}
+	m := config.BuildMandate(4242, requested, sel)
+
+	var sources []string
+	for _, mt := range m.EffectiveSandbox().AdditionalMounts {
+		sources = append(sources, mt.Source)
+	}
+	assert.NotContains(t, sources, "/host/declined", "a declined request must be stripped from the mandate")
+	assert.Contains(t, sources, "/host/ro")
+	assert.Contains(t, sources, "/host/rw")
+
+	ro, ok := m.GrantFor(config.SeamMount, "/host/ro")
+	require.True(t, ok)
+	assert.True(t, ro.Granted)
+	assert.False(t, ro.Writable, "a read-only grant must not be writable")
+
+	rw, ok := m.GrantFor(config.SeamMount, "/host/rw")
+	require.True(t, ok)
+	assert.True(t, rw.Granted)
+	assert.True(t, rw.Writable, "an explicitly-writable grant must be recorded writable")
+
+	declined, ok := m.GrantFor(config.SeamMount, "/host/declined")
+	require.True(t, ok, "a declined seam must still be recorded, for audit")
+	assert.False(t, declined.Granted)
+}
+
+// TestMandateOwnerPIDIsStampedAndVoidWhenDead proves the mandate is owned by
+// the client PID: a live owner is honored for a new container, a dead owner is
+// not (the mandate does not survive its owner).
+func TestMandateOwnerPIDIsStampedAndVoidWhenDead(t *testing.T) {
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{{Source: "/host/x", Destination: "/x", ReadOnly: true}}
+
+	m := config.BuildMandate(999999, requested, config.Selections{Mounts: map[string]bool{"/host/x": false}, Env: map[string]bool{}})
+	assert.Equal(t, 999999, m.OwnerPID, "the mandate must carry the client PID that obtained it")
+
+	// A PID that cannot be live.
+	assert.False(t, m.OwnerAlive(func(int) bool { return false }),
+		"a mandate whose owner is dead must not be honored")
+	assert.True(t, m.OwnerAlive(func(int) bool { return true }),
+		"a mandate whose owner is live must be honored")
+
+	// The runner refuses to create a container under a dead mandate.
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+	runner.SetMandate(m)
+	runner.mandateAlive = func(int) bool { return false }
+
+	_, err := runner.createContainer(context.Background())
+	require.Error(t, err)
+	assert.IsType(t, MandateVoidError{}, err,
+		"a container must never be created under a mandate whose owner is gone")
+}
+
+// recordingFallbackRunner stands in for the host runner: it records whether it
+// was ever invoked, so a test can prove a refused mandate never reaches it.
+type recordingFallbackRunner struct {
+	runs int
+}
+
+func (f *recordingFallbackRunner) Run(context.Context, Input) (Output, error) {
+	f.runs++
+	return Output{Output: "host", ExitCode: "0"}, nil
+}
+func (f *recordingFallbackRunner) Restart(context.Context) error { return nil }
+func (f *recordingFallbackRunner) Close(context.Context) error   { return nil }
+func (f *recordingFallbackRunner) AllowFallback(bool)            {}
+func (f *recordingFallbackRunner) RunnerType() string            { return "host" }
+func (f *recordingFallbackRunner) GetOS() string                 { return runtime.GOOS }
+func (f *recordingFallbackRunner) SetMessageChannel(chan<- Msg)  {}
+func (f *recordingFallbackRunner) HealthCheck(context.Context) error {
+	return nil
+}
+
+// TestVoidMandateNeverFallsBackToHost proves the failure direction of a
+// REFUSED mandate: a void mandate must never be retried on the host runner.
+// Host fallback is strictly more authority than the mandate granted, so
+// allowing it (`sandbox.allow_host_fallback = true`, which a committed
+// .agents/asimi.conf can request) must not turn a refusal into unsandboxed
+// execution (edict 1036).
+func TestVoidMandateNeverFallsBackToHost(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+	host := mock.start(t)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+
+	fallback := &recordingFallbackRunner{}
+	runner := NewPodmanRunner(&Config{AllowHostFallback: true},
+		repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", fallback)
+	require.True(t, runner.allowFallback, "the test must exercise the fallback path")
+	runner.conn = makeConnCtx(t, host)
+	runner.checkImage = func(context.Context) error { return nil }
+
+	m := config.BuildMandate(999999, &config.Config{}, config.Selections{})
+	runner.SetMandate(m)
+	runner.mandateAlive = func(int) bool { return false }
+
+	_, err := runner.Run(context.Background(), Input{Command: "echo hello"})
+
+	require.Error(t, err)
+	assert.IsType(t, MandateVoidError{}, err,
+		"a void mandate must be returned as a refusal, not masked as sandbox unavailability")
+	assert.Zero(t, fallback.runs,
+		"a void mandate must never run the command on the host: that is more authority than it granted")
+}
+
+// decodeMountSpec parses the mounts array out of a create body.
+func decodeMountSpec(t *testing.T, body []byte) []struct {
+	Source      string   `json:"source"`
+	Destination string   `json:"destination"`
+	Type        string   `json:"type"`
+	Options     []string `json:"options"`
+} {
+	t.Helper()
+	var spec struct {
+		Mounts []struct {
+			Source      string   `json:"source"`
+			Destination string   `json:"destination"`
+			Type        string   `json:"type"`
+			Options     []string `json:"options"`
+		} `json:"mounts"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec), "create body must be a specgen JSON spec")
+	return spec.Mounts
+}
+
+// findMount returns the mount with the given destination, failing if absent.
+func findMount(t *testing.T, mounts []struct {
+	Source      string   `json:"source"`
+	Destination string   `json:"destination"`
+	Type        string   `json:"type"`
+	Options     []string `json:"options"`
+}, dest string) struct {
+	Source      string   `json:"source"`
+	Destination string   `json:"destination"`
+	Type        string   `json:"type"`
+	Options     []string `json:"options"`
+} {
+	t.Helper()
+	for _, m := range mounts {
+		if m.Destination == dest {
+			return m
+		}
+	}
+	t.Fatalf("mount with destination %q not found in create spec", dest)
+	return struct {
+		Source      string   `json:"source"`
+		Destination string   `json:"destination"`
+		Type        string   `json:"type"`
+		Options     []string `json:"options"`
+	}{}
+}
+
+// TestMandateGovernsContainerSpec is edict 1036 acceptance 2 at the enforcement
+// point: once a mandate is bound, the container is built from the mandate's
+// granted (stripped) config — NOT from the runner's own config, which still
+// holds the repository's raw request. A mount the Ruler declined must not reach
+// podman even though the runner was constructed with it.
+func TestMandateGovernsContainerSpec(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+
+	grantedSource := t.TempDir()
+	declinedSource := t.TempDir()
+
+	// The Ruler granted one read-only mount and declined the other.
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: grantedSource, Destination: "/root/.config/gh", ReadOnly: true},
+		{Source: declinedSource, Destination: "/root/.config/gcloud", ReadOnly: true},
+	}
+	m := config.BuildMandate(4242, requested, config.Selections{
+		Mounts: map[string]bool{grantedSource: false},
+		Env:    map[string]bool{},
+	})
+
+	// The runner's own config still carries both (the raw repository request).
+	runnerCfg := &Config{AdditionalMounts: []config.Mount{
+		{Source: grantedSource, Destination: "/root/.config/gh", ReadOnly: false},
+		{Source: declinedSource, Destination: "/root/.config/gcloud", ReadOnly: false},
+	}}
+	runner := NewPodmanRunner(runnerCfg, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+	runner.SetMandate(m)
+	runner.mandateAlive = func(int) bool { return true }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body)
+
+	spec := decodeMountSpec(t, body)
+	granted := findMount(t, spec, "/root/.config/gh")
+	assert.Equal(t, []string{"ro"}, granted.Options,
+		"the mandate's grant (read-only) must govern the emitted options, not the runner's raw config")
+	for _, mt := range spec {
+		assert.NotEqual(t, "/root/.config/gcloud", mt.Destination,
+			"a mount the Ruler declined must never reach the create spec")
+	}
+}
+
+// TestMandateOwnerPIDStampedOnContainerLabels is edict 1036 acceptance 3 at the
+// enforcement point: the container is stamped with the MANDATE's owner PID (the
+// client process that holds the authority), not with this process's PID, so the
+// existing orphan reaper reaps exactly when the grant dies.
+func TestMandateOwnerPIDStampedOnContainerLabels(t *testing.T) {
+	mock := newMockPodmanServer("", http.StatusNotFound)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+
+	requested := &config.Config{}
+	m := config.BuildMandate(424242, requested, config.Selections{})
+
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+	runner.SetMandate(m)
+	runner.mandateAlive = func(int) bool { return true }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	body := mock.lastCreateBody
+	mock.mu.Unlock()
+	require.NotEmpty(t, body)
+
+	var spec struct {
+		Labels map[string]string `json:"labels"`
+	}
+	require.NoError(t, json.Unmarshal(body, &spec))
+	assert.Equal(t, "424242", spec.Labels[SandboxLabelOwnerPID],
+		"the container must be owned by the mandate's owner PID, not by this process")
+}
+
+// mockInspectJSONWithOwner builds an inspect response for a RUNNING container
+// that records ownerPID in the label the runner stamps at create time. An empty
+// owner omits the label entirely, standing in for a container created before
+// ownership was recorded.
+func mockInspectJSONWithOwner(ownerPID string) string {
+	labels := "{}"
+	if ownerPID != "" {
+		labels = fmt.Sprintf(`{"%s":%q}`, SandboxLabelOwnerPID, ownerPID)
+	}
+	return fmt.Sprintf(`{"State":{"Running":true,"Status":"running","Pid":12345},"Config":{"Tty":false,"Labels":%s}}`, labels)
+}
+
+// mockInspectStoppedWithOwner is the stopped-container twin of
+// mockInspectJSONWithOwner: initialize() must adopt and START it.
+func mockInspectStoppedWithOwner(ownerPID string) string {
+	return fmt.Sprintf(`{"State":{"Running":false,"Status":"exited","Pid":0},"Config":{"Tty":false,"Labels":{"%s":%q}}}`,
+		SandboxLabelOwnerPID, ownerPID)
+}
+
+// TestReusedContainerIsRecreatedForADifferentOwner closes the half of the
+// mandate that the create path alone could not: initialize() adopts an existing
+// container by name, and a reused container keeps the mounts baked in when it
+// was created. Without this check, Client A could grant gcloud read-write,
+// exit, and Client B — who declined gcloud — would inherit that bind merely by
+// working the same edict, since per-edict container names are stable and
+// edictRunners is in-memory only (edict 1036 acceptance 1 and 3).
+//
+// The mandate does not outlive its owner, so a container created under a
+// different owner must be removed and rebuilt from THIS runner's mandate.
+func TestReusedContainerIsRecreatedForADifferentOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorded string
+	}{
+		{"previous-session-owner", "11111"},
+		{"unlabelled-legacy-container", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockPodmanServer(mockInspectJSONWithOwner(tc.recorded), http.StatusOK)
+			defer mock.close()
+
+			host := mock.start(t)
+			connCtx := makeConnCtx(t, host)
+
+			projectRoot := t.TempDir()
+			makeSandboxFiles(t, projectRoot)
+
+			requested := &config.Config{}
+			m := config.BuildMandate(424242, requested, config.Selections{})
+			runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+			runner.conn = connCtx
+			runner.checkImage = func(context.Context) error { return nil }
+			runner.SetMandate(m)
+			runner.mandateAlive = func(int) bool { return true }
+
+			require.NoError(t, runner.initialize(context.Background()))
+
+			mock.mu.Lock()
+			removes, creates, body := mock.removeCount, mock.createCount, mock.lastCreateBody
+			mock.mu.Unlock()
+
+			assert.Equal(t, 1, removes,
+				"a container created under a different authority must be removed, not adopted")
+			assert.Equal(t, 1, creates,
+				"a fresh container must be created from this runner's mandate")
+			require.NotEmpty(t, body)
+			var spec struct {
+				Labels map[string]string `json:"labels"`
+			}
+			require.NoError(t, json.Unmarshal(body, &spec))
+			assert.Equal(t, "424242", spec.Labels[SandboxLabelOwnerPID],
+				"the rebuilt container must record the current mandate's owner")
+		})
+	}
+}
+
+// TestContainerUnderTheSameOwnerIsReused is the complement: an existing
+// container that already records this runner's owner IS reused, so the
+// authority check does not turn every session into a cold container.
+func TestContainerUnderTheSameOwnerIsReused(t *testing.T) {
+	mock := newMockPodmanServer(mockInspectJSONWithOwner("424242"), http.StatusOK)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+
+	m := config.BuildMandate(424242, &config.Config{}, config.Selections{})
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+	runner.SetMandate(m)
+	runner.mandateAlive = func(int) bool { return true }
+
+	require.NoError(t, runner.initialize(context.Background()))
+
+	mock.mu.Lock()
+	removes, creates := mock.removeCount, mock.createCount
+	mock.mu.Unlock()
+	assert.Equal(t, 0, removes, "a container under this mandate's owner must be kept")
+	assert.Equal(t, 0, creates, "a container under this mandate's owner must not be rebuilt")
+}
+
+// TestVoidMandateNeverAdoptsAnExistingContainer is the reuse-side twin of
+// TestVoidMandateNeverFallsBackToHost: a mandate whose owner is dead must not
+// start, inspect-and-reuse or rebuild a container. The create path alone was
+// gated; initialize() could still adopt a previous session's container and run
+// with authority the dead client granted (edict 1036).
+func TestVoidMandateNeverAdoptsAnExistingContainer(t *testing.T) {
+	mock := newMockPodmanServer(mockInspectJSONWithOwner("11111"), http.StatusOK)
+	defer mock.close()
+
+	host := mock.start(t)
+	connCtx := makeConnCtx(t, host)
+
+	projectRoot := t.TempDir()
+	makeSandboxFiles(t, projectRoot)
+
+	m := config.BuildMandate(999999, &config.Config{}, config.Selections{})
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.conn = connCtx
+	runner.checkImage = func(context.Context) error { return nil }
+	runner.SetMandate(m)
+	runner.mandateAlive = func(int) bool { return false }
+
+	err := runner.initialize(context.Background())
+	require.Error(t, err)
+	assert.IsType(t, MandateVoidError{}, err,
+		"a dead mandate must not initialize against an existing container")
+
+	mock.mu.Lock()
+	starts, creates, removes := mock.startCount, mock.createCount, mock.removeCount
+	mock.mu.Unlock()
+	assert.Equal(t, 0, starts, "a dead mandate must not start a previous session's container")
+	assert.Equal(t, 0, creates, "a dead mandate must not create a container")
+	assert.Equal(t, 0, removes,
+		"a void mandate must refuse before touching host state, not reconcile then refuse")
+}
+
+// TestMandateRebindIsRaceFree covers the re-bind path: the Court pushes a
+// reconnected client's mandate onto a runner that is already serving another
+// edict (court.propagateMandate). The binding must be guarded, because the
+// runner's mandate is read while a container is being built. Run under -race to
+// see the regression.
+func TestMandateRebindIsRaceFree(t *testing.T) {
+	projectRoot := t.TempDir()
+	runner := NewPodmanRunner(&Config{}, repo.RepoInfo{ProjectRoot: projectRoot, Slug: "Owner/Repo"}, "0", nil)
+	runner.mandateAlive = func(int) bool { return true }
+
+	requested := &config.Config{}
+	mounts := []config.Mount{
+		{Source: "/host/a", Destination: "/a", ReadOnly: true},
+		{Source: "/host/b", Destination: "/b", ReadOnly: true},
+	}
+	requested.Sandbox.AdditionalMounts = mounts
+	first := config.BuildMandate(1111, requested, config.Selections{
+		Mounts: map[string]bool{"/host/a": false},
+		Env:    map[string]bool{},
+	})
+	second := config.BuildMandate(2222, requested, config.Selections{
+		Mounts: map[string]bool{"/host/b": true},
+		Env:    map[string]bool{},
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			runner.SetMandate(first)
+			runner.SetMandate(second)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			// These are the reads createContainer/execCommand perform.
+			_ = runner.effectiveSandbox()
+			_ = runner.ownerPIDForContainer()
+			_ = runner.voidMandate()
+			_ = runner.Mandate()
+		}
+	}()
+
+	wg.Wait()
 }

@@ -36,6 +36,34 @@ func DefaultConfContent() string {
 // TODO: find a better way and remove this global
 var ConfigCreated bool
 
+// applyMountReadOnlyDefaults sets ReadOnly=true on every additional_mounts
+// entry that did not explicitly set read_only in the config. koanf exposes the
+// raw array entries, so an entry that omits the key is distinguishable from one
+// that sets read_only = false. The two layers (user, project) are merged by
+// koanf, so this inspects the merged view.
+//
+// It fails CLOSED: every entry starts read-only and is only cleared when the
+// merged view positively shows read_only = false for that entry. If the raw
+// value ever comes back in a shape this function does not recognise, no entry
+// is opened for writing — a writable bind must never be the accidental result
+// of a parse surprise.
+func applyMountReadOnlyDefaults(k *koanf.Koanf, cfg *Config) {
+	entries, _ := k.Get("sandbox.additional_mounts").([]interface{})
+	for i := range cfg.Sandbox.AdditionalMounts {
+		cfg.Sandbox.AdditionalMounts[i].ReadOnly = true
+		if i >= len(entries) {
+			continue
+		}
+		entry, ok := entries[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if v, ok := entry["read_only"].(bool); ok {
+			cfg.Sandbox.AdditionalMounts[i].ReadOnly = v
+		}
+	}
+}
+
 // DefaultConfig returns the configuration populated with sensible defaults.
 func DefaultConfig() Config {
 	homeDir, err := os.UserHomeDir()
@@ -272,6 +300,34 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 		}
 		config.Sandbox.AdditionalMounts[i].Source = source
 	}
+
+	// Drop any additional_mounts entry whose source or destination is blank.
+	// An empty table-array header leaves a zero-value entry (both fields are
+	// ""), and the "empty header = active" rule means blanks reach the runner.
+	// In the trust dialog a blank source renders a row with no label — the
+	// Ruler is invited to tick a row that names nothing — and at the runner a
+	// blank source has no host meaning at all (os.Stat("") always fails, so the
+	// mount is silently skipped), so dropping it grants nothing. A blank
+	// destination with a real source is unbuildable, so it goes too (edict
+	// 1036).
+	kept := make([]Mount, 0, len(config.Sandbox.AdditionalMounts))
+	for _, m := range config.Sandbox.AdditionalMounts {
+		if strings.TrimSpace(m.Source) == "" || strings.TrimSpace(m.Destination) == "" {
+			slog.Warn("dropping additional mount with a blank source or destination",
+				"source", m.Source, "destination", m.Destination)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	config.Sandbox.AdditionalMounts = kept
+
+	// Read-only is the safe default for additional_mounts: a host path is
+	// mounted with Options:["ro"] unless it explicitly asks for read_only =
+	// false. The committed config may *request* a writable bind, but the Ruler
+	// still has to grant it at the trust dialog (edict 1036). A bool cannot
+	// distinguish "absent" from "false", so consult koanf for which entries
+	// set the key.
+	applyMountReadOnlyDefaults(k, &config)
 
 	// Resolve API keys from environment variables when requested
 	if resolveKeys {

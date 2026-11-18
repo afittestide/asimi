@@ -1,12 +1,18 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -270,36 +276,52 @@ func TestDaemonHandshakeThenRPC(t *testing.T) {
 	_, client, stop := dialServeOne(t, shared, projectRoot)
 	defer stop()
 
-	// After handshake, the server registers c handlers
-	// asynchronously, so we retry briefly until HasMinister succeeds.
-	// This is a benign race: the SetContext response is sent before
-	// RegisterCourtHandlers runs.
-	var hasMinister bool
-	for i := 0; i < 50; i++ {
-		hasMinister = client.HasMinister("chancellor")
-		if hasMinister {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !hasMinister {
+	// The server registers its handlers before the SetContext reply, so a
+	// Court method may be called the instant the handshake returns — no
+	// retry, no benign race (edict 1036).
+	if !client.HasMinister("chancellor") {
 		t.Error("HasMinister(chancellor) = false, want true")
 	}
 
-	var e *storage.Edict
-	var err error
-	for i := 0; i < 50; i++ {
-		e, err = client.CreateEdict("#1", "handshake test", "")
-		if err == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	e, err := client.CreateEdict("#1", "handshake test", "")
 	if err != nil {
 		t.Fatalf("CreateEdict: %v", err)
 	}
 	if e.Intent != "handshake test" {
 		t.Errorf("edict.Intent = %q, want %q", e.Intent, "handshake test")
+	}
+}
+
+// TestDaemonSessionSeamsImmediatelyAfterHandshake pins the ordering the trust
+// dialog depends on (edict 1036): the Court handlers are registered BEFORE the
+// SetContext reply becomes observable, so a client that calls SessionSeams the
+// instant the handshake returns gets the requested seams — never
+// CodeUnknownMethod. This test deliberately does NOT retry; a retry loop here
+// would hide exactly the race it is meant to catch.
+func TestDaemonSessionSeamsImmediatelyAfterHandshake(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	agentsDir := filepath.Join(projectRoot, ".agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	conf := "[sandbox]\n\n[[sandbox.additional_mounts]]\nsource = \"" + projectRoot + "\"\ndestination = \"/root/.config/gh\"\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(conf), 0o644); err != nil {
+		t.Fatalf("write asimi.conf: %v", err)
+	}
+
+	_, client, stop := dialServeOne(t, shared, projectRoot)
+	defer stop()
+
+	// No retry: the first call after the handshake must succeed.
+	seams, err := client.SessionSeams()
+	if err != nil {
+		t.Fatalf("SessionSeams immediately after the handshake: %v", err)
+	}
+	if len(seams) != 1 {
+		t.Fatalf("seams = %d, want the one requested mount", len(seams))
 	}
 }
 
@@ -891,4 +913,189 @@ func TestDaemonRejectsHandshakeUsernameMismatch(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Log("serveClients didn't shut down in time")
 	}
+}
+
+// mandateClientSockEnv and mandateClientRootEnv switch
+// TestDaemonMandateOwnerIsTheClientProcess into its client role: the test
+// re-executes its own binary as a SEPARATE client process so the socket peer
+// PID differs from the daemon's.
+const (
+	mandateClientSockEnv = "ASIMI_TEST_MANDATE_SOCK"
+	mandateClientRootEnv = "ASIMI_TEST_MANDATE_ROOT"
+)
+
+// syncBuffer is a goroutine-safe log sink: the daemon writes to it from the
+// connection handler while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestDaemonMandateOwnerIsTheClientProcess is edict 1036 acceptance 3's
+// end-to-end proof across a real socket in the DEFAULT deployment: the Court
+// lives inside the daemon, so a mandate owned by the Court's own PID outlives
+// the client that granted it. The in-process harness cannot show this — there
+// the peer PID and the daemon PID are the same process — so the client here is
+// a separate process, and the assertion is on the daemon's own record of who
+// owns the mandate.
+func TestDaemonMandateOwnerIsTheClientProcess(t *testing.T) {
+	// Client role: the re-executed binary dials, handshakes, reads the
+	// requested seams and applies a mandate, then reports its own PID.
+	if sockPath := os.Getenv(mandateClientSockEnv); sockPath != "" {
+		runMandateClient(t, sockPath, os.Getenv(mandateClientRootEnv))
+		return
+	}
+
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("peer PID is only resolvable on linux and darwin; elsewhere the mandate falls back to the daemon PID")
+	}
+
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+	var logs syncBuffer
+	shared.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "mandate.sock")
+	if len(sockPath) >= 104 {
+		sockPath = filepath.Join(os.TempDir(), "asimi-mandate-"+time.Now().Format("150405.000000")+".sock")
+		t.Cleanup(func() { _ = os.Remove(sockPath) })
+	}
+	listener, err := rpc.Listen(sockPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- serveClients(ctx, listener, shared) }()
+	defer func() {
+		cancel()
+		_ = listener.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(3 * time.Second):
+		}
+	}()
+
+	// The repository requests one mount, so the seam list is non-empty over
+	// the wire and the mandate has something to carry.
+	projectRoot := t.TempDir()
+	agentsDir := filepath.Join(projectRoot, ".agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	conf := "[sandbox]\n\n[[sandbox.additional_mounts]]\nsource = \"" + projectRoot + "\"\ndestination = \"/root/.config/gh\"\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(conf), 0o644); err != nil {
+		t.Fatalf("write asimi.conf: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run", "^TestDaemonMandateOwnerIsTheClientProcess$", "-test.timeout", "90s")
+	cmd.Env = append(os.Environ(),
+		mandateClientSockEnv+"="+sockPath,
+		mandateClientRootEnv+"="+projectRoot,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("client subprocess failed: %v\n%s", err, out)
+	}
+
+	var clientPID int
+	var seams int
+	for _, field := range strings.Fields(string(out)) {
+		if v, ok := strings.CutPrefix(field, "CLIENT_PID="); ok {
+			clientPID, _ = strconv.Atoi(v)
+		}
+		if v, ok := strings.CutPrefix(field, "SEAMS="); ok {
+			seams, _ = strconv.Atoi(v)
+		}
+	}
+	if clientPID <= 0 {
+		t.Fatalf("client subprocess did not report its PID: %s", out)
+	}
+	if clientPID == os.Getpid() {
+		t.Fatalf("the client must be a separate process to prove peer-PID ownership")
+	}
+	if seams == 0 {
+		t.Fatalf("the requested seams must reach the client over the wire: %s", out)
+	}
+
+	// The daemon's own record of the mandate must name the client process.
+	var applied string
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(line, `msg="mandate applied"`) {
+			applied = line
+		}
+	}
+	if applied == "" {
+		t.Fatalf("the daemon never recorded applying the mandate:\n%s", logs.String())
+	}
+	if !strings.Contains(applied, "owner_pid="+strconv.Itoa(clientPID)) {
+		t.Fatalf("the mandate must be owned by the client process %d, got: %s", clientPID, applied)
+	}
+	if strings.Contains(applied, "owner_pid="+strconv.Itoa(os.Getpid())) {
+		t.Fatalf("the mandate must not be owned by the daemon %d: %s", os.Getpid(), applied)
+	}
+}
+
+// runMandateClient is the client half of
+// TestDaemonMandateOwnerIsTheClientProcess: it drives the public RPC surface a
+// TUI would drive, then reports its PID so the daemon's ownership can be
+// checked against it.
+func runMandateClient(t *testing.T, sockPath, projectRoot string) {
+	t.Helper()
+	netConn, err := rpc.Dial(sockPath)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer netConn.Close()
+	conn := rpc.New(netConn, rpc.Options{})
+	go func() { _ = conn.Serve() }()
+	defer conn.Close()
+
+	client := rpc.NewCourtClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := client.SetContext(ctx, types.SetContextParams{
+		Project:     "test-project",
+		Username:    testUsername(),
+		ProjectRoot: projectRoot,
+	}); err != nil {
+		t.Fatalf("SetContext: %v", err)
+	}
+
+	// The handlers are registered before the SetContext reply, so the seam
+	// list is readable immediately — no retry (edict 1036).
+	seams, err := client.SessionSeams()
+	if err != nil {
+		t.Fatalf("SessionSeams: %v", err)
+	}
+	if len(seams) == 0 {
+		t.Fatalf("the requested seams must reach the client over the wire")
+	}
+	sel := config.Selections{Mounts: map[string]bool{}, Env: map[string]bool{}}
+	for _, s := range seams {
+		if s.Kind == config.SeamMount {
+			sel.Mounts[s.Mount.Source] = false // granted read-only
+		}
+	}
+	if err := client.ApplyMandate(sel); err != nil {
+		t.Fatalf("ApplyMandate: %v", err)
+	}
+	fmt.Printf("CLIENT_PID=%d SEAMS=%d\n", os.Getpid(), len(seams))
 }

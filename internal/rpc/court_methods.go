@@ -40,4 +40,6 @@ const (
 	MethodGetSessionExport       = "GetSessionExport"
 	MethodSetContext             = "SetContext"
 	MethodEnsureEdictWorktree    = "EnsureEdictWorktree"
+	MethodSessionSeams           = "SessionSeams"
+	MethodApplyMandate           = "ApplyMandate"
 )

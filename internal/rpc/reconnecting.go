@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/courtapi"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
@@ -796,6 +797,40 @@ func (rc *ReconnectingClient) ApproximateContextSize(provider, model string) int
 	}
 	size := client.ApproximateContextSize(provider, model)
 	return size
+}
+
+// SessionSeams returns the concrete host-asset seams the committed config
+// requests, retrying on a broken connection like other read-only methods. A
+// read that cannot reach the Court is reported as an error — never as an empty
+// slice, which would read as "the repository requested nothing" (edict 1036).
+func (rc *ReconnectingClient) SessionSeams() ([]config.Seam, error) {
+	client := rc.getClient()
+	if client == nil {
+		return nil, ErrClosed
+	}
+	seams, err := client.SessionSeams()
+	if rc.reconnectIfError(err, rc.shouldRetryReadOnly) {
+		if client = rc.getClient(); client != nil {
+			return client.SessionSeams()
+		}
+	}
+	return seams, err
+}
+
+// ApplyMandate binds the Ruler's trust-dialog answer as the session mandate,
+// retrying on a broken connection like other methods.
+func (rc *ReconnectingClient) ApplyMandate(sel config.Selections) error {
+	client := rc.getClient()
+	if client == nil {
+		return ErrClosed
+	}
+	err := client.ApplyMandate(sel)
+	if rc.reconnectIfError(err, rc.shouldRetry) {
+		if client = rc.getClient(); client != nil {
+			return client.ApplyMandate(sel)
+		}
+	}
+	return err
 }
 
 var _ courtapi.Client = (*ReconnectingClient)(nil)

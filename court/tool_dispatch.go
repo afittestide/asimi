@@ -18,6 +18,7 @@ import (
 
 	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal"
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/utils"
 	"github.com/afittestide/asimi/storage"
 )
@@ -342,31 +343,111 @@ func (s *Court) StartRitual(name string, key storage.EdictKey, inputs map[string
 
 // --- HostChecker ---
 
-// CheckHostCommand matches a command against config.RunOnHost and
-// config.SafeRunOnHost patterns. Returns (runOnHost, needsApproval).
-func (s *Court) CheckHostCommand(cmd string) (runOnHost, needsApproval bool) {
-	// In isolated-host mode, all commands run on host without approval
+// HostExecRefusedError is returned when a command is routed to the host but the
+// session's mandate carries no host-execution grant. It is a REFUSAL, not an
+// outage, and callers must surface it rather than retrying the command
+// somewhere with more authority — running on the host is strictly more
+// authority than the sandbox, so a fallback would grant what the mandate did
+// not (edict 1036, seam 7).
+type HostExecRefusedError struct {
+	Command string
+	// Reason says why no grant was found, so the refusal is actionable.
+	Reason string
+}
+
+func (e HostExecRefusedError) Error() string {
+	return fmt.Sprintf("refusing to run %q on the host: %s; "+
+		"host execution needs an affirmative grant and none was given", e.Command, e.Reason)
+}
+
+// CheckHostCommand reports whether a command must run on the host
+// (runOnHost), whether that needs a per-command approval (needsApproval), and
+// any refusal (err).
+//
+// The mandate is the sole authority: run_on_host/safe_run_on_host in the
+// committed config are only a *request* to reach the host. Host execution is
+// strictly more authority than the sandbox, so the pattern decides what would
+// run on the host, while the Ruler's SeamHostExec grant decides whether it may.
+// Without the grant — which is the no-dialog case, where the mandate is
+// RestrictiveMandate — the command is refused, fail-closed, with a typed error.
+//
+// isolated-host is checked first and is not a mandate question at all: the
+// operator bypassed the sandbox on the command line, so there is no host seam to
+// gate (seam 8, deliberately not gated).
+func (s *Court) CheckHostCommand(cmd string) (runOnHost, needsApproval bool, err error) {
+	// In isolated-host mode, all commands run on host without approval. This is
+	// the operator's explicit CLI bypass (seam 8), outside the mandate's reach.
 	if s.isolatedHost {
-		return true, false
+		return true, false, nil
 	}
 
-	if s.sessionCfg == nil || s.sessionCfg.Sandbox.RunOnHost == nil {
-		return false, false
+	sandbox := s.hostPatterns()
+	if sandbox.RunOnHost == nil && sandbox.SafeRunOnHost == nil {
+		return false, false, nil
 	}
 
 	// Check SafeRunOnHost first (higher priority - no approval needed)
-	for _, pattern := range s.sessionCfg.Sandbox.SafeRunOnHost {
-		if matched, _ := regexp.MatchString(pattern, cmd); matched {
-			return true, false
+	matched := false
+	for _, pattern := range sandbox.SafeRunOnHost {
+		if ok, _ := regexp.MatchString(pattern, cmd); ok {
+			matched, needsApproval = true, false
+			break
 		}
 	}
 
 	// Check RunOnHost patterns (requires approval)
-	for _, pattern := range s.sessionCfg.Sandbox.RunOnHost {
-		if matched, _ := regexp.MatchString(pattern, cmd); matched {
-			return true, true
+	if !matched {
+		for _, pattern := range sandbox.RunOnHost {
+			if ok, _ := regexp.MatchString(pattern, cmd); ok {
+				matched, needsApproval = true, true
+				break
+			}
 		}
 	}
 
-	return false, false
+	if !matched {
+		return false, false, nil
+	}
+
+	if reason, granted := s.hostExecGrant(); !granted {
+		return false, false, HostExecRefusedError{Command: cmd, Reason: reason}
+	}
+	return true, needsApproval, nil
+}
+
+// hostPatterns returns the sandbox config whose run_on_host patterns decide
+// what *would* run on the host: the mandate's granted config when a mandate is
+// bound, else the session config. The patterns are not narrowed by the mandate
+// (they only say which commands belong on the host), but reading the granted
+// config keeps this path on the same authority as the container it describes.
+func (s *Court) hostPatterns() config.SandboxConfig {
+	if m := s.Mandate(); m != nil && m.Config != nil {
+		return m.Config.Sandbox
+	}
+	if s.sessionCfg != nil {
+		return s.sessionCfg.Sandbox
+	}
+	return config.SandboxConfig{}
+}
+
+// hostExecGrant reports whether the session's mandate carries the explicit
+// host-execution grant, and a human-readable reason when it does not. It reads
+// the grant record, never the effective config: run_on_host in the config is a
+// request, and only Mandate.Grants pins the Ruler's decision.
+func (s *Court) hostExecGrant() (reason string, granted bool) {
+	s.mandateMu.RLock()
+	m := s.mandate
+	s.mandateMu.RUnlock()
+
+	if m == nil {
+		return "no mandate is bound, so no host-execution grant exists", false
+	}
+	g, ok := m.GrantFor(config.SeamHostExec, config.SeamHostRunner)
+	if !ok {
+		return "the mandate records no host-execution decision", false
+	}
+	if !g.Granted {
+		return "the Ruler declined host execution for this session", false
+	}
+	return "", true
 }

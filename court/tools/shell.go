@@ -13,7 +13,7 @@ import (
 // RunShellCommand is a tool for running shell commands in a persistent shell.
 // It uses the runners package for actual execution.
 type RunShellCommand struct {
-	shouldRunOnHost func(cmd string) (runOnHost, needsApproval bool)
+	shouldRunOnHost func(cmd string) (runOnHost, needsApproval bool, err error)
 	runner          runners.Runner
 	msgChan         *chan<- runners.Msg // pointer to Court.msgChan — single source of truth
 	projectRoot     string              // working directory for ephemeral HostRunner
@@ -28,7 +28,7 @@ type RunShellCommand struct {
 // re-read on every ephemeral host runner creation (zero values fall back to
 // runner defaults).
 func NewRunShellCommand(
-	hostChecker func(string) (bool, bool),
+	hostChecker func(string) (bool, bool, error),
 	runner runners.Runner,
 	msgChan *chan<- runners.Msg,
 	projectRoot string,
@@ -75,6 +75,36 @@ func (t *RunShellCommand) newHostRunner(root string) *runners.HostRunner {
 	return hostRunner
 }
 
+// runOnHostFallback runs a command on the host after the sandbox proved
+// unavailable, and reports whether the mandate allowed it. The host checker is
+// the consent gate: if it refuses, or the command does not match a host pattern
+// at all, nothing runs and the caller returns the original sandbox error.
+//
+// It always requires approval: the fallback is not an operator-approved path,
+// so a nil approval channel must deny rather than silently bypass, which is
+// what HostRunner.requestApproval already does.
+func (t *RunShellCommand) runOnHostFallback(
+	ctx context.Context,
+	hostRoot string,
+	input runners.Input,
+	sandboxErr error,
+) (runners.Output, bool) {
+	if t.shouldRunOnHost == nil {
+		return runners.Output{}, false
+	}
+	runOnHost, _, err := t.shouldRunOnHost(input.Command)
+	if err != nil || !runOnHost {
+		slog.Warn("sandbox unavailable and host execution is not granted; refusing",
+			"command", input.Command, "reason", sandboxErr, "refusal", err)
+		return runners.Output{}, false
+	}
+	slog.Warn("sandbox unavailable, running on host (host execution granted)",
+		"command", input.Command)
+	hostRunner := t.newHostRunner(hostRoot)
+	out, _ := hostRunner.Run(ctx, input)
+	return out, true
+}
+
 // runnerFor resolves the runner a call must use: the per-call runner carried in
 // context (the edict's worktree-aware runner) wins over the runner registered at
 // construction time (bound to the Court's project root). Without this, a ritual
@@ -107,10 +137,18 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 		BypassApproval: params.BypassApproval,
 	}
 
-	// Check if command should run on host based on config patterns
+	// Check if command should run on host based on config patterns. A non-nil
+	// error is a REFUSAL (the mandate carries no host-execution grant): return
+	// it without running the command anywhere. Falling through would run it in
+	// the sandbox — or, worse, on the host — under authority the mandate never
+	// granted (edict 1036, seam 7).
 	runOnHost, requiresApproval := false, true
 	if t.shouldRunOnHost != nil {
-		runOnHost, requiresApproval = t.shouldRunOnHost(params.Command)
+		var hostErr error
+		runOnHost, requiresApproval, hostErr = t.shouldRunOnHost(params.Command)
+		if hostErr != nil {
+			return "", hostErr
+		}
 	}
 
 	if runOnHost {
@@ -144,32 +182,30 @@ func (t *RunShellCommand) Call(ctx context.Context, input string) (string, error
 		}
 
 		// SandboxMissingError and SandboxSetupMissingError are permanent
-		// states (missing image or missing .agents/sandbox files). Fall
-		// back to host execution without attempting a restart.
+		// states (missing image or missing .agents/sandbox files).
+		//
+		// Falling back to the host here is a HOST-EXECUTION decision, not a
+		// retry: it lands the command off the sandbox with more authority than
+		// the mandate granted. So it takes the same grant as seam 7, and the
+		// approval bypass that used to be inferred from a nil channel is gone —
+		// it was unsandboxed execution with nobody asked. Without the grant the
+		// sandbox error is returned unchanged (edict 1036, seam 7).
 		if _, isMissing := runErr.(runners.SandboxMissingError); isMissing {
-			slog.Warn("sandbox not available, running on host", "command", runnerInput.Command)
-			hostRunner := t.newHostRunner(hostRoot)
-			bypassApproval := t.msgChan == nil || *t.msgChan == nil
-			hostOutput, hostErr := hostRunner.Run(ctx, runners.Input{
-				Command:        runnerInput.Command,
-				Description:    runnerInput.Description,
-				BypassApproval: bypassApproval,
-			})
+			hostOutput, granted := t.runOnHostFallback(ctx, hostRoot, runnerInput, runErr)
+			if !granted {
+				return "", runErr
+			}
 			output.Output = hostOutput.Output
 			output.ExitCode = hostOutput.ExitCode
-			runErr = hostErr
+			runErr = nil
 		} else if _, isSetupMissing := runErr.(runners.SandboxSetupMissingError); isSetupMissing {
-			slog.Warn("sandbox setup missing, running on host", "command", runnerInput.Command)
-			hostRunner := t.newHostRunner(hostRoot)
-			bypassApproval := t.msgChan == nil || *t.msgChan == nil
-			hostOutput, hostErr := hostRunner.Run(ctx, runners.Input{
-				Command:        runnerInput.Command,
-				Description:    runnerInput.Description,
-				BypassApproval: bypassApproval,
-			})
+			hostOutput, granted := t.runOnHostFallback(ctx, hostRoot, runnerInput, runErr)
+			if !granted {
+				return "", runErr
+			}
 			output.Output = hostOutput.Output
 			output.ExitCode = hostOutput.ExitCode
-			runErr = hostErr
+			runErr = nil
 		} else if runErr != nil {
 			// For transient harness errors, try to restart and retry once
 			if restartErr := runner.Restart(ctx); restartErr != nil {

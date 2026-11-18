@@ -29,9 +29,11 @@ import (
 	"github.com/afittestide/asimi/internal/courtapi"
 	"github.com/afittestide/asimi/internal/ministers"
 	"github.com/afittestide/asimi/internal/repo"
+	"github.com/afittestide/asimi/internal/rpc"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/types"
 	"github.com/afittestide/asimi/internal/utils"
+	"github.com/afittestide/asimi/internal/wire"
 	"github.com/afittestide/asimi/internal/worktree"
 	"github.com/afittestide/asimi/storage"
 
@@ -3906,6 +3908,11 @@ type mockCourtClient struct {
 	submitPromptCalls       int
 	resetMinisterSessionIDs []string
 	restoreMinisterSessions []string
+
+	sessionSeams    []config.Seam
+	sessionSeamsErr error
+	appliedMandates []config.Selections
+	applyMandateFn  func(config.Selections) error
 }
 
 type publishedEvent struct {
@@ -4061,6 +4068,18 @@ func (m *mockCourtClient) ResetMinisterSession(id string, channelID ...string) {
 
 func (m *mockCourtClient) RestoreMinisterSession(tabType string, msgs []schemas.ChatMessage, channelID ...string) error {
 	m.restoreMinisterSessions = append(m.restoreMinisterSessions, tabType)
+	return nil
+}
+
+func (m *mockCourtClient) SessionSeams() ([]config.Seam, error) {
+	return m.sessionSeams, m.sessionSeamsErr
+}
+
+func (m *mockCourtClient) ApplyMandate(sel config.Selections) error {
+	m.appliedMandates = append(m.appliedMandates, sel)
+	if m.applyMandateFn != nil {
+		return m.applyMandateFn(sel)
+	}
 	return nil
 }
 
@@ -9685,6 +9704,718 @@ func TestTerminalBanners_NameLingForEveryAttributedTerminal(t *testing.T) {
 				"the %s banner must name the ling that ended", name)
 			assert.Contains(t, chat.Viewport.View(), "[forge/ling-2] two",
 				"the surviving ling's block is untouched")
+		})
+	}
+}
+
+// trustDialogSeams is the concrete-seam set gh #180 asks the Ruler to judge:
+// mount seams that request a writable bind, and passthrough env vars.
+func trustDialogSeams() []config.Seam {
+	return []config.Seam{
+		{Kind: config.SeamMount, Label: "~/.config/gh", Mount: config.Mount{Source: "/home/u/.config/gh", Destination: "/root/.config/gh"}},
+		{Kind: config.SeamMount, Label: "~/.config/gcloud", Mount: config.Mount{Source: "/home/u/.config/gcloud", Destination: "/root/.config/gcloud"}},
+		{Kind: config.SeamEnv, Label: "GOOGLE_APPLICATION_CREDENTIALS", EnvName: "GOOGLE_APPLICATION_CREDENTIALS"},
+	}
+}
+
+// TestTrustDialog_DefaultsToNothingGranted is the safe-default guarantee: an
+// untouched dialog grants nothing at all and never opens a mount for writing.
+// "Allow all" is an explicit choice, not the pre-checked default (edict 1036).
+func TestTrustDialog_DefaultsToNothingGranted(t *testing.T) {
+	d := NewTrustDialog(trustDialogSeams())
+
+	assert.Equal(t, 0, d.GrantedCount(), "nothing may be granted before the Ruler acts")
+	assert.False(t, d.allowAll, "Allow all must not be the pre-checked default")
+
+	sel := d.Selections()
+	assert.Empty(t, sel.Mounts, "no mount may be granted by default")
+	assert.Empty(t, sel.Env, "no env var may be granted by default")
+}
+
+// TestTrustDialog_GrantIsReadOnlyUntilOpenedForWriting proves the dialog's own
+// read-only default: granting a mount forwards writable=false, and only an
+// explicit `w` turns it writable.
+func TestTrustDialog_GrantIsReadOnlyUntilOpenedForWriting(t *testing.T) {
+	d := NewTrustDialog(trustDialogSeams())
+
+	d.cursor = 1 // ~/.config/gcloud
+	d.Toggle()
+	sel := d.Selections()
+	writable, ok := sel.Mounts["/home/u/.config/gcloud"]
+	require.True(t, ok, "the granted mount must appear in the selections")
+	assert.False(t, writable, "a granted mount is read-only until explicitly opened")
+
+	d.ToggleWritable()
+	sel = d.Selections()
+	assert.True(t, sel.Mounts["/home/u/.config/gcloud"], "an explicit `w` opens the mount for writing")
+}
+
+// TestTrustDialog_WritableIsInertOnEnvAndUngranted ensures authority cannot be
+// widened on a seam that carries none.
+func TestTrustDialog_WritableIsInertOnEnvAndUngranted(t *testing.T) {
+	d := NewTrustDialog(trustDialogSeams())
+
+	// Ungranted mount.
+	d.cursor = 0
+	d.ToggleWritable()
+	assert.Empty(t, d.Selections().Mounts, "writable must not grant an ungranted mount")
+
+	// Env seam.
+	d.cursor = 2
+	d.Toggle()
+	d.ToggleWritable()
+	sel := d.Selections()
+	assert.True(t, sel.Env["GOOGLE_APPLICATION_CREDENTIALS"])
+	assert.Empty(t, sel.Mounts, "an env seam has no writable dimension")
+}
+
+// TestTrustDialog_AllowAllIsExplicitAndNamesEverySeam proves Allow all is an
+// affirmative, all-or-nothing action that grants every requested seam.
+func TestTrustDialog_AllowAllIsExplicitAndNamesEverySeam(t *testing.T) {
+	d := NewTrustDialog(trustDialogSeams())
+
+	d.ToggleAllowAll()
+	assert.True(t, d.allowAll)
+	assert.Equal(t, len(trustDialogSeams()), d.GrantedCount())
+
+	sel := d.Selections()
+	assert.Len(t, sel.Mounts, 2)
+	assert.True(t, sel.Env["GOOGLE_APPLICATION_CREDENTIALS"])
+	// Allow all still respects the request's read-only intent: mounts stay
+	// read-only unless individually opened.
+	for source, writable := range sel.Mounts {
+		assert.False(t, writable, "Allow all must not silently open %s for writing", source)
+	}
+
+	// Toggling off revokes everything, including any widening.
+	d.ToggleWritable()
+	d.ToggleAllowAll()
+	assert.False(t, d.allowAll)
+	assert.Equal(t, 0, d.GrantedCount())
+}
+
+// TestTrustDialog_AllowAllComposesWithAnOpenedMount pins the combination the
+// Chancellor found unpinned: tick a mount, press `w` (the row renders " rw"),
+// then press `a`. The row still renders " rw" — so Selections and the mandate
+// must agree with it, not silently downgrade to ro. Allow all supplies reach,
+// Mounts supplies write; the two compose (edict 1036).
+func TestTrustDialog_AllowAllComposesWithAnOpenedMount(t *testing.T) {
+	d := NewTrustDialog(trustDialogSeams())
+
+	d.cursor = 1 // ~/.config/gcloud
+	d.Toggle()   // grant it
+	d.ToggleWritable()
+	require.True(t, d.writable[1])
+
+	d.ToggleAllowAll() // affirmatively grant everything
+	require.True(t, d.allowAll)
+	require.True(t, d.writable[1], "Allow all must not silently clear an explicit write grant")
+
+	sel := d.Selections()
+	assert.True(t, sel.Mounts["/home/u/.config/gcloud"],
+		"the opened mount must stay writable in the answer Allow all produces")
+	assert.False(t, sel.Mounts["/home/u/.config/gh"],
+		"a mount the Ruler never opened stays read-only")
+
+	// Pin render ⇔ selection ⇔ mandate to one meaning.
+	rendered := d.Render(100)
+	assert.Contains(t, rendered, "~/.config/gcloud rw",
+		"the row the Ruler opened must render rw, matching what it grants")
+
+	requested := &config.Config{}
+	requested.Sandbox.AdditionalMounts = []config.Mount{
+		{Source: "/home/u/.config/gh", Destination: "/root/.config/gh"},
+		{Source: "/home/u/.config/gcloud", Destination: "/root/.config/gcloud"},
+	}
+	m := config.BuildMandate(7, requested, sel)
+	var opened, closed *config.Mount
+	for i := range m.EffectiveSandbox().AdditionalMounts {
+		mt := &m.EffectiveSandbox().AdditionalMounts[i]
+		switch mt.Source {
+		case "/home/u/.config/gcloud":
+			opened = mt
+		case "/home/u/.config/gh":
+			closed = mt
+		}
+	}
+	require.NotNil(t, opened, "the opened mount must be granted")
+	require.NotNil(t, closed, "the Allow-all-reached mount must be granted")
+	assert.False(t, opened.ReadOnly,
+		"a mount the dialog rendered rw must land writable in the mandate")
+	assert.True(t, closed.ReadOnly,
+		"a mount the Ruler never opened must land read-only in the mandate")
+
+	// And the grant record must say so too.
+	g, ok := m.GrantFor(config.SeamMount, "/home/u/.config/gcloud")
+	require.True(t, ok)
+	assert.True(t, g.Writable, "the grant record must agree with the rendered rw")
+
+	// The dialog's own answer never sets AllowAll (it sends the explicit seam
+	// list), so pin the composition at the mandate boundary directly: an
+	// AllowAll answer WITH an opened mount must honour the write.
+	composed := config.BuildMandate(7, requested, config.Selections{
+		AllowAll: true,
+		Mounts:   map[string]bool{"/home/u/.config/gcloud": true},
+	})
+	for _, mt := range composed.EffectiveSandbox().AdditionalMounts {
+		if mt.Source == "/home/u/.config/gcloud" {
+			assert.False(t, mt.ReadOnly,
+				"Allow all plus an opened mount must land writable, not be downgraded to ro")
+		} else {
+			assert.True(t, mt.ReadOnly,
+				"a mount the Ruler never opened must stay read-only under Allow all")
+		}
+	}
+}
+
+// TestTrustDialog_EscDeniesAll proves the negative answer is the restrictive
+// one: esc settles the dialog with no grants at all.
+func TestTrustDialog_EscDeniesAll(t *testing.T) {
+	m := TUIModel{trustDialog: NewTrustDialog(trustDialogSeams()), commandLine: NewCommandLineComponent()}
+
+	newModel, _, handled := m.handleTrustDialogKey("esc")
+	require.True(t, handled, "esc belongs to the dialog")
+	updated := newModel.(TUIModel)
+	assert.Nil(t, updated.trustDialog, "esc must dismiss the dialog")
+}
+
+// TestTrustDialog_EnterSettlesAndDismisses proves enter resolves the dialog and
+// hands the Ruler's answer over exactly once.
+func TestTrustDialog_EnterSettlesAndDismisses(t *testing.T) {
+	m := TUIModel{trustDialog: NewTrustDialog(trustDialogSeams()), commandLine: NewCommandLineComponent()}
+	m.trustDialog.cursor = 1
+	m.trustDialog.Toggle()
+
+	newModel, cmd, handled := m.handleTrustDialogKey("enter")
+	require.True(t, handled, "enter belongs to the dialog")
+	updated := newModel.(TUIModel)
+	assert.Nil(t, updated.trustDialog, "enter must dismiss the dialog")
+	assert.NotNil(t, cmd, "enter must apply the mandate")
+}
+
+// TestTrustDialog_HandsoffNeverOpensTheDialog pins the no-dialog default at the
+// wiring level: with no Ruler to answer, handsoff must never open the chooser
+// (there is nobody to grant), and must instead bind the restrictive mandate
+// immediately. Widening authority because no one was asked is exactly the
+// accident this guards against (edict 1036).
+func TestTrustDialog_HandsoffNeverOpensTheDialog(t *testing.T) {
+	m := TUIModel{handsoff: true, commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{sessionSeams: trustDialogSeams()}
+	m.court = mock
+
+	cmd := m.openTrustDialog(trustDialogSeams(), nil)
+	assert.Nil(t, m.trustDialog, "handsoff must not present a dialog nobody can answer")
+	require.NotNil(t, cmd, "handsoff must bind a mandate without asking")
+
+	cmd()
+	require.Len(t, mock.appliedMandates, 1)
+	assert.Empty(t, mock.appliedMandates[0].Mounts, "handsoff must grant no mounts")
+	assert.Empty(t, mock.appliedMandates[0].Env, "handsoff must grant no env vars")
+	assert.False(t, mock.appliedMandates[0].AllowAll, "handsoff must never imply Allow all")
+}
+
+// TestTrustDialog_InteractiveWaitsForTheRuler is the complement: with a Ruler
+// present the dialog is shown and NO mandate is applied until they answer.
+// A session must not hold host authority just because the screen is up.
+func TestTrustDialog_InteractiveWaitsForTheRuler(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	cmd := m.openTrustDialog(trustDialogSeams(), nil)
+	require.NotNil(t, m.trustDialog, "the chooser must be presented to the Ruler")
+	assert.Nil(t, cmd, "opening the dialog must not apply anything")
+	assert.Empty(t, mock.appliedMandates, "no authority before the Ruler answers")
+}
+
+// TestTrustDialog_EnterAppliesExactlyTheShownSelections proves the wiring hands
+// the Ruler's answer to the court verbatim: a granted read-only mount is
+// forwarded read-only and an ungranted seam is absent (edict 1036).
+func TestTrustDialog_EnterAppliesExactlyTheShownSelections(t *testing.T) {
+	m := TUIModel{trustDialog: NewTrustDialog(trustDialogSeams()), commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	m.trustDialog.cursor = 1 // ~/.config/gcloud
+	m.trustDialog.Toggle()
+
+	_, cmd, handled := m.handleTrustDialogKey("enter")
+	require.True(t, handled)
+	require.NotNil(t, cmd)
+	cmd()
+
+	require.Len(t, mock.appliedMandates, 1)
+	sel := mock.appliedMandates[0]
+	writable, ok := sel.Mounts["/home/u/.config/gcloud"]
+	require.True(t, ok, "the granted mount must be in the answer")
+	assert.False(t, writable, "a granted mount is read-only unless explicitly opened")
+	assert.NotContains(t, sel.Mounts, "/home/u/.config/gh", "an ungranted mount must be absent")
+	assert.Empty(t, sel.Env, "an ungranted env var must be absent")
+}
+
+// TestTrustDialog_EscAppliesNothing proves the negative answer is also wired:
+// esc settles the dialog and sends an empty grant set, so a declined dialog
+// never leaves the raw repository request in force.
+func TestTrustDialog_EscAppliesNothing(t *testing.T) {
+	m := TUIModel{trustDialog: NewTrustDialog(trustDialogSeams()), commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	_, cmd, handled := m.handleTrustDialogKey("esc")
+	require.True(t, handled)
+	require.NotNil(t, cmd)
+	cmd()
+
+	require.Len(t, mock.appliedMandates, 1)
+	assert.Empty(t, mock.appliedMandates[0].Mounts)
+	assert.Empty(t, mock.appliedMandates[0].Env)
+}
+
+// TestTrustDialog_RenderDoesNotOverClaimTheBoundary pins the wording: the
+// dialog only decides seams 2-3, so its title must say these are the *requested*
+// assets and the body must name what stays open regardless of the answer. An
+// empty request must not read as "nothing is exposed" — the session still gets
+// a writable project bind, cache volumes and the host network namespace (edict
+// 1036's "do not over-claim the boundary").
+//
+// The empty branch is CAUSE-QUALIFIED (edict 1036): a genuinely empty request
+// and a request that could not be read are different facts and say different
+// things. This test pins the genuinely-empty case only; the unreadable case is
+// pinned by TestTrustDialog_RenderDistinguishesUnreadableFromEmpty below.
+func TestTrustDialog_RenderDoesNotOverClaimTheBoundary(t *testing.T) {
+	rendered := NewTrustDialog(trustDialogSeams()).Render(80)
+
+	assert.Contains(t, rendered, "requested host assets",
+		"the title must scope the dialog to the requested seams, not all host assets")
+	assert.Contains(t, rendered, "Not covered here",
+		"the dialog must name what it does not govern")
+	assert.Contains(t, rendered, "project directory stays read-write",
+		"the always-open working-tree bind is the worst omission to leave unsaid")
+
+	empty := NewTrustDialog(nil).Render(80)
+	assert.Contains(t, empty, "requested no extra host assets",
+		"an empty request must be described as such, not as an absence of host exposure")
+	assert.NotContains(t, empty, "(no host assets requested)",
+		"the old wording claimed no host assets are exposed, which is false")
+	assert.Contains(t, empty, "Not covered here",
+		"the empty case is exactly where the uncovered seams must be spelled out")
+	assert.NotContains(t, empty, "could not be read",
+		"a genuinely empty request must not be described as a failed read")
+}
+
+// TestTrustDialog_RenderDistinguishesUnreadableFromEmpty is the split the Ruler
+// hit: an unreadable requirement used to render as "(the repository requested
+// no extra host assets)" — a lie when the repo requests six. The unreadable
+// state must say the request could not be read, name the error, and grant
+// nothing; it must not borrow the genuinely-empty wording (edict 1036).
+func TestTrustDialog_RenderDistinguishesUnreadableFromEmpty(t *testing.T) {
+	loadErr := errors.New("rpc: unknown method: SessionSeams")
+	d := NewUnreadTrustDialog(loadErr)
+	require.ErrorIs(t, d.LoadErr(), loadErr)
+
+	rendered := d.Render(90)
+	assert.Contains(t, rendered, "could not be read",
+		"an unreadable request must say so, not claim the repository asked for nothing")
+	assert.Contains(t, rendered, loadErr.Error(),
+		"the failure must be named so the Ruler can act on it")
+	assert.NotContains(t, rendered, "requested no extra host assets",
+		"the unreadable case must NOT borrow the honest-empty wording")
+	assert.NotContains(t, rendered, "Allow all",
+		"an unreadable request offers nothing to allow")
+	assert.Contains(t, rendered, "Not covered here",
+		"the uncovered seams stay disclosed whatever the request state")
+
+	// No answer can grant anything from an unreadable request.
+	assert.Equal(t, 0, d.GrantedCount())
+	d.ToggleAllowAll()
+	assert.Equal(t, 0, d.GrantedCount(), "an unreadable request cannot be allowed")
+	assert.Empty(t, d.Selections().Mounts)
+	assert.Empty(t, d.Selections().Env)
+}
+
+// TestLoadTrustSeams_ReportsAReadFailure pins that a failed read reaches the
+// dialog as an error rather than an empty request (edict 1036).
+func TestLoadTrustSeams_ReportsAReadFailure(t *testing.T) {
+	readErr := errors.New("boom")
+	mock := &mockCourtClient{sessionSeamsErr: readErr}
+
+	msg, ok := loadTrustSeams(mock)().(trustSeamsLoadedMsg)
+	require.True(t, ok)
+	require.ErrorIs(t, msg.err, readErr, "a failed read must be reported, not hidden")
+	assert.Empty(t, msg.seams)
+
+	// No court client at all is a failure too — not an empty request.
+	msg, ok = loadTrustSeams(nil)().(trustSeamsLoadedMsg)
+	require.True(t, ok)
+	require.Error(t, msg.err, "a missing court client cannot read the request")
+}
+
+// TestLoadTrustSeams_SucceedsAfterTransientUnknownMethod pins the handshake
+// race fix from the client side: a CodeUnknownMethod (handlers not registered
+// yet) is retried rather than surfaced, and a later success is reported with
+// its seams and no error (edict 1036).
+func TestLoadTrustSeams_SucceedsAfterTransientUnknownMethod(t *testing.T) {
+	calls := 0
+	court := &seamReadStub{
+		read: func() ([]config.Seam, error) {
+			calls++
+			if calls < 3 {
+				return nil, &wire.Error{Code: wire.CodeUnknownMethod, Message: "unknown method: SessionSeams"}
+			}
+			return trustDialogSeams(), nil
+		},
+	}
+
+	msg, ok := loadTrustSeams(court)().(trustSeamsLoadedMsg)
+	require.True(t, ok)
+	require.NoError(t, msg.err)
+	assert.Len(t, msg.seams, len(trustDialogSeams()))
+	assert.GreaterOrEqual(t, calls, 3, "a transient unknown-method must be retried")
+}
+
+// TestLoadTrustSeams_DoesNotRetryNonTransientErrors keeps the bound honest: an
+// error that cannot improve with time is reported immediately.
+func TestLoadTrustSeams_DoesNotRetryNonTransientErrors(t *testing.T) {
+	calls := 0
+	court := &seamReadStub{
+		read: func() ([]config.Seam, error) {
+			calls++
+			return nil, &wire.Error{Code: wire.CodeDecodeFailed, Message: "bad params"}
+		},
+	}
+
+	msg, ok := loadTrustSeams(court)().(trustSeamsLoadedMsg)
+	require.True(t, ok)
+	require.Error(t, msg.err)
+	assert.Equal(t, 1, calls, "a deterministic failure must not be retried")
+}
+
+// TestTrustDialog_UnreadableAppliesTheRestrictiveMandate proves the wiring: when
+// the request could not be read, the dialog tells the Ruler and the Ruler's
+// answer still applies the restrictive mandate — never a widened one (edict
+// 1036).
+func TestTrustDialog_UnreadableAppliesTheRestrictiveMandate(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	cmd := m.openTrustDialog(nil, errors.New("rpc: peer disconnected"))
+	require.NotNil(t, m.trustDialog, "the Ruler must be told the request could not be read")
+	require.Error(t, m.trustDialog.LoadErr())
+	require.NotNil(t, cmd, "an unreadable request applies the restrictive mandate at once: there is nothing to choose")
+	require.NoError(t, cmd().(mandateAppliedMsg).err)
+
+	require.Len(t, mock.appliedMandates, 1)
+	assert.Empty(t, mock.appliedMandates[0].Mounts, "an unreadable request grants no mounts")
+	assert.Empty(t, mock.appliedMandates[0].Env, "an unreadable request grants no env")
+	assert.False(t, mock.appliedMandates[0].AllowAll, "an unreadable request never implies Allow all")
+
+	// Dismissing it must not apply a second, different mandate.
+	_, applyCmd, handled := m.handleTrustDialogKey("enter")
+	require.True(t, handled)
+	assert.Nil(t, applyCmd, "the unreadable dialog only explains; it applies nothing further")
+	assert.Len(t, mock.appliedMandates, 1)
+}
+
+// TestTrustDialog_ApplyMandateFailureIsSurfaced proves a discarded Ruler answer
+// is visible: the mandate-applied message carries the error and Update toasts
+// it (edict 1036).
+func TestTrustDialog_ApplyMandateFailureIsSurfaced(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{applyMandateFn: func(config.Selections) error {
+		return errors.New("court refused the mandate")
+	}}
+	m.court = mock
+
+	msg := m.applyMandate(restrictiveSelections())()
+	applied, ok := msg.(mandateAppliedMsg)
+	require.True(t, ok)
+	require.Error(t, applied.err)
+
+	newModel, _ := m.Update(applied)
+	updated := newModel.(TUIModel)
+	toasts := updated.commandLine.ActiveToasts()
+	require.NotEmpty(t, toasts, "a failed mandate application must be shown to the Ruler")
+	assert.Equal(t, "error", toasts[len(toasts)-1].Type)
+	assert.Contains(t, toasts[len(toasts)-1].Message, "court refused the mandate")
+}
+
+// seamReadStub is a minimal SessionSeams provider for the retry tests.
+type seamReadStub struct {
+	read func() ([]config.Seam, error)
+}
+
+func (s *seamReadStub) SessionSeams() ([]config.Seam, error) { return s.read() }
+
+// TestTrustDialog_DoesNotClaimToCoverIsolatedHost is seam 8's guarantee, pinned
+// where the Ruler actually reads it (edict 1036): --isolated-host bypasses the
+// sandbox entirely and is NOT GATED — it is a deliberate operator choice on the
+// command line, so the dialog must never imply it is covered.
+//
+// The promise has two halves, both asserted: no seam row corresponds to the
+// flag, and the rendered text names the flag as an operator choice the
+// chooser's answers cannot turn on or off. The dialog must also never claim a
+// sandbox is protecting the session — with this flag set there is none.
+func TestTrustDialog_DoesNotClaimToCoverIsolatedHost(t *testing.T) {
+	d := NewTrustDialog(trustDialogSeams())
+
+	// 1. No row corresponds to the operator's flag, under any answer.
+	assert.False(t, d.Covers(config.HostBypassFlag),
+		"no seam row may claim to cover the operator's --isolated-host flag")
+	for _, seam := range d.seams {
+		assert.NotEqual(t, config.HostBypassFlag, seam.Label)
+		assert.NotEqual(t, config.HostBypassFlag, seam.EnvName)
+		assert.NotEqual(t, config.HostBypassFlag, seam.Mount.Source)
+	}
+	d.ToggleAllowAll()
+	assert.False(t, d.Covers(config.HostBypassFlag),
+		"Allow all must not widen into the flag either")
+
+	// 2. The rendered text cannot read as if the sandbox were in force.
+	rendered := NewTrustDialog(trustDialogSeams()).Render(80)
+	assert.Contains(t, rendered, config.HostBypassFlag,
+		"the dialog must name --isolated-host as outside its answers, not silently omit it")
+	assert.Contains(t, rendered, "operator choice on the command line",
+		"the flag must be described as the operator's act, not a granted seam")
+	assert.Contains(t, rendered, "no dialog answer turns it on or off",
+		"the dialog must say its answers cannot switch the sandbox bypass")
+	assert.NotContains(t, strings.ToLower(rendered), "sandbox is in force",
+		"nothing may assert a sandbox protects a session that bypassed it")
+	assert.NotContains(t, strings.ToLower(rendered), "sandboxed",
+		"the dialog must not call the session sandboxed: --isolated-host has no sandbox")
+}
+
+// TestTrustDialog_UnknownKeyStaysModal pins the dialog as a hard modal: a key
+// it does not recognise is swallowed rather than leaking to the handlers
+// underneath. ctrl+c is not this function's business — TUIModel.Update
+// intercepts it before the dialog is reached, which the test below pins.
+func TestTrustDialog_UnknownKeyStaysModal(t *testing.T) {
+	m := TUIModel{trustDialog: NewTrustDialog(trustDialogSeams()), commandLine: NewCommandLineComponent()}
+
+	newModel, cmd, handled := m.handleTrustDialogKey("q")
+	assert.True(t, handled, "the dialog is modal: an unrecognised key belongs to it")
+	assert.Nil(t, cmd)
+	assert.NotNil(t, newModel.(TUIModel).trustDialog, "an unknown key must not dismiss the dialog")
+}
+
+// TestTrustDialog_CtrlCStillAborts proves the modal does not trap the Ruler:
+// ctrl+c reaches handleCtrlC even while the dialog is up, because Update
+// intercepts it before dispatching to the dialog.
+func TestTrustDialog_CtrlCStillAborts(t *testing.T) {
+	model := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, nil)
+	model.trustDialog = NewTrustDialog(trustDialogSeams())
+
+	newModel, _ := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated := newModel.(TUIModel)
+	assert.False(t, updated.ctrlCLastPress.IsZero(), "ctrl+c must be recorded by handleCtrlC, not eaten by the dialog")
+	assert.NotNil(t, updated.trustDialog, "a first ctrl+c records the press; it does not settle the dialog")
+}
+
+// TestTrustDialog_HostExecNeedsItsOwnRow is seam 7's promise, made true where
+// the Ruler acts on it (edict 1036). The dialog told the Ruler that on-host
+// commands "stay open either way" while `safe_run_on_host` ran them with no
+// consent at all. Now the seam is a row of its own:
+//
+//   - it starts ungranted, like every seam;
+//   - "Allow all" does NOT tick it (unsandboxed authority is not an asset the
+//     sandbox can bound, so no blanket choice may reach it);
+//   - ticking it by name is the only way to send HostExec to the court.
+func TestTrustDialog_HostExecNeedsItsOwnRow(t *testing.T) {
+	seams := append(trustDialogSeams(),
+		config.Seam{Kind: config.SeamHostExec, Label: config.SeamHostRunner})
+	d := NewTrustDialog(seams)
+	hostRow := len(seams) - 1
+
+	assert.False(t, d.Selections().HostExec, "host execution must start ungranted")
+
+	d.ToggleAllowAll()
+	assert.False(t, d.Selections().HostExec,
+		"Allow all must not grant unsandboxed host execution")
+	assert.False(t, d.granted[hostRow], "the host row must stay unticked under Allow all")
+	assert.True(t, d.granted[0], "the ordinary seams are still granted by Allow all")
+
+	// Ungranted seams and env seams carry no host authority.
+	d.ToggleWritable()
+	assert.False(t, d.Selections().HostExec)
+
+	// The Ruler's own row is the only path.
+	d.cursor = hostRow
+	d.Toggle()
+	assert.True(t, d.Selections().HostExec,
+		"ticking the host row by name is the explicit grant")
+
+	// Revoking it takes it away again.
+	d.Toggle()
+	assert.False(t, d.Selections().HostExec, "unticking the row revokes the grant")
+
+	// The rendered row must say the command leaves the sandbox, so the choice
+	// cannot be mistaken for another in-sandbox mount.
+	rendered := NewTrustDialog(seams).Render(100)
+	assert.Contains(t, rendered, "host "+config.SeamHostRunner,
+		"the host seam must be presented as its own row")
+	assert.Contains(t, rendered, "OFF the sandbox",
+		"the row must say the command runs outside the sandbox")
+	assert.NotContains(t, rendered, "on-host commands stay open either way",
+		"the dialog must not claim the seam is ungated now that it is gated")
+}
+
+// TestLoadTrustSeams_RetriesPeerDisconnect pins the second transient branch:
+// a dropped socket is retried exactly like an unregistered method, because the
+// reconnect may already be in flight when the boot-time read happens (edict
+// 1036). Only the unknown-method path was pinned before.
+func TestLoadTrustSeams_RetriesPeerDisconnect(t *testing.T) {
+	calls := 0
+	court := &seamReadStub{
+		read: func() ([]config.Seam, error) {
+			calls++
+			if calls < 2 {
+				return nil, rpc.ErrPeerDisconnected
+			}
+			return trustDialogSeams(), nil
+		},
+	}
+
+	msg, ok := loadTrustSeams(court)().(trustSeamsLoadedMsg)
+	require.True(t, ok)
+	require.NoError(t, msg.err, "a reconnect during boot must not surface as a read failure")
+	assert.Len(t, msg.seams, len(trustDialogSeams()))
+	assert.GreaterOrEqual(t, calls, 2, "a peer disconnect must be retried")
+}
+
+// TestLoadTrustSeams_GivesUpAfterTheBound keeps the retry finite: a Court that
+// never answers must not stall the boot forever. After the bound the read
+// failure is reported so the restrictive mandate applies and the Ruler is told
+// (edict 1036).
+func TestLoadTrustSeams_GivesUpAfterTheBound(t *testing.T) {
+	calls := 0
+	court := &seamReadStub{
+		read: func() ([]config.Seam, error) {
+			calls++
+			return nil, &wire.Error{Code: wire.CodeUnknownMethod, Message: "never ready"}
+		},
+	}
+
+	msg, ok := loadTrustSeams(court)().(trustSeamsLoadedMsg)
+	require.True(t, ok)
+	require.Error(t, msg.err, "a Court that never becomes ready must be reported, not hidden")
+	assert.Equal(t, trustSeamsMaxAttempts, calls,
+		"the retry must stop exactly at the bound, so boot cannot stall")
+	assert.Empty(t, msg.seams)
+}
+
+// TestTrustSeamsLoadedMsg_UpdateForwardsTheError drives the production wiring
+// rather than calling openTrustDialog directly: the boot-time message must
+// carry a read failure into the dialog as a failure. The original defect was a
+// trustSeamsLoadedMsg.err that NOTHING read, so a broken RPC arrived at the
+// dialog looking like an empty request (edict 1036).
+func TestTrustSeamsLoadedMsg_UpdateForwardsTheError(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	readErr := errors.New("rpc: unknown method: SessionSeams")
+	updated, cmd := m.Update(trustSeamsLoadedMsg{err: readErr})
+	model := updated.(TUIModel)
+
+	require.NotNil(t, model.trustDialog, "a failed read must be shown to the Ruler")
+	require.ErrorIs(t, model.trustDialog.LoadErr(), readErr,
+		"the message's error must reach the dialog, not be dropped at the Update boundary")
+	require.NotNil(t, cmd, "an unreadable request applies the restrictive mandate at once")
+	cmd()
+
+	require.Len(t, mock.appliedMandates, 1, "the restrictive mandate must be bound")
+	assert.Empty(t, mock.appliedMandates[0].Mounts, "an unreadable request grants no mounts")
+	assert.Empty(t, mock.appliedMandates[0].Env, "an unreadable request grants no env")
+}
+
+// TestTrustSeamsLoadedMsg_UpdateOpensTheChooser is the success half: a clean
+// read with seams opens the chooser and applies NOTHING until the Ruler
+// answers — a request is not a grant.
+func TestTrustSeamsLoadedMsg_UpdateOpensTheChooser(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	updated, cmd := m.Update(trustSeamsLoadedMsg{seams: trustDialogSeams()})
+	model := updated.(TUIModel)
+
+	require.NotNil(t, model.trustDialog, "a readable request must open the chooser")
+	assert.NoError(t, model.trustDialog.LoadErr())
+	assert.Nil(t, cmd, "opening the chooser must not apply anything")
+	assert.Empty(t, mock.appliedMandates, "no authority before the Ruler answers")
+}
+
+// TestTrustDialog_UnreadableIsInert proves the unreadable dialog cannot be
+// driven into granting anything, whatever keys arrive: there are no rows to
+// move through and no box to tick, so no key sequence can manufacture a grant
+// from a request nobody could read (edict 1036).
+//
+// The second half matters more than it looks. NewUnreadTrustDialog builds a
+// dialog with no seams, so the loadErr guards in rows()/Toggle() are
+// unreachable *through that constructor* — a regression that let a dialog hold
+// stale seams AND a load error would make them the only thing standing between
+// a failed read and a grant. This pins that case directly.
+func TestTrustDialog_UnreadableIsInert(t *testing.T) {
+	d := NewUnreadTrustDialog(errors.New("rpc: peer disconnected"))
+
+	// Movement has nowhere to go: rows() is zero, so the cursor is clamped.
+	d.Move(1)
+	d.Move(-1)
+	d.Move(5)
+
+	// Neither the per-row toggle nor a directed "grant everything" can grant.
+	d.Toggle()
+	for range 20 {
+		d.ToggleWritable()
+	}
+	if got := d.GrantedCount(); got != 0 {
+		t.Fatalf("GrantedCount after toggling an unreadable request = %d, want 0", got)
+	}
+
+	sel := d.Selections()
+	assert.Empty(t, sel.Mounts, "an unreadable request can grant no mount")
+	assert.Empty(t, sel.Env, "an unreadable request can grant no env")
+	assert.False(t, sel.HostExec, "an unreadable request can never grant host execution")
+	assert.False(t, sel.AllowAll, "an unreadable request can never imply Allow all")
+
+	// Defense in depth: never assume the constructor is the only way in.
+	stale := &TrustDialog{
+		seams:    trustDialogSeams(),
+		granted:  make([]bool, len(trustDialogSeams())),
+		writable: make([]bool, len(trustDialogSeams())),
+		loadErr:  errors.New("rpc: peer disconnected"),
+	}
+	stale.Toggle()
+	if got := stale.GrantedCount(); got != 0 {
+		t.Fatalf("a load error must veto a stale seam: GrantedCount = %d, want 0", got)
+	}
+	stale.ToggleWritable()
+	stale.ToggleAllowAll()
+	if got := stale.GrantedCount(); got != 0 {
+		t.Fatalf("Allow all on a load-errored dialog = %d grants, want 0", got)
+	}
+	assert.Empty(t, stale.Selections().Mounts, "a load error must veto stale mount grants")
+	assert.Empty(t, stale.Selections().Env, "a load error must veto stale env grants")
+}
+
+// TestTrustDialog_UnreadableIsDismissibleByKeyboard proves the Ruler is never
+// trapped in a dialog that explains a failure: both accept and deny settle it,
+// and neither sends a second mandate (the restrictive one was already bound).
+func TestTrustDialog_UnreadableIsDismissibleByKeyboard(t *testing.T) {
+	for _, key := range []string{"enter", "esc"} {
+		t.Run(key, func(t *testing.T) {
+			m := TUIModel{
+				trustDialog: NewUnreadTrustDialog(errors.New("rpc: peer disconnected")),
+				commandLine: NewCommandLineComponent(),
+			}
+			mock := &mockCourtClient{}
+			m.court = mock
+
+			newModel, cmd, handled := m.handleTrustDialogKey(key)
+			require.True(t, handled, "the dialog owns the keyboard while it explains a failure")
+			assert.Nil(t, cmd, "the restrictive mandate was already applied; nothing further to send")
+			assert.Nil(t, newModel.(TUIModel).trustDialog, "the key must dismiss the dialog")
+			assert.Empty(t, mock.appliedMandates, "no mandate is re-applied on dismissal")
 		})
 	}
 }

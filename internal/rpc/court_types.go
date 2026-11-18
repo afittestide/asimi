@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/storage"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -221,4 +222,12 @@ type EnsureEdictWorktreeParams struct {
 }
 type EnsureEdictWorktreeResult struct {
 	WorktreeRel string `msgpack:"worktree_rel"`
+}
+
+type SessionSeamsResult struct {
+	Seams []config.Seam `msgpack:"seams"`
+}
+
+type ApplyMandateParams struct {
+	Selections config.Selections `msgpack:"selections"`
 }

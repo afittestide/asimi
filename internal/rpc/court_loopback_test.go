@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/courtapi"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/wire"
@@ -49,6 +50,11 @@ type fakeCourt struct {
 	prompts  []string // "target/message"
 	restored []string // "tabType/N"
 	listed   []string // providers passed to ListModels
+
+	// Seam request: the Court-side answer the trust dialog reads (edict 1036).
+	seams    []config.Seam
+	seamsErr error
+	mandates []config.Selections
 }
 
 func newFakeCourt() *fakeCourt {
@@ -309,6 +315,24 @@ func (f *fakeCourt) ResumeRitual(channelID string) bool {
 
 func (f *fakeCourt) CancellableStreamCtx(_ string) context.Context {
 	return context.Background()
+}
+
+// SessionSeams returns the seam request the committed config recorded, or the
+// read failure the test injected. An empty (nil) seam list with a nil error is
+// the honest "no extra host assets requested" answer (edict 1036).
+func (f *fakeCourt) SessionSeams() ([]config.Seam, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.seams, f.seamsErr
+}
+
+// ApplyMandate records the Ruler's answer so the wire test can assert the
+// selections arrived intact rather than merely that the call returned.
+func (f *fakeCourt) ApplyMandate(sel config.Selections) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mandates = append(f.mandates, sel)
+	return nil
 }
 
 func intString(n int) string {
@@ -941,5 +965,169 @@ func TestLoopbackCourtApproximateContextSizeLocalFallback(t *testing.T) {
 	empty := &LoopbackCourt{}
 	if got := empty.ApproximateContextSize("openai", "gpt-4o"); got != 0 {
 		t.Errorf("ApproximateContextSize with no client and no local = %d, want 0", got)
+	}
+}
+
+// startSeamPair wires a fake Court to a CourtClient over net.Pipe and returns
+// the typed client plus a cleanup that closes both ends.
+func startSeamPair(t *testing.T, impl *fakeCourt) (*CourtClient, func()) {
+	t.Helper()
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+
+	return NewCourtClient(clientConn), func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}
+}
+
+// TestCourtClient_SessionSeams_EmptyIsNotAnError pins the distinction ling
+// 4158031f exists for: a successful read that yields no seams comes back as
+// (nil, nil), while a read that never reached the Court comes back with an
+// error. Collapsing the two was the defect — it made a broken RPC look exactly
+// like "the repository requested nothing" (edict 1036).
+func TestCourtClient_SessionSeams_EmptyIsNotAnError(t *testing.T) {
+	impl := newFakeCourt()
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	seams, err := client.SessionSeams()
+	if err != nil {
+		t.Fatalf("an empty successful answer is not a read failure: %v", err)
+	}
+	if len(seams) != 0 {
+		t.Fatalf("seams = %d, want none to grant", len(seams))
+	}
+}
+
+// TestCourtClient_SessionSeams_ReturnsTheRequestedAssets proves the concrete
+// seams survive the wire intact, so the dialog lists the real request instead
+// of a truncated one.
+func TestCourtClient_SessionSeams_ReturnsTheRequestedAssets(t *testing.T) {
+	impl := newFakeCourt()
+	impl.seams = []config.Seam{
+		{Kind: config.SeamMount, Label: "/home/u/.config/gcloud", Mount: config.Mount{
+			Source: "/home/u/.config/gcloud", Destination: "/root/.config/gcloud", ReadOnly: true,
+		}},
+		{Kind: config.SeamEnv, Label: "GOOGLE_APPLICATION_CREDENTIALS", EnvName: "GOOGLE_APPLICATION_CREDENTIALS"},
+	}
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	seams, err := client.SessionSeams()
+	if err != nil {
+		t.Fatalf("SessionSeams: %v", err)
+	}
+	if len(seams) != 2 {
+		t.Fatalf("seams = %d, want the mount and the env var", len(seams))
+	}
+	if seams[0].Kind != config.SeamMount || seams[0].Mount.Source != "/home/u/.config/gcloud" {
+		t.Errorf("mount seam = %+v, want the requested gcloud mount", seams[0])
+	}
+	if !seams[0].Mount.ReadOnly {
+		t.Error("the requested read-only default must survive the wire")
+	}
+	if seams[1].Kind != config.SeamEnv || seams[1].EnvName != "GOOGLE_APPLICATION_CREDENTIALS" {
+		t.Errorf("env seam = %+v, want the requested env var", seams[1])
+	}
+}
+
+// TestCourtClient_SessionSeams_ReadFailureIsReported is the negative half: the
+// Court cannot answer, so the client must return an error. An empty slice here
+// is exactly the lie that produced the Ruler's empty trust dialog.
+func TestCourtClient_SessionSeams_ReadFailureIsReported(t *testing.T) {
+	impl := newFakeCourt()
+	impl.seamsErr = errors.New("config read failed")
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	seams, err := client.SessionSeams()
+	if err == nil {
+		t.Fatal("a Court that cannot answer must not look like an empty request")
+	}
+	if !strings.Contains(err.Error(), "config read failed") {
+		t.Errorf("err = %v, want the Court-side cause to reach the caller", err)
+	}
+	if len(seams) != 0 {
+		t.Errorf("seams = %v, want nothing to grant after a failed read", seams)
+	}
+}
+
+// TestCourtClient_SessionSeams_UnknownMethodIsNotAnEmptyRequest covers the
+// unregistered-handler case the daemon race produced. It must surface as a
+// CodeUnknownMethod wire error — the exact code loadTrustSeams retries — not as
+// a nil seam list (edict 1036).
+func TestCourtClient_SessionSeams_UnknownMethodIsNotAnEmptyRequest(t *testing.T) {
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	// Deliberately register nothing: this is the pre-handshake daemon state.
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	seams, err := NewCourtClient(clientConn).SessionSeams()
+	if err == nil {
+		t.Fatal("an unregistered method must not read as an empty request")
+	}
+	if len(seams) != 0 {
+		t.Errorf("seams = %v, want nothing to grant", seams)
+	}
+	var we *wire.Error
+	if !errors.As(err, &we) {
+		t.Fatalf("err = %T (%v), want an inspectable *wire.Error for retry classification", err, err)
+	}
+	if we.Code != wire.CodeUnknownMethod {
+		t.Errorf("code = %d, want CodeUnknownMethod (%d): loadTrustSeams retries exactly this code",
+			we.Code, wire.CodeUnknownMethod)
+	}
+}
+
+// TestCourtClient_ApplyMandate_ReachesTheCourt proves the Ruler's answer crosses
+// the wire rather than being silently dropped — the failure mode where a grant
+// was applied to nothing and the repository request stayed in force.
+func TestCourtClient_ApplyMandate_ReachesTheCourt(t *testing.T) {
+	impl := newFakeCourt()
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	sel := config.Selections{
+		Mounts: map[string]bool{"/home/u/.config/gcloud": false},
+		Env:    map[string]bool{"GOOGLE_APPLICATION_CREDENTIALS": true},
+	}
+	if err := client.ApplyMandate(sel); err != nil {
+		t.Fatalf("ApplyMandate: %v", err)
+	}
+
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	if len(impl.mandates) != 1 {
+		t.Fatalf("court received %d mandates, want the Ruler's answer", len(impl.mandates))
+	}
+	got := impl.mandates[0]
+	if got.Mounts["/home/u/.config/gcloud"] != false {
+		t.Errorf("mount answer = %v, want the named mount granted read-only", got.Mounts)
+	}
+	if !got.Env["GOOGLE_APPLICATION_CREDENTIALS"] {
+		t.Errorf("env answer = %v, want the named env var granted", got.Env)
+	}
+	if got.AllowAll {
+		t.Error("an explicit per-seam selection must not arrive as Allow all")
 	}
 }

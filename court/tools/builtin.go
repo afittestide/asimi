@@ -16,10 +16,13 @@ import (
 //
 // Nil fields are safe — the corresponding tools simply won't be registered.
 type ToolRegistrationOpts struct {
-	Ctx         ToolContext
-	Runner      runners.Runner
-	MsgChan     *chan<- runners.Msg
-	HostChecker func(cmd string) (runOnHost, needsApproval bool)
+	Ctx     ToolContext
+	Runner  runners.Runner
+	MsgChan *chan<- runners.Msg
+	// HostChecker decides whether a command must run on the host. A non-nil
+	// error is a refusal: the session's mandate carries no host-execution
+	// grant, and the command must not run (edict 1036, seam 7).
+	HostChecker func(cmd string) (runOnHost, needsApproval bool, err error)
 	DBPath      string
 	// Timeouts is a lazy getter returning the configured host command/approval
 	// deadlines for ephemeral HostRunner instances. Host commands honor

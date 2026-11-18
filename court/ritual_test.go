@@ -1703,6 +1703,59 @@ func TestThenStepFailureEmitsToolCallErrorMsg(t *testing.T) {
 	}
 }
 
+// TestGivenFailureElidesTheChatLineNotTheInput pins the disposition of the
+// court/ritual.go "trim raw" marker: the one-line chat rendering of a failed
+// given is elided, while Input (and the returned error) keep the raw text so
+// the raw history and the failure cause stay complete.
+func TestGivenFailureElidesTheChatLineNotTheInput(t *testing.T) {
+	long := "!echo " + strings.Repeat("x", 300)
+
+	ritual := &RitualDef{
+		Name: "step-given-long-fail",
+		Steps: []RitualStep{
+			{Name: "work", Minister: "forge", Task: "do work", Given: []string{long}},
+		},
+	}
+	registry := NewRitualRegistry()
+	registry.Register(ritual)
+
+	db := setupRitualTestDB(t)
+	court := newRitualTestCourt(t, "step-done\n", nil)
+	mockRunner := &mockCallCountRunner{
+		results: []runners.Output{{Output: "boom\n", ExitCode: "1"}},
+	}
+	runner := NewRitualRunner(registry, court.GetMinister, nil, db, mockRunner, nil, repo.RepoInfo{})
+
+	var messages []any
+	ctx := context.Background()
+	exec, err := runner.Start(ctx, "step-given-long-fail", testEK(17), nil, func(msg any) {
+		messages = append(messages, msg)
+	})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	_ = runner.Run(ctx, exec)
+
+	var errMsg *runners.ToolCallErrorMsg
+	for i := range messages {
+		if m, ok := messages[i].(runners.ToolCallErrorMsg); ok {
+			errMsg = &m
+		}
+	}
+	if errMsg == nil {
+		t.Fatalf("expected a ToolCallErrorMsg for the failed given, got messages: %+v", messages)
+	}
+	if len(errMsg.Formatted) > 60 {
+		t.Errorf("the chat line must be elided to <=60 bytes, got %d: %q", len(errMsg.Formatted), errMsg.Formatted)
+	}
+	if !strings.HasSuffix(errMsg.Formatted, "...") {
+		t.Errorf("an elided line must be marked with \"...\", got %q", errMsg.Formatted)
+	}
+	if errMsg.Input != long {
+		t.Errorf("Input must keep the raw given verbatim; got %d bytes, want %d", len(errMsg.Input), len(long))
+	}
+}
+
 func TestStepLevelGivenEmitsToolCallMessages(t *testing.T) {
 	db := setupRitualTestDB(t)
 
