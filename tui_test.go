@@ -10345,6 +10345,40 @@ func TestTrustSeamsLoadedMsg_UpdateOpensTheChooser(t *testing.T) {
 	assert.Empty(t, mock.appliedMandates, "no authority before the Ruler answers")
 }
 
+// TestTrustSeamsLoadedMsg_UpdateEmptyAppliesRestrictiveMandate pins the
+// genuinely-empty case: a clean read with zero seams has nothing to choose,
+// so the chooser must NOT open. Instead the restrictive mandate is applied at
+// once — the same no-answer default the unreadable path uses — and the
+// session stays disclosed through a toast, not a hard modal (edict 1059).
+func TestTrustSeamsLoadedMsg_UpdateEmptyAppliesRestrictiveMandate(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+
+	updated, cmd := m.Update(trustSeamsLoadedMsg{seams: nil})
+	model := updated.(TUIModel)
+
+	require.Nil(t, model.trustDialog, "an empty request must not open the chooser")
+	require.NotNil(t, cmd, "an empty request applies the restrictive mandate at once")
+	cmd()
+
+	require.Len(t, mock.appliedMandates, 1, "the restrictive mandate must be bound")
+	assert.Empty(t, mock.appliedMandates[0].Mounts, "an empty request grants no mounts")
+	assert.Empty(t, mock.appliedMandates[0].Env, "an empty request grants no env")
+
+	// The skip must be disclosed, not silent: the toast names the mandate and
+	// every seam that stays open despite it (seams 1, 6, 7, 8).
+	toasts := model.commandLine.ActiveToasts()
+	require.Len(t, toasts, 1, "skipping the dialog must surface exactly one disclosure toast")
+	assert.Equal(t, "info", toasts[0].Type, "a genuine empty request is normal operation, not an error")
+	assert.Contains(t, toasts[0].Message, "restrictive mandate applied",
+		"the toast must state what was applied")
+	for _, seam := range []string{"Working dir (rw)", "host network", "run_on_host", config.HostBypassFlag} {
+		assert.Contains(t, toasts[0].Message, seam,
+			"the toast must disclose that %q stays as configured", seam)
+	}
+}
+
 // TestTrustDialog_UnreadableIsInert proves the unreadable dialog cannot be
 // driven into granting anything, whatever keys arrive: there are no rows to
 // move through and no box to tick, so no key sequence can manufacture a grant

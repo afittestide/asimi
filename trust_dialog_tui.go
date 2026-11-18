@@ -96,6 +96,15 @@ func (m *TUIModel) openTrustDialog(seams []config.Seam, loadErr error) tea.Cmd {
 		m.trustDialog = NewUnreadTrustDialog(loadErr)
 		return m.applyMandate(restrictiveSelections())
 	}
+	// A genuinely empty request has nothing to choose. A chooser with no
+	// rows is a hard modal nobody can answer, so the restrictive mandate
+	// is applied at once and a toast discloses what stays open (edict
+	// 1059 / zhengming 44a2a226d637953a).
+	if len(seams) == 0 {
+		slog.Info("empty host asset request: applying restrictive mandate without a trust dialog")
+		m.commandLine.AddToast("Trust: no host assets requested — restrictive mandate applied. Working dir (rw), host network, run_on_host and --isolated-host remain as configured (docs/sandbox-seams.md).", "info", 8*time.Second)
+		return m.applyMandate(restrictiveSelections())
+	}
 	m.trustDialog = NewTrustDialog(seams)
 	return nil
 }

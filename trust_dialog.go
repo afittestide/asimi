@@ -244,7 +244,7 @@ func (d *TrustDialog) Render(width int) string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Allow this session access"))
 	b.WriteString("\n")
-	b.WriteString(hintStyle.Render("The following host resources are requested by the sandbox:"))
+	b.WriteString(hintStyle.Render("The following requested host assets are up for your answer:"))
 	b.WriteString("\n\n")
 
 	switch {
@@ -276,11 +276,11 @@ func (d *TrustDialog) Render(width int) string {
 		switch s.Kind {
 		case config.SeamMount:
 			if d.granted[i] && d.writable[i] {
-				mode = "RW"
+				mode = "rw"
 			} else {
-				mode = "RO"
+				mode = "ro"
 			}
-			b.WriteString(fmt.Sprintf("%s%s %s - %s\n", cursor, box, s.Label, mode))
+			b.WriteString(fmt.Sprintf("%s%s %s %s\n", cursor, box, s.Label, mode))
 		case config.SeamEnv:
 			b.WriteString(fmt.Sprintf("%s%s %s - env var\n", cursor, box, s.Label))
 		case config.SeamHostExec:
@@ -300,6 +300,21 @@ func (d *TrustDialog) Render(width int) string {
 		}
 		b.WriteString(fmt.Sprintf("%s%s Allow all\n", allowCursor, allowBox))
 	}
+
+	// The footer names what this dialog does NOT govern, whatever its state:
+	// these seams are always configured — never chosen here — so the dialog
+	// must not read as if its answers were the whole boundary. The working
+	// tree bind is stated as the one true fact whether or not a sandbox is in
+	// force; --isolated-host is an operator choice on the command line and no
+	// dialog answer turns it on or off (edict 1036, seam 8; docs/sandbox-seams.md).
+	b.WriteString(hintStyle.Render("Not covered here (always as configured):"))
+	b.WriteString("\n")
+	b.WriteString(hintStyle.Render("  project directory stays read-write, host network,"))
+	b.WriteString("\n")
+	b.WriteString(hintStyle.Render(fmt.Sprintf("  run_on_host, %s (operator choice on the command line;", config.HostBypassFlag)))
+	b.WriteString("\n")
+	b.WriteString(hintStyle.Render("  no dialog answer turns it on or off). See docs/sandbox-seams.md"))
+	b.WriteString("\n")
 
 	b.WriteString("\n")
 	return b.String()
