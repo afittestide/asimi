@@ -196,7 +196,9 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 	// Scope identity is resolved from the OS, never from config (edict 1006).
 	s.username = config.OSUsername()
 
-	// Reserve edict 1 for Court Infrastructure operations
+	// Ensure the legacy court infrastructure edict (edict 1) exists. The
+	// reservation is being drawn down: new work should not use edict 1;
+	// system-level invariants use the id-0 Court key.
 	s.ensureCourtInfrastructureEdict()
 
 	// Create all ministers — each needs its own base (channels/maps are reference types).
@@ -1037,8 +1039,8 @@ func (s *Court) EdictKey(edictID uint) storage.EdictKey {
 	return storage.EdictKey{ID: edictID, Username: s.username, Project: s.config.Project}
 }
 
-// CourtEdictKey returns the Court Infrastructure edict key (edict 1).
-// This is used for system-level operations like startup events.
+// CourtEdictKey returns the Court/system edict key (id 0), used for
+// system-level events like startup. It is not edict 1.
 func (s *Court) CourtEdictKey() storage.EdictKey {
 	return storage.EdictKey{ID: 0, Username: s.username, Project: s.config.Project}
 }
@@ -1209,8 +1211,9 @@ func (s *Court) ministerIDs() []string {
 	return ids
 }
 
-// ensureCourtInfrastructureEdict creates edict 1 if it doesn't exist.
-// Edict 1 is reserved for Court Infrastructure operations (init, bootstrap, etc.)
+// ensureCourtInfrastructureEdict creates the legacy court infrastructure edict
+// (edict 1) if it doesn't exist. Its reservation is being drawn down; new work
+// should not use edict 1 — system-level invariants use the id-0 Court key.
 func (s *Court) ensureCourtInfrastructureEdict() {
 	var edict storage.Edict
 	if err := s.db.First(&edict, "id = ? AND username = ? AND project = ?", 1, s.username, s.config.Project).Error; err == nil {
@@ -1260,7 +1263,8 @@ func (s *Court) SetRunner(r runners.Runner) {
 // caching it on first use. Every edict gets its own runner (and therefore its
 // own podman container), so concurrent edicts never share mutable runner state.
 // System rituals (edict 1) and calls with edictID 0 fall back to the Court's
-// main runner, which is also the connection runner.
+// main runner, which is also the connection runner. This bypass is load-
+// bearing and deferred for removal.
 func (s *Court) RunnerForEdict(edictID uint) (runners.Runner, error) {
 	if s == nil {
 		return nil, fmt.Errorf("court not initialized")

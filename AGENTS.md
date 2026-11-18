@@ -14,9 +14,9 @@
 
 ## Reserved Edict IDs
 
-**Edict 1** is reserved for **Court Infrastructure** operations:
-- System-level operations (init, bootstrap, project setup)
-- Infrastructure decisions and precedents
+**Edict 1** was reserved for **Court Infrastructure** operations. This
+reservation is being drawn down (2026-11-18 ruling): new work should not use
+edict 1; system-level invariants use the id-0 Court key (`CourtEdictKey`).
 
 This ensures system operations have proper audit trails and prevents edict_id=0 from breaking precedent tracking.
 

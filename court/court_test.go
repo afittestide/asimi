@@ -132,6 +132,29 @@ func TestCourt_ConnDone_NeverClosed(t *testing.T) {
 	}
 }
 
+// TestCourt_CourtEdictKeyIsIdZero pins the production behavior that
+// CourtEdictKey returns the id-0 Court/system key — not edict 1 — per e972.
+// headless.go (court_started) and tui.go route system events through this key.
+func TestCourt_CourtEdictKeyIsIdZero(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, nil)
+
+	k := s.CourtEdictKey()
+	if k.ID != 0 {
+		t.Errorf("CourtEdictKey().ID = %d, want 0 (Court/system key)", k.ID)
+	}
+	if k.Username != s.username {
+		t.Errorf("CourtEdictKey().Username = %q, want %q", k.Username, s.username)
+	}
+	if k.Project != cfg.Project {
+		t.Errorf("CourtEdictKey().Project = %q, want %q", k.Project, cfg.Project)
+	}
+	if k.ID == s.EdictKey(1).ID {
+		t.Errorf("CourtEdictKey() must not be the edict-1 key (doc e972)")
+	}
+}
+
 // runGit runs a git command in the given directory, failing the test on error.
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()

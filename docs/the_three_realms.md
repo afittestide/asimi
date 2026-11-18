@@ -66,4 +66,5 @@ Keep three axes apart or every ruling contradicts the last:
 ### The Seal Chain — ascension
 
   Judge's Seal → Chancellor's Seal → Ruler's Seal → 頒行.
-  `seals/` is the only immutable history. Only Edict 1 does not ascend.
+  `seals/` is the only immutable history. All edicts ascend; the historical
+  edict-1 exemption is being eliminated.

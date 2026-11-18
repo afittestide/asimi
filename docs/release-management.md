@@ -170,6 +170,9 @@ bump, roadmap update, verification (including the `just get-threats` vulnerabili
 gate), chancellor review, commit-and-tag, and finally asks the Ruler to confirm
 the push via zhengming.
 
+Create a dedicated release edict and enact `release-version` bound to it (one
+edict per release); do not use edict 1.
+
 ## See Also
 
 - [docs/roadmap.md](roadmap.md) - Planned and in-flight work

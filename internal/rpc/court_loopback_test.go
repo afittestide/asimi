@@ -78,7 +78,7 @@ func (f *fakeCourt) EdictKey(edictID uint) storage.EdictKey {
 }
 
 func (f *fakeCourt) CourtEdictKey() storage.EdictKey {
-	return storage.EdictKey{ID: 1, Username: "alice", Project: "asimi"}
+	return storage.EdictKey{ID: 0, Username: "alice", Project: "asimi"}
 }
 
 func (f *fakeCourt) CreateEdict(issueRef, intent, sessionID string) (*storage.Edict, error) {
@@ -368,7 +368,7 @@ func TestCourtRPCLoopback(t *testing.T) {
 	if k := client.EdictKey(42); k.ID != 42 || k.Username != "alice" {
 		t.Errorf("EdictKey = %+v", k)
 	}
-	if k := client.CourtEdictKey(); k.ID != 1 {
+	if k := client.CourtEdictKey(); k.ID != 0 {
 		t.Errorf("CourtEdictKey = %+v", k)
 	}
 
