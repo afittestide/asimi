@@ -208,11 +208,20 @@ func (s *SealService) GetSealStatus(key EdictKey) (map[string]bool, error) {
 // left untouched and reports false, which makes retirement idempotent. Use it
 // instead of raw SQL when the Court or a minister closes a prompt nobody
 // answered (e1010).
+//
+// Only the three terminal dispositions are accepted, each with its own
+// distinct cause — they are never interchangeable (e1037):
+//
+//	expired             — the clock ran out; nobody answered by the deadline.
+//	superseded_by_edict — the target edict ended (Ruler-sealed or cancelled),
+//	                      so the question no longer applies.
+//	dismissed           — a newer execution of the same work superseded the
+//	                      prompt; the edict itself still stands.
 func (s *SealService) DisposeZhengming(requestID string, status ZhengmingStatus, reason string) (bool, error) {
 	if requestID == "" {
 		return false, fmt.Errorf("request_id is required")
 	}
-	if status != ZhengmingDismissed && status != ZhengmingExpired {
+	if !TerminalZhengmingStatus(status) {
 		return false, fmt.Errorf("status %q is not a terminal disposition", status)
 	}
 

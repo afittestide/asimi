@@ -217,13 +217,40 @@ const (
 	ZhengmingPending  ZhengmingStatus = "pending"
 	ZhengmingAnswered ZhengmingStatus = "answered"
 	ZhengmingExpired  ZhengmingStatus = "expired"
-	// ZhengmingDismissed marks a prompt the Court retired without the Ruler
-	// answering it — a superseded abort-recovery prompt, or a request closed by
-	// a sanctioned disposition (including a Ruler abandonment). It is NOT
+	// ZhengmingDismissed marks a prompt the Court retired because a newer
+	// execution of the same work superseded it (or a sanctioned manual
+	// dismissal). The edict still stands and may be gated again. It is NOT
 	// 'answered': the record must not claim the Ruler spoke when the Court
 	// retired the prompt. The reason is recorded in DispositionReason.
 	ZhengmingDismissed ZhengmingStatus = "dismissed"
+	// ZhengmingSupersededByEdict marks a prompt whose target edict ended —
+	// Ruler-sealed or cancelled — so the question no longer applies. Distinct
+	// from ZhengmingExpired (the clock ran out) and ZhengmingDismissed (the
+	// work was superseded while the edict stands); the three must never be
+	// used interchangeably (e1037).
+	ZhengmingSupersededByEdict ZhengmingStatus = "superseded_by_edict"
 )
+
+// TerminalZhengmingStatus reports whether status is one of the three terminal
+// dispositions a Court-initiated retirement may write: dismissed (a newer
+// execution superseded the work), expired (the deadline elapsed and nobody
+// answered), or superseded_by_edict (the target edict ended — sealed or
+// cancelled). The set is closed: a caller cannot admit a fourth terminal
+// status by accident (e1037).
+func TerminalZhengmingStatus(status ZhengmingStatus) bool {
+	switch status {
+	case ZhengmingDismissed, ZhengmingExpired, ZhengmingSupersededByEdict:
+		return true
+	}
+	return false
+}
+
+// Legacy zhengming vocabulary note (e1037): the live database holds terminal
+// rows written before the typed set above existed — 'cancelled' (15 rows) and
+// 'resolved' (8 rows), alongside the typed 'dismissed' (1120) and 'expired'
+// (244). Those legacy values predate the typed set and are left untouched;
+// history is not rewritten and no second spelling of any typed status is
+// minted. New writers must use the typed constants only.
 
 // Zhengming represents a clarification request from a minister
 type Zhengming struct {

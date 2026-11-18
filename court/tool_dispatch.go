@@ -64,6 +64,11 @@ func (s *Court) RequestZhengming(ctx context.Context, key storage.EdictKey, ques
 		}
 	}
 
+	// The deadline is written but deliberately not consumed (Ruler ruling
+	// 2026-11-18: a question never goes stale — it is answered by the Ruler or
+	// ends when its edict seals). Do not add a timeout_at reader without a new
+	// ruling. See also: the terminal-dispositions vocabulary in
+	// storage/court_schema.go.
 	req := storage.Zhengming{
 		RequestID:  requestID,
 		EdictID:    key.ID,

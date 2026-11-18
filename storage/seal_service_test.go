@@ -545,6 +545,10 @@ func TestDisposeZhengming_IdempotentAndUnblocks(t *testing.T) {
 
 // TestDisposeZhengming_RejectsNonTerminalStatus guards the typed vocabulary: a
 // caller cannot dispose a prompt into a non-terminal or non-dismissed state.
+// Extended by e1037: the guard is now a predicate over the three terminal
+// dispositions (dismissed, expired, superseded_by_edict) — anything else,
+// including pending and the deprecated-but-still-terminal legacy spellings
+// that never joined the typed set, must be refused.
 func TestDisposeZhengming_RejectsNonTerminalStatus(t *testing.T) {
 	db := setupSealServiceTestDB(t)
 	svc := NewSealService(db)
@@ -552,7 +556,88 @@ func TestDisposeZhengming_RejectsNonTerminalStatus(t *testing.T) {
 	if _, err := svc.DisposeZhengming("req-1", ZhengmingAnswered, "nope"); err == nil {
 		t.Error("disposing into 'answered' must be refused")
 	}
+	if _, err := svc.DisposeZhengming("req-1", ZhengmingPending, "nope"); err == nil {
+		t.Error("disposing into 'pending' must be refused")
+	}
+	if _, err := svc.DisposeZhengming("req-1", ZhengmingStatus("cancelled"), "nope"); err == nil {
+		t.Error("the legacy 'cancelled' spelling must be refused — history is not rewritten")
+	}
+	if _, err := svc.DisposeZhengming("req-1", ZhengmingStatus("resolved"), "nope"); err == nil {
+		t.Error("the legacy 'resolved' spelling must be refused — history is not rewritten")
+	}
 	if _, err := svc.DisposeZhengming("", ZhengmingDismissed, "nope"); err == nil {
 		t.Error("an empty request_id must be refused")
+	}
+}
+
+// TestDisposeZhengming_SupersededByEdict guards the e1037 vocabulary: a
+// prompt whose target edict ended is retired as superseded_by_edict — a
+// distinct fact from 'expired' — and its answer stays untouched: the Ruler
+// never spoke.
+func TestDisposeZhengming_SupersededByEdict(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	edict := Edict{ID: 11, Username: "testuser", Project: "testproject", Intent: "superseded"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("create edict: %v", err)
+	}
+	req := Zhengming{
+		RequestID: "req-super", EdictID: edict.ID, Username: "testuser", Project: "testproject",
+		MinisterID: "secretary", Questions: ZhengmingQuestions{{Text: "still relevant?"}},
+		Status: ZhengmingPending, Priority: PriorityNormal, TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&req).Error; err != nil {
+		t.Fatalf("create zhengming: %v", err)
+	}
+
+	wrote, err := svc.DisposeZhengming("req-super", ZhengmingSupersededByEdict, "court: edict cancelled")
+	if err != nil {
+		t.Fatalf("dispose: %v", err)
+	}
+	if !wrote {
+		t.Fatal("dispose wrote no row, want one")
+	}
+
+	var got Zhengming
+	if err := db.First(&got, "request_id = ?", "req-super").Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != ZhengmingSupersededByEdict {
+		t.Errorf("status = %q, want superseded_by_edict", got.Status)
+	}
+	if got.DispositionReason != "court: edict cancelled" {
+		t.Errorf("disposition_reason = %q, want it recorded verbatim", got.DispositionReason)
+	}
+	if got.Answer != "" {
+		t.Errorf("answer = %q, want empty — the Ruler never spoke", got.Answer)
+	}
+	if got.AnsweredAt != nil {
+		t.Error("answered_at set on a superseded prompt, want nil")
+	}
+
+	// A second dispose with a different terminal status is a reported no-op:
+	// the row is no longer pending, so the disposition cannot be rewritten.
+	wrote, err = svc.DisposeZhengming("req-super", ZhengmingExpired, "court: deadline elapsed")
+	if err != nil {
+		t.Fatalf("second dispose: %v", err)
+	}
+	if wrote {
+		t.Error("second dispose wrote a row, want none (idempotent)")
+	}
+	if err := db.First(&got, "request_id = ?", "req-super").Error; err != nil {
+		t.Fatalf("reload after second dispose: %v", err)
+	}
+	if got.Status != ZhengmingSupersededByEdict {
+		t.Errorf("status rewritten to %q, want superseded_by_edict preserved", got.Status)
+	}
+
+	// The retirement lifts the block on the edict.
+	status, err := svc.GetEdictStatus(edict.Key())
+	if err != nil {
+		t.Fatalf("get status: %v", err)
+	}
+	if status == EdictBlocked {
+		t.Error("status = blocked after dispose, want unblocked")
 	}
 }

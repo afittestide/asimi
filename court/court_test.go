@@ -6180,3 +6180,486 @@ func TestCourt_IsolatedHostIsNotADialogSeam(t *testing.T) {
 		assert.False(t, granted, "a grant record for the CLI flag must be impossible")
 	}
 }
+
+// --- Pending zhengming triage before delivery (e1037) ---
+
+// insertTriageZhengming seeds one pending request and returns its ID.
+func insertTriageZhengming(t *testing.T, db *gorm.DB, req storage.Zhengming) string {
+	t.Helper()
+	if req.Username == "" {
+		req.Username = config.OSUsername()
+	}
+	if req.Project == "" {
+		req.Project = "testproject"
+	}
+	if req.MinisterID == "" {
+		req.MinisterID = "secretary"
+	}
+	req.Status = storage.ZhengmingPending
+	if req.Priority == "" {
+		req.Priority = storage.PriorityNormal
+	}
+	if req.TimeoutAt.IsZero() {
+		req.TimeoutAt = time.Now().Add(24 * time.Hour)
+	}
+	require.NoError(t, db.Create(&req).Error)
+	return req.RequestID
+}
+
+// insertTriageEdict seeds a live edict and returns it.
+func insertTriageEdict(t *testing.T, db *gorm.DB, intent string) storage.Edict {
+	t.Helper()
+	edict := storage.Edict{Intent: intent, Username: config.OSUsername(), Project: "testproject"}
+	require.NoError(t, db.Create(&edict).Error)
+	return edict
+}
+
+// triageDisposition fetches a request's recorded terminal disposition, failing
+// if it is still pending. It asserts the honest-vocabulary rule: answer stays
+// empty for every Court-initiated retirement.
+func triageDisposition(t *testing.T, db *gorm.DB, requestID string) (storage.ZhengmingStatus, string) {
+	t.Helper()
+	var got storage.Zhengming
+	require.NoError(t, db.First(&got, "request_id = ?", requestID).Error)
+	assert.NotEqual(t, storage.ZhengmingPending, got.Status, "request %s should be terminal", requestID)
+	assert.Empty(t, got.Answer, "a Court retirement must never claim the Ruler answered")
+	return got.Status, got.DispositionReason
+}
+
+func assertStillPending(t *testing.T, db *gorm.DB, requestID string) {
+	t.Helper()
+	var got storage.Zhengming
+	require.NoError(t, db.First(&got, "request_id = ?", requestID).Error)
+	assert.Equal(t, storage.ZhengmingPending, got.Status, "request %s must survive triage", requestID)
+}
+
+// TestZhengmingTriage_RetirementClasses is the table-driven core: one case per
+// class, each proving the terminal status and the disposition reason name the
+// class, and that nothing outside the class is retired.
+func TestZhengmingTriage_RetirementClasses(t *testing.T) {
+	tests := []struct {
+		name       string
+		fixture    func(t *testing.T, s *Court, db *gorm.DB) string
+		wantStatus storage.ZhengmingStatus
+		wantReason string
+		wantClass  string
+	}{
+		{
+			name: "A: edict ascended on a live Ruler seal",
+			fixture: func(t *testing.T, s *Court, db *gorm.DB) string {
+				edict := insertTriageEdict(t, db, "ascend me")
+				require.NoError(t, db.Create(&storage.Seal{
+					SealID: "seal-live", EdictID: edict.ID, Username: edict.Username,
+					Project: edict.Project, MinisterID: "ruler",
+				}).Error)
+				return insertTriageZhengming(t, db, storage.Zhengming{
+					RequestID: "class-a", EdictID: edict.ID,
+					Questions: storage.ZhengmingQuestions{{Text: "still needed?"}},
+				})
+			},
+			wantStatus: storage.ZhengmingSupersededByEdict,
+			wantReason:  "court: edict ascended (Ruler sealed)",
+			wantClass:   zhengmingClassAscended,
+		},
+		{
+			name: "B: edict cancelled",
+			fixture: func(t *testing.T, s *Court, db *gorm.DB) string {
+				edict := insertTriageEdict(t, db, "cancel me")
+				require.NoError(t, db.Model(&storage.Edict{}).
+					Where("id = ? AND username = ? AND project = ?", edict.ID, edict.Username, edict.Project).
+					Update("cancelled_at", time.Now()).Error)
+				return insertTriageZhengming(t, db, storage.Zhengming{
+					RequestID: "class-b", EdictID: edict.ID,
+					Questions: storage.ZhengmingQuestions{{Text: "anyone?"}},
+				})
+			},
+			wantStatus: storage.ZhengmingSupersededByEdict,
+			wantReason:  "court: edict cancelled",
+			wantClass:   zhengmingClassCancelled,
+		},
+		{
+			name: "C: older prompt superseded by a newer exec marker",
+			fixture: func(t *testing.T, s *Court, db *gorm.DB) string {
+				edict := insertTriageEdict(t, db, "supersede me")
+				old := insertTriageZhengming(t, db, storage.Zhengming{
+					RequestID: "class-c-old", EdictID: edict.ID, MinisterID: "forge",
+					Questions: storage.ZhengmingQuestions{{Text: "aborted at step 0 [exec:exec-old]"}},
+					CreatedAt: time.Now().Add(-2 * time.Minute),
+				})
+				insertTriageZhengming(t, db, storage.Zhengming{
+					RequestID: "class-c-new", EdictID: edict.ID, MinisterID: "forge",
+					Questions: storage.ZhengmingQuestions{{Text: "aborted at step 3 [exec:exec-new]"}},
+					CreatedAt: time.Now().Add(-time.Minute),
+				})
+				return old
+			},
+			wantStatus: storage.ZhengmingDismissed,
+			wantReason:  "court: superseded by execution exec-new",
+			wantClass:   zhengmingClassSuperseded,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, db := newDisposalTestCourt(t)
+			requestID := tt.fixture(t, s, db)
+
+			pending, err := s.pendingZhengming()
+			require.NoError(t, err)
+			plan := s.planZhengmingRetirements(pending)
+			require.Len(t, plan, 1, "exactly the class fixture must be planned for retirement")
+			assert.Equal(t, tt.wantReason, plan[0].reason)
+			assert.Equal(t, tt.wantClass, plan[0].class)
+			assert.Equal(t, tt.wantStatus, plan[0].status, "classes A/B retire as superseded_by_edict, class C as dismissed")
+
+			// The plan must survive the actual write path.
+			require.NoError(t, s.DisposeZhengmingWithStatus(plan[0].requestID, plan[0].status, plan[0].reason))
+			status, reason := triageDisposition(t, db, requestID)
+			assert.Equal(t, tt.wantStatus, status)
+			assert.Equal(t, tt.wantReason, reason)
+		})
+	}
+}
+
+// TestZhengmingTriage_CoarseDedupGuard pins the forbidden dedup key: edict 1 +
+// secretary holds seven genuinely distinct questions. Keying on
+// (edict_id, minister_id) alone would silently retire six real gates — the
+// violation of rejected precedent ec8778ea02990cf4: a gate may never be
+// silently skipped, displaced, or inferred.
+func TestZhengmingTriage_CoarseDedupGuard(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	questions := []string{
+		"Leaked OpenRouter key 9a30fbb09e48a2f4 — rotate it?",
+		"Worktree disk at 98% 0b9b245663425304 — prune?",
+		"13 open incidents 4bd9456d1ec51454 — triage them?",
+		"Docs drift 38f69c2db203ae92 — regenerate?",
+		"Stale branch e0 — delete?",
+		"Manifest ledger out of date — reforge?",
+		"Ritual registry has an unregistered name — fix?",
+	}
+	for i, q := range questions {
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: fmt.Sprintf("edict1-secretary-%d", i),
+			EdictID:   1, MinisterID: "secretary",
+			Questions: storage.ZhengmingQuestions{{Text: q}},
+			CreatedAt: time.Now().Add(-time.Duration(len(questions)-i) * time.Minute),
+		})
+	}
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	require.Len(t, pending, len(questions))
+	assert.Empty(t, s.planZhengmingRetirements(pending),
+		"seven distinct questions on edict 1 must all survive: a coarse (edict_id, minister_id) key would kill six real gates")
+}
+
+// TestZhengmingTriage_ExecMarkerDedup covers guard 2: only the older of a
+// marker pair is retired (as dismissed, never superseded_by_edict), a lone
+// marker is spared, and markerless clusters are left for the Secretary.
+func TestZhengmingTriage_ExecMarkerDedup(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	// e1021's pair.
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "e1021-old", EdictID: 1021, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort recovery [exec:e1021-exec-a]"}},
+		CreatedAt: time.Now().Add(-30 * time.Minute),
+	})
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "e1021-new", EdictID: 1021, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort recovery [exec:e1021-exec-b]"}},
+		CreatedAt: time.Now().Add(-10 * time.Minute),
+	})
+	// e1036's pair.
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "e1036-old", EdictID: 1036, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort recovery [exec:e1036-exec-a]"}},
+		CreatedAt: time.Now().Add(-40 * time.Minute),
+	})
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "e1036-new", EdictID: 1036, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort recovery [exec:e1036-exec-b]"}},
+		CreatedAt: time.Now().Add(-5 * time.Minute),
+	})
+	// A lone marker must never be superseded by itself.
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "lone-marker", EdictID: 1037, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort recovery [exec:e1037-exec-a]"}},
+		CreatedAt: time.Now().Add(-20 * time.Minute),
+	})
+	// A markerless cluster on one edict stays pending.
+	for i := 0; i < 3; i++ {
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: fmt.Sprintf("e1026-forge-%d", i),
+			EdictID:   1026, MinisterID: "forge",
+			Questions: storage.ZhengmingQuestions{{Text: fmt.Sprintf("question %d", i)}},
+			CreatedAt: time.Now().Add(-time.Duration(10-i) * time.Minute),
+		})
+	}
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	plan := s.planZhengmingRetirements(pending)
+	require.Len(t, plan, 2, "exactly the two older marker prompts are superseded")
+	reasons := map[string]zhengmingRetirement{}
+	for _, r := range plan {
+		reasons[r.requestID] = r
+	}
+	assert.Equal(t, "court: superseded by execution e1021-exec-b", reasons["e1021-old"].reason)
+	assert.Equal(t, storage.ZhengmingDismissed, reasons["e1021-old"].status)
+	assert.Equal(t, "court: superseded by execution e1036-exec-b", reasons["e1036-old"].reason)
+	assert.Equal(t, storage.ZhengmingDismissed, reasons["e1036-old"].status)
+	_, hasNew := reasons["e1021-new"]
+	assert.False(t, hasNew, "the newer marker prompt must survive")
+}
+
+// TestZhengmingTriage_NoOrphanClass is the deleted-class-D regression: a
+// pending request whose edict row does not exist (edict_id just above
+// MAX(edicts.id), older than 24h) now SURVIVES triage. Its repair belongs to
+// e1009, not here.
+func TestZhengmingTriage_NoOrphanClass(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	var maxID uint
+	require.NoError(t, db.Model(&storage.Edict{}).Select("COALESCE(MAX(id),0)").Scan(&maxID).Error)
+	minted := maxID + 1
+
+	id := insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "aged-no-edict", EdictID: minted, MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{Text: "who am I?"}},
+		CreatedAt: time.Now().Add(-48 * time.Hour),
+	})
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	assert.Empty(t, s.planZhengmingRetirements(pending),
+		"class D is deleted: a request with no edict row survives, however old")
+	assertStillPending(t, db, id)
+}
+
+// TestZhengmingTriage_TombstonedSealDoesNotRetire covers guard 4: a tombstoned
+// Ruler seal (stale_at set) means the edict still reads active, so the pending
+// request keeps its gate.
+func TestZhengmingTriage_TombstonedSealDoesNotRetire(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict := insertTriageEdict(t, db, "intent changed after sealing")
+
+	stale := time.Now().Add(-time.Hour)
+	require.NoError(t, db.Create(&storage.Seal{
+		SealID: "seal-stale", EdictID: edict.ID, Username: edict.Username,
+		Project: edict.Project, MinisterID: "ruler", StaleAt: &stale,
+	}).Error)
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "after-tombstone", EdictID: edict.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "still open?"}},
+	})
+
+	status, err := s.GetSealService().GetEdictStatus(edict.Key())
+	require.NoError(t, err)
+	require.NotEqual(t, storage.EdictSealed, status, "a tombstoned seal must not read as sealed")
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	assert.Empty(t, s.planZhengmingRetirements(pending),
+		"a stale seal is not a retirement reason — the edict is still active")
+	assertStillPending(t, db, "after-tombstone")
+}
+
+// TestZhengmingTriage_NeverRetiresPermanentEdicts pins the explicit carve-out:
+// edict 1 (Court Infrastructure) and edict 0 (the unscoped pseudo-edict) are
+// permanent, whatever else is true of their prompts.
+func TestZhengmingTriage_NeverRetiresPermanentEdicts(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	for _, edictID := range []uint{0, 1} {
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: fmt.Sprintf("permanent-%d", edictID),
+			EdictID:   edictID, MinisterID: "secretary",
+			Questions: storage.ZhengmingQuestions{{Text: "old but permanent"}},
+			CreatedAt: time.Now().Add(-30 * 24 * time.Hour),
+		})
+	}
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	assert.Empty(t, s.planZhengmingRetirements(pending),
+		"edicts 0 and 1 are permanent: never retired")
+}
+
+// TestZhengmingTriage_NeverConsultsTimeoutAt pins the deadline rule: triage
+// never dedups or retires on timeout_at (it has no consumer — Ruler ruling
+// 2026-11-18), so a row far past deadline with a live target survives.
+func TestZhengmingTriage_NeverConsultsTimeoutAt(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict := insertTriageEdict(t, db, "live target")
+
+	id := insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "far-past-deadline", EdictID: edict.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "still live?"}},
+		TimeoutAt: time.Now().Add(-100 * 24 * time.Hour),
+		CreatedAt: time.Now().Add(-101 * 24 * time.Hour),
+	})
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	assert.Empty(t, s.planZhengmingRetirements(pending),
+		"timeout_at must never be a triage key: a live target survives however late")
+	assertStillPending(t, db, id)
+}
+
+// TestZhengmingTriage_OutOfScopeRowsNeverTriaged pins the scoping guard:
+// rows in another user's or project's ledger are never retired.
+func TestZhengmingTriage_OutOfScopeRowsNeverTriaged(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	for _, req := range []storage.Zhengming{
+		{RequestID: "other-user", EdictID: 2, Username: "someone-else", Project: "testproject",
+			MinisterID: "secretary", Questions: storage.ZhengmingQuestions{{Text: "theirs"}},
+			TimeoutAt: time.Now().Add(time.Hour), CreatedAt: time.Now().Add(-48 * time.Hour)},
+		{RequestID: "other-project", EdictID: 9002, Username: config.OSUsername(), Project: "some-other-project",
+			MinisterID: "secretary", Questions: storage.ZhengmingQuestions{{Text: "theirs"}},
+			TimeoutAt: time.Now().Add(time.Hour), CreatedAt: time.Now().Add(-48 * time.Hour)},
+	} {
+		req.Status = storage.ZhengmingPending
+		require.NoError(t, db.Create(&req).Error)
+	}
+
+	survivors, counts, ok := s.triagePendingZhengming()
+	assert.False(t, ok, "no in-scope rows exist: the pass short-circuits without claiming anything")
+	assert.Equal(t, 0, counts.Retired, "out-of-scope rows must never be triaged")
+	assert.Empty(t, survivors, "no in-scope rows exist: the survivors list must be empty")
+	for _, foreign := range []string{"other-user", "other-project"} {
+		assertStillPending(t, db, foreign)
+	}
+}
+
+// TestZhengmingTriage_RetiresSurvivorsCounts covers the entry point's shape:
+// triage retires classes A/B/C, returns the survivors, and counts only
+// dispositions actually written.
+func TestZhengmingTriage_RetiresSurvivorsCounts(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	// Two ascended edicts, one cancelled, one superseded pair, one survivor.
+	for i := 0; i < 2; i++ {
+		edict := insertTriageEdict(t, db, fmt.Sprintf("ascended %d", i))
+		require.NoError(t, db.Create(&storage.Seal{
+			SealID: fmt.Sprintf("seal-asc-%d", i), EdictID: edict.ID, Username: edict.Username,
+			Project: edict.Project, MinisterID: "ruler",
+		}).Error)
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: fmt.Sprintf("asc-%d", i), EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "?"}},
+		})
+	}
+	cancelled := insertTriageEdict(t, db, "cancelled")
+	require.NoError(t, db.Model(&storage.Edict{}).
+		Where("id = ? AND username = ? AND project = ?", cancelled.ID, cancelled.Username, cancelled.Project).
+		Update("cancelled_at", time.Now()).Error)
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "cancelled-1", EdictID: cancelled.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "?"}},
+	})
+	superseded := insertTriageEdict(t, db, "superseded")
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "sup-old", EdictID: superseded.ID, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort [exec:old]"}},
+		CreatedAt: time.Now().Add(-10 * time.Minute),
+	})
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "sup-new", EdictID: superseded.ID, MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{Text: "abort [exec:new]"}},
+		CreatedAt: time.Now().Add(-time.Minute),
+	})
+	survivor := insertTriageEdict(t, db, "still open")
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "survivor-1", EdictID: survivor.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "still needs an answer"}},
+	})
+
+	survivors, counts, ok := s.triagePendingZhengming()
+	require.True(t, ok)
+	assert.Equal(t, 4, counts.Retired)
+	assert.Equal(t, 2, counts.Ascended)
+	assert.Equal(t, 1, counts.Cancelled)
+	assert.Equal(t, 1, counts.Superseded)
+
+	// Survivors: the untouched survivor and the newer member of the pair.
+	ids := make([]string, 0, len(survivors))
+	for _, r := range survivors {
+		ids = append(ids, r.RequestID)
+	}
+	assert.ElementsMatch(t, []string{"survivor-1", "sup-new"}, ids)
+
+	// Classes A and B were written as superseded_by_edict, class C as dismissed.
+	for _, id := range []string{"asc-0", "asc-1", "cancelled-1"} {
+		status, _ := triageDisposition(t, db, id)
+		assert.Equal(t, storage.ZhengmingSupersededByEdict, status, "%s must retire as superseded_by_edict", id)
+	}
+	status, reason := triageDisposition(t, db, "sup-old")
+	assert.Equal(t, storage.ZhengmingDismissed, status)
+	assert.Equal(t, "court: superseded by execution new", reason)
+
+	// The counts must agree with the rows actually written: 2 superseded_by_edict + 1 dismissed... plus class C = 4 total.
+	var supersededByEdict int64
+	require.NoError(t, db.Model(&storage.Zhengming{}).
+		Where("status = ? AND username = ? AND project = ?", storage.ZhengmingSupersededByEdict, s.username, s.config.Project).
+		Count(&supersededByEdict).Error)
+	assert.EqualValues(t, 3, supersededByEdict)
+
+	// A second pass is idempotent: nothing retired twice, survivors returned.
+	survivors2, counts2, ok2 := s.triagePendingZhengming()
+	require.True(t, ok2)
+	assert.Equal(t, 0, counts2.Retired, "a repeated pass retires nothing twice")
+	require.Len(t, survivors2, 2)
+	ids2 := make([]string, 0, len(survivors2))
+	for _, r := range survivors2 {
+		ids2 = append(ids2, r.RequestID)
+	}
+	assert.ElementsMatch(t, []string{"survivor-1", "sup-new"}, ids2)
+}
+
+// TestZhengmingTriage_AlreadyTerminalIsReportedNoOp pins Ling 3's ordering
+// hardening: a prompt whose row moved to a terminal status between the read
+// and the write is handled without a spurious error and without resurrecting
+// the row — and is not counted.
+func TestZhengmingTriage_AlreadyTerminalIsReportedNoOp(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict := insertTriageEdict(t, db, "race me")
+	require.NoError(t, db.Model(&storage.Edict{}).
+		Where("id = ? AND username = ? AND project = ?", edict.ID, edict.Username, edict.Project).
+		Update("cancelled_at", time.Now()).Error)
+
+	id := insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "raced", EdictID: edict.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "?"}},
+	})
+
+	pending, err := s.pendingZhengming()
+	require.NoError(t, err)
+	plan := s.planZhengmingRetirements(pending)
+	require.Len(t, plan, 1)
+
+	// The row goes terminal between the read and the write (e.g. the Ruler
+	// answered). The disposal is a reported no-op (errZhengmingNotPending),
+	// never a spurious error, and the answer must survive untouched.
+	require.NoError(t, db.Model(&storage.Zhengming{}).Where("request_id = ?", id).
+		Updates(map[string]any{"status": storage.ZhengmingAnswered, "answer": "Approve"}).Error)
+
+	err = s.DisposeZhengmingWithStatus(plan[0].requestID, plan[0].status, plan[0].reason)
+	require.Error(t, err, "a refused write must report a refusal")
+	require.ErrorIs(t, err, errZhengmingNotPending, "the refusal is the reported no-op, not a failure")
+
+	var got storage.Zhengming
+	require.NoError(t, db.First(&got, "request_id = ?", id).Error)
+	assert.Equal(t, storage.ZhengmingAnswered, got.Status, "an answered row must never be resurrected or rewritten")
+	assert.Equal(t, "Approve", got.Answer)
+	assert.Empty(t, got.DispositionReason)
+
+	// The no-op is not counted as a retirement. With no pending rows left
+	// the pass short-circuits (ok=false), which is itself the claim-once
+	// guarantee: a retired row cannot be counted twice.
+	_, counts, ok := s.triagePendingZhengming()
+	assert.False(t, ok, "no pending rows: the pass must not claim or count anything")
+	assert.Equal(t, 0, counts.Retired, "an already-terminal row is never counted as retired")
+}

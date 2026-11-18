@@ -2,6 +2,7 @@ package court
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -2066,6 +2067,13 @@ func (s *Court) CancelZhengming(requestID string) {
 	}
 }
 
+// errZhengmingNotPending reports that a disposal was refused because the row
+// is no longer pending — already answered or already retired. Callers that
+// race another writer (an answer, an earlier triage pass) treat it as a
+// reported no-op, not a failure: no disposition was written, nothing needs
+// repair (e1037).
+var errZhengmingNotPending = errors.New("zhengming request is not pending")
+
 // DismissZhengming retires a pending zhengming request on the Court's own
 // authority — a superseded abort prompt, say — recording a reason that names
 // why. It is the sanctioned alternative to direct SQL for closing a prompt no
@@ -2078,7 +2086,18 @@ func (s *Court) DismissZhengming(requestID, reason string) error {
 	if reason == "" {
 		reason = "court: dismissed by minister"
 	}
-	return s.disposeZhengming(requestID, storage.ZhengmingDismissed, reason)
+	return s.DisposeZhengmingWithStatus(requestID, storage.ZhengmingDismissed, reason)
+}
+
+// DisposeZhengmingWithStatus is the status-aware disposal path for triage
+// (e1037): classes A and B (the target edict ended) retire as
+// superseded_by_edict, class C (exec-marker supersession) as dismissed. It
+// routes through disposeZhengming, never raw SQL.
+func (s *Court) DisposeZhengmingWithStatus(requestID string, status storage.ZhengmingStatus, reason string) error {
+	if s == nil {
+		return fmt.Errorf("court not initialized")
+	}
+	return s.disposeZhengming(requestID, status, reason)
 }
 
 // disposeZhengming writes a request's terminal disposition with a recorded
@@ -2108,7 +2127,7 @@ func (s *Court) disposeZhengming(requestID string, status storage.ZhengmingStatu
 		return err
 	}
 	if !wrote {
-		return fmt.Errorf("zhengming request %s is not pending (status: %s)", requestID, req.Status)
+		return fmt.Errorf("%w (request_id %s, status %s)", errZhengmingNotPending, requestID, req.Status)
 	}
 
 	// Release any in-process waiter, matching the old CancelZhengming
