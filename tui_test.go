@@ -3845,15 +3845,17 @@ func TestSetContextParams_FallsBackToRepoInfoSlugWhenConfigProjectEmpty(t *testi
 		"Project should fall back to repoInfo.Slug when config.Court.Project is empty")
 }
 
-func TestSetContextParams_ConfigProjectTakesPrecedenceOverRepoInfoSlug(t *testing.T) {
-	// When config sets a project, it wins over repoInfo.Slug
+func TestSetContextParams_RepoInfoSlugIgnoresConfiguredProject(t *testing.T) {
+	// A committed [court] project must not choose scope: the checkout-derived
+	// repoInfo.Slug always wins (edict 1005).
 	cfg := mockConfig()
 	cfg.Court.Project = "configured/project"
-	r := &repo.RepoInfo{Slug: "owner/repo"}
+	r := &repo.RepoInfo{Slug: "daonb/repo"}
 	m := NewTUIModel(cfg, r, nil, nil, nil, nil, nil, nil)
 	params := m.setContextParams()
-	assert.Equal(t, "configured/project", params.Project,
-		"config.Court.Project should take precedence over repoInfo.Slug")
+	assert.Equal(t, "daonb/repo", params.Project,
+		"repoInfo.Slug should win; config.Court.Project must have no effect")
+	assert.NotEqual(t, "configured/project", params.Project)
 }
 
 func TestSetContextParams_ProjectEmptyWhenNeitherConfigNorRepoInfoProvides(t *testing.T) {

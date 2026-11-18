@@ -1,17 +1,21 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx"
 
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
+	"github.com/afittestide/asimi/internal/runners"
 )
 
 // TestProvideConfig_ReturnsErrorOnMalformedConfig verifies that ProvideConfig
@@ -231,4 +235,104 @@ func TestNoGlobalRunnerSingleton(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Empty(t, offenders, "package-global runner singleton must be fully retired")
+}
+
+// --- Edict 1005: ProvideCourt scope derivation ---
+
+// fakeCourtRunner is the minimal runners.Runner ProvideCourt needs to build a
+// Court. It never runs anything; these tests exercise scope resolution, not
+// shell execution.
+type fakeCourtRunner struct{ runners.Runner }
+
+func (fakeCourtRunner) Run(context.Context, runners.Input) (runners.Output, error) {
+	return runners.Output{}, nil
+}
+func (fakeCourtRunner) Restart(context.Context) error        { return nil }
+func (fakeCourtRunner) Close(context.Context) error          { return nil }
+func (fakeCourtRunner) AllowFallback(bool)                   {}
+func (fakeCourtRunner) RunnerType() string                   { return "fake" }
+func (fakeCourtRunner) GetOS() string                        { return "linux" }
+func (fakeCourtRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (fakeCourtRunner) HealthCheck(context.Context) error    { return nil }
+
+// provideCourtParams builds the fx params ProvideCourt takes, pointed at a
+// fixture checkout.
+func provideCourtParams(t *testing.T, projectRoot string, hasVCS bool) CourtParams {
+	t.Helper()
+	db := setupTestGormDB(t)
+	return CourtParams{
+		Lifecycle: nopLifecycle{},
+		GormDB:    db,
+		Config:    &Config{},
+		RepoInfo: repo.RepoInfo{
+			ProjectRoot: projectRoot,
+			HasVCS:      hasVCS,
+		},
+		Runner: fakeCourtRunner{},
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+}
+
+// TestProvideCourtRefusesOnOriginlessAmbiguity pins edict 1005 acceptance: the
+// boot path (TUI/headless, via fx) must refuse when the checkout has no origin
+// remote and its remotes name different repos, rather than silently picking a
+// scope that can receive writes. Falsifiable: pass a committed [court] project
+// through the config and the refusal must still happen — the pin is not a
+// source of scope.
+func TestProvideCourtRefusesOnOriginlessAmbiguity(t *testing.T) {
+	dir := t.TempDir()
+	runProviderGit(t, dir, "init")
+	// Two remotes naming different repos, and deliberately no origin.
+	runProviderGit(t, dir, "remote", "add", "fork", "https://github.com/daonb/data-poisoning-benchmark.git")
+	runProviderGit(t, dir, "remote", "add", "upstream", "https://github.com/OCT7-IO/other-repo.git")
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	params := provideCourtParams(t, dir, true)
+	// A committed pin must not bypass the refusal.
+	params.Config.Court.Project = "pinned/project"
+
+	c, err := ProvideCourt(params)
+	require.Error(t, err, "origin-less ambiguous checkout must refuse to boot")
+	assert.Nil(t, c)
+	assert.Contains(t, err.Error(), "add an origin remote",
+		"the error must tell the user how to fix the checkout")
+	assert.NotContains(t, err.Error(), "pinned/project",
+		"a committed [court] project must not rescue the boot or leak into scope")
+}
+
+// TestProvideCourtDerivesScopeFromCheckout verifies the success path: with an
+// origin present the Court boots and its scope is <verified user>/<origin repo
+// basename>, never the committed pin.
+func TestProvideCourtDerivesScopeFromCheckout(t *testing.T) {
+	dir := t.TempDir()
+	runProviderGit(t, dir, "init")
+	runProviderGit(t, dir, "remote", "add", "origin", "https://github.com/afittestide/asimi-cli.git")
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	params := provideCourtParams(t, dir, true)
+	params.Config.Court.Project = "pinned/project"
+
+	c, err := ProvideCourt(params)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	defer c.Stop()
+
+	want := repo.SanitizeSegment(config.OSUsername()) + "/asimi-cli"
+	if got := c.EdictKey(1).Project; got != want {
+		t.Errorf("Court project = %q, want checkout-derived %q (committed pin must be ignored)", got, want)
+	}
+}
+
+// nopLifecycle is a do-nothing fx.Lifecycle for tests that never start the app.
+type nopLifecycle struct{}
+
+func (nopLifecycle) Append(fx.Hook) {}
+
+// runProviderGit runs a git command in dir, failing the test on error.
+func runProviderGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
 }

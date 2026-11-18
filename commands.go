@@ -395,26 +395,31 @@ func handleInitCommand(model *TUIModel, args []string) tea.Cmd {
 		}
 	}
 
-	// Check if project name is already set in config
-	if model.config.Court.Project == "" {
-		// repoInfo.Slug is the source of truth: discovery already resolves it
-		// through the tracked-remote → origin → basename precedence. Only fall
-		// back to the shared resolver when it is empty (edict 996).
-		ri := model.status.repoInfo
-		slug := ri.Slug
-		if slug == "" {
-			slug = repo.ResolveProjectSlug("", ri.ProjectRoot, ri.HasVCS)
-		}
-		if slug == "" {
+	// :init always seeds/refreshes the project config and creates the init
+	// edict. It no longer gates on a committed [court] project: that pin is not
+	// a source of scope (edict 1005), only a relic of the old behaviour.
+	//
+	// repoInfo.Slug is the source of truth: discovery already resolves it from
+	// origin → basename under the <verified user>/<repo> shape. Only fall back
+	// to the shared resolver when it is empty, surfacing its origin-less
+	// ambiguity error rather than picking a scope.
+	ri := model.status.repoInfo
+	slug := ri.Slug
+	if slug == "" {
+		resolved, err := repo.ResolveProjectSlug(ri.ProjectRoot, ri.HasVCS)
+		if err != nil {
 			return func() tea.Msg {
-				return showContextMsg{content: "No git remote found. Please set up a git remote origin before running :init."}
+				return showContextMsg{content: err.Error()}
 			}
 		}
-		return saveProjectNameAndInit(model, slug)
+		slug = resolved
 	}
-
-	// Project name exists, proceed with creating the edict
-	return createInitEdict(model)
+	if slug == "" {
+		return func() tea.Msg {
+			return showContextMsg{content: "No git remote found. Please set up a git remote origin before running :init."}
+		}
+	}
+	return saveProjectNameAndInit(model, slug)
 }
 
 // createInitEdict creates the edict for project-init ritual
@@ -474,32 +479,23 @@ func handleAPIKeyInput(model *TUIModel, provider, apiKey string) tea.Cmd {
 
 // saveProjectNameAndInit seeds the project config with the given project name,
 // reloads the config, and creates the init edict.
+//
+// It no longer writes [court] project: scope is derived from the checkout
+// (edict 1005), so a committed pin would be inert data that misleads the user
+// into thinking it chooses scope. The parameter is retained because the
+// resolved slug is still useful in log/diagnostic messages.
 func saveProjectNameAndInit(model *TUIModel, projectName string) tea.Cmd {
-	// Seed .agents/asimi.conf from the embedded default template before writing
-	// the project name. Without this, SetProjectConfig would create a stub file
-	// containing only the [court] section, and the ritual's template-seeding
-	// step would later skip the file (since it exists), leaving the user with a
-	// near-empty config missing every default section.
+	// Seed .agents/asimi.conf from the embedded default template. Without this,
+	// the ritual's template-seeding step would later skip the file (since it
+	// exists), leaving the user with a near-empty config missing every default
+	// section.
 	projectRoot := model.status.repoInfo.ProjectRoot
 	if err := config.EnsureProjectConfig(projectRoot); err != nil {
 		return func() tea.Msg {
 			return showContextMsg{content: fmt.Sprintf("Failed to seed project config: %v", err)}
 		}
 	}
-
-	// Save project name to .agents/asimi.conf
-	if err := config.SetProjectConfig(projectRoot, "court", "project", projectName); err != nil {
-		return func() tea.Msg {
-			return showContextMsg{content: fmt.Sprintf("Failed to save project name: %v", err)}
-		}
-	}
-
-	// Reload project config to pick up the new project name
-	if reloaded, err := config.LoadProjectConfig(model.status.repoInfo.ProjectRoot, true); err != nil {
-		slog.Warn("Failed to reload config after setting project name", "error", err)
-	} else {
-		model.config = reloaded
-	}
+	slog.Debug("project scope is derived from the checkout, not pinned", "project", projectName)
 
 	// Proceed with creating the init edict
 	return createInitEdict(model)

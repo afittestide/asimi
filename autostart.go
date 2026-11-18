@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/rpc"
 	"github.com/afittestide/asimi/internal/types"
@@ -328,13 +327,13 @@ func daemonSetContext(ctx context.Context, conn *rpc.Conn) error {
 	if u, err := user.Current(); err == nil {
 		username = u.Username
 	}
-	// Resolve the project with the shared resolver so the handshake cannot pin
-	// an origin-only slug that overrides a configured [court] project on the
-	// daemon (edict 968). A config load failure degrades to the repo-derived
-	// slug rather than blocking the handshake.
-	project := repoInfo.Slug
-	if projectCfg, err := config.LoadProjectConfig(repoInfo.ProjectRoot, false); err == nil {
-		project = repo.ResolveProjectSlug(projectCfg.Court.Project, repoInfo.ProjectRoot, repoInfo.HasVCS)
+	// Resolve the project from the checkout only: a committed [court] project
+	// is client-controlled data and must not choose scope (edict 1005). The
+	// error is surfaced so an origin-less, ambiguous checkout refuses the
+	// handshake instead of silently scoping writes to the wrong project.
+	project, err := repo.ResolveProjectSlug(repoInfo.ProjectRoot, repoInfo.HasVCS)
+	if err != nil {
+		return fmt.Errorf("resolve project scope: %w", err)
 	}
 	if err := rpc.NewCourtClient(conn).SetContext(ctx, types.SetContextParams{
 		Project:         project,

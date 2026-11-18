@@ -191,7 +191,7 @@ const DefaultDiskMinFreeMiB = 4096
 type CourtConfig struct {
 	RitualTimeout   time.Duration `koanf:"ritual_timeout"`    // legacy, unused
 	StepIdleTimeout time.Duration `koanf:"step_idle_timeout"` // max silence before aborting a ritual step (default 5m)
-	Project         string        `koanf:"project"`           // project slug for edict scoping
+	Project         string        `koanf:"project"`           // deprecated: ignored; slug is derived from the checkout (edict 1005)
 	IsolatedHost    bool          `koanf:"isolated_host"`     // skip sandbox, run commands on host without approval
 	OutputLimit     int           `koanf:"output_limit"`      // max chars of heavy output fields in summary mode (default 500)
 	// RunnerFlatlineTimeout is how long a per-edict container may sit idle

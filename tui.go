@@ -621,7 +621,7 @@ func (m *TUIModel) switchModel() tea.Cmd {
 // current state. APIKeys is always populated from environment variables
 // so that daemon mode receives the keys on every call (e.g., model switch).
 func (m *TUIModel) setContextParams() types.SetContextParams {
-	return buildSetContextParams(m.config, m.repoInfo)
+	return buildSetContextParams(m.repoInfo)
 }
 
 // collectAPIKeys gathers API keys from environment variables and the OS keyring

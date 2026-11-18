@@ -449,11 +449,86 @@ func (db *DB) registerRegexpFunction() error {
 	return nil
 }
 
+// MigrateProjectSlugs rewrites every Court `project` value to the
+// "<user>/<origin repo basename>" shape introduced by edict 1005.
+//
+// The old value was "<remote owner>/<repo>" (e968) or a bare repo name on
+// gitless ground, so the new value reuses the old second segment as the
+// basename and prefixes it with the row's username. `user` is the verified,
+// already-sanitized local username (the caller owns slug sanitization, so the
+// result matches what the resolver writes). Rows whose `username` is the
+// non-verified role 'forge' or is NULL/empty are corrected to `user` in the
+// same pass — the Ruler ruled those rogue rows are migrated in place, not
+// quarantined — so no row keeps a non-verified identity or the old
+// owner-shaped slug. Rows under some other distinct username are left alone:
+// they belong to another user's ledger, and merging them would be data loss,
+// not migration.
+//
+// The rewrite is idempotent: a value already in "<user>/<basename>" keeps its
+// basename, so re-running produces the same result. Rows with an EMPTY project
+// are untouched (explicit Chancellor waiver: nothing to migrate, tracked in
+// ling 1c5f3b2dd8d8bace).
+func MigrateProjectSlugs(db *gorm.DB, user string) error {
+	if db == nil {
+		return fmt.Errorf("cannot migrate project slugs: nil database")
+	}
+	if user == "" {
+		return fmt.Errorf("cannot migrate project slugs: verified user is empty")
+	}
+	tables := []string{
+		"edicts",
+		"seals",
+		"zhengming_requests",
+		"tian_events",
+		"tian_event_dlq",
+		"lings",
+		"forge_manifests",
+		"judge_verdicts",
+		"censor_precedents",
+		"incidents",
+		"ruler_councils",
+	}
+	for _, table := range tables {
+		// Older databases (or partial test schemas) may lack a table; skipping
+		// keeps the migration idempotent and non-fatal on such ground.
+		if !db.Migrator().HasTable(table) {
+			continue
+		}
+		// Correct the rogue identities first (forge / NULL / empty) so the slug
+		// prefix below resolves to a real person.
+		if err := db.Exec(
+			fmt.Sprintf(`UPDATE %s SET username = ? WHERE username IS NULL OR username = '' OR username = 'forge'`, table),
+			user,
+		).Error; err != nil {
+			return fmt.Errorf("correct %s.username: %w", table, err)
+		}
+		// Rewrite the slug only where it is not already in the new shape.
+		if err := db.Exec(
+			fmt.Sprintf(`UPDATE %s
+				SET project = username || '/' ||
+					CASE WHEN instr(project, '/') > 0
+						THEN substr(project, instr(project, '/') + 1)
+						ELSE project
+					END
+				WHERE project IS NOT NULL AND project != ''
+				  AND project != username || '/' ||
+					CASE WHEN instr(project, '/') > 0
+						THEN substr(project, instr(project, '/') + 1)
+						ELSE project
+					END`, table),
+		).Error; err != nil {
+			return fmt.Errorf("rewrite %s.project: %w", table, err)
+		}
+	}
+	return nil
+}
+
 // PostGormMigrate runs data migrations that depend on GORM-managed tables
 // existing. It must be called after db.AutoMigrate has run so that tables
 // like `seals` are guaranteed to exist. This is idempotent and safe to run
-// on every startup.
-func PostGormMigrate(db *gorm.DB) error {
+// on every startup. slugUser is the verified, sanitized local username used to
+// prefix migrated project slugs (edict 1005).
+func PostGormMigrate(db *gorm.DB, slugUser string) error {
 	result := db.Exec(`UPDATE seals SET minister_id = 'chancellor' WHERE minister_id = 'sage'`)
 	if result.Error != nil {
 		return fmt.Errorf("rename sage seals to chancellor: %w", result.Error)
@@ -496,6 +571,15 @@ func PostGormMigrate(db *gorm.DB) error {
 	}
 	slog.Debug("post-GORM migration: normalized NULL censor_precedents.edict_id to 0",
 		"rows_affected", normalize.RowsAffected)
+
+	// Rewrite Court project values to the "<verified user>/<repo basename>"
+	// shape (edict 1005). Safe to run on every startup: it is idempotent and
+	// only touches rows outside the new shape. The caller supplies the
+	// sanitized prefix so slug sanitization has exactly one implementation.
+	if err := MigrateProjectSlugs(db, slugUser); err != nil {
+		return err
+	}
+	slog.Debug("post-GORM migration: rewrote Court project slugs to the verified-user shape")
 	return nil
 }
 

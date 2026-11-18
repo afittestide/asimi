@@ -979,7 +979,7 @@ func TestPostGormMigrate_RenamesSageSeals(t *testing.T) {
 	}
 
 	// Call PostGormMigrate — should rename sage → chancellor
-	require.NoError(t, PostGormMigrate(gormDB))
+	require.NoError(t, PostGormMigrate(gormDB, "daonb"))
 
 	// Verify no seals remain with minister_id='sage'
 	var sageCount int64
@@ -999,7 +999,7 @@ func TestPostGormMigrate_RenamesSageSeals(t *testing.T) {
 	require.Equal(t, int64(1), rulerCount, "ruler seals should be untouched")
 
 	// Verify idempotency: running again should be a no-op
-	require.NoError(t, PostGormMigrate(gormDB))
+	require.NoError(t, PostGormMigrate(gormDB, "daonb"))
 	require.NoError(t, gormDB.Model(&Seal{}).Where("minister_id = 'sage'").Count(&sageCount).Error)
 	require.Equal(t, int64(0), sageCount, "idempotent: still no sage seals")
 	require.NoError(t, gormDB.Model(&Seal{}).Where("minister_id = 'chancellor'").Count(&chancellorCount).Error)
@@ -1038,7 +1038,7 @@ func TestPostGormMigrate_BackfillsCensorPrecedentEdictID(t *testing.T) {
 		Ruling: PrecedentApproved,
 	}).Error)
 
-	require.NoError(t, PostGormMigrate(gormDB))
+	require.NoError(t, PostGormMigrate(gormDB, "daonb"))
 
 	var precA, precB, precEdict CensorPrecedent
 	require.NoError(t, gormDB.Where("precedent_id = ?", "p-a").First(&precA).Error)

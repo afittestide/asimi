@@ -57,7 +57,7 @@ func runHeadlessModeImpl() int {
 	defer app.Stop(context.Background())
 
 	// Initialize the LLM client (same as TUI's Init → SetContext)
-	if err := c.SetContext(ctx, headlessContextParams(cfg, &repoInfo)); err != nil {
+	if err := c.SetContext(ctx, headlessContextParams(&repoInfo)); err != nil {
 		fmt.Fprintf(os.Stderr, "asimi: LLM init failed: %v\n", err)
 		return 1
 	}
@@ -90,10 +90,12 @@ func runHeadlessModeImpl() int {
 	return exitCode
 }
 
-// buildSetContextParams extracts SetContextParams from config and repo info.
-// Shared by both the TUI (TUIModel.setContextParams) and headless mode
-// (headlessContextParams) to keep the two paths in sync.
-func buildSetContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParams {
+// buildSetContextParams extracts SetContextParams from repo info. Shared by
+// both the TUI (TUIModel.setContextParams) and headless mode
+// (headlessContextParams) to keep the two paths in sync. The config is not a
+// source of scope: project and username are derived from the checkout and the
+// OS user (edicts 1005/1006).
+func buildSetContextParams(ri *repo.RepoInfo) types.SetContextParams {
 	projectRoot := ""
 	worktreePath := ""
 	branch := ""
@@ -110,9 +112,14 @@ func buildSetContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParam
 			projectRoot = cwd
 		}
 	}
+	// The project slug is derived from the checkout, never from a committed
+	// [court] project (edict 1005). The daemon re-derives it anyway; sending it
+	// here keeps the two paths consistent. An origin-less ambiguity is logged
+	// rather than aborting the handshake — the daemon is the authority and will
+	// refuse if it truly cannot resolve.
 	project := ""
-	if cfg != nil {
-		project = cfg.Court.Project
+	if ri != nil {
+		project = ri.Slug
 	}
 	// The handshake username is resolved from the OS user, never from config:
 	// a committed [court] username must not choose scope (edict 1006).
@@ -123,12 +130,6 @@ func buildSetContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParam
 	if username == "" {
 		username = "guest"
 		slog.Warn("failed to get current user, running as guest")
-	}
-	// Fall back to repoInfo.Slug (from git remote) when config doesn't set it.
-	// This mirrors ProvideCourt (providers.go) and ensures the daemon
-	// receives the correct slug for sandbox image naming.
-	if project == "" && ri != nil {
-		project = ri.Slug
 	}
 	// Determine agent name for ATIF
 	atifAgentName := atifAgentName()
@@ -150,8 +151,8 @@ func buildSetContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParam
 }
 
 // headlessContextParams builds SetContextParams for headless mode.
-func headlessContextParams(cfg *Config, ri *repo.RepoInfo) types.SetContextParams {
-	return buildSetContextParams(cfg, ri)
+func headlessContextParams(ri *repo.RepoInfo) types.SetContextParams {
+	return buildSetContextParams(ri)
 }
 
 // handsoffSealCourt is the narrow Court seam the handsoff seal pass needs: it

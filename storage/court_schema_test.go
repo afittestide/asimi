@@ -103,7 +103,13 @@ func setupCourtSchemaTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("failed to open test db: %v", err)
 	}
-	if err := db.AutoMigrate(&CensorPrecedent{}, &ForgeManifest{}, &Seal{}); err != nil {
+	// Migrate every Court table PostGormMigrate touches: the slug migration
+	// (edict 1005) spans all of them, so a partial schema would mask defects.
+	if err := db.AutoMigrate(
+		&Edict{}, &Seal{}, &Zhengming{}, &TianEvent{}, &TianEventDLQ{},
+		&Ling{}, &ForgeManifest{}, &JudgeVerdict{}, &CensorPrecedent{},
+		&Incident{}, &RulerCouncil{},
+	); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 	return db
@@ -132,14 +138,14 @@ func TestPostGormMigrate_NormalizesNullEdictIDAndBackfills(t *testing.T) {
 
 	// Seed a manifest to drive the backfill.
 	if err := db.Create(&ForgeManifest{
-		ManifestID: "m1", EdictID: 42, Username: "u", Project: "p", Status: ManifestQuenched,
+		ManifestID: "m1", EdictID: 42, Username: "daonb", Project: "daonb/p", Status: ManifestQuenched,
 	}).Error; err != nil {
 		t.Fatalf("failed to seed manifest: %v", err)
 	}
 
 	// Per-manifest precedent with edict_id unset (backfill target).
 	if err := db.Create(&CensorPrecedent{
-		PrecedentID: "per-manifest", ManifestID: "m1", Username: "u", Project: "p",
+		PrecedentID: "per-manifest", ManifestID: "m1", Username: "daonb", Project: "daonb/p",
 		Principle: "ethics_review", Ruling: PrecedentApproved,
 	}).Error; err != nil {
 		t.Fatalf("failed to seed per-manifest precedent: %v", err)
@@ -150,14 +156,14 @@ func TestPostGormMigrate_NormalizesNullEdictIDAndBackfills(t *testing.T) {
 	// because the owner is known. A NULL-blind backfill would miss this row and
 	// the normalization would then wrongly collapse it to the sentinel.
 	if err := db.Create(&CensorPrecedent{
-		PrecedentID: "per-manifest-null", ManifestID: "m1", Username: "u", Project: "p",
+		PrecedentID: "per-manifest-null", ManifestID: "m1", Username: "daonb", Project: "daonb/p",
 		Principle: "ethics_review", Ruling: PrecedentApproved,
 	}).Error; err != nil {
 		t.Fatalf("failed to seed NULL per-manifest precedent: %v", err)
 	}
 	// Edict-level / legacy precedent (must stay 0, not be resurrected from a manifest).
 	if err := db.Create(&CensorPrecedent{
-		PrecedentID: "edict-level", ManifestID: "", Username: "u", Project: "p",
+		PrecedentID: "edict-level", ManifestID: "", Username: "daonb", Project: "daonb/p",
 		Principle: "ethics_review", Ruling: PrecedentRejected,
 	}).Error; err != nil {
 		t.Fatalf("failed to seed edict-level precedent: %v", err)
@@ -167,7 +173,7 @@ func TestPostGormMigrate_NormalizesNullEdictIDAndBackfills(t *testing.T) {
 		t.Fatalf("failed to force NULL: %v", err)
 	}
 
-	if err := PostGormMigrate(db); err != nil {
+	if err := PostGormMigrate(db, "daonb"); err != nil {
 		t.Fatalf("PostGormMigrate failed: %v", err)
 	}
 
@@ -195,7 +201,7 @@ func TestPostGormMigrate_NormalizesNullEdictIDAndBackfills(t *testing.T) {
 	if edictLevel.EdictID != 0 {
 		t.Errorf("normalization: edict-level edict_id = %d, want 0 (NULL collapsed)", edictLevel.EdictID)
 	}
-	if edictLevel.Username != "u" || edictLevel.Project != "p" {
+	if edictLevel.Username != "daonb" || edictLevel.Project != "daonb/p" {
 		t.Errorf("normalization must not disturb username/project, got %q/%q", edictLevel.Username, edictLevel.Project)
 	}
 
@@ -209,7 +215,7 @@ func TestPostGormMigrate_NormalizesNullEdictIDAndBackfills(t *testing.T) {
 	}
 
 	// Idempotency: a second run must not change any value.
-	if err := PostGormMigrate(db); err != nil {
+	if err := PostGormMigrate(db, "daonb"); err != nil {
 		t.Fatalf("second PostGormMigrate failed: %v", err)
 	}
 	var perManifest2 CensorPrecedent
@@ -226,5 +232,143 @@ func TestPostGormMigrate_NormalizesNullEdictIDAndBackfills(t *testing.T) {
 	db.Where("precedent_id = ?", "edict-level").First(&edictLevel2)
 	if edictLevel2.EdictID != 0 {
 		t.Errorf("idempotency: edict-level edict_id drifted to %d", edictLevel2.EdictID)
+	}
+}
+
+// TestMigrateProjectSlugs_ReshapesDocketAndCorrectsRogueUsernames covers edict
+// 1005's required migration:
+//   - "<old owner>/<repo>" becomes "<verified user>/<repo>" (the owner segment is
+//     replaced, the basename preserved),
+//   - a gitless project with no slash is kept as the basename,
+//   - 'forge' and NULL/empty usernames are corrected to the verified user in
+//     the same pass (the Ruler ruled the rogue rows are migrated, not
+//     quarantined),
+//   - a genuine other user's ledger is left alone (no data loss by merging),
+//   - an EMPTY project is untouched (Chancellor waiver, ling 1c5f3b2dd8d8bace),
+//   - a second run changes nothing (idempotent).
+func TestMigrateProjectSlugs_ReshapesDocketAndCorrectsRogueUsernames(t *testing.T) {
+	db := setupCourtSchemaTestDB(t)
+
+	seed := []Edict{
+		{ID: 1, Username: "daonb", Project: "afittestide/asimi-cli", Intent: "old owner shape"},
+		{ID: 2, Username: "daonb", Project: "asimi-cli", Intent: "gitless basename"},
+		{ID: 3, Username: "forge", Project: "daonb/crypto-new", Intent: "rogue role identity"},
+		{ID: 4, Username: "", Project: "tuzig/terminal7", Intent: "empty identity"},
+		{ID: 5, Username: "alice", Project: "alice/other-repo", Intent: "another user's ledger"},
+		{ID: 6, Username: "daonb", Project: "", Intent: "empty project (waived)"},
+	}
+	for _, e := range seed {
+		if err := db.Create(&e).Error; err != nil {
+			t.Fatalf("failed to seed edict %d: %v", e.ID, err)
+		}
+	}
+
+	if err := PostGormMigrate(db, "daonb"); err != nil {
+		t.Fatalf("PostGormMigrate failed: %v", err)
+	}
+
+	want := map[uint]struct{ user, project string }{
+		1: {"daonb", "daonb/asimi-cli"},
+		2: {"daonb", "daonb/asimi-cli"},
+		3: {"daonb", "daonb/crypto-new"},
+		4: {"daonb", "daonb/terminal7"},
+		5: {"alice", "alice/other-repo"},
+		6: {"daonb", ""},
+	}
+	for id, w := range want {
+		var got Edict
+		if err := db.Where("id = ?", id).First(&got).Error; err != nil {
+			t.Fatalf("failed to reload edict %d: %v", id, err)
+		}
+		if got.Project != w.project {
+			t.Errorf("edict %d project = %q, want %q", id, got.Project, w.project)
+		}
+		if got.Username != w.user {
+			t.Errorf("edict %d username = %q, want %q", id, got.Username, w.user)
+		}
+	}
+
+	// No row may keep the old owner-shaped slug for a verified user.
+	var staleCount int64
+	if err := db.Model(&Edict{}).Where("username = ? AND project LIKE ?", "daonb", "afittestide/%").Count(&staleCount).Error; err != nil {
+		t.Fatalf("failed to count stale slugs: %v", err)
+	}
+	if staleCount != 0 {
+		t.Errorf("expected 0 rows under the old owner shape, got %d", staleCount)
+	}
+
+	// Idempotency: a second run must not change any value.
+	if err := PostGormMigrate(db, "daonb"); err != nil {
+		t.Fatalf("second PostGormMigrate failed: %v", err)
+	}
+	var again Edict
+	db.Where("id = ?", 1).First(&again)
+	if again.Project != "daonb/asimi-cli" || again.Username != "daonb" {
+		t.Errorf("idempotency: edict 1 drifted to %q/%q", again.Username, again.Project)
+	}
+}
+
+// TestMigrateProjectSlugs_CoversEveryCourtTable verifies acceptance 4 across all
+// eleven Court tables, not just edicts: no row may be left under the old
+// owner-shaped slug, and a rogue username anywhere is corrected.
+func TestMigrateProjectSlugs_CoversEveryCourtTable(t *testing.T) {
+	db := setupCourtSchemaTestDB(t)
+
+	// One representative row per table, all under the old "owner/repo" shape.
+	if err := db.Create(&Seal{SealID: "s1", EdictID: 1, Username: "daonb", Project: "afittestide/asimi-cli", MinisterID: "judge"}).Error; err != nil {
+		t.Fatalf("seed seals: %v", err)
+	}
+	if err := db.Create(&Zhengming{RequestID: "z1", EdictID: 1, Username: "forge", Project: "tuzig/terminal7"}).Error; err != nil {
+		t.Fatalf("seed zhengming: %v", err)
+	}
+	if err := db.Create(&TianEvent{EdictID: 1, Username: "daonb", Project: "bennydaon/idp", EventType: EventEdictCreated}).Error; err != nil {
+		t.Fatalf("seed tian_events: %v", err)
+	}
+	if err := db.Create(&TianEventDLQ{EdictID: 1, Username: "daonb", Project: "BoG--IL/frontend", EventType: EventEdictCreated}).Error; err != nil {
+		t.Fatalf("seed tian_event_dlq: %v", err)
+	}
+	if err := db.Create(&Ling{LingID: "l1", EdictID: 1, Username: "daonb", Project: "bennydaon/frontend"}).Error; err != nil {
+		t.Fatalf("seed lings: %v", err)
+	}
+	if err := db.Create(&ForgeManifest{ManifestID: "m1", EdictID: 1, Username: "daonb", Project: "afittestide/asimi-cli"}).Error; err != nil {
+		t.Fatalf("seed forge_manifests: %v", err)
+	}
+	if err := db.Create(&JudgeVerdict{VerdictID: "v1", ManifestID: "m1", Username: "daonb", Project: "afittestide/asimi-cli", Outcome: VerdictPassed}).Error; err != nil {
+		t.Fatalf("seed judge_verdicts: %v", err)
+	}
+	if err := db.Create(&CensorPrecedent{PrecedentID: "p1", Username: "daonb", Project: "afittestide/asimi-cli", Principle: "ethics_review", Ruling: PrecedentApproved}).Error; err != nil {
+		t.Fatalf("seed censor_precedents: %v", err)
+	}
+	if err := db.Create(&Incident{IncidentID: "i1", Username: "daonb", Project: "tuzig/terminal7"}).Error; err != nil {
+		t.Fatalf("seed incidents: %v", err)
+	}
+	if err := db.Create(&RulerCouncil{CouncilID: "c1", EdictID: 1, Username: "daonb", Project: "bennydaon/idp"}).Error; err != nil {
+		t.Fatalf("seed ruler_councils: %v", err)
+	}
+
+	if err := PostGormMigrate(db, "daonb"); err != nil {
+		t.Fatalf("PostGormMigrate failed: %v", err)
+	}
+
+	// No row in any table may still carry an owner-shaped slug, and none may
+	// keep the non-verified 'forge' identity.
+	for _, table := range []string{
+		"seals", "zhengming_requests", "tian_events", "tian_event_dlq", "lings",
+		"forge_manifests", "judge_verdicts", "censor_precedents", "incidents", "ruler_councils",
+	} {
+		var stale int64
+		if err := db.Table(table).Where("project NOT LIKE ?", "daonb/%").Count(&stale).Error; err != nil {
+			t.Fatalf("count stale %s: %v", table, err)
+		}
+		if stale != 0 {
+			t.Errorf("%s: %d rows left outside the daonb/ shape", table, stale)
+		}
+		var forge int64
+		if err := db.Table(table).Where("username = ?", "forge").Count(&forge).Error; err != nil {
+			t.Fatalf("count forge %s: %v", table, err)
+		}
+		if forge != 0 {
+			t.Errorf("%s: %d rows still under the 'forge' role identity", table, forge)
+		}
 	}
 }

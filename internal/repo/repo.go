@@ -15,6 +15,8 @@ import (
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
+
+	"github.com/afittestide/asimi/internal/config"
 )
 
 // RepoInfo contains information about the git repository and worktree.
@@ -331,8 +333,10 @@ func (r *RepoInfo) BranchSlugOrDefault() string {
 		return ""
 	}
 	slug := SanitizeSegment(r.Branch)
-	// TODO: pick a better default branch for cases when working outside repo,
-	//       to avoid a collision make it illegal in git.
+	// Detached HEAD (or an unborn branch) has no branch name. Default to
+	// "main": the slug is a namespacing label for session records, never a
+	// git ref used for writes, so it cannot collide with a real branch
+	// (e1005 ruling, striking the old TODO).
 	if slug == "" {
 		return "main"
 	}
@@ -548,50 +552,51 @@ func readShortStatus(repo *gogit.Repository) string {
 	return summarizePorcelain(out)
 }
 
-// ProjectSlug resolves the project slug (e.g., "owner/repo") for the checkout
-// using a single, deterministic precedence — never origin-only:
+// ProjectSlug resolves the project slug for the checkout. The shape is
+// "<verified local username>/<origin repo basename>": the first segment is the
+// OS user (the only identity the Court can verify, edict 1006) and the second
+// is the origin remote's repo basename with the remote owner dropped.
 //
-//  1. (callers) an explicit [court] project override — see ResolveProjectSlug
-//  2. the remote tracked by the current branch (its upstream)
-//  3. origin
-//  4. the sanitized directory basename
-//
-// With two remotes (origin + upstream) the tracked remote wins, so the slug
-// does not depend on which remote happens to be named origin. On gitless ground
-// the basename fallback gives the directory a valid, unique identity (sandbox
-// image names, court DB scoping).
+// Precedence is origin → sanitized directory basename. Origin is consulted
+// because it is branch-invariant and naturally per-user: switching branches
+// never changes scope, so two people's forks of one repo stay distinct. The
+// branch's tracked remote is deliberately ignored (edict 1005, reversing e968).
+// On gitless ground the basename fallback gives the directory a valid, unique
+// identity (sandbox image names, court DB scoping).
 func ProjectSlug(projectRoot string, hasVCS bool) string {
-	if projectRoot == "" {
-		return ""
-	}
-	if hasVCS {
-		if slug := slugFromRemotes(projectRoot); slug != "" {
-			return slug
-		}
-	}
-	// No VCS (or no usable remote): derive identity from the directory basename.
-	return SanitizeSegment(filepath.Base(projectRoot))
+	slug, _ := resolveProjectSlug(projectRoot, hasVCS)
+	return slug
 }
 
 // ResolveProjectSlug is the single resolver shared by every caller (repo info,
-// the daemon handshake, daemon create, the TUI provider, and commands). An
-// explicit project (e.g. [court] project in .agents/asimi.conf) wins on every
-// path; otherwise ProjectSlug's deterministic precedence applies. When more than
-// one distinct slug is derivable from the remotes and no explicit project is
-// configured, the ambiguity is reported (logged) rather than silently picking
-// one — the tracked/origin slug is still returned so callers stay deterministic.
-func ResolveProjectSlug(explicit, projectRoot string, hasVCS bool) string {
-	if explicit != "" {
-		return explicit
+// the daemon handshake, daemon create, the TUI provider, and commands). The
+// slug always comes from the checkout: origin resolves first, so a two-remote
+// fork (origin + upstream) resolves deterministically. Because the owner is
+// dropped, remotes naming the same repo collapse to one slug; only an
+// origin-less checkout whose remotes name different repos is genuinely
+// ambiguous. That case is a hard error naming the candidates — silently
+// picking one could scope writes to the wrong project.
+func ResolveProjectSlug(projectRoot string, hasVCS bool) (string, error) {
+	return resolveProjectSlug(projectRoot, hasVCS)
+}
+
+// resolveProjectSlug probes origin once and returns both the slug and, on an
+// origin-less ambiguous checkout, the error. ProjectSlug discards the error.
+func resolveProjectSlug(projectRoot string, hasVCS bool) (string, error) {
+	if projectRoot == "" {
+		return "", nil
 	}
-	slug := ProjectSlug(projectRoot, hasVCS)
 	if hasVCS {
+		name := originRepoBasename(projectRoot)
+		if name != "" {
+			return slugForRepo(name), nil
+		}
 		if candidates := DerivedSlugs(projectRoot); len(candidates) > 1 {
-			slog.Warn("multiple project slugs derivable from remotes; no [court] project configured",
-				"chosen", slug, "candidates", strings.Join(candidates, ", "))
+			return "", fmt.Errorf("cannot determine project scope: no origin remote and %d candidate repos (%s); add an origin remote or run in a gitless directory",
+				len(candidates), strings.Join(candidates, ", "))
 		}
 	}
-	return slug
+	return slugForRepo(SanitizeSegment(filepath.Base(projectRoot))), nil
 }
 
 // DerivedSlugs returns the sorted, de-duplicated slugs derivable from every
@@ -610,7 +615,7 @@ func DerivedSlugs(workingDir string) []string {
 		if !ok || url == "" {
 			continue
 		}
-		slug := slugFromRemoteURL(url)
+		slug := slugForRepo(repoBasenameFromURL(url))
 		if slug == "" || seen[slug] {
 			continue
 		}
@@ -621,32 +626,31 @@ func DerivedSlugs(workingDir string) []string {
 	return slugs
 }
 
-// slugFromRemotes resolves the slug from the checkout's remotes using the
-// tracked-remote→origin precedence. Returns "" when no remote yields a slug.
-func slugFromRemotes(workingDir string) string {
-	if branch := currentBranchName(workingDir); branch != "" {
-		if remote, ok := gitConfigGet(workingDir, "branch."+branch+".remote"); ok && remote != "" {
-			if url, ok := gitConfigGet(workingDir, "remote."+remote+".url"); ok && url != "" {
-				if slug := slugFromRemoteURL(url); slug != "" {
-					return slug
-				}
-			}
-		}
-	}
-	if url, err := GitRemoteOriginURL(workingDir); err == nil && url != "" {
-		return slugFromRemoteURL(url)
-	}
-	return ""
-}
-
-// slugFromRemoteURL parses a git remote URL into a canonical lowercase slug
-// (owner/repo), preserving the "/" separator required by podman image names.
-func slugFromRemoteURL(remoteURL string) string {
-	owner, name := ParseGitRemote(remoteURL)
-	if owner == "" || name == "" {
+// originRepoBasename returns the sanitized repo basename of the checkout's
+// origin remote, or "" when origin is unset or unparseable.
+func originRepoBasename(workingDir string) string {
+	url, err := GitRemoteOriginURL(workingDir)
+	if err != nil || url == "" {
 		return ""
 	}
-	return strings.ToLower(owner) + "/" + strings.ToLower(name)
+	return repoBasenameFromURL(url)
+}
+
+// repoBasenameFromURL extracts the sanitized repo basename from a git remote
+// URL. The remote owner is deliberately discarded: the slug's first segment is
+// the verified local user instead (edict 1005).
+func repoBasenameFromURL(remoteURL string) string {
+	_, name := ParseGitRemote(remoteURL)
+	return SanitizeSegment(name)
+}
+
+// slugForRepo prefixes a repo basename with the verified local username. The
+// "/" separator is preserved because podman image names require it.
+func slugForRepo(repoBasename string) string {
+	if repoBasename == "" {
+		return ""
+	}
+	return SanitizeSegment(config.OSUsername()) + "/" + repoBasename
 }
 
 // gitRemoteNames lists the checkout's configured remote names.
@@ -662,16 +666,6 @@ func gitRemoteNames(workingDir string) []string {
 		}
 	}
 	return names
-}
-
-// currentBranchName returns the short name of the checked-out branch, or "" on
-// detached HEAD or error.
-func currentBranchName(workingDir string) string {
-	out, err := runGitCommand(workingDir, "symbolic-ref", "--short", "-q", "HEAD")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 // gitConfigGet reads a single git config value via `git config --get`. The

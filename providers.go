@@ -377,7 +377,7 @@ func ProvideGormDB(params GormDBParams) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to migrate Court schema: %w", err)
 	}
 
-	if err := storage.PostGormMigrate(db); err != nil {
+	if err := storage.PostGormMigrate(db, repo.SanitizeSegment(config.OSUsername())); err != nil {
 		return nil, fmt.Errorf("failed post-GORM migration: %w", err)
 	}
 
@@ -398,20 +398,23 @@ type CourtParams struct {
 }
 
 // ProvideCourt creates the Court coordinator with lifecycle management
-func ProvideCourt(params CourtParams) *court.Court {
+func ProvideCourt(params CourtParams) (*court.Court, error) {
 
 	// Start with defaults, then overlay config file values. The Court
 	// username is never taken from config — it is resolved from the OS user
 	// inside NewCourt so a committed [court] username cannot re-scope the
 	// session onto another user's ledger (edict 1006).
 	cfg := config.DefaultCourtConfig()
-	if params.Config.Court.Project != "" {
-		cfg.Project = params.Config.Court.Project
-	} else if params.RepoInfo.Slug != "" {
-		// Shared resolver: tracked-remote → origin → basename, warning when the
-		// remotes disagree — never an origin-only pick. (edict 968)
-		cfg.Project = repo.ResolveProjectSlug("", params.RepoInfo.ProjectRoot, params.RepoInfo.HasVCS)
+	// The project scope always comes from the checkout: a committed
+	// [court] project is client-controlled data and must not choose scope
+	// (edict 1005). ResolveProjectSlug errors only when origin is absent and
+	// the remotes name different repos, in which case boot must refuse rather
+	// than silently pick a scope that can receive writes.
+	project, err := repo.ResolveProjectSlug(params.RepoInfo.ProjectRoot, params.RepoInfo.HasVCS)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project scope: %w", err)
 	}
+	cfg.Project = project
 	cfg.IsolatedHost = params.Config.Court.IsolatedHost
 	if params.Config.Court.OutputLimit > 0 {
 		cfg.OutputLimit = params.Config.Court.OutputLimit
@@ -446,5 +449,5 @@ func ProvideCourt(params CourtParams) *court.Court {
 		},
 	})
 
-	return s
+	return s, nil
 }

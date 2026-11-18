@@ -206,11 +206,17 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 			// HasVCS is the single authoritative gitless-ground flag and
 			// SetContextParams does not carry it over the wire — re-derive it
 			// so the RepoInfo never treats a real git repository as gitless.
+			// The slug is likewise derived here, never taken from the client:
+			// it names the sandbox image/container and scopes Court reads
+			// (edict 1005).
 			var hasVCS bool
+			slug := ""
 			if p.ProjectRoot != "" {
-				hasVCS = repo.GetRepoInfoForRoot(p.ProjectRoot).HasVCS
+				ri := repo.GetRepoInfoForRoot(p.ProjectRoot)
+				hasVCS = ri.HasVCS
+				slug = ri.Slug
 			}
-			repoInfo := repo.RepoInfo{ProjectRoot: p.ProjectRoot, WorktreePath: p.WorktreePath, Branch: p.Branch, HasVCS: hasVCS, Slug: p.Project}
+			repoInfo := repo.RepoInfo{ProjectRoot: p.ProjectRoot, WorktreePath: p.WorktreePath, Branch: p.Branch, HasVCS: hasVCS, Slug: slug}
 			ct, runner, err = createCourt(ctx, shared, connID, p, verifiedUsername, projectCfg, repoInfo, shared.NewSessionStore, p.IsolatedHost)
 			if err != nil {
 				return nil, wire.NewError(0, err.Error())

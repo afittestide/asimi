@@ -9,6 +9,8 @@ import (
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/stretchr/testify/require"
+
+	"github.com/afittestide/asimi/internal/config"
 )
 
 func TestIsMainBranch(t *testing.T) {
@@ -184,8 +186,8 @@ func TestGetRepoInfoForRoot_NonExistentDir(t *testing.T) {
 	require.False(t, info.IsWorktree)
 	// Gitless ground still gets identity: the sanitized directory basename.
 	require.False(t, info.HasVCS, "HasVCS should be false without a git repository")
-	require.Equal(t, "exist", info.Slug,
-		"gitless directory yields the basename slug")
+	require.Equal(t, SanitizeSegment(config.OSUsername())+"/exist", info.Slug,
+		"gitless directory yields <verified user>/<basename>")
 }
 
 func TestGetRepoInfoForRoot_Gitless(t *testing.T) {
@@ -200,8 +202,8 @@ func TestGetRepoInfoForRoot_Gitless(t *testing.T) {
 	require.False(t, info.IsMain, "no branch means not main")
 	require.Empty(t, info.BranchSlugOrDefault(),
 		"BranchSlugOrDefault must not report main when there is no repo")
-	require.Equal(t, "hello-world-trial", info.Slug,
-		"gitless slug derives from the sanitized directory basename")
+	require.Equal(t, SanitizeSegment(config.OSUsername())+"/hello-world-trial", info.Slug,
+		"gitless slug derives from <verified user>/<sanitized basename>")
 	require.True(t, info.Gitless())
 }
 
@@ -337,8 +339,11 @@ func TestParseGitRemote(t *testing.T) {
 	}
 }
 
-func TestProjectSlugLowercasesRemoteSegments(t *testing.T) {
-	// projectSlug uses git config --get remote.origin.url, so set up a real repo.
+func TestProjectSlugUsesVerifiedUserAndOriginRepo(t *testing.T) {
+	// The slug is "<verified local user>/<origin repo basename>": the remote
+	// owner is dropped and the first segment is the OS user (edict 1005).
+	user := SanitizeSegment(config.OSUsername())
+
 	dir := t.TempDir()
 	_, err := runGitCommand(dir, "init")
 	require.NoError(t, err)
@@ -346,18 +351,25 @@ func TestProjectSlugLowercasesRemoteSegments(t *testing.T) {
 	require.NoError(t, err)
 	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
 
-	slug := ProjectSlug(dir, true)
-	require.Equal(t, "myorg/myproject", slug)
+	require.Equal(t, user+"/myproject", ProjectSlug(dir, true))
+	// The remote owner ("myorg") must not appear: the first segment is the
+	// verified user, per the naming rule (edict 1005).
+	require.NotContains(t, ProjectSlug(dir, true), "myorg")
 
-	// Gitless ground falls back to the sanitized directory basename.
+	// Gitless ground falls back to the sanitized directory basename, still
+	// prefixed with the verified user.
 	gitless := t.TempDir()
-	require.Equal(t, SanitizeSegment(filepath.Base(gitless)), ProjectSlug(gitless, false))
+	require.Equal(t, user+"/"+SanitizeSegment(filepath.Base(gitless)), ProjectSlug(gitless, false))
 }
 
-// TestProjectSlug_TwoRemotesUsesTrackedRemote covers edict 968: with two remotes
-// the slug must follow the branch's tracked remote, not whichever is named
-// origin, and an explicit [court] project must win on every path.
-func TestProjectSlug_TwoRemotesUsesTrackedRemote(t *testing.T) {
+// TestProjectSlug_OriginFirstIgnoresTrackedRemote covers edict 1005, which
+// reverses e968: origin is the only remote consulted, so the slug is a function
+// of the checkout rather than the mutable checked-out branch. The remote owner
+// is dropped, so two forks of one repo collapse to a single candidate; only an
+// origin-less checkout whose remotes name different repos is a hard error.
+func TestProjectSlug_OriginFirstIgnoresTrackedRemote(t *testing.T) {
+	user := SanitizeSegment(config.OSUsername())
+
 	dir := t.TempDir()
 	_, err := runGitCommand(dir, "init", "-b", "main")
 	require.NoError(t, err)
@@ -372,7 +384,7 @@ func TestProjectSlug_TwoRemotesUsesTrackedRemote(t *testing.T) {
 	_, err = runGitCommand(dir, "commit", "-m", "init")
 	require.NoError(t, err)
 
-	// origin is the fork; upstream is the canonical (tracked) remote.
+	// origin is the fork; upstream is the canonical remote the branch tracks.
 	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
 	require.NoError(t, err)
 	_, err = runGitCommand(dir, "remote", "add", "upstream", "https://github.com/OCT7-IO/data-poisoning-benchmark.git")
@@ -383,23 +395,38 @@ func TestProjectSlug_TwoRemotesUsesTrackedRemote(t *testing.T) {
 	require.NoError(t, err)
 	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
 
-	// The tracked remote wins over origin.
-	require.Equal(t, "oct7-io/data-poisoning-benchmark", ProjectSlug(dir, true))
-
-	// Both remote slugs are derivable — the ambiguity signal for the resolver.
-	require.Equal(t, []string{
-		"daonb/data-poisoning-benchmark",
-		"oct7-io/data-poisoning-benchmark",
-	}, DerivedSlugs(dir))
-
-	// An explicit [court] project wins over any remote-derived slug.
-	require.Equal(t, "oct7-io/data-poisoning-benchmark",
-		ResolveProjectSlug("oct7-io/data-poisoning-benchmark", dir, true))
-
-	// Without a tracked branch, the resolver falls back to origin.
-	_, err = runGitCommand(dir, "config", "--unset", "branch.main.remote")
+	// Origin wins and its owner is dropped; the tracked remote is ignored.
+	slug, err := ResolveProjectSlug(dir, true)
 	require.NoError(t, err)
-	require.Equal(t, "daonb/data-poisoning-benchmark", ProjectSlug(dir, true))
+	require.Equal(t, user+"/data-poisoning-benchmark", slug)
+	// The remote owner must be dropped, not passed through: 'daonb' is the
+	// origin owner here and is not the first segment.
+	require.NotEqual(t, "daonb/data-poisoning-benchmark", slug)
+
+	// Switching the tracked remote must not change the slug (branch-invariance).
+	_, err = runGitCommand(dir, "config", "branch.main.remote", "origin")
+	require.NoError(t, err)
+	require.Equal(t, user+"/data-poisoning-benchmark", ProjectSlug(dir, true))
+
+	// Both remote basenames collapse to one slug, so there is no ambiguity.
+	require.Equal(t, []string{user + "/data-poisoning-benchmark"}, DerivedSlugs(dir))
+
+	// Originless with disagreeing repo basenames is a hard error naming both.
+	_, err = runGitCommand(dir, "remote", "remove", "origin")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "remote", "add", "fork", "https://github.com/OCT7-IO/other-repo.git")
+	require.NoError(t, err)
+	_, err = ResolveProjectSlug(dir, true)
+	require.ErrorContains(t, err, "add an origin remote")
+	require.ErrorContains(t, err, "data-poisoning-benchmark")
+	require.ErrorContains(t, err, "other-repo")
+
+	// With origin present the resolver never errors, whatever the other remotes.
+	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
+	require.NoError(t, err)
+	slug, err = ResolveProjectSlug(dir, true)
+	require.NoError(t, err)
+	require.Equal(t, user+"/data-poisoning-benchmark", slug)
 }
 
 // newTestRepo creates a RepoInfo backed by a real git repo in a temp dir.
@@ -634,4 +661,41 @@ func TestRepoInfo_EffectiveRoot(t *testing.T) {
 	if got := (RepoInfo{}).EffectiveRoot(); got != "" {
 		t.Errorf("EffectiveRoot = %q, want empty", got)
 	}
+}
+
+// TestProjectSlug_AcceptanceExample pins the exact case named in edict 1005:
+// a checkout whose origin is afittestide/asimi-cli resolves to
+// <verified user>/asimi-cli — the owner segment replaced by the local user,
+// independent of the checked-out branch.
+func TestProjectSlug_AcceptanceExample(t *testing.T) {
+	user := SanitizeSegment(config.OSUsername())
+
+	dir := t.TempDir()
+	_, err := runGitCommand(dir, "init", "-b", "main")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.email", "test@example.com")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "user.name", "Test")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x\n"), 0o644))
+	_, err = runGitCommand(dir, "add", "f.txt")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "commit", "-m", "init")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/afittestide/asimi-cli.git")
+	require.NoError(t, err)
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	// The old value was "afittestide/asimi-cli"; the new shape replaces the
+	// owner segment with the verified user.
+	require.Equal(t, user+"/asimi-cli", ProjectSlug(dir, true))
+
+	// A different branch with a different upstream must not move the slug.
+	_, err = runGitCommand(dir, "remote", "add", "other", "https://github.com/someone/else.git")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "checkout", "-b", "feature")
+	require.NoError(t, err)
+	_, err = runGitCommand(dir, "config", "branch.feature.remote", "other")
+	require.NoError(t, err)
+	require.Equal(t, user+"/asimi-cli", ProjectSlug(dir, true))
 }

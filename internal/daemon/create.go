@@ -64,13 +64,17 @@ func createCourt(
 	if osUser := config.OSUsername(); osUser != verifiedUsername {
 		return nil, nil, fmt.Errorf("daemon: refusing connection: socket peer %q does not match OS user %q", verifiedUsername, osUser)
 	}
-	if projectCfg.Court.Project != "" {
-		courtCfg.Project = projectCfg.Court.Project
-	} else if hp.Project != "" {
-		courtCfg.Project = hp.Project
-	} else {
-		courtCfg.Project = repo.ResolveProjectSlug("", repoInfo.ProjectRoot, repoInfo.HasVCS)
+	// The project scope is always derived from the checkout: neither a
+	// committed [court] project nor the client handshake slug may choose it
+	// (edict 1005 — the client slug names a path only the server can verify).
+	// ResolveProjectSlug errors only when origin is absent and the remotes name
+	// different repos, in which case the handshake must refuse rather than
+	// silently scope writes to the wrong project.
+	project, err := repo.ResolveProjectSlug(repoInfo.ProjectRoot, repoInfo.HasVCS)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve project scope: %w", err)
 	}
+	courtCfg.Project = project
 	if projectCfg.Court.OutputLimit > 0 {
 		courtCfg.OutputLimit = projectCfg.Court.OutputLimit
 	}
@@ -138,10 +142,15 @@ func reconfigureModel(ctx context.Context, ct *court.Court, hp types.SetContextP
 
 	// HasVCS is the single authoritative gitless-ground flag and SetContextParams
 	// does not carry it over the wire — re-derive it so the RepoInfo never
-	// treats a real git repository as gitless ground.
+	// treats a real git repository as gitless ground. The slug is derived here
+	// too: the client's Project is advisory, never the sandbox image name or
+	// Court scope (edict 1005).
 	var hasVCS bool
+	slug := ""
 	if hp.ProjectRoot != "" {
-		hasVCS = repo.GetRepoInfoForRoot(hp.ProjectRoot).HasVCS
+		ri := repo.GetRepoInfoForRoot(hp.ProjectRoot)
+		hasVCS = ri.HasVCS
+		slug = ri.Slug
 	}
 
 	repoInfo := repo.RepoInfo{
@@ -149,7 +158,7 @@ func reconfigureModel(ctx context.Context, ct *court.Court, hp types.SetContextP
 		WorktreePath: hp.WorktreePath,
 		Branch:       hp.Branch,
 		HasVCS:       hasVCS,
-		Slug:         hp.Project,
+		Slug:         slug,
 	}
 
 	bifrostClient, err := court.InitBifrost(

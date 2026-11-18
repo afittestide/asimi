@@ -385,13 +385,14 @@ func TestSetContext_EmptyProjectDerivesSlugFromGitRemote(t *testing.T) {
 	require.NoError(t, err)
 
 	// The chancellor's MinisterBase should have received the repoInfo
-	// with a non-empty slug derived from the git remote.
+	// with a non-empty slug derived from the git remote. Under the
+	// <verified user>/<origin repo> shape the owner is dropped (edict 1005).
 	chancellor := s.GetMinister("secretary")
 	require.NotNil(t, chancellor)
 	if base, ok := chancellor.(interface{ RepoInfo() repo.RepoInfo }); ok {
 		ri := base.RepoInfo()
 		assert.NotEmpty(t, ri.Slug, "slug should be derived from git remote when Project is empty")
-		assert.Equal(t, "testorg/testrepo", ri.Slug)
+		assert.Equal(t, repo.SanitizeSegment(config.OSUsername())+"/testrepo", ri.Slug)
 	}
 }
 

@@ -597,12 +597,13 @@ func TestHandleInitCommand_AutoDerivesSlug(t *testing.T) {
 	assert.Equal(t, storage.EventRitualEnacted, mock.publishedEvents[0].eventType)
 	assert.Equal(t, "project-init", mock.publishedEvents[0].payload["ritual_name"])
 
-	// Verify the project name was saved to .agents/asimi.conf
+	// Verify the config is seeded but carries no [court] project pin: scope is
+	// derived from the checkout, so the pin would be inert and misleading.
 	confPath := filepath.Join(tmpDir, ".agents", "asimi.conf")
 	data, err := os.ReadFile(confPath)
-	require.NoError(t, err, "config file should exist")
-	require.Contains(t, string(data), "owner/myrepo",
-		"config should contain the auto-derived slug")
+	require.NoError(t, err, "config file should be seeded")
+	require.NotContains(t, string(data), "owner/myrepo",
+		":init must not write a committed [court] project pin")
 }
 
 // TestHandleInitCommand_GitlessDerivesBasenameSlug documents e968's contract:
@@ -643,14 +644,16 @@ func TestHandleInitCommand_GitlessDerivesBasenameSlug(t *testing.T) {
 
 	confPath := filepath.Join(tmpDir, ".agents", "asimi.conf")
 	data, err := os.ReadFile(confPath)
-	require.NoError(t, err, "config file should exist")
-	require.Contains(t, string(data), wantSlug,
-		"config should contain the sanitized directory-basename slug")
+	require.NoError(t, err, "config file should be seeded")
+	require.NotContains(t, string(data), wantSlug,
+		":init must not write a committed [court] project pin")
 }
 
 // TestHandleInitCommand_ProjectAlreadySet tests that handleInitCommand proceeds
-// directly to createInitEdict when config.Court.Project is already set.
-func TestHandleInitCommand_ProjectAlreadySet(t *testing.T) {
+// TestHandleInitCommand_IgnoresExistingProject tests that a pre-existing
+// config.Court.Project no longer short-circuits :init: the pin is not a source
+// of scope (edict 1005), so the config is still seeded and the ritual enacted.
+func TestHandleInitCommand_IgnoresExistingProject(t *testing.T) {
 	skipIfNotCI(t)
 	tmpDir := t.TempDir()
 
@@ -664,7 +667,7 @@ func TestHandleInitCommand_ProjectAlreadySet(t *testing.T) {
 		status: StatusComponent{
 			repoInfo: &repo.RepoInfo{
 				ProjectRoot: tmpDir,
-				Slug:        "should/not/be/used",
+				Slug:        "daonb/repo",
 			},
 		},
 		court: mock,
@@ -678,9 +681,12 @@ func TestHandleInitCommand_ProjectAlreadySet(t *testing.T) {
 	require.Len(t, mock.publishedEvents, 1, "expected EventRitualEnacted to be published")
 	assert.Equal(t, storage.EventRitualEnacted, mock.publishedEvents[0].eventType)
 
-	// Config file should NOT have been created (saveProjectNameAndInit was skipped)
-	_, err := os.Stat(filepath.Join(tmpDir, ".agents", "asimi.conf"))
-	assert.True(t, os.IsNotExist(err), "config file should not exist when project already set")
+	// The config is seeded, and the old pin is not carried forward.
+	confPath := filepath.Join(tmpDir, ".agents", "asimi.conf")
+	data, err := os.ReadFile(confPath)
+	require.NoError(t, err, "config file should be seeded")
+	require.NotContains(t, string(data), "existing/project",
+		"the stored pin must not survive as an authoritative project")
 }
 
 // TestSaveProjectNameAndInit tests the saveProjectNameAndInit helper directly.
@@ -705,11 +711,13 @@ func TestSaveProjectNameAndInit(t *testing.T) {
 
 	cmd := saveProjectNameAndInit(mockTUI, "test-org/test-repo")
 
-	// Verify config file was created with the project name
+	// The config is seeded, but no [court] project pin is written: scope comes
+	// from the checkout (edict 1005).
 	confPath := filepath.Join(tmpDir, ".agents", "asimi.conf")
 	data, err := os.ReadFile(confPath)
-	require.NoError(t, err, "config file should exist")
-	assert.Contains(t, string(data), "test-org/test-repo")
+	require.NoError(t, err, "config file should be seeded")
+	assert.NotContains(t, string(data), "test-org/test-repo",
+		"saveProjectNameAndInit must not write a committed [court] project pin")
 
 	// Verify event was published (createInitEdict runs)
 	require.Len(t, mock.publishedEvents, 1)

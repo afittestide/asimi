@@ -380,23 +380,21 @@ func TestHeadlessSink_RitualStepStarted_NoFinish(t *testing.T) {
 	}
 }
 
-// TestHeadlessContextParams verifies that headlessContextParams correctly
-// builds SetContextParams from config and repo info.
+// TestHeadlessContextParams verifies that headlessContextParams builds
+// SetContextParams from repo info, and that a committed [court] project has no
+// effect: scope is derived from the checkout (edict 1005).
 func TestHeadlessContextParams(t *testing.T) {
-	cfg := &Config{
-		Court: config.CourtConfig{
-			Project: "testproject",
-		},
-	}
 	ri := &repo.RepoInfo{
 		ProjectRoot:  "/path/to/project",
 		WorktreePath: "/path/to/worktree",
 		Branch:       "main",
+		Slug:         "daonb/derived",
 	}
 
-	params := headlessContextParams(cfg, ri)
+	params := headlessContextParams(ri)
 
-	assert.Equal(t, "testproject", params.Project)
+	assert.Equal(t, "daonb/derived", params.Project, "committed [court] project must not choose scope")
+	assert.NotEqual(t, "pinned-project", params.Project)
 	// The username always comes from the OS user, never config (edict 1006).
 	assert.Equal(t, config.OSUsername(), params.Username)
 	assert.Equal(t, "/path/to/project", params.ProjectRoot)
@@ -407,19 +405,19 @@ func TestHeadlessContextParams(t *testing.T) {
 // TestHeadlessContextParams_NilRepoInfo verifies fallback to CWD.
 func TestHeadlessContextParams_NilRepoInfo(t *testing.T) {
 	cfg := &Config{}
-	params := headlessContextParams(cfg, nil)
+	_ = cfg
+	params := headlessContextParams(nil)
 	assert.NotEmpty(t, params.ProjectRoot)
 }
 
-// TestHeadlessContextParams_ProjectFromSlug verifies that when config
-// doesn't set a project, it falls back to repoInfo.Slug.
+// TestHeadlessContextParams_ProjectFromSlug verifies the project always comes
+// from repoInfo.Slug, the checkout-derived slug (edict 1005).
 func TestHeadlessContextParams_ProjectFromSlug(t *testing.T) {
-	cfg := &Config{}
 	ri := &repo.RepoInfo{
 		ProjectRoot: "/path/to/project",
 		Slug:        "my-slug",
 	}
-	params := headlessContextParams(cfg, ri)
+	params := headlessContextParams(ri)
 	assert.Equal(t, "my-slug", params.Project)
 }
 

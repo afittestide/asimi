@@ -27,6 +27,16 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
+// runGit runs a git command in dir, failing the test on error. Test-only
+// scaffolding for checkout fixtures.
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
 // testUsername returns the current OS user's username for daemon tests.
 // This matches what the server's unixPeerUsername will verify against.
 // Panics on failure because a silent fallback would mask bugs in tests.
@@ -519,6 +529,10 @@ func TestCreateCourtSetsRepoInfoBeforeStart(t *testing.T) {
 	defer cleanup()
 
 	projectRoot := t.TempDir()
+	// Make the checkout a real repo with an origin so the checkout-derived slug
+	// is deterministic and distinct from the committed pin.
+	runGit(t, projectRoot, "init")
+	runGit(t, projectRoot, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
 	agentsDir := filepath.Join(projectRoot, ".agents")
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .agents: %v", err)
@@ -756,13 +770,17 @@ func TestDaemonTwoClientsIsolation(t *testing.T) {
 // repository re-scope the session onto another user's ledger. The Court
 // username must be the socket-verified OS user, not the pinned value.
 //
-// Project pinning is intentionally left untouched here — dropping the
-// committed [court] project is the paired slug-precedence edict.
+// The committed [court] project must be ignored for the same reason (edict
+// 1005): scope is derived from the checkout, never from tracked config.
 func TestCreateCourtIgnoresCommittedUsername(t *testing.T) {
 	shared, cleanup := newTestShared(t)
 	defer cleanup()
 
 	projectRoot := t.TempDir()
+	// Make the checkout a real repo with an origin so the checkout-derived slug
+	// is deterministic and distinct from the committed pin.
+	runGit(t, projectRoot, "init")
+	runGit(t, projectRoot, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
 	agentsDir := filepath.Join(projectRoot, ".agents")
 	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
 		t.Fatalf("mkdir .agents: %v", err)
@@ -780,12 +798,11 @@ func TestCreateCourtIgnoresCommittedUsername(t *testing.T) {
 		t.Fatalf("config project = %q, want pinned slug", projectCfg.Court.Project)
 	}
 
-	// The handshake carries an origin-derived slug (daonb/...); the pinned config
-	// must win so the daemon scope matches the TUI's.
-	repoInfo := repo.RepoInfo{
-		ProjectRoot: projectRoot,
-		Slug:        "daonb/data-poisoning-benchmark",
-		Branch:      "main",
+	// The handshake slug is advisory: the Court derives scope from the
+	// checkout (edict 1005). The pinned committed project must NOT win.
+	repoInfo := repo.GetRepoInfoForRoot(projectRoot)
+	if !repoInfo.HasVCS {
+		t.Fatal("fixture is not a git checkout; the slug would fall back to the directory basename")
 	}
 	c, _, err := createCourt(
 		context.Background(),
@@ -808,8 +825,12 @@ func TestCreateCourtIgnoresCommittedUsername(t *testing.T) {
 	defer c.Stop()
 
 	key := c.EdictKey(1)
-	if key.Project != "oct7-io/data-poisoning-benchmark" {
-		t.Errorf("Court project = %q, want pinned %q", key.Project, "oct7-io/data-poisoning-benchmark")
+	wantProject := repo.SanitizeSegment(config.OSUsername()) + "/data-poisoning-benchmark"
+	if key.Project != wantProject {
+		t.Errorf("Court project = %q, want checkout-derived %q (committed pin must be ignored)", key.Project, wantProject)
+	}
+	if key.Project == "oct7-io/data-poisoning-benchmark" {
+		t.Error("Court project came from the committed [court] project pin; it must have no effect (edict 1005)")
 	}
 	if key.Username != testUsername() {
 		t.Errorf("Court username = %q, want verified OS user %q (committed config must be ignored)", key.Username, testUsername())
@@ -1098,4 +1119,93 @@ func runMandateClient(t *testing.T, sockPath, projectRoot string) {
 		t.Fatalf("ApplyMandate: %v", err)
 	}
 	fmt.Printf("CLIENT_PID=%d SEAMS=%d\n", os.Getpid(), len(seams))
+}
+
+// TestCreateCourtIgnoresHandshakeSlug covers edict 1005's daemon rule: the
+// client-supplied handshake Project must not choose Court scope or the sandbox
+// RepoInfo slug. A client could claim any slug, so the server derives it from
+// the checkout instead.
+func TestCreateCourtIgnoresHandshakeSlug(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	runGit(t, projectRoot, "init")
+	runGit(t, projectRoot, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".agents"), 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	projectCfg, err := config.LoadProjectConfig(projectRoot, false)
+	if err != nil {
+		t.Fatalf("LoadProjectConfig: %v", err)
+	}
+
+	c, _, err := createCourt(
+		context.Background(),
+		shared,
+		1,
+		types.SetContextParams{
+			// A forged slug the client has no business choosing.
+			Project:     "attacker/evil-repo",
+			Username:    testUsername(),
+			ProjectRoot: projectRoot,
+		},
+		testUsername(),
+		projectCfg,
+		repo.GetRepoInfoForRoot(projectRoot),
+		nil,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("createCourt: %v", err)
+	}
+	defer c.Stop()
+
+	want := repo.SanitizeSegment(config.OSUsername()) + "/data-poisoning-benchmark"
+	if got := c.EdictKey(1).Project; got != want {
+		t.Errorf("Court project = %q, want checkout-derived %q (handshake slug must be ignored)", got, want)
+	}
+	if got := c.EdictKey(1).Project; got == "attacker/evil-repo" {
+		t.Error("Court scope came from the client handshake slug; it must be derived server-side")
+	}
+}
+
+// TestCreateCourtRefusesOriginlessAmbiguity covers edict 1005 acceptance 5: a
+// checkout with no origin remote whose remotes name different repos has nothing
+// deterministic to scope to, so the session must refuse to boot rather than
+// silently pick one and scope writes to the wrong project.
+func TestCreateCourtRefusesOriginlessAmbiguity(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	runGit(t, projectRoot, "init")
+	// Two remotes naming different repos, and deliberately no origin.
+	runGit(t, projectRoot, "remote", "add", "fork", "https://github.com/daonb/data-poisoning-benchmark.git")
+	runGit(t, projectRoot, "remote", "add", "upstream", "https://github.com/OCT7-IO/other-repo.git")
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".agents"), 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	projectCfg, err := config.LoadProjectConfig(projectRoot, false)
+	if err != nil {
+		t.Fatalf("LoadProjectConfig: %v", err)
+	}
+
+	_, _, err = createCourt(
+		context.Background(),
+		shared,
+		1,
+		types.SetContextParams{Username: testUsername(), ProjectRoot: projectRoot},
+		testUsername(),
+		projectCfg,
+		repo.GetRepoInfoForRoot(projectRoot),
+		nil,
+		true,
+	)
+	if err == nil {
+		t.Fatal("createCourt on an origin-less ambiguous checkout = nil error, want refusal")
+	}
+	if !strings.Contains(err.Error(), "add an origin remote") {
+		t.Errorf("error = %v, want it to instruct adding an origin remote", err)
+	}
 }
