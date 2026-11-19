@@ -286,7 +286,16 @@ func (m *TUIModel) handleSessionSelected(session *court.Session) tea.Cmd {
 	if m.creatingTab == "" {
 		// Normal resume: clear edict key, switch to session's tab type
 		m.currentEdictKey = storage.EdictKey{}
-		if session.TabType != "" {
+		if len(m.tabs.Content().Chat.Messages) > 0 {
+			// The active tab has history: restore into a fresh tab instead of
+			// overwriting it.
+			tabType := session.TabType
+			if tabType == "" {
+				tabType = "secretary"
+			}
+			label := strings.ToUpper(tabType[:1]) + tabType[1:]
+			m.tabs.Add(label, TabType(tabType), m.tabs.UniqueTarget(tabType))
+		} else if session.TabType != "" {
 			m.tabs.SwitchToTabType(TabType(session.TabType))
 		}
 	} else {
