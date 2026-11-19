@@ -89,8 +89,11 @@ podman is compatible with docker so there's no need to learn new commands.
 Asimi uses it instead of docker because it's more secure - on linux it doesn't require a daemon.
 
 The sandbox is based on `.agents/sandbox/Dockerfile` which is created by the `init` command. 
-To build the image run `just build-sandbox` for an image named as in:
-`localhost/asimi/sandbox/afittestide/asimi:latest`.
+To build the image run `just build-sandbox` on the host for an image named as in:
+`localhost/asimi/sandbox/<username>/<repo>:latest`.
+The tag is scoped to your user (the only identity the court can verify), so the
+build must happen on the host — inside the sandbox the user is root and the
+tag would be wrong; the recipe fails fast there.
 Asimi will launch a container based on this image the first time the model calls the shell tool.
 The container will stay up as long as the program is running. 
 Once the program exits, the container is shutdown and removed.

@@ -12,7 +12,7 @@ const (
 	contextBarWidth          = 10
 	autocompactBufferRatio   = 0.225
 	memoryFileOverheadTokens = 20
-	defaultUnknownContextRef = 8192
+	defaultUnknownContextRef = 262144
 )
 
 // ContextInfo holds information about context usage.

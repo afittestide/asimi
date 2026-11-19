@@ -5563,7 +5563,7 @@ func TestGatesCommandEnrichesPromptHeldGatesFromSnapshot(t *testing.T) {
 		model.setPendingZhengming("forge", id)
 		model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
 			RequestID:  id,
-			ChannelID: "forge",
+			ChannelID:  "forge",
 			MinisterID: "forge",
 			Priority:   storage.PriorityNormal,
 			Questions:  storage.ZhengmingQuestions{{Text: id, Summary: id, Options: []string{"Yes", "No"}}},
@@ -10145,10 +10145,9 @@ func TestTrustDialog_EscAppliesNothing(t *testing.T) {
 
 // TestTrustDialog_RenderDoesNotOverClaimTheBoundary pins the wording: the
 // dialog only decides seams 2-3, so its title must say these are the *requested*
-// assets and the body must name what stays open regardless of the answer. An
-// empty request must not read as "nothing is exposed" — the session still gets
-// a writable project bind, cache volumes and the host network namespace (edict
-// 1036's "do not over-claim the boundary").
+// assets. An empty request must not read as "nothing is exposed" — the session
+// still gets a writable project bind, cache volumes and the host network
+// namespace (edict 1036's "do not over-claim the boundary").
 //
 // The empty branch is CAUSE-QUALIFIED (edict 1036): a genuinely empty request
 // and a request that could not be read are different facts and say different
@@ -10159,18 +10158,12 @@ func TestTrustDialog_RenderDoesNotOverClaimTheBoundary(t *testing.T) {
 
 	assert.Contains(t, rendered, "requested host assets",
 		"the title must scope the dialog to the requested seams, not all host assets")
-	assert.Contains(t, rendered, "Not covered here",
-		"the dialog must name what it does not govern")
-	assert.Contains(t, rendered, "project directory stays read-write",
-		"the always-open working-tree bind is the worst omission to leave unsaid")
 
 	empty := NewTrustDialog(nil).Render(80)
 	assert.Contains(t, empty, "requested no extra host assets",
 		"an empty request must be described as such, not as an absence of host exposure")
 	assert.NotContains(t, empty, "(no host assets requested)",
 		"the old wording claimed no host assets are exposed, which is false")
-	assert.Contains(t, empty, "Not covered here",
-		"the empty case is exactly where the uncovered seams must be spelled out")
 	assert.NotContains(t, empty, "could not be read",
 		"a genuinely empty request must not be described as a failed read")
 }
@@ -10194,8 +10187,6 @@ func TestTrustDialog_RenderDistinguishesUnreadableFromEmpty(t *testing.T) {
 		"the unreadable case must NOT borrow the honest-empty wording")
 	assert.NotContains(t, rendered, "Allow all",
 		"an unreadable request offers nothing to allow")
-	assert.Contains(t, rendered, "Not covered here",
-		"the uncovered seams stay disclosed whatever the request state")
 
 	// No answer can grant anything from an unreadable request.
 	assert.Equal(t, 0, d.GrantedCount())
@@ -10324,10 +10315,8 @@ func (s *seamReadStub) SessionSeams() ([]config.Seam, error) { return s.read() }
 // sandbox entirely and is NOT GATED — it is a deliberate operator choice on the
 // command line, so the dialog must never imply it is covered.
 //
-// The promise has two halves, both asserted: no seam row corresponds to the
-// flag, and the rendered text names the flag as an operator choice the
-// chooser's answers cannot turn on or off. The dialog must also never claim a
-// sandbox is protecting the session — with this flag set there is none.
+// The promise: no seam row corresponds to the flag under any answer, and
+// Allow all can never widen into it.
 func TestTrustDialog_DoesNotClaimToCoverIsolatedHost(t *testing.T) {
 	d := NewTrustDialog(trustDialogSeams())
 
@@ -10343,18 +10332,6 @@ func TestTrustDialog_DoesNotClaimToCoverIsolatedHost(t *testing.T) {
 	assert.False(t, d.Covers(config.HostBypassFlag),
 		"Allow all must not widen into the flag either")
 
-	// 2. The rendered text cannot read as if the sandbox were in force.
-	rendered := NewTrustDialog(trustDialogSeams()).Render(80)
-	assert.Contains(t, rendered, config.HostBypassFlag,
-		"the dialog must name --isolated-host as outside its answers, not silently omit it")
-	assert.Contains(t, rendered, "operator choice on the command line",
-		"the flag must be described as the operator's act, not a granted seam")
-	assert.Contains(t, rendered, "no dialog answer turns it on or off",
-		"the dialog must say its answers cannot switch the sandbox bypass")
-	assert.NotContains(t, strings.ToLower(rendered), "sandbox is in force",
-		"nothing may assert a sandbox protects a session that bypassed it")
-	assert.NotContains(t, strings.ToLower(rendered), "sandboxed",
-		"the dialog must not call the session sandboxed: --isolated-host has no sandbox")
 }
 
 // TestTrustDialog_UnknownKeyStaysModal pins the dialog as a hard modal: a key

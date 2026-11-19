@@ -1,4 +1,8 @@
-project_name := `git config --get remote.origin.url | sed -E 's/.*[:\/]([^\/]+)\/([^\/]+)\.git$/\1\/\2/' | tr '[A-Z]' '[a-z]'`
+# Sandbox image scope: "<username>/<origin repo basename>", mirroring the
+# runner's slug (internal/repo/repo.go). The origin owner is dropped and the
+# verified local user replaces it. Inside the sandbox this resolves as
+# root/<repo>, so recipes that count on it must run on the host (host-only).
+project_name := `user=$(id -un | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'); url=$(git config --get remote.origin.url 2>/dev/null | sed -E 's/\.git$//; s/\/+$//'); [ -n "$url" ] || url=$PWD; repo=$(basename "$url" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'); printf '%s/%s' "$user" "$repo"`
 now := `date +%Y%m%dT%H%M%S`
 
 # List all available recipes
@@ -330,16 +334,28 @@ get-threats:
     echo "VULN GATE PASSED: all reported findings are accepted in $allowlist."
 
 # Init and start the podman machine 
-init-podman:
+init-podman: host-only
     podman machine init --disk-size 30 --memory 4096 >/dev/null 2>&1 || true
     podman machine start >/dev/null 2>&1 || true
+# Fail fast with a clear error when run inside the sandbox: the sandbox's
+# user is root, so project_name resolves differently there (root/<repo> vs
+# <username>/<repo> on the host), and podman cannot reach the host machine.
+host-only:
+    #!/usr/bin/env bash
+    if [ -n "${container:-}" ]; then
+        echo "ERROR: this recipe must run on the host, not in the sandbox." >&2
+        echo "       project_name is user-scoped ('$(id -un)/<repo>') and the sandbox user is root," >&2
+        echo "       so building here tags an image the runner will never look for." >&2
+        exit 1
+    fi
+
 # Build the sandbox container.
 build-sandbox: init-podman
     podman builder prune -f >/dev/null 2>&1 || true
     podman build -t localhost/asimi/sandbox/{{project_name}}:latest -f .agents/sandbox/Dockerfile .
 
 # Clean up the sandbox container
-clean-sandbox:
+clean-sandbox: host-only
     podman rmi localhost/asimi/sandbox/{{project_name}}:latest
     # TODO: add removel of the shared go's cache
 

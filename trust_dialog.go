@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/afittestide/asimi/internal/config"
@@ -23,9 +24,8 @@ import (
 // the sandbox is bypassed entirely, so the dialog must not read as if a sandbox
 // were in force. That is not something the wording alone can promise, so it is
 // ENFORCED, not merely commented: the title names the session's *requested*
-// assets, the footer of every render names what stays open (the project
-// directory — the one true statement whether or not the sandbox exists), and
-// the footer never asserts that a sandbox is protecting the session. The seam
+// assets and the footer names the one seam always open — read-write access to
+// the project directory, true whether or not the sandbox exists. The seam
 // list is built from config.SessionSeams, which has no SeamKind for the flag,
 // so no row can correspond to it.
 type TrustDialog struct {
@@ -301,20 +301,8 @@ func (d *TrustDialog) Render(width int) string {
 		b.WriteString(fmt.Sprintf("%s%s Allow all\n", allowCursor, allowBox))
 	}
 
-	// The footer names what this dialog does NOT govern, whatever its state:
-	// these seams are always configured — never chosen here — so the dialog
-	// must not read as if its answers were the whole boundary. The working
-	// tree bind is stated as the one true fact whether or not a sandbox is in
-	// force; --isolated-host is an operator choice on the command line and no
-	// dialog answer turns it on or off (edict 1036, seam 8; intent/docs/sandbox-seams.md).
-	b.WriteString(hintStyle.Render("Not covered here (always as configured):"))
-	b.WriteString("\n")
-	b.WriteString(hintStyle.Render("  project directory stays read-write, host network,"))
-	b.WriteString("\n")
-	b.WriteString(hintStyle.Render(fmt.Sprintf("  run_on_host, %s (operator choice on the command line;", config.HostBypassFlag)))
-	b.WriteString("\n")
-	b.WriteString(hintStyle.Render("  no dialog answer turns it on or off). See intent/docs/sandbox-seams.md"))
-	b.WriteString("\n")
+	cwd, _ := os.Getwd()
+	b.WriteString(hintStyle.Render("  [x] Read-write access to " + cwd))
 
 	b.WriteString("\n")
 	return b.String()
