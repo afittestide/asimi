@@ -5,11 +5,12 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-11-19
 
 ### Added
 
 - **Minister of Rites (禮部)** — a new minister owns all documentation, and the docs tree moves to `intent/docs/` (e1017)
+- **Retry on tranient provider errors** - completly with configs and exponential backoff timer
 - **Trust dialog** — a genuinely untrusted or unknown seam request now opens an explicit trust dialog instead of being silently granted; the dialog applies the restrictive mandate with a disclosure toast so the Ruler can see exactly what a request was trusted to do (e1059)
 - **Honest zhengming retirement vocabulary** — provably-dead prompts (edict ascended or cancelled, exec-marker supersession) now retire with distinct dispositions (`superseded_by_edict`, `dismissed`) that never write `answer`, and the triage pass is idempotent and retry-safe; the deadline stays deliberately unconsumed by Ruler ruling — a question is answered or ends when its edict seals (e1037)
 - **Court project scope is `<verified user>`/`<origin repo>`, branch-invariant** — the daemon derives the project slug from the checkout's verified origin, never the client handshake, with a v7-to-v8 slug migration (e1005)
@@ -28,8 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **All ministers can create incidents** — the `create_incident` tool was gated to a subset of ministers; every minister can now file an incident
 - **Interactive Minister sessions read the main tree after `:switch`** — `RepoInfo` is now carried into `SessionConfig` and the registry is re-rooted in `ConfigureModel`, so a minister's `read_file` follows the Court into the new worktree (e1051)
 - **`enact_ritual` silently succeeded for unknown ritual names** — the ritual name is now validated against the ritual registry in `StartRitual` and an error is returned (e841)
-
-### Fixed
 
 - go-jose/v4 bumped to v4.1.9 and OpenTelemetry to v1.47.0, clearing four Dependabot alerts (one high: DoS parsing malicious JWKs in the container-decryption path, pulled in via the podman bindings) (e1066)
 
