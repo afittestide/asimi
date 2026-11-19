@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Minister of Rites (禮部)** — a new minister owns all documentation, and the docs tree moves to `intent/docs/` (e1017)
 
+### Fixed
+
+- go-jose/v4 bumped to v4.1.9 and OpenTelemetry to v1.47.0, clearing four Dependabot alerts (one high: DoS parsing malicious JWKs in the container-decryption path, pulled in via the podman bindings) (e1066)
+
 ## [0.16.1] - 2026-11-10
 
 ### Added
