@@ -1,6 +1,6 @@
 # Changelog
 
-All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and their notable changes are documented in the file.
+All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and their user notable changes are documented in the file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Minister of Rites (禮部)** — a new minister owns all documentation, and the docs tree moves to `intent/docs/` (e1017)
+- **Trust dialog** — a genuinely untrusted or unknown seam request now opens an explicit trust dialog instead of being silently granted; the dialog applies the restrictive mandate with a disclosure toast so the Ruler can see exactly what a request was trusted to do (e1059)
+- **Honest zhengming retirement vocabulary** — provably-dead prompts (edict ascended or cancelled, exec-marker supersession) now retire with distinct dispositions (`superseded_by_edict`, `dismissed`) that never write `answer`, and the triage pass is idempotent and retry-safe; the deadline stays deliberately unconsumed by Ruler ruling — a question is answered or ends when its edict seals (e1037)
+- **Court project scope is `<verified user>`/`<origin repo>`, branch-invariant** — the daemon derives the project slug from the checkout's verified origin, never the client handshake, with a v7-to-v8 slug migration (e1005)
+- **`suggest_edict` split into `new_edict` and `replace_edict`** — honest names and true semantics for the two write modes; a cancelled or Ruler-sealed edict is refused as a replacement target at call time AND at approval time (retiring leaked prompts as `superseded_by_edict`), so an approval can never again be silently absorbed by a dead edict; `issue_ref` links edicts to their GitHub issues; the `ruler_modified` contract is documented — the minister receives, integrates, and re-suggests (e873)
+- **`create-sandbox` skill** — a skill for connecting the asimi sandbox to the host's container daemon (colima, Docker Desktop, or native Docker) on macOS, delivered alongside Letter 0006 answering the sending court (e1054)
+
+### Changed
+
+- **A daemon the client cannot speak to is refused** — when the on-disk daemon's protocol or build is incompatible with the client, the client now refuses it with an error instead of silently adopting it (e1056)
+- **Edict 1 is drawn down** — Court infrastructure stops using reserved edict 1 for new work; system-level invariants use the id-0 Court key (`CourtEdictKey`), and the `CourtEdictKey` id-0 bug is fixed (e972)
+
+### Fixed
+
+- **Ritual failure shown twice in the TUI** — `startRitual` re-notified a failure the `Run` path had already reported, so every failed ritual displayed its failure twice (e1060)
+- **Our own healthcheck discarded the `__ASIMI_HEALTHY` sentinel and exit status** — a silently-failing exec was declared healthy; the healthcheck now honours both the sentinel and the exit status (e1054)
+- **All ministers can create incidents** — the `create_incident` tool was gated to a subset of ministers; every minister can now file an incident
+- **Interactive Minister sessions read the main tree after `:switch`** — `RepoInfo` is now carried into `SessionConfig` and the registry is re-rooted in `ConfigureModel`, so a minister's `read_file` follows the Court into the new worktree (e1051)
+- **`enact_ritual` silently succeeded for unknown ritual names** — the ritual name is now validated against the ritual registry in `StartRitual` and an error is returned (e841)
 
 ## [0.16.1] - 2026-11-10
 
