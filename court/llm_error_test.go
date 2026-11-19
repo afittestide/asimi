@@ -1,6 +1,7 @@
 package court
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -205,6 +206,49 @@ func TestProviderRequestContext_WrapBifrost_NilError(t *testing.T) {
 	assert.NotContains(t, err.Error(), "check that the configured model")
 	assert.False(t, isCredentialExhaustion(nil))
 }
+
+// TestIsTransientProviderError pins the transient-error classifier: 5xx and
+// 408/429 retry, network-failure shapes with no status retry, and 4xx /
+// credential exhaustion never do.
+func TestIsTransientProviderError(t *testing.T) {
+	ctx := ChatRequestContext("openai", "https://api.example.com")
+	tests := []struct {
+		name      string
+		err       error
+		transient bool
+	}{
+		{name: "500", err: ctx.Wrap("POST", intPtr(500), errors.New("internal error")), transient: true},
+		{name: "503", err: ctx.Wrap("POST", intPtr(503), errors.New("service unavailable")), transient: true},
+		{name: "502 bad gateway", err: ctx.Wrap("POST", intPtr(502), errors.New("bad gateway")), transient: true},
+		{name: "408 request timeout", err: ctx.Wrap("POST", intPtr(408), errors.New("request timeout")), transient: true},
+		{name: "429 rate limited", err: ctx.Wrap("POST", intPtr(429), errors.New("rate limited")), transient: true},
+		{name: "404 not found", err: ctx.Wrap("POST", intPtr(404), errors.New("Not Found")), transient: false},
+		{name: "400 bad request", err: ctx.Wrap("POST", intPtr(400), errors.New("bad request")), transient: false},
+		{name: "401 unauthorized", err: ctx.Wrap("POST", intPtr(401), errors.New("unauthorized")), transient: false},
+		{name: "connection reset no status", err: ctx.Wrap("POST", nil, errors.New("read tcp 1.2.3.4:443->5.6.7.8:999: read: connection reset by peer")), transient: true},
+		{name: "connection refused no status", err: ctx.Wrap("POST", nil, errors.New("dial tcp: connection refused")), transient: true},
+		{name: "broken pipe no status", err: ctx.Wrap("POST", nil, errors.New("write: broken pipe")), transient: true},
+		{name: "EOF no status", err: ctx.Wrap("POST", nil, errors.New("unexpected EOF")), transient: true},
+		{name: "io timeout no status", err: ctx.Wrap("POST", nil, errors.New("read: i/o timeout")), transient: true},
+		{name: "stream idle timeout", err: ctx.Wrap("POST", nil, errors.New("stream idle timeout exceeded")), transient: true},
+		{name: "TLS handshake timeout", err: ctx.Wrap("POST", nil, errors.New("net/http: TLS handshake timeout")), transient: true},
+		{name: "plain message no status", err: ctx.Wrap("POST", nil, errors.New("model overloaded")), transient: false},
+		{
+			name: "credential exhaustion sentinel",
+			err: fmt.Errorf("provider API error (openai @ x, POST /v1/chat/completions, status 502): %s: all configured keys returned permanent per-key errors",
+				credentialExhaustionType),
+			transient: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equalf(t, tt.transient, isTransientProviderError(tt.err), "%q", tt.err)
+		})
+	}
+	assert.False(t, isTransientProviderError(nil))
+}
+
+func intPtr(n int) *int { return &n }
 
 // TestChatRequestContext_UsesEnvConvention checks the env-var fallback path
 // matches Account.GetConfigForProvider's resolution order.

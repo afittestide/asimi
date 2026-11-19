@@ -1787,6 +1787,287 @@ func TestIsContextOverflowError(t *testing.T) {
 	assert.False(t, isContextOverflowError(nil))
 }
 
+// transientProvider fails the first calls with a configurable provider error
+// and then succeeds, so tests can exercise the session-level transient retry
+// loop. When always is set it fails on every call.
+type transientProvider struct {
+	mu          sync.Mutex
+	calls       int
+	always      bool
+	successAt   int // call index (1-based) from which it succeeds; default 3
+	bifrostErr  *schemas.BifrostError
+	partialDrop bool // call 1 streams partial content before failing
+}
+
+func (p *transientProvider) shouldFail() bool {
+	p.calls++
+	if p.always {
+		return true
+	}
+	successAt := p.successAt
+	if successAt == 0 {
+		successAt = 3
+	}
+	return p.calls < successAt
+}
+
+func (p *transientProvider) chatErr() *schemas.BifrostError {
+	if p.bifrostErr != nil {
+		return p.bifrostErr
+	}
+	status := 503
+	return &schemas.BifrostError{
+		StatusCode: &status,
+		Error:      &schemas.ErrorField{Message: "upstream overloaded"},
+	}
+}
+
+func (p *transientProvider) ChatCompletionRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	p.mu.Lock()
+	fail := p.shouldFail()
+	p.mu.Unlock()
+	if fail {
+		return nil, p.chatErr()
+	}
+	content := "third time lucky"
+	return &schemas.BifrostChatResponse{
+		Choices: []schemas.BifrostResponseChoice{{
+			Index:                       0,
+			ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{Message: &schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: &content}}},
+			FinishReason:                strPtr("stop"),
+		}},
+	}, nil
+}
+
+// partialDrop makes the first streaming call stream one content chunk and
+// then fail with the transient error, simulating a mid-stream network drop
+// after partial content was already streamed.
+func (p *transientProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	p.mu.Lock()
+	fail := p.shouldFail()
+	call := p.calls
+	partialDrop := p.partialDrop && call == 1
+	p.mu.Unlock()
+	ch := make(chan *schemas.BifrostStreamChunk)
+	go func() {
+		defer close(ch)
+		if fail {
+			if partialDrop {
+				content := "partial "
+				ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+					Choices: []schemas.BifrostResponseChoice{{
+						Index: 0,
+						ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+							Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+						},
+					}},
+				}}
+				ch <- &schemas.BifrostStreamChunk{BifrostError: p.chatErr()}
+				return
+			}
+			ch <- &schemas.BifrostStreamChunk{BifrostError: p.chatErr()}
+			return
+		}
+		content := "third time lucky"
+		finish := "stop"
+		ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+				},
+				FinishReason: &finish,
+			}},
+		}}
+	}()
+	return ch, nil
+}
+
+func (p *transientProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *transientProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *transientProvider) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// e1063: a provider that fails twice with 5xx and then succeeds must retry
+// through with one StreamRetryWarnMsg per failed attempt and no StreamErrorMsg.
+func TestSession_TransientError_RetriesAndSucceeds(t *testing.T) {
+	prov := &transientProvider{successAt: 3}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1063-model",
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	var warns []StreamRetryWarnMsg
+	var errorMsgs int
+	sess.SetNotify(func(msg any) {
+		switch m := msg.(type) {
+		case StreamRetryWarnMsg:
+			warns = append(warns, m)
+		case StreamErrorMsg:
+			errorMsgs++
+		}
+	}, "test-channel")
+
+	resp, err := sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.NoError(t, err, "transient 5xx must be retried, not halt the session")
+	assert.Contains(t, resp, "third time lucky")
+
+	// One warning per failed attempt (2 failures), no generic error.
+	require.Len(t, warns, 2)
+	assert.Equal(t, 1, warns[0].Attempt)
+	assert.Equal(t, 2, warns[1].Attempt)
+	assert.Equal(t, 3, warns[0].Max)
+	assert.Zero(t, errorMsgs, "retry success must not surface StreamErrorMsg")
+}
+
+// e1063: a provider that always fails surfaces StreamErrorMsg only after
+// the retry budget is exhausted (1 + maxRetries calls).
+func TestSession_TransientError_AlwaysFailsAfterMaxRetries(t *testing.T) {
+	prov := &transientProvider{always: true}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider:               "openai",
+		Model:                  "e1063-model",
+		MaxRetries:             2,
+		MaxRetryBackoffSeconds: 1,
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	var warns int
+	var errorMsgs int
+	sess.SetNotify(func(msg any) {
+		switch msg.(type) {
+		case StreamRetryWarnMsg:
+			warns++
+		case StreamErrorMsg:
+			errorMsgs++
+		}
+	}, "test-channel")
+
+	_, err = sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.Error(t, err)
+	assert.Equal(t, 2, warns, "one warning per retry")
+	assert.Equal(t, 1, errorMsgs, "StreamErrorMsg surfaces exactly once, after retries are exhausted")
+	assert.Equal(t, 3, prov.callCount(), "1 initial call + 2 retries")
+}
+
+// e1063: a non-transient 400 must not retry — immediate StreamErrorMsg.
+func TestSession_NonTransientError_NoRetry(t *testing.T) {
+	status := 400
+	prov := &transientProvider{always: true, bifrostErr: &schemas.BifrostError{
+		StatusCode: &status,
+		Error:      &schemas.ErrorField{Message: "bad request"},
+	}}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1063-model",
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	var warns int
+	var errorMsgs int
+	sess.SetNotify(func(msg any) {
+		switch msg.(type) {
+		case StreamRetryWarnMsg:
+			warns++
+		case StreamErrorMsg:
+			errorMsgs++
+		}
+	}, "test-channel")
+
+	_, err = sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.Error(t, err)
+	assert.Zero(t, warns, "non-transient error must not warn")
+	assert.Equal(t, 1, errorMsgs, "immediate StreamErrorMsg")
+	assert.Equal(t, 1, prov.callCount(), "no retry for non-transient 400")
+}
+
+// e1063: cancelling the context during the backoff returns ctx.Err instead of
+// burning the budget sleeping.
+func TestSession_TransientError_CtxCancelledDuringBackoff(t *testing.T) {
+	prov := &transientProvider{always: true}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider:               "openai",
+		Model:                  "e1063-model",
+		MaxRetries:             3,
+		MaxRetryBackoffSeconds: 60,
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var warns int
+	sess.SetNotify(func(msg any) {
+		if _, ok := msg.(StreamRetryWarnMsg); ok {
+			warns++
+			cancel() // cancel as soon as the first backoff starts
+		}
+	}, "test-channel")
+
+	_, err = sess.AskWithStreaming(ctx, "Hello", nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, warns)
+}
+
+// e1063: the configured llm.max_retry_backoff clamps the computed backoff
+// (short cap keeps the test fast).
+func TestSession_TransientError_BackoffCapped(t *testing.T) {
+	prov := &transientProvider{always: true}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider:               "openai",
+		Model:                  "e1063-model",
+		MaxRetries:             3,
+		MaxRetryBackoffSeconds: 1,
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	var backoffs []time.Duration
+	sess.SetNotify(func(msg any) {
+		if m, ok := msg.(StreamRetryWarnMsg); ok {
+			backoffs = append(backoffs, m.Backoff)
+		}
+	}, "test-channel")
+
+	_, err = sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.Error(t, err)
+	require.Len(t, backoffs, 3, "three retries, three warnings")
+	// 1s doubling capped at the 1s cap: 1s, 1s, 1s.
+	for i, b := range backoffs {
+		assert.Equalf(t, time.Second, b, "backoff %d must be clamped to the 1s cap", i)
+	}
+}
+
+// e1063: content streamed before a mid-stream transient drop must be dropped
+// before the retry: AskWithStreaming returns the stream buffer, so a leaked
+// partial would prepend itself to the retried answer.
+func TestSession_TransientError_PartialStreamDroppedBeforeRetry(t *testing.T) {
+	prov := &transientProvider{successAt: 2, partialDrop: true}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider:               "openai",
+		Model:                  "e1063-model",
+		MaxRetries:             2,
+		MaxRetryBackoffSeconds: 1,
+	}}, nil, nil, func(any) {}, "You are a helpful assistant", "test-channel")
+	require.NoError(t, err)
+
+	sess.SetNotify(func(any) {}, "test-channel")
+	resp, err := sess.AskWithStreaming(context.Background(), "Hello", nil)
+	require.NoError(t, err, "partial content then transient error must retry, not fail")
+	// The retried answer alone — the pre-drop "partial " must not survive in
+	// the returned response (AskWithStreaming returns the stream buffer).
+	assert.Equal(t, "third time lucky", resp)
+	assert.Equal(t, 2, prov.callCount(), "1 dropped call + 1 successful retry")
+}
+
 // overflowProvider 400s on the first calls with a context-overflow message
 // and then succeeds, so tests can exercise the recovery + retry path. When
 // alwaysFail is set it overflows on every call.

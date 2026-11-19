@@ -91,9 +91,10 @@ var contextOverflowPhrases = []string{
 	"too many tokens",
 }
 
-// contextOverflowStatusPattern captures the HTTP status embedded in a
-// wrapped provider error ("... , status 400): ..." or "status 413: ...").
-var contextOverflowStatusPattern = regexp.MustCompile(`status (\d{3})\b`)
+// httpStatusPattern captures the HTTP status embedded in a wrapped provider
+// error ("... , status 400): ..." or "status 413: ..."). Shared by the
+// context-overflow and transient-error classifiers.
+var httpStatusPattern = regexp.MustCompile(`status (\d{3})\b`)
 
 // isContextOverflowError reports whether err is a provider rejection caused
 // by the prompt exceeding the context window. It matches when a known
@@ -117,7 +118,7 @@ func isContextOverflowError(err error) bool {
 	// When a status made it onto the error string, it must be client-error
 	// 400/413. Errors whose status never crossed the wire (bare stream
 	// message) still classify on the phrase alone.
-	if m := contextOverflowStatusPattern.FindStringSubmatch(msg); len(m) == 2 {
+	if m := httpStatusPattern.FindStringSubmatch(msg); len(m) == 2 {
 		if m[1] != "400" && m[1] != "413" {
 			return false
 		}
@@ -334,6 +335,61 @@ type StreamMaxTokensReachedMsg struct {
 	ChannelID string `msgpack:"channel_id"`
 	Content   string `msgpack:"content,omitempty"`
 	LingID    string `msgpack:"ling_id,omitempty"`
+}
+
+// StreamRetryWarnMsg warns that a transient provider error occurred and the
+// session is retrying with backoff. Unlike StreamErrorMsg it does not mark
+// the session failed: no error status, no forgotten lings, the tab keeps
+// streaming. Attempt is 1-based; Max is the retry budget (llm.max_retries);
+// Backoff is the pause before the next attempt.
+type StreamRetryWarnMsg struct {
+	ChannelID string        `msgpack:"-"`
+	Attempt   int           `msgpack:"-"`
+	Max       int           `msgpack:"-"`
+	Backoff   time.Duration `msgpack:"-"`
+	Err       error         `msgpack:"-"`
+	LingID    string        `msgpack:"-"`
+}
+
+type streamRetryWarnMsgWire struct {
+	ChannelID string `msgpack:"channel_id"`
+	Attempt   int    `msgpack:"attempt"`
+	Max       int    `msgpack:"max"`
+	BackoffMS int64  `msgpack:"backoff_ms"`
+	Err       string `msgpack:"err,omitempty"`
+	LingID    string `msgpack:"ling_id,omitempty"`
+}
+
+// MarshalMsgpack encodes StreamRetryWarnMsg for the notification wire.
+func (s StreamRetryWarnMsg) MarshalMsgpack() ([]byte, error) {
+	w := streamRetryWarnMsgWire{
+		ChannelID: s.ChannelID,
+		Attempt:   s.Attempt,
+		Max:       s.Max,
+		BackoffMS: int64(s.Backoff / time.Millisecond),
+		LingID:    s.LingID,
+	}
+	if s.Err != nil {
+		w.Err = s.Err.Error()
+	}
+	return msgpack.Marshal(w)
+}
+
+// UnmarshalMsgpack decodes StreamRetryWarnMsg from the notification wire.
+func (s *StreamRetryWarnMsg) UnmarshalMsgpack(b []byte) error {
+	var w streamRetryWarnMsgWire
+	if err := msgpack.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	s.ChannelID = w.ChannelID
+	s.Attempt = w.Attempt
+	s.Max = w.Max
+	s.Backoff = time.Duration(w.BackoffMS) * time.Millisecond
+	s.LingID = w.LingID
+	if w.Err != "" {
+		s.Err = errors.New(w.Err)
+	}
+	return nil
 }
 
 // StreamContextOverflowMsg signals that a provider rejected the request
@@ -1807,9 +1863,37 @@ func buildPromptWithContext(userPrompt string, contextFiles map[string]string) s
 
 // --- LLM Response Generation ---
 
+// sessionRetryDefaults are the fallbacks when the config leaves them unset.
+const (
+	defaultMaxRetries          = 3
+	defaultMaxRetryBackoffSecs = 60
+	firstRetryBackoff          = time.Second
+)
+
+// retryBudget returns the session retry budget and backoff cap from config.
+func (s *Session) retryBudget() (maxRetries int, backoffCap time.Duration) {
+	maxRetries = defaultMaxRetries
+	capSecs := defaultMaxRetryBackoffSecs
+	if s.config != nil {
+		if s.config.MaxRetries > 0 {
+			maxRetries = s.config.MaxRetries
+		}
+		if s.config.MaxRetryBackoffSeconds > 0 {
+			capSecs = s.config.MaxRetryBackoffSeconds
+		}
+	}
+	return maxRetries, time.Duration(capSecs) * time.Second
+}
+
 // generateLLMResponse calls the LLM and returns the response. When stream is
 // true it takes the streaming path, emitting content and reasoning chunks via
 // s.notify as deltas arrive.
+//
+// Transient provider failures (5xx, 408/429, mid-stream network drops) are
+// retried with exponential backoff (1s doubling, capped at
+// llm.max_retry_backoff_seconds) for up to llm.max_retries attempts, warning
+// via StreamRetryWarnMsg instead of failing the session. When retries are
+// exhausted the error surfaces unchanged.
 //
 // On a provider context-overflow rejection it recovers once: it learns the
 // real window from the error, runs a bounded compaction that fits within that
@@ -1817,14 +1901,59 @@ func buildPromptWithContext(userPrompt string, contextFiles map[string]string) s
 // returns an actionable contextOverflowError instead of a raw provider error
 // so the caller can keep the session alive.
 func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*responseChoice, error) {
-	choice, err := s.doGenerateLLMResponse(ctx, stream)
-	if err == nil {
-		return choice, nil
+	maxRetries, backoffCap := s.retryBudget()
+	backoff := firstRetryBackoff
+	var choice *responseChoice
+	var err error
+	for attempt := 0; ; attempt++ {
+		choice, err = s.doGenerateLLMResponse(ctx, stream)
+		if err == nil {
+			return choice, nil
+		}
+		// Context overflow keeps its dedicated recovery path; the transient
+		// retry loop must never swallow it.
+		if isContextOverflowError(err) {
+			break
+		}
+		if !isTransientProviderError(err) || attempt >= maxRetries {
+			return nil, err
+		}
+		if s.notify != nil {
+			s.notify(StreamRetryWarnMsg{
+				ChannelID: s.channelID,
+				Attempt:   attempt + 1,
+				Max:       maxRetries,
+				Backoff:   backoff,
+				Err:       err,
+				LingID:    s.lingID,
+			})
+		}
+		// Honor ctx cancellation during the backoff: a cancelled session
+		// must not spend its budget sleeping.
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		// A partial streamed response must not be duplicated on the retry.
+		if stream {
+			s.resetStreamBuffer()
+		}
+		backoff *= 2
+		if backoff > backoffCap {
+			backoff = backoffCap
+		}
 	}
-	if !isContextOverflowError(err) {
-		return nil, err
-	}
+	return s.recoverContextOverflow(ctx, stream, err)
+}
 
+// recoverContextOverflow is the single-retry context-overflow recovery: learn
+// the true window from the error, compact history to fit, and re-send the
+// current request. Called by generateLLMResponse with the overflow error in
+// hand.
+func (s *Session) recoverContextOverflow(ctx context.Context, stream bool, err error) (*responseChoice, error) {
 	// The provider just told us the true window; trust it over any registry
 	// estimate before doing anything else.
 	if size := parseContextOverflowLimit(err); size > 0 {

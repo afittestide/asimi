@@ -1906,6 +1906,57 @@ func TestStreamContextOverflowMsg_UnknownWindow(t *testing.T) {
 	assert.True(t, foundHint, "unknown-window overflow must still surface an actionable hint")
 }
 
+// e1063: a transient provider error must render a warning toast + chat line
+// without setting the error status, forgetting lings, or stopping the
+// streaming tab — the session is retrying and stays alive.
+func TestStreamRetryWarnMsg_WarningKeepsSessionStreaming(t *testing.T) {
+	if globalTheme == nil {
+		globalTheme = NewTheme()
+	}
+	model := newTestModel(t)
+	channelID := model.tabs.ActiveTab().Target
+
+	// A prompt is in flight when the retry warning arrives.
+	model.startWaitingForResponse()
+	model.tabs.ActiveTab().Streaming = true
+	model.streamCompleteCallback = func(*TUIModel) tea.Cmd { return nil }
+
+	msgCountBefore := len(model.tabs.Content().Chat.Messages)
+
+	newModel, _ := model.handleCustomMessages(court.StreamRetryWarnMsg{
+		ChannelID: channelID,
+		Attempt:   1,
+		Max:       3,
+		Backoff:   time.Second,
+		Err:       fmt.Errorf("read: connection reset by peer"),
+	})
+	updatedModel := newModel.(TUIModel)
+
+	// Never a failed session: no error icon.
+	assert.False(t, updatedModel.status.HasError, "retry warning must not SetError")
+
+	// The tab keeps streaming: the retried response renders in place.
+	assert.True(t, updatedModel.tabs.ActiveTab().Streaming, "retry warning must keep the tab streaming")
+	assert.True(t, updatedModel.waitingForResponse, "retry warning must keep the wait indicator")
+	assert.NotNil(t, updatedModel.streamCompleteCallback, "retry warning must keep the completion callback armed")
+
+	// A warning line and retry details surface in the chat.
+	var warn string
+	for _, m := range updatedModel.tabs.Content().Chat.Messages[msgCountBefore:] {
+		if strings.Contains(m.Content, "retrying in") {
+			warn = m.Content
+		}
+	}
+	require.NotEmpty(t, warn, "retry warning must surface a chat line")
+	assert.Contains(t, warn, "connection reset by peer", "warning must name the error")
+	assert.Contains(t, warn, "attempt 1/3", "warning must name the attempt")
+
+	// Never a generic "Model Error:".
+	for _, m := range updatedModel.tabs.Content().Chat.Messages {
+		assert.NotContains(t, m.Content, "Model Error", "retry warning must not render as a model error")
+	}
+}
+
 // --- Connection drop detection tests (edict 552) ---
 
 func TestConnectionLostMsg_SavesPendingRetry(t *testing.T) {

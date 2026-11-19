@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -91,6 +92,50 @@ func isCredentialExhaustion(be *schemas.BifrostError) bool {
 		return true
 	}
 	return be.Error != nil && be.Error.Type != nil && *be.Error.Type == credentialExhaustionType
+}
+
+// transientNetworkPatterns are the message shapes a provider error with no
+// HTTP status takes when the underlying network transport failed mid-flight:
+// dropped connections, refused dials, dead sockets, timeouts.
+var transientNetworkPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)connection reset by peer`),
+	regexp.MustCompile(`(?i)connection refused`),
+	regexp.MustCompile(`(?i)broken pipe`),
+	regexp.MustCompile(`\bEOF\b`),
+	regexp.MustCompile(`(?i)i/o timeout`),
+	regexp.MustCompile(`(?i)stream idle timeout`),
+	regexp.MustCompile(`(?i)TLS handshake timeout`),
+}
+
+// isTransientProviderError reports whether a provider failure is transient:
+// a 5xx status (500–599), HTTP 408 (request timeout) or 429 (rate limited);
+// or — when no status reached the error — an underlying network-failure
+// shape (connection reset, refused, broken pipe, EOF, timeouts). Retrying
+// these is worthwhile; 4xx rejections (bad request, not found, auth) and
+// credential exhaustion never are, and context overflow keeps its own
+// dedicated recovery path.
+func isTransientProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), credentialExhaustionType) {
+		return false
+	}
+	if m := httpStatusPattern.FindStringSubmatch(err.Error()); len(m) == 2 {
+		code, convErr := strconv.Atoi(m[1])
+		if convErr == nil {
+			if code >= 500 && code <= 599 {
+				return true
+			}
+			return code == 408 || code == 429
+		}
+	}
+	for _, re := range transientNetworkPatterns {
+		if re.MatchString(err.Error()) {
+			return true
+		}
+	}
+	return false
 }
 
 // errSecretPatterns match the shapes credentials take when a provider (or a

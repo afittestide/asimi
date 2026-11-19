@@ -89,6 +89,7 @@ func DefaultConfig() Config {
 			RequestTimeoutSeconds:    300,
 			StreamIdleTimeoutSeconds: 600,
 			MaxRetries:               3,
+			MaxRetryBackoffSeconds:   60,
 		},
 		History: HistoryConfig{
 			Enabled:      true,

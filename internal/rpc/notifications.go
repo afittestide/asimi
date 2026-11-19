@@ -21,6 +21,7 @@ const (
 	NotifyStreamInterrupted          = "stream.interrupted"
 	NotifyStreamMaxTokens            = "stream.max_tokens"
 	NotifyStreamContextOverflow      = "stream.context_overflow"
+	NotifyStreamRetryWarn            = "stream.retry_warn"
 	NotifyStreamError                = "stream.error"
 	NotifyEventsDrained              = "events.drained"
 	NotifyMinisterInvoking           = "minister.invoking"
@@ -52,6 +53,7 @@ var (
 		reflect.TypeOf(court.StreamInterruptedMsg{}):            NotifyStreamInterrupted,
 		reflect.TypeOf(court.StreamMaxTokensReachedMsg{}):       NotifyStreamMaxTokens,
 		reflect.TypeOf(court.StreamContextOverflowMsg{}):        NotifyStreamContextOverflow,
+		reflect.TypeOf(court.StreamRetryWarnMsg{}):              NotifyStreamRetryWarn,
 		reflect.TypeOf(court.StreamErrorMsg{}):                  NotifyStreamError,
 		reflect.TypeOf(court.EventsDrainedMsg{}):                NotifyEventsDrained,
 		reflect.TypeOf(court.MinisterInvokingMsg{}):             NotifyMinisterInvoking,
@@ -125,6 +127,7 @@ var (
 		NotifyStreamInterrupted:          decode[court.StreamInterruptedMsg],
 		NotifyStreamMaxTokens:            decode[court.StreamMaxTokensReachedMsg],
 		NotifyStreamContextOverflow:      decode[court.StreamContextOverflowMsg],
+		NotifyStreamRetryWarn:            decode[court.StreamRetryWarnMsg],
 		NotifyStreamError:                decode[court.StreamErrorMsg],
 		NotifyEventsDrained:              decode[court.EventsDrainedMsg],
 		NotifyMinisterInvoking:           decode[court.MinisterInvokingMsg],

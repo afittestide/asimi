@@ -2713,6 +2713,22 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCompleteCallback = nil // Clear callback on overflow (no completion will follow)
 		m.repoInfo.RefreshDiff()
 
+	case court.StreamRetryWarnMsg:
+		// Transient provider error; the session is retrying with backoff.
+		// Warning only: no error status, no forgotten lings, the tab keeps
+		// streaming so the retried response renders in place.
+		tab := m.tabs.TabByTarget(msg.ChannelID)
+		if tab == nil {
+			return m, nil
+		}
+		chat := tab.Content.Chat
+		chat.AddToRawHistory("STREAM_RETRY_WARN", fmt.Sprintf("transient provider error: %v", msg.Err))
+		slog.Warn("court.StreamRetryWarnMsg", "error", msg.Err, "attempt", msg.Attempt, "max", msg.Max, "backoff", msg.Backoff, "channel", msg.ChannelID)
+		warn := fmt.Sprintf("⚠️  transient provider error (%v), retrying in %s (attempt %d/%d)",
+			msg.Err, msg.Backoff, msg.Attempt, msg.Max)
+		chat.AddMessage(lingBanner(chat, msg.LingID, fmt.Sprintf("\n%s%s", systemPrefix, warn)))
+		m.commandLine.AddToast(warn, "warning", 3*time.Second)
+
 	case court.StreamErrorMsg:
 		tab := m.tabs.TabByTarget(msg.ChannelID)
 		if tab == nil {

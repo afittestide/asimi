@@ -3,6 +3,7 @@ package court
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -96,6 +97,44 @@ func TestStreamMaxTokensReachedMsgRoundTrip(t *testing.T) {
 	_ = msgpack.Unmarshal(b, &out)
 	if out != in {
 		t.Fatalf("%+v != %+v", out, in)
+	}
+}
+
+// TestStreamRetryWarnMsgRoundTrip locks StreamRetryWarnMsg into the msgpack
+// wire contract: attempt, max, backoff, and the error string survive.
+func TestStreamRetryWarnMsgRoundTrip(t *testing.T) {
+	in := StreamRetryWarnMsg{
+		ChannelID: "e1063",
+		Attempt:   2,
+		Max:       3,
+		Backoff:   2 * time.Second,
+		Err:       errors.New("read: connection reset by peer"),
+		LingID:    "ling-1",
+	}
+	b, err := msgpack.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out StreamRetryWarnMsg
+	if err := msgpack.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.ChannelID != in.ChannelID || out.Attempt != in.Attempt || out.Max != in.Max ||
+		out.Backoff != in.Backoff || out.LingID != in.LingID {
+		t.Fatalf("round trip: got %+v want %+v", out, in)
+	}
+	if out.Err == nil || out.Err.Error() != in.Err.Error() {
+		t.Fatalf("round trip err: got %v want %v", out.Err, in.Err)
+	}
+
+	// Minimal message (no ling, no error) stays lossless on the wire.
+	b, _ = msgpack.Marshal(StreamRetryWarnMsg{ChannelID: "forge"})
+	var plain StreamRetryWarnMsg
+	if err := msgpack.Unmarshal(b, &plain); err != nil {
+		t.Fatalf("unmarshal plain: %v", err)
+	}
+	if plain.ChannelID != "forge" || plain.Err != nil {
+		t.Fatalf("plain round trip leaked fields: %+v", plain)
 	}
 }
 
