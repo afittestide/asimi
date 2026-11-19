@@ -620,6 +620,22 @@ func (s *Court) SetNotify(notify internal.NotifyFunc) {
 		events := s.drainedEvents
 		go func() { notify(EventsDrainedMsg{Events: events}) }()
 	}
+
+	// A request raised while the UI was disconnected sits pending in the DB,
+	// invisible to the Ruler. On reconnect, triage first — e1037's
+	// triagePendingZhengming retires the rows whose reason to exist has
+	// ended — then deliver a dialog only for the survivors that still block
+	// ascent. Replaying every pending row would stack one dialog per row
+	// (e1043).
+	if notify != nil {
+		go func() {
+			survivors, counts, ok := s.triagePendingZhengming()
+			if !ok {
+				return
+			}
+			s.deliverPendingZhengming(notify, survivors, counts)
+		}()
+	}
 }
 
 // Start initializes the Court lifecycle.

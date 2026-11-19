@@ -21,6 +21,8 @@ import (
 
 	"reflect"
 
+	"github.com/vmihailenco/msgpack/v5"
+
 	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/mocks"
@@ -7071,4 +7073,328 @@ func TestZhengmingAnswered_NewEdictApprovalCarriesIssueRef(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond, "edict should be created from the approved suggestion")
 
 	assert.Equal(t, "afittestide/asimi-cli#180", edict.IssueRef, "the issue_ref must round-trip into the created edict")
+}
+
+// --- Delivery half: dialogs only for survivors that block ascent (e1043) ---
+
+// TestZhengmingDelivery_BlockingOnlyDialogs covers guard 1: a survivor with a
+// live waiter produces exactly one ZhengmingPendingMsg; a non-blocking
+// survivor produces none.
+func TestZhengmingDelivery_BlockingOnlyDialogs(t *testing.T) {
+	t.Run("non-blocking survivor produces no dialog", func(t *testing.T) {
+		s, db := newDisposalTestCourt(t)
+		edict := insertTriageEdict(t, db, "quiet gate")
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: "non-blocking", EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "FYI only"}},
+		})
+
+		var dialogs []string
+		var mu sync.Mutex
+		s.SetNotify(func(msg any) {
+			if m, ok := msg.(ZhengmingPendingMsg); ok {
+				mu.Lock()
+				dialogs = append(dialogs, m.RequestID)
+				mu.Unlock()
+			}
+		})
+		time.Sleep(300 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Empty(t, dialogs, "a gate nothing is parked on must not stack a dialog")
+		assertStillPending(t, db, "non-blocking")
+	})
+
+	t.Run("blocking survivor with a live waiter produces exactly one dialog", func(t *testing.T) {
+		s, db := newDisposalTestCourt(t)
+		edict := insertTriageEdict(t, db, "blocking gate")
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: "blocking", EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "I am parked on"}},
+		})
+
+		// Register a live waiter, as WaitForZhengming does.
+		ch := make(chan ZhengmingAnswer, 1)
+		s.zhengming.mu.Lock()
+		s.zhengming.pending["blocking"] = ch
+		s.zhengming.mu.Unlock()
+
+		var dialogs []string
+		var mu sync.Mutex
+		s.SetNotify(func(msg any) {
+			if m, ok := msg.(ZhengmingPendingMsg); ok {
+				mu.Lock()
+				dialogs = append(dialogs, m.RequestID)
+				mu.Unlock()
+			}
+		})
+
+		require.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(dialogs) > 0
+		}, 2*time.Second, 20*time.Millisecond)
+
+		time.Sleep(200 * time.Millisecond) // allow a duplicate to show up
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, []string{"blocking"}, dialogs)
+	})
+}
+
+// TestZhengmingDelivery_LiveRitalBlocks covers guard 2: a survivor whose edict
+// has a live ritual_executions row (pending/running) but no waiter counts as
+// blocking.
+func TestZhengmingDelivery_LiveRitualBlocks(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict := insertTriageEdict(t, db, "ritual in flight")
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "ritual-blocking", EdictID: edict.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "step needs an answer"}},
+	})
+	require.NoError(t, db.Create(&RitualExecution{
+		ID: "exec-live", RitualName: "swift-strike", EdictID: edict.ID,
+		Username: edict.Username, Project: edict.Project, State: RitualStateRunning,
+	}).Error)
+
+	var dialogs []string
+	var mu sync.Mutex
+	s.SetNotify(func(msg any) {
+		if m, ok := msg.(ZhengmingPendingMsg); ok {
+			mu.Lock()
+			dialogs = append(dialogs, m.RequestID)
+			mu.Unlock()
+		}
+	})
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(dialogs) > 0
+	}, 2*time.Second, 20*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"ritual-blocking"}, dialogs)
+}
+
+// TestZhengmingDelivery_ZeroPendingIsSilent covers guard 4 and 5: no pending
+// rows and no retirements emit nothing at all, and a nil notify must not
+// panic.
+func TestZhengmingDelivery_ZeroPendingIsSilent(t *testing.T) {
+	t.Run("empty pending set emits nothing", func(t *testing.T) {
+		s, _ := newDisposalTestCourt(t)
+		var msgs []any
+		var mu sync.Mutex
+		s.SetNotify(func(msg any) {
+			mu.Lock()
+			msgs = append(msgs, msg)
+			mu.Unlock()
+		})
+		time.Sleep(200 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Empty(t, msgs, "a quiet boot must be quiet")
+	})
+
+	t.Run("nil notify does not panic", func(t *testing.T) {
+		s, db := newDisposalTestCourt(t)
+		edict := insertTriageEdict(t, db, "live")
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: "nil-notify", EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "?"}},
+		})
+		assert.NotPanics(t, func() { s.SetNotify(nil) })
+	})
+}
+
+// TestZhengmingDelivery_OutOfScopeNeverDelivered covers guard 6: rows outside
+// the Court's (username, project) scope are never delivered.
+func TestZhengmingDelivery_OutOfScopeNeverDelivered(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict := insertTriageEdict(t, db, "in scope")
+	ch := make(chan ZhengmingAnswer, 1)
+	s.zhengming.mu.Lock()
+	s.zhengming.pending["in-scope"] = ch
+	s.zhengming.mu.Unlock()
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "in-scope", EdictID: edict.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "mine"}},
+	})
+	// Same shape, other ledgers — with live waiters, to prove scoping, not
+	// the blocking signal, keeps them off the screen.
+	require.NoError(t, db.Create(&storage.Zhengming{
+		RequestID: "other-user", EdictID: edict.ID, Username: "someone-else",
+		Project: "testproject", MinisterID: "secretary", Status: storage.ZhengmingPending,
+		Priority: storage.PriorityNormal, Questions: storage.ZhengmingQuestions{{Text: "theirs"}},
+		TimeoutAt: time.Now().Add(time.Hour),
+	}).Error)
+	require.NoError(t, db.Create(&storage.Zhengming{
+		RequestID: "other-project", EdictID: 9002, Username: config.OSUsername(),
+		Project: "some-other-project", MinisterID: "secretary", Status: storage.ZhengmingPending,
+		Priority: storage.PriorityNormal, Questions: storage.ZhengmingQuestions{{Text: "theirs"}},
+		TimeoutAt: time.Now().Add(time.Hour),
+	}).Error)
+
+	var delivered []string
+	var mu sync.Mutex
+	s.SetNotify(func(msg any) {
+		if m, ok := msg.(ZhengmingPendingMsg); ok {
+			mu.Lock()
+			delivered = append(delivered, m.RequestID)
+			mu.Unlock()
+		}
+	})
+	time.Sleep(300 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"in-scope"}, delivered,
+		"only the Court's own scope's gate is delivered")
+	for _, foreign := range []string{"other-user", "other-project"} {
+		var got storage.Zhengming
+		require.NoError(t, db.First(&got, "request_id = ?", foreign).Error)
+		assert.Equal(t, storage.ZhengmingPending, got.Status,
+			"row %s is outside the Court's scope and is never delivered", foreign)
+	}
+}
+
+// TestZhengmingDelivery_ToastCountsMatchDispositions covers guard 7: the
+// summary counts the dispositions e1037's triage actually wrote, and the
+// awaiting count is the survivors that opened no dialog.
+func TestZhengmingDelivery_ToastCountsMatchDispositions(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+
+	// One ascended edict, one cancelled, one survivor with a live waiter
+	// (delivered as a dialog), one survivor with neither signal (awaiting).
+	ascended := insertTriageEdict(t, db, "ascended")
+	require.NoError(t, db.Create(&storage.Seal{
+		SealID: "seal-asc", EdictID: ascended.ID, Username: ascended.Username,
+		Project: ascended.Project, MinisterID: "ruler",
+	}).Error)
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "asc-1", EdictID: ascended.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "?"}},
+	})
+
+	cancelled := insertTriageEdict(t, db, "cancelled")
+	require.NoError(t, db.Model(&storage.Edict{}).
+		Where("id = ? AND username = ? AND project = ?", cancelled.ID, cancelled.Username, cancelled.Project).
+		Update("cancelled_at", time.Now()).Error)
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "cancelled-1", EdictID: cancelled.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "?"}},
+	})
+
+	blocking := insertTriageEdict(t, db, "blocking survivor")
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "blocking-1", EdictID: blocking.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "parked on me"}},
+	})
+	ch := make(chan ZhengmingAnswer, 1)
+	s.zhengming.mu.Lock()
+	s.zhengming.pending["blocking-1"] = ch
+	s.zhengming.mu.Unlock()
+
+	quiet := insertTriageEdict(t, db, "quiet survivor")
+	insertTriageZhengming(t, db, storage.Zhengming{
+		RequestID: "quiet-1", EdictID: quiet.ID,
+		Questions: storage.ZhengmingQuestions{{Text: "listed in :gates"}},
+	})
+
+	var dialogs []string
+	var summary *ZhengmingTriageMsg
+	var mu sync.Mutex
+	s.SetNotify(func(msg any) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch m := msg.(type) {
+		case ZhengmingPendingMsg:
+			dialogs = append(dialogs, m.RequestID)
+		case ZhengmingTriageMsg:
+			summary = &m
+		}
+	})
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return summary != nil
+	}, 2*time.Second, 20*time.Millisecond)
+
+	mu.Lock()
+	require.NotNil(t, summary)
+	assert.Equal(t, []string{"blocking-1"}, dialogs, "only the blocking survivor opens a dialog")
+	assert.Equal(t, 2, summary.Retired, "one ascended, one cancelled — actually written")
+	assert.Equal(t, 1, summary.Ascended)
+	assert.Equal(t, 1, summary.Cancelled)
+	assert.Equal(t, 0, summary.Superseded)
+	assert.Equal(t, 1, summary.Awaiting, "the quiet survivor alone is awaiting")
+	assert.Contains(t, summary.Text, "2 retired")
+	assert.Contains(t, summary.Text, "edict ascended x1")
+	assert.Contains(t, summary.Text, "cancelled x1")
+	assert.Contains(t, summary.Text, "superseded x0")
+	assert.Contains(t, summary.Text, "1 awaiting an answer (:gates)")
+	assertStillPending(t, db, "quiet-1")
+
+	// The counts must agree with the rows actually written.
+	var supersededByEdict int64
+	require.NoError(t, db.Model(&storage.Zhengming{}).
+		Where("status = ? AND username = ? AND project = ?",
+			storage.ZhengmingSupersededByEdict, s.username, s.config.Project).
+		Count(&supersededByEdict).Error)
+	assert.EqualValues(t, summary.Retired, supersededByEdict)
+	mu.Unlock()
+
+	// A repeated install delivers nothing twice.
+	dialogs = nil
+	summary = nil
+	s.SetNotify(func(msg any) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch m := msg.(type) {
+		case ZhengmingPendingMsg:
+			dialogs = append(dialogs, m.RequestID)
+		case ZhengmingTriageMsg:
+			summary = &m
+		}
+	})
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return summary != nil
+	}, 2*time.Second, 20*time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 0, summary.Retired, "retirement is idempotent across installs")
+	assert.Equal(t, []string{"blocking-1"}, dialogs, "the blocking gate is delivered once per install, never replayed twice")
+	assert.Equal(t, 1, summary.Awaiting)
+}
+
+// TestTakeSnapshot_PendingZhengmingUncapped pins the removed row cap: every
+// pending gate must be listed, or :gates is a lie.
+func TestTakeSnapshot_PendingZhengmingUncapped(t *testing.T) {
+	s, db := newDisposalTestCourt(t)
+	edict := insertTriageEdict(t, db, "many gates")
+	const n = 25
+	for i := 0; i < n; i++ {
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: fmt.Sprintf("gate-%02d", i), EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: fmt.Sprintf("question %d", i)}},
+		})
+	}
+	snap := s.TakeSnapshot()
+	assert.Len(t, snap.Zhengming, n, "the snapshot must list every pending gate, not the first 20")
+}
+
+// TestZhengmingTriageMsg_WireRoundTrip locks the summary onto the wire contract.
+func TestZhengmingTriageMsg_WireRoundTrip(t *testing.T) {
+	in := ZhengmingTriageMsg{
+		Retired: 16, Ascended: 15, Cancelled: 1, Superseded: 2, Awaiting: 50,
+		Text: "Zhengming triage: 16 retired — edict ascended x15, cancelled x1, superseded x2 · 50 awaiting an answer (:gates)",
+	}
+	b, err := msgpack.Marshal(in)
+	require.NoError(t, err)
+	var out ZhengmingTriageMsg
+	require.NoError(t, msgpack.Unmarshal(b, &out))
+	assert.Equal(t, in, out)
 }

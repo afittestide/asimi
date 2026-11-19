@@ -8,8 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/afittestide/asimi/court"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/internal/wire"
 	"github.com/afittestide/asimi/storage"
 )
 
@@ -202,4 +206,58 @@ func comparableEqual(a, b any) bool {
 		return ok && at == bt
 	}
 	return false
+}
+
+// TestZhengmingTriageNotificationIsRouted is the wire-contract guard for the
+// e1043 summary. The court-side msgpack test proves the struct round-trips, but
+// it would still pass if both registry entries in notifications.go were deleted
+// — the summary would then be dropped by PumpNotifications and the Ruler would
+// learn nothing about 50 gates sitting in :gates. So assert the mapping exists
+// on the server side and that the client side decodes back to the same value.
+func TestZhengmingTriageNotificationIsRouted(t *testing.T) {
+	want := court.ZhengmingTriageMsg{
+		Retired: 16, Ascended: 15, Cancelled: 1, Superseded: 0, Awaiting: 50,
+		Text: "Zhengming triage: 16 retired — edict ascended x15, cancelled x1, superseded x0 · 50 awaiting an answer (:gates)",
+	}
+
+	method, ok := methodForType(want)
+	require.True(t, ok, "the triage summary must have a wire method, or it is silently dropped")
+	assert.Equal(t, NotifyZhengmingTriage, method)
+
+	dec, ok := methodToDecoder[method]
+	require.True(t, ok, "the triage summary must have a decoder, or the client drops it")
+
+	raw, err := wire.Encode(want)
+	require.NoError(t, err)
+	decoded, err := dec(raw)
+	require.NoError(t, err)
+	assert.Equal(t, want, decoded, "the summary must survive the wire unchanged")
+}
+
+// TestNotificationRegistriesAreSymmetric guards against a half-registration:
+// a message type added to typeToMethod without a decoder (or the reverse) is
+// dropped on exactly one side of the connection, which is invisible in tests
+// that only exercise one direction.
+func TestNotificationRegistriesAreSymmetric(t *testing.T) {
+	typeToMethodMu.RLock()
+	methods := make(map[string]bool, len(typeToMethod))
+	for _, method := range typeToMethod {
+		methods[method] = true
+	}
+	typeToMethodMu.RUnlock()
+
+	methodToDecoderMu.RLock()
+	decoders := make([]string, 0, len(methodToDecoder))
+	for method := range methodToDecoder {
+		decoders = append(decoders, method)
+	}
+	methodToDecoderMu.RUnlock()
+
+	for method := range methods {
+		_, ok := methodToDecoder[method]
+		assert.True(t, ok, "method %q has a sender type but no client decoder", method)
+	}
+	for _, method := range decoders {
+		assert.True(t, methods[method], "method %q has a decoder but no sender type", method)
+	}
 }

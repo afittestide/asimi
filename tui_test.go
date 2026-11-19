@@ -10455,3 +10455,83 @@ func TestTrustDialog_UnreadableIsDismissibleByKeyboard(t *testing.T) {
 		})
 	}
 }
+
+// TestZhengmingTriageMsg_ReportsWithoutOpeningAGate is the TUI half of e1043:
+// the summary of a reconnect triage pass must reach the Ruler as exactly one
+// notice (one toast plus one chat line) and must never put a prompt into
+// answering mode. The whole point of the edit is that retired gates stop
+// stacking dialogs, so a handler that opened one — or that swallowed the
+// summary while 50 gates sit in :gates — would restore the bug in the UI layer
+// even with the Court triage correct.
+func TestZhengmingTriageMsg_ReportsWithoutOpeningAGate(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+	model.tabs.SwitchToTabType("secretary")
+
+	require.Nil(t, model.prompt().answering, "prompt should not be answering initially")
+	require.Empty(t, model.commandLine.toasts)
+	chat := model.tabs.ChatByTab(model.tabs.ActiveTab().Target)
+	require.NotNil(t, chat)
+	messagesBefore := len(chat.Messages)
+
+	summary := court.ZhengmingTriageMsg{
+		Retired:    16,
+		Ascended:   15,
+		Cancelled:  1,
+		Superseded: 0,
+		Awaiting:   50,
+		Text:       "Zhengming triage: 16 retired — edict ascended x15, cancelled x1, superseded x0 · 50 awaiting an answer (:gates)",
+	}
+
+	newModel, _ := model.handleCustomMessages(summary)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	// Exactly one notice, carrying the Court's own counts.
+	require.Len(t, updated.commandLine.toasts, 1, "a triage pass must produce exactly one summary toast")
+	toast := updated.commandLine.toasts[0]
+	assert.Contains(t, toast.Message, "16 retired")
+	assert.Contains(t, toast.Message, "50 awaiting an answer (:gates)")
+
+	// One chat line, so the summary survives the toast timeout.
+	activeChat := updated.tabs.ChatByTab(updated.tabs.ActiveTab().Target)
+	require.NotNil(t, activeChat)
+	require.Equal(t, messagesBefore+1, len(activeChat.Messages),
+		"the summary should add exactly one chat line")
+	assert.Contains(t, activeChat.Messages[len(activeChat.Messages)-1].Content, "16 retired")
+
+	// And crucially: no gate was opened by the summary.
+	assert.Nil(t, updated.prompt().answering,
+		"a triage summary must not put the prompt into answering mode")
+	assert.Zero(t, updated.prompt().PendingAnsweringCount(),
+		"a triage summary must not queue a gate")
+}
+
+// TestZhengmingTriageMsg_SurvivesMissingCommandLine guards the handler's nil
+// check on the command line: the summary is advisory, so losing the toast must
+// never crash the TUI. The chat line still lands, so the counts stay readable
+// after the toast would have expired.
+func TestZhengmingTriageMsg_SurvivesMissingCommandLine(t *testing.T) {
+	model := newTestModel(t)
+	model.tabs.DismissWelcome()
+	model.commandLine = nil
+
+	chat := model.tabs.ChatByTab(model.tabs.ActiveTab().Target)
+	require.NotNil(t, chat)
+	before := len(chat.Messages)
+
+	msg := court.ZhengmingTriageMsg{Retired: 1, Ascended: 1, Text: "Zhengming triage: 1 retired"}
+
+	var newModel tea.Model
+	assert.NotPanics(t, func() {
+		newModel, _ = model.handleCustomMessages(msg)
+	}, "a summary with no command line must not panic")
+
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	updatedChat := updated.tabs.ChatByTab(updated.tabs.ActiveTab().Target)
+	require.NotNil(t, updatedChat)
+	require.Equal(t, before+1, len(updatedChat.Messages),
+		"the chat line must still record the summary when the toast cannot be shown")
+	assert.Contains(t, updatedChat.Messages[before].Content, "1 retired")
+}

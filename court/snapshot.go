@@ -112,10 +112,12 @@ func (s *Court) TakeSnapshot() Snapshot {
 		}
 	}
 
-	// Pending zhengming (clarification requests, filtered by username/project)
+	// Pending zhengming (clarification requests, filtered by username/project).
+	// Deliberately unbounded: :gates claims to list every pending gate, so a
+	// silent row cap would be a second way to hide one (e1043).
 	var pending []storage.Zhengming
 	if err := s.db.Where("status = ? AND username = ? AND project = ?", storage.ZhengmingPending, s.username, s.config.Project).
-		Order("priority DESC, created_at ASC").Limit(20).Find(&pending).Error; err == nil {
+		Order("priority DESC, created_at ASC").Find(&pending).Error; err == nil {
 		for _, z := range pending {
 			var questions []string
 			for _, q := range z.Questions {

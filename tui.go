@@ -3206,6 +3206,21 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case court.ZhengmingTriageMsg:
+		// A reconnect triage pass retired stale gates and delivered dialogs
+		// only for survivors that still block ascent. Everything else is
+		// listed by :gates, so one summary toast is the Ruler's whole notice —
+		// no dialog per surviving row (e1043).
+		if m.commandLine != nil {
+			m.commandLine.AddToast(msg.Text, "info", 8*time.Second)
+		}
+		if tab := m.tabs.ActiveTab(); tab != nil {
+			if chat := m.tabs.ChatByTab(tab.Target); chat != nil {
+				chat.AddMessage(systemPrefix + msg.Text)
+			}
+		}
+		return m, nil
+
 	case AnsweredMsg:
 		m.retireAnsweredGate(msg.RequestID)
 		// Check if this is an edict action menu response

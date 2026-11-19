@@ -28,6 +28,7 @@ const (
 	NotifyEvent                      = "event"
 	NotifyZhengmingPending           = "zhengming.pending"
 	NotifyZhengmingAnswered          = "zhengming.answered"
+	NotifyZhengmingTriage            = "zhengming.triage"
 	NotifyRitualStep                 = "ritual.step"
 	NotifyContainerLaunched          = "runner.container_launched"
 	NotifyToolCallScheduled          = "toolcall.scheduled"
@@ -58,6 +59,7 @@ var (
 		reflect.TypeOf(court.EventNotificationMsg{}):            NotifyEvent,
 		reflect.TypeOf(court.ZhengmingPendingMsg{}):             NotifyZhengmingPending,
 		reflect.TypeOf(court.ZhengmingAnsweredMsg{}):            NotifyZhengmingAnswered,
+		reflect.TypeOf(court.ZhengmingTriageMsg{}):              NotifyZhengmingTriage,
 		reflect.TypeOf(court.RitualStepMsg{}):                   NotifyRitualStep,
 		reflect.TypeOf(runners.ContainerLaunchedMsg{}):          NotifyContainerLaunched,
 		reflect.TypeOf(runners.ToolCallScheduledMsg{}):          NotifyToolCallScheduled,
@@ -130,6 +132,7 @@ var (
 		NotifyEvent:                      decode[court.EventNotificationMsg],
 		NotifyZhengmingPending:           decode[court.ZhengmingPendingMsg],
 		NotifyZhengmingAnswered:          decode[court.ZhengmingAnsweredMsg],
+		NotifyZhengmingTriage:            decode[court.ZhengmingTriageMsg],
 		NotifyRitualStep:                 decode[court.RitualStepMsg],
 		NotifyContainerLaunched:          decode[runners.ContainerLaunchedMsg],
 		NotifyToolCallScheduled:          decode[runners.ToolCallScheduledMsg],
