@@ -8,11 +8,11 @@ import (
 	"github.com/pmezard/go-difflib/difflib"
 )
 
-// This file holds the $EDITOR review pass used by suggest_edict for large
-// documents. It is deliberately not a Tool: nothing ever dispatched it as one,
-// and registering it cost a bespoke repair path (a placeholder in the registry
-// plus a SetNotify re-registration of live sessions) for a hook no minister
-// could reach.
+// This file holds the $EDITOR review pass used by new_edict and replace_edict
+// for large documents. It is deliberately not a Tool: nothing ever dispatched
+// it as one, and registering it cost a bespoke repair path (a placeholder in
+// the registry plus a SetNotify re-registration of live sessions) for a hook
+// no minister could reach.
 
 // EditorOutcome is what the host established about the review. It replaces the
 // old Saved bool, which collapsed two different facts: "the bytes on disk were

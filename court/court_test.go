@@ -1132,9 +1132,10 @@ func TestZhengmingAnswered_AnswerConstants(t *testing.T) {
 	assert.Equal(t, "Let me clarify", tools.AnswerLetMeClarify)
 }
 
-// TestZhengmingAnswered_ApproveEdictRefinesExistingEdict verifies that when
-// a zhengming request has EdictID > 0, approving it appends the suggestion
-// to the existing edict's intent instead of creating a new edict.
+// TestZhengmingAnswered_ApproveEdictRefinesExistingEdict verifies the
+// e873 replace semantics: when a zhengming request has EdictID > 0 (a
+// replace_edict suggestion), approving it REPLACES the existing edict's intent
+// instead of appending a Clarification block (the old suggest_edict defect).
 func TestZhengmingAnswered_ApproveEdictRefinesExistingEdict(t *testing.T) {
 	db := setupCourtTestDB(t)
 	cfg := config.DefaultCourtConfig()
@@ -1178,20 +1179,19 @@ func TestZhengmingAnswered_ApproveEdictRefinesExistingEdict(t *testing.T) {
 			"answer":     tools.AnswerApproveEdict,
 		})
 
-	// Poll for the intent to be updated (async handler)
+	// Poll for the intent to be replaced (async handler)
 	require.Eventually(t, func() bool {
 		var fresh storage.Edict
 		if db.First(&fresh, 42).Error != nil {
 			return false
 		}
-		return strings.Contains(fresh.Intent, "Original intent") &&
-			strings.Contains(fresh.Intent, "Add better error handling")
-	}, 2*time.Second, 50*time.Millisecond, "edict intent should contain both original and appended suggestion")
+		return fresh.Intent == "Add better error handling"
+	}, 2*time.Second, 50*time.Millisecond, "edict intent should be replaced by the suggestion")
 
 	// Verify no new edict was created (edict 1 is the auto-created court infrastructure edict)
 	var count int64
 	db.Model(&storage.Edict{}).Where("id != ? AND id != ?", 1, 42).Count(&count)
-	assert.Equal(t, int64(0), count, "no new edict should be created when refining")
+	assert.Equal(t, int64(0), count, "no new edict should be created when replacing")
 }
 
 // TestZhengmingAnswered_NonSentinelAnswerWithEdictID0CreatesEdict verifies that
@@ -6259,8 +6259,8 @@ func TestZhengmingTriage_RetirementClasses(t *testing.T) {
 				})
 			},
 			wantStatus: storage.ZhengmingSupersededByEdict,
-			wantReason:  "court: edict ascended (Ruler sealed)",
-			wantClass:   zhengmingClassAscended,
+			wantReason: "court: edict ascended (Ruler sealed)",
+			wantClass:  zhengmingClassAscended,
 		},
 		{
 			name: "B: edict cancelled",
@@ -6275,8 +6275,8 @@ func TestZhengmingTriage_RetirementClasses(t *testing.T) {
 				})
 			},
 			wantStatus: storage.ZhengmingSupersededByEdict,
-			wantReason:  "court: edict cancelled",
-			wantClass:   zhengmingClassCancelled,
+			wantReason: "court: edict cancelled",
+			wantClass:  zhengmingClassCancelled,
 		},
 		{
 			name: "C: older prompt superseded by a newer exec marker",
@@ -6295,8 +6295,8 @@ func TestZhengmingTriage_RetirementClasses(t *testing.T) {
 				return old
 			},
 			wantStatus: storage.ZhengmingDismissed,
-			wantReason:  "court: superseded by execution exec-new",
-			wantClass:   zhengmingClassSuperseded,
+			wantReason: "court: superseded by execution exec-new",
+			wantClass:  zhengmingClassSuperseded,
 		},
 	}
 
@@ -6663,4 +6663,412 @@ func TestZhengmingTriage_AlreadyTerminalIsReportedNoOp(t *testing.T) {
 	_, counts, ok := s.triagePendingZhengming()
 	assert.False(t, ok, "no pending rows: the pass must not claim or count anything")
 	assert.Equal(t, 0, counts.Retired, "an already-terminal row is never counted as retired")
+}
+
+// ---------------------------------------------------------------------------
+// e873: replace_edict semantics, approval-time guards, issue_ref threading
+// ---------------------------------------------------------------------------
+
+// TestCourt_SetIntent_ReplacesWithoutClarificationMarker verifies the true
+// replace path: SetIntent overwrites the intent (no "**Clarification:**"
+// block, no concatenation) and invalidates seals exactly as appendToIntent
+// does.
+func TestCourt_SetIntent_ReplacesWithoutClarificationMarker(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Project = "testproject"
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	edict := storage.Edict{ID: 77, Intent: "old intent body", Username: config.OSUsername(), Project: "testproject"}
+	require.NoError(t, db.Create(&edict).Error)
+
+	key := storage.EdictKey{ID: 77, Username: config.OSUsername(), Project: "testproject"}
+	sealSvc := s.GetSealService()
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
+
+	require.NoError(t, s.SetIntentWithIssueRef(77, "the entire new intent", "afittestide/asimi-cli#168"))
+
+	var fresh storage.Edict
+	require.NoError(t, db.First(&fresh, "id = ? AND username = ? AND project = ?", 77, key.Username, key.Project).Error)
+	assert.Equal(t, "the entire new intent", fresh.Intent, "the intent must be replaced, not appended")
+	assert.NotContains(t, fresh.Intent, "**Clarification:**", "a replace must not append a Clarification block")
+	assert.Equal(t, "afittestide/asimi-cli#168", fresh.IssueRef, "a non-empty issue_ref must set the link")
+
+	// Seals were earned against the old intent: stale now.
+	hasJudge, err := sealSvc.HasSeal(key, "judge")
+	require.NoError(t, err)
+	assert.False(t, hasJudge, "the judge seal must be invalidated by a replacement")
+}
+
+// TestCourt_SetIntent_EmptyIssueRefLeavesLinkUnchanged verifies the empty
+// issue_ref contract on the replace path.
+func TestCourt_SetIntent_EmptyIssueRefLeavesLinkUnchanged(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Project = "testproject"
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	edict := storage.Edict{ID: 78, Intent: "old", IssueRef: "afittestide/asimi-cli#1", Username: config.OSUsername(), Project: "testproject"}
+	require.NoError(t, db.Create(&edict).Error)
+
+	require.NoError(t, s.SetIntentWithIssueRef(78, "new", ""))
+
+	var fresh storage.Edict
+	require.NoError(t, db.First(&fresh, "id = ?", 78).Error)
+	assert.Equal(t, "afittestide/asimi-cli#1", fresh.IssueRef, "an empty issue_ref must leave the link unchanged")
+}
+
+// TestZhengmingAnswered_ApprovedReplacementReplacesIntent verifies the
+// approval routing branches on the request kind: approving a replace_edict
+// suggestion overwrites the target intent (no Clarification block) and
+// invalidates seals.
+func TestZhengmingAnswered_ApprovedReplacementReplacesIntent(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+
+	go s.ritualGuard.Run(ctx)
+
+	edict := storage.Edict{
+		ID:       52,
+		Username: config.OSUsername(),
+		Project:  cfg.Project,
+		Intent:   "Original intent",
+	}
+	require.NoError(t, db.Create(&edict).Error)
+
+	key := storage.EdictKey{ID: 52, Username: config.OSUsername(), Project: cfg.Project}
+	require.NoError(t, s.GetSealService().GrantSeal(key, "chancellor", storage.JSON{}))
+	var sealedChancellor storage.Seal
+	require.NoError(t, db.Where("edict_id = ? AND minister_id = ?", 52, "chancellor").First(&sealedChancellor).Error)
+	require.Nil(t, sealedChancellor.StaleAt)
+
+	req := storage.Zhengming{
+		RequestID:  "test-replace-1",
+		EdictID:    52,
+		Username:   config.OSUsername(),
+		Project:    cfg.Project,
+		MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "The entire replacement intent\n\nIssue-Ref: afittestide/asimi-cli#168",
+			Summary: "replace intent",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	s.PublishEvent(key, storage.EventZhengmingAnswered, storage.JSON{
+		"request_id": "test-replace-1",
+		"answer":     tools.AnswerApproveEdict,
+	})
+
+	require.Eventually(t, func() bool {
+		var fresh storage.Edict
+		if db.First(&fresh, 52).Error != nil {
+			return false
+		}
+		return fresh.Intent == "The entire replacement intent"
+	}, 2*time.Second, 50*time.Millisecond, "the intent must be replaced, not appended")
+
+	var fresh storage.Edict
+	require.NoError(t, db.First(&fresh, 52).Error)
+	assert.NotContains(t, fresh.Intent, "**Clarification:**", "no Clarification block on the replace path")
+	assert.Equal(t, "afittestide/asimi-cli#168", fresh.IssueRef, "the issue_ref must round-trip into the target edict")
+
+	// The seal was earned against the old intent: stale now.
+	var after storage.Seal
+	require.NoError(t, db.Where("edict_id = ? AND minister_id = ?", 52, "chancellor").First(&after).Error)
+	require.NotNil(t, after.StaleAt, "the chancellor seal must be invalidated by the replacement")
+}
+
+// TestZhengmingAnswered_ApprovalAgainstCancelledTargetWritesNothing is the
+// regression for the e873 Defect-5 bug (observed on cancelled edict 180):
+// an approval carrying a cancelled edict's id must write nothing — no
+// Clarification block appended, no seal voided, no edict created — and must be
+// refused visibly: the prompt is retired as superseded_by_edict with an empty
+// answer and the outcome surfaces on the Tian ledger.
+func TestZhengmingAnswered_ApprovalAgainstCancelledTargetWritesNothing(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+
+	go s.ritualGuard.Run(ctx)
+
+	cancelledAt := time.Date(2026, 4, 5, 12, 0, 0, 0, time.UTC)
+	edict := storage.Edict{
+		ID:          180,
+		Username:    config.OSUsername(),
+		Project:     cfg.Project,
+		Intent:      "The tombstone intent",
+		CancelledAt: &cancelledAt,
+	}
+	require.NoError(t, db.Create(&edict).Error)
+
+	// A live chancellor seal granted before the cancellation (the observed
+	// failure shape: the approval voided it 1ms after answering).
+	key := storage.EdictKey{ID: 180, Username: config.OSUsername(), Project: cfg.Project}
+	require.NoError(t, s.GetSealService().GrantSeal(key, "chancellor", storage.JSON{}))
+	var seal storage.Seal
+	require.NoError(t, db.Where("edict_id = ? AND minister_id = ?", 180, "chancellor").First(&seal).Error)
+	require.Nil(t, seal.StaleAt)
+
+	req := storage.Zhengming{
+		RequestID:  "test-cancelled-approval",
+		EdictID:    180,
+		Username:   config.OSUsername(),
+		Project:    cfg.Project,
+		MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "The gh 180 mandate design",
+			Summary: "trust dialog mandate chooser",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	require.NoError(t, s.HandleZhengmingResponse(context.Background(), "test-cancelled-approval", tools.AnswerApproveEdict))
+
+	// The prompt is retired as superseded_by_edict with an empty answer.
+	var retired storage.Zhengming
+	require.NoError(t, db.First(&retired, "request_id = ?", "test-cancelled-approval").Error)
+	assert.Equal(t, storage.ZhengmingSupersededByEdict, retired.Status)
+	assert.Empty(t, retired.Answer, "the Ruler did not speak; the answer stays empty")
+	assert.Contains(t, retired.DispositionReason, "cancelled")
+
+	// Nothing was written to the edict: byte-identical intent, seal untouched.
+	var fresh storage.Edict
+	require.NoError(t, db.First(&fresh, "id = ?", 180).Error)
+	assert.Equal(t, "The tombstone intent", fresh.Intent)
+	assert.NotContains(t, fresh.Intent, "**Clarification:**")
+	require.NotNil(t, fresh.CancelledAt, "the cancellation state is untouched")
+
+	var sealAfter storage.Seal
+	require.NoError(t, db.Where("edict_id = ? AND minister_id = ?", 180, "chancellor").First(&sealAfter).Error)
+	require.Nil(t, sealAfter.StaleAt, "no seal may be voided by a refused approval")
+
+	// No edict was created from the refused suggestion.
+	var count int64
+	db.Model(&storage.Edict{}).Where("id NOT IN ?", []uint{1, 180}).Count(&count)
+	assert.Equal(t, int64(0), count, "no edict may be created by a refused approval")
+
+	// The refusal is visible on the Tian ledger, not just a log line.
+	var events []storage.TianEvent
+	require.NoError(t, db.Find(&events, "event_type = ?", storage.EventZhengmingDismissed).Error)
+	require.NotEmpty(t, events, "the refused approval must produce a visible event")
+}
+
+// TestZhengmingAnswered_ApprovalAgainstSealedTargetWritesNothing: a
+// ruler-sealed target is refused the same way as a cancelled one.
+func TestZhengmingAnswered_ApprovalAgainstSealedTargetWritesNothing(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	edict := storage.Edict{
+		ID:       55,
+		Username: config.OSUsername(),
+		Project:  cfg.Project,
+		Intent:   "Sealed history",
+	}
+	require.NoError(t, db.Create(&edict).Error)
+
+	key := storage.EdictKey{ID: 55, Username: config.OSUsername(), Project: cfg.Project}
+	require.NoError(t, s.GetSealService().GrantSeal(key, "ruler", storage.JSON{}))
+
+	req := storage.Zhengming{
+		RequestID:  "test-sealed-approval",
+		EdictID:    55,
+		Username:   config.OSUsername(),
+		Project:    cfg.Project,
+		MinisterID: "chancellor",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Rewrite the sealed intent",
+			Summary: "rewrite",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	require.NoError(t, s.HandleZhengmingResponse(context.Background(), "test-sealed-approval", tools.AnswerApproveEdict))
+
+	var fresh storage.Edict
+	require.NoError(t, db.First(&fresh, "id = ?", 55).Error)
+	assert.Equal(t, "Sealed history", fresh.Intent, "a sealed intent is frozen history")
+
+	var retired storage.Zhengming
+	require.NoError(t, db.First(&retired, "request_id = ?", "test-sealed-approval").Error)
+	assert.Equal(t, storage.ZhengmingSupersededByEdict, retired.Status)
+	assert.Empty(t, retired.Answer)
+}
+
+// TestZhengmingAnswered_NewEdictIssueRefNotPollutedByEvidence guards the
+// annotation-ordering contract (Defect 4): suggestionWithMetadata appends
+// "Issue-Ref:" BEFORE "Evidence:", so the approval handler must strip the
+// trailing annotations in the right order — the stored issue_ref must be
+// exactly the reference, never the reference with the evidence block
+// swallowed into it.
+func TestZhengmingAnswered_NewEdictIssueRefNotPollutedByEvidence(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+
+	go s.ritualGuard.Run(ctx)
+
+	req := storage.Zhengming{
+		RequestID:  "test-newedict-evidence",
+		EdictID:    0,
+		Username:   config.OSUsername(),
+		Project:    cfg.Project,
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Build the mandate chooser\n\nIssue-Ref: afittestide/asimi-cli#180\n\nEvidence: court/court.go:42-47",
+			Summary: "mandate chooser",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
+		storage.EventZhengmingAnswered, storage.JSON{
+			"request_id": "test-newedict-evidence",
+			"answer":     tools.AnswerApproveEdict,
+		})
+
+	var edict storage.Edict
+	require.Eventually(t, func() bool {
+		return db.Where("intent = ?", "Build the mandate chooser").First(&edict).Error == nil
+	}, 2*time.Second, 50*time.Millisecond, "edict should be created from the approved suggestion")
+
+	assert.Equal(t, "afittestide/asimi-cli#180", edict.IssueRef,
+		"the issue_ref must be exactly the reference — the evidence block must not be swallowed into it")
+	assert.NotContains(t, edict.IssueRef, "Evidence:")
+	assert.NotContains(t, edict.Intent, "Issue-Ref:")
+	assert.NotContains(t, edict.Intent, "Evidence:")
+}
+
+// TestZhengmingAnswered_ReplaceIssueRefNotPollutedByEvidence is the same
+// ordering guard on the replace_edict path: an approved replacement carrying
+// both annotations must store the exact reference and a clean intent.
+func TestZhengmingAnswered_ReplaceIssueRefNotPollutedByEvidence(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+
+	go s.ritualGuard.Run(ctx)
+
+	edict := storage.Edict{
+		ID:       61,
+		Username: config.OSUsername(),
+		Project:  cfg.Project,
+		Intent:   "Original intent",
+	}
+	require.NoError(t, db.Create(&edict).Error)
+
+	req := storage.Zhengming{
+		RequestID:  "test-replace-evidence",
+		EdictID:    61,
+		Username:   config.OSUsername(),
+		Project:    cfg.Project,
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "The entire replacement intent\n\nIssue-Ref: afittestide/asimi-cli#168\n\nEvidence: court/court.go:42-47",
+			Summary: "replace intent",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	s.PublishEvent(storage.EdictKey{ID: 61, Username: config.OSUsername(), Project: cfg.Project},
+		storage.EventZhengmingAnswered, storage.JSON{
+			"request_id": "test-replace-evidence",
+			"answer":     tools.AnswerApproveEdict,
+		})
+
+	require.Eventually(t, func() bool {
+		var fresh storage.Edict
+		if db.First(&fresh, 61).Error != nil {
+			return false
+		}
+		return fresh.Intent == "The entire replacement intent"
+	}, 2*time.Second, 50*time.Millisecond, "the intent must be replaced")
+
+	var fresh storage.Edict
+	require.NoError(t, db.First(&fresh, 61).Error)
+	assert.Equal(t, "afittestide/asimi-cli#168", fresh.IssueRef,
+		"the issue_ref must be exactly the reference — the evidence block must not be swallowed into it")
+	assert.NotContains(t, fresh.IssueRef, "Evidence:")
+	assert.NotContains(t, fresh.Intent, "Issue-Ref:")
+	assert.NotContains(t, fresh.Intent, "Evidence:")
+}
+
+// TestZhengmingAnswered_NewEdictApprovalCarriesIssueRef verifies the Defect-4
+// thread end to end: an approved new_edict suggestion carrying an Issue-Ref
+// annotation creates an edict with that issue_ref.
+func TestZhengmingAnswered_NewEdictApprovalCarriesIssueRef(t *testing.T) {
+	db := setupCourtTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	s := NewCourt(db, cfg, nil, slog.Default())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
+	defer cancel()
+
+	go s.ritualGuard.Run(ctx)
+
+	req := storage.Zhengming{
+		RequestID:  "test-newedict-issue",
+		EdictID:    0,
+		Username:   config.OSUsername(),
+		Project:    cfg.Project,
+		MinisterID: "secretary",
+		Questions: storage.ZhengmingQuestions{{
+			Text:    "Build the mandate chooser\n\nIssue-Ref: afittestide/asimi-cli#180",
+			Summary: "mandate chooser",
+			Options: []string{tools.AnswerApproveEdict, tools.AnswerReject},
+		}},
+		Status:   storage.ZhengmingPending,
+		Priority: storage.PriorityNormal,
+	}
+	require.NoError(t, db.Create(&req).Error)
+
+	s.PublishEvent(storage.EdictKey{ID: 0, Username: config.OSUsername(), Project: cfg.Project},
+		storage.EventZhengmingAnswered, storage.JSON{
+			"request_id": "test-newedict-issue",
+			"answer":     tools.AnswerApproveEdict,
+		})
+
+	var edict storage.Edict
+	require.Eventually(t, func() bool {
+		return db.Where("intent = ?", "Build the mandate chooser").First(&edict).Error == nil
+	}, 2*time.Second, 50*time.Millisecond, "edict should be created from the approved suggestion")
+
+	assert.Equal(t, "afittestide/asimi-cli#180", edict.IssueRef, "the issue_ref must round-trip into the created edict")
 }

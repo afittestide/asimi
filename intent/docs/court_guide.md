@@ -138,7 +138,7 @@ Each minister is a specialized AI agent with a specific role:
 
 | Minister | Role | Core Tools | Specialized Tools |
 |----------|------|------------|-------------------|
-| **Secretary** | Manages court business and provides a bird's eye view of the Court | `read_file`, `glob`, `grep` | `suggest_edict`, `enact_ritual`, `consult_minister`, `asimisql` |
+| **Secretary** | Manages court business and provides a bird's eye view of the Court | `read_file`, `glob`, `grep` | `new_edict`, `replace_edict`, `enact_ritual`, `consult_minister`, `asimisql` |
 | **Chancellor** | Coordinates all ministers, manages edict lifecycle, interfaces with the Ruler | — | `create_edict`, `cancel_edict`, `answer_zhengming`, `get_edict_status`, `list_edicts`, `list_rituals`, `enact_ritual` |
 | **War** | Analyzes edicts, creates execution plans, decomposes work into Lings | `read_file`, `glob`, `grep` | `create_ling`, `update_ling`, `list_lings` |
 | **Forge** | Implements code changes according to plans | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `run_shell_command` | `create_manifest`, `update_manifest`, `commit_manifest` |
@@ -547,7 +547,8 @@ When a step exhausts all `max_retries` attempts, the Court invokes the `report_f
 ### Secretary Tools
 
 **Edict Management:**
-- `suggest_edict(intent)` — Distill the Ruler's intent into a new edict
+- `new_edict(suggestion, summary, issue_ref?)` — Distill the Ruler's intent into a NEW edict. Routes an async Zhengming request; the tool itself writes nothing — the Ruler's approval creates the edict. If status is `ruler_modified`, nothing was saved: integrate the Ruler's modified text into the suggestion and call `new_edict` again — that is the designed loop. Pass `issue_ref` (e.g. `afittestide/asimi-cli#168`) so the edict is traceable to its issue.
+- `replace_edict(edict_id, suggestion, summary, issue_ref?)` — Replace an existing edict's intent. Routes an async Zhengming request; on approval the intent is OVERWRITTEN (no Clarification block) and the edict's seals invalidated. Eligibility rule: a cancelled or ruler-sealed edict is NOT a valid replacement target — a new intent needs `new_edict`. Same `ruler_modified` contract as `new_edict`.
 - `enact_ritual(ritual_name, edict_id)` — Start a ritual for an edict
 - `consult_minister(minister_id, task)` — Dispatch ad-hoc work to another minister
 

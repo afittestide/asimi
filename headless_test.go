@@ -819,7 +819,7 @@ func TestHeadlessSink_SuggestedEdictPrints(t *testing.T) {
 // TestHeadlessSink_EditorRequest_HandsoffAutoApproves verifies that the
 // headless sink handles tools.EditorRequest by auto-approving the content
 // unchanged. In handsoff mode, it must NOT print the document. Without this
-// handler, the suggest_edict editor review blocks forever on ResultChan.
+// handler, the edict-suggestion editor review blocks forever on ResultChan.
 func TestHeadlessSink_EditorRequest_HandsoffAutoApproves(t *testing.T) {
 	sink := newHeadlessSink(nil)
 	sink.handsoff = true

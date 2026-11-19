@@ -131,7 +131,12 @@ func registerIntentTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 	r.Register(ResolveIncidentTool{Ctx: opts.Ctx}, intentWrite)
 
 	if opts.ZhengmingRequester != nil && opts.NotifyFn != nil {
-		r.Register(SuggestEdictTool{
+		r.Register(NewEdictTool{
+			Ctx:       opts.Ctx,
+			Requester: opts.ZhengmingRequester,
+			NotifyFn:  opts.NotifyFn,
+		}, intentExec)
+		r.Register(ReplaceEdictTool{
 			Ctx:       opts.Ctx,
 			Requester: opts.ZhengmingRequester,
 			NotifyFn:  opts.NotifyFn,

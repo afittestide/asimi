@@ -117,13 +117,13 @@ func (r *reviewRequester) RequestZhengming(ctx context.Context, key storage.Edic
 	return "req-1", nil
 }
 
-// TestSuggestEdictLargePayloadUnchangedFallsThrough verifies that an unchanged
+// TestNewEdictLargePayloadUnchangedFallsThrough verifies that an unchanged
 // review still reaches the Ruler as a zhengming prompt: no phantom rejection,
-// no skipped review, and suggest_edict's three-way contract is unchanged.
-func TestSuggestEdictLargePayloadUnchangedFallsThrough(t *testing.T) {
+// no skipped review, and the tools three-way contract is unchanged.
+func TestNewEdictLargePayloadUnchangedFallsThrough(t *testing.T) {
 	body := strings.Repeat("evidence line\n", 50) // >500 chars
 	requester := &reviewRequester{}
-	tool := SuggestEdictTool{
+	tool := NewEdictTool{
 		Ctx:       testCtx(),
 		Requester: requester,
 		NotifyFn: func() func(any) {
@@ -156,12 +156,12 @@ func TestSuggestEdictLargePayloadUnchangedFallsThrough(t *testing.T) {
 	}
 }
 
-// TestSuggestEdictLargePayloadEditorFailure verifies a real editor failure is
+// TestNewEdictLargePayloadEditorFailure verifies a real editor failure is
 // surfaced as an error rather than being reported as a rejection.
-func TestSuggestEdictLargePayloadEditorFailure(t *testing.T) {
+func TestNewEdictLargePayloadEditorFailure(t *testing.T) {
 	body := strings.Repeat("evidence line\n", 50)
 	requester := &reviewRequester{}
-	tool := SuggestEdictTool{
+	tool := NewEdictTool{
 		Ctx:       testCtx(),
 		Requester: requester,
 		NotifyFn: func() func(any) {
@@ -184,14 +184,14 @@ func TestSuggestEdictLargePayloadEditorFailure(t *testing.T) {
 	}
 }
 
-// TestSuggestEdictLargePayloadModifiedBouncesBack verifies the ruler_modified
+// TestNewEdictLargePayloadModifiedBouncesBack verifies the ruler_modified
 // contract survives the refactor: an edited suggestion returns the diff and
 // never reaches zhengming.
-func TestSuggestEdictLargePayloadModifiedBouncesBack(t *testing.T) {
+func TestNewEdictLargePayloadModifiedBouncesBack(t *testing.T) {
 	original := strings.Repeat("original line\n", 50)
 	edited := strings.Repeat("edited line\n", 50)
 	requester := &reviewRequester{}
-	tool := SuggestEdictTool{
+	tool := NewEdictTool{
 		Ctx:       testCtx(),
 		Requester: requester,
 		NotifyFn: func() func(any) {
@@ -232,14 +232,14 @@ func TestSuggestEdictLargePayloadModifiedBouncesBack(t *testing.T) {
 	}
 }
 
-// TestSuggestEdictLargePayloadDiscardStillReachesZhengming verifies a
+// TestNewEdictLargePayloadDiscardStillReachesZhengming verifies a
 // deliberate discard keeps its meaning: the review reports a rejection and
-// suggest_edict's three-way branch is unchanged (it still falls through to
+// the tool's three-way branch is unchanged (it still falls through to
 // zhengming with the original text, and the Court records the Ruler's answer).
-func TestSuggestEdictLargePayloadDiscardStillReachesZhengming(t *testing.T) {
+func TestNewEdictLargePayloadDiscardStillReachesZhengming(t *testing.T) {
 	body := strings.Repeat("evidence line\n", 50)
 	requester := &reviewRequester{}
-	tool := SuggestEdictTool{
+	tool := NewEdictTool{
 		Ctx:       testCtx(),
 		Requester: requester,
 		NotifyFn: func() func(any) {

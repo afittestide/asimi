@@ -1226,8 +1226,8 @@ func TestChancellor_ScratchpadIncludesRituals(t *testing.T) {
 	}
 
 	// Verify secretary role text includes new guidance
-	if !strings.Contains(prompt, "You distill the ruler's intent as a new or revised edicts using suggest_edict") {
-		t.Errorf("Expected 'You distill the ruler's intent as a new or revised edicts using suggest_edict' in system prompt, got:\n%s", prompt)
+	if !strings.Contains(prompt, "You distill the ruler's intent as a new or revised edicts using new_edict") {
+		t.Errorf("Expected 'You distill the ruler's intent as a new or revised edicts using new_edict' in system prompt, got:\n%s", prompt)
 	}
 	// Verify old auto-selection guidance is gone
 	if strings.Contains(prompt, "Use castle-siege for medium sized changes") {

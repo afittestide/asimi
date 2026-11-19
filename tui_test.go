@@ -3307,7 +3307,7 @@ func TestInitRitualWithLLM_E2E(t *testing.T) {
 	tm := teatest.NewTestModel(t, tuiModel, teatest.WithInitialTermSize(200, 50))
 	// Intercept EditorRequest messages before they reach the TUI — teatest's
 	// tea.ExecProcess does not run external commands, so any tool that sends an
-	// EditorRequest (e.g. sage.suggest_edict → editor review for large payloads)
+	// EditorRequest (e.g. new_edict → editor review for large payloads)
 	// would otherwise block forever waiting on ResultChan.
 	c.SetNotify(func(msg any) {
 		if req, ok := msg.(tools.EditorRequest); ok {
@@ -8195,7 +8195,7 @@ func TestAnsweringEditDone_UnchangedKeepsGateOpen(t *testing.T) {
 // TestHandsoff_EditorRequest_AutoApproves verifies that in handsoff mode an
 // EditorRequest is auto-approved without opening $EDITOR. Without this guard
 // the TUI would spawn $EDITOR even in handsoff, blocking on interactive input
-// while the suggest_edict editor review waits on ResultChan.
+// while the edict-suggestion editor review waits on ResultChan.
 func TestHandsoff_EditorRequest_AutoApproves(t *testing.T) {
 	model := newTestModel(t)
 	model.handsoff = true

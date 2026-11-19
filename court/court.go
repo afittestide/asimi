@@ -367,31 +367,46 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 			}
 		}
 
-		// 2. Handle "Approve edict" for suggestion-based edict creation or refinement
+		// 2. Handle "Approve edict" for suggestion-based edict creation or replacement
 		if answer == tools.AnswerApproveEdict {
 			var req storage.Zhengming
 			if err := s.db.First(&req, "request_id = ?", requestID).Error; err == nil {
 				if len(req.Questions) > 0 {
 					suggestion := req.Questions[0].Text
 					summary := req.Questions[0].Summary
-					// Remove "Evidence:" part if present
+					// Strip the metadata annotations the tools add so the
+					// stored intent carries the suggestion, not the envelope.
+					issueRef := stripIssueRef(&suggestion)
 					if idx := strings.Index(suggestion, "\n\nEvidence:"); idx != -1 {
 						suggestion = suggestion[:idx]
 					}
 					if req.EdictID > 0 {
-						// Refine existing edict: append suggestion to intent
-						if err := s.appendToIntent(storage.EdictKey{
-							ID:       req.EdictID,
-							Username: req.Username,
-							Project:  req.Project,
-						}, suggestion); err != nil {
-							s.logger.Warn("failed to append suggestion to edict intent", "edict_id", req.EdictID, "error", err)
+						// Replace an existing edict's intent. Only a request
+						// raised by replace_edict (an edict suggestion with a
+						// target) may replace — the handler branches on the
+						// request kind, never on EdictID > 0 alone, which
+						// conflates "has a target" with "means to replace"
+						// (ask_ruler gates carry targets too).
+						key := storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project}
+						if !isEdictReplacementRequest(&req) {
+							s.reportRefusedApproval(&req, key, "not a replacement request", nil)
+						} else if status, statusErr := s.GetSealService().GetEdictStatus(key); statusErr != nil {
+							// Approval-time eligibility guard (defense in depth, Defect 5):
+							// a prompt can slip past the call-time guard (an older pending
+							// prompt, a direct DB row) and must not write to a dead target.
+							s.reportRefusedApproval(&req, key, "unknown", statusErr)
+						} else if status != storage.EdictActive && status != storage.EdictBlocked {
+							s.reportRefusedApproval(&req, key, string(status), nil)
+						} else if err := s.setIntentFor(key, suggestion, issueRef); err != nil {
+							// A failed write is also visible, never silent.
+							s.reportFailedApproval(&req, key, err)
 						} else {
-							s.logger.Info("appended suggestion to edict intent", "edict_id", req.EdictID, "request_id", requestID)
+							s.logger.Info("replaced edict intent from approved suggestion",
+								"edict_id", req.EdictID, "request_id", requestID)
 						}
 					} else {
 						// Create new edict from the suggestion
-						edict, err := s.CreateEdict("", suggestion, req.SessionID)
+						edict, err := s.CreateEdict(issueRef, suggestion, req.SessionID)
 						if err != nil {
 							s.logger.Warn("failed to create edict from zhengming approval", "error", err)
 						} else if summary != "" {
@@ -487,7 +502,7 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		ritualLauncher = s
 	}
 
-	// NotifyFn — lazy getter for the current notify, used by suggest_edict
+	// NotifyFn — lazy getter for the current notify, used by the edict tools
 	notifyFn := func() func(any) { return s.notify }
 
 	// Collect registered minister IDs so tool descriptions can list them dynamically.
@@ -1153,7 +1168,7 @@ func (s *Court) nextEdictID() uint {
 // sessionID links the edict to the chat session that suggested it (empty for direct ruler-created edicts).
 //
 // The summary is NOT a parameter: the one caller that has one (approved
-// suggest_edict) writes it with a follow-up Update, so adding the parameter
+// new_edict/replace_edict) writes it with a follow-up Update, so adding the parameter
 // would mean threading it through the RPC CreateEdict contract and every test
 // fixture for a single write. That remains the shape until a second caller
 // needs it.
@@ -1252,15 +1267,46 @@ func (s *Court) AppendToIntent(edictID uint, clarification string) error {
 	return s.appendToIntent(key, clarification)
 }
 
-// SetIntent replaces an edict's intent with the given text.
+// SetIntent replaces an edict's intent with the given text — a true replace:
+// no "**Clarification:**" marker, no concatenation. It invalidates existing
+// seals exactly as appendToIntent does: seals were earned against the old
+// intent, so a replacement invalidates them at least as much as an append.
+//
+// NO PRESERVATION of the old intent: the Court DB already snapshots intents
+// at seal time, and a ruler-sealed edict is refused as a replacement target
+// anyway (both by the replace_edict tool at call time and by the approval-time
+// guard), so nothing of value is lost (Ruler ruling zhengming
+// a5fde164a34e9840, 2026-11-18). Do not re-add archival "for safety".
 func (s *Court) SetIntent(edictID uint, intent string) error {
-	key := s.EdictKey(edictID)
+	return s.setIntentFor(s.EdictKey(edictID), intent, "")
+}
+
+// SetIntentWithIssueRef replaces an edict's intent and, when issueRef is
+// non-empty, sets/updates the edict's issue_ref (empty leaves it unchanged).
+// The issue_ref write is merged into the same Update so intent and link move
+// atomically.
+func (s *Court) SetIntentWithIssueRef(edictID uint, intent, issueRef string) error {
+	return s.setIntentFor(s.EdictKey(edictID), intent, issueRef)
+}
+
+// setIntentFor is the shared implementation of the Court-facing replace path.
+func (s *Court) setIntentFor(key storage.EdictKey, intent, issueRef string) error {
 	var edict storage.Edict
 	if err := s.db.Where("id = ? AND username = ? AND project = ?", key.ID, key.Username, key.Project).First(&edict).Error; err != nil {
 		return fmt.Errorf("get edict: %w", err)
 	}
-	if err := s.db.Model(&storage.Edict{}).Where("id = ?", edict.ID).Update("intent", intent).Error; err != nil {
+	updates := map[string]any{"intent": intent}
+	if issueRef != "" {
+		updates["issue_ref"] = issueRef
+	}
+	if err := s.db.Model(&storage.Edict{}).Where("id = ?", edict.ID).Updates(updates).Error; err != nil {
 		return fmt.Errorf("update edict intent: %w", err)
+	}
+
+	// Invalidate existing seals — they were earned against the old intent
+	// (see appendToIntent for the precedent).
+	if err := s.GetSealService().InvalidateSeals(key); err != nil {
+		return fmt.Errorf("invalidate seals: %w", err)
 	}
 	return nil
 }
@@ -2006,14 +2052,166 @@ func (s *Court) RunShellCommand(ctx context.Context, input runners.Input) (runne
 }
 
 // isEdictSuggestionRequest reports whether a zhengming request is an edict
-// suggestion (as created by suggest_edict): a single question whose first
-// option approves edict creation. Answers to such requests only create or
-// refine an edict when they explicitly equal "Approve edict".
+// suggestion (as created by new_edict/replace_edict): a single question whose
+// first option approves edict creation. Answers to such requests only create
+// or replace an edict when they explicitly equal "Approve edict".
 func isEdictSuggestionRequest(req *storage.Zhengming) bool {
 	if req == nil || len(req.Questions) == 0 || len(req.Questions[0].Options) == 0 {
 		return false
 	}
 	return req.Questions[0].Options[0] == tools.AnswerApproveEdict
+}
+
+// isEdictReplacementRequest reports whether a zhengming request was raised by
+// the replace_edict tool: an edict suggestion targeting an existing edict
+// (EdictID > 0). Since suggest_edict is gone, replace_edict is the only tool
+// that mints this shape, so the shape IS the request kind — the approval
+// handler branches on it rather than on EdictID > 0 alone, because that test
+// conflates "has a target" with "means to replace" for every other prompt
+// shape (ask_ruler gates, ritual approvals).
+func isEdictReplacementRequest(req *storage.Zhengming) bool {
+	return isEdictSuggestionRequest(req) && req.EdictID > 0
+}
+
+// stripIssueRef removes the "Issue-Ref:" annotation the suggestion tools
+// append, mutating suggestion in place and returning the ref ("" when none).
+// The annotation is the thread that carries the issue link from tool call to
+// approval write (Defect 4).
+//
+// The reference stops at the next annotation ("\n\nEvidence: " is appended
+// AFTER the Issue-Ref block by suggestionWithMetadata): everything between
+// the Issue-Ref marker and the next annotation is the reference, never more.
+func stripIssueRef(suggestion *string) string {
+	const marker = "\n\nIssue-Ref: "
+	idx := strings.LastIndex(*suggestion, marker)
+	if idx == -1 {
+		return ""
+	}
+	ref := (*suggestion)[idx+len(marker):]
+	// The reference ends at the next annotation block, if any — the ref is a
+	// single-line canonical reference, so any paragraph break after it belongs
+	// to a following annotation, not to the ref.
+	if cut := strings.Index(ref, "\n\n"); cut != -1 {
+		ref = ref[:cut]
+	}
+	*suggestion = (*suggestion)[:idx]
+	return strings.TrimSpace(ref)
+}
+
+// reportRefusedApproval surfaces an approval the Court refused to apply so a
+// consumed approval is never indistinguishable from success (Defect 5's
+// security-of-record requirement). It writes a Tian ledger event and a
+// message on the enacting session in addition to the log — never a silent
+// Warn. status names the refusal reason ("cancelled", "sealed", "unknown");
+// cause, when non-nil, is the underlying status-lookup error.
+func (s *Court) reportRefusedApproval(req *storage.Zhengming, key storage.EdictKey, status string, cause error) {
+	text := fmt.Sprintf("approval of request %s refused: edict %d is %s; nothing was written — use new_edict",
+		req.RequestID, key.ID, status)
+	if cause != nil {
+		text += fmt.Sprintf(" (status lookup failed: %v)", cause)
+	}
+	s.logger.Error("refused approval against ineligible edict target",
+		"request_id", req.RequestID, "edict_id", key.ID, "status", status, "error", cause)
+	s.PublishEvent(key, storage.EventZhengmingDismissed, storage.JSON{
+		"request_id": req.RequestID,
+		"status":     "refused",
+		"reason":     text,
+	})
+	if req.SessionID != "" {
+		if err := s.AddSessionMessage(req.SessionID, "system", text); err != nil {
+			s.logger.Warn("could not surface refused approval on the enacting session",
+				"request_id", req.RequestID, "session_id", req.SessionID, "error", err)
+		}
+	}
+}
+
+// reportFailedApproval surfaces an approval whose write failed after the
+// target passed the eligibility guard — same visibility contract as
+// reportRefusedApproval.
+func (s *Court) reportFailedApproval(req *storage.Zhengming, key storage.EdictKey, cause error) {
+	text := fmt.Sprintf("approval of request %s failed to replace edict %d's intent: %v — nothing was written",
+		req.RequestID, key.ID, cause)
+	s.logger.Error("failed to apply approved edict replacement",
+		"request_id", req.RequestID, "edict_id", key.ID, "error", cause)
+	s.PublishEvent(key, storage.EventZhengmingDismissed, storage.JSON{
+		"request_id": req.RequestID,
+		"status":     "failed",
+		"reason":     text,
+	})
+	if req.SessionID != "" {
+		if err := s.AddSessionMessage(req.SessionID, "system", text); err != nil {
+			s.logger.Warn("could not surface failed approval on the enacting session",
+				"request_id", req.RequestID, "session_id", req.SessionID, "error", err)
+		}
+	}
+}
+
+// refuseIneligibleApprovalTarget intercepts an "Approve edict" answer for a
+// request whose target edict is cancelled or ruler-sealed BEFORE the answer is
+// recorded. It retires the prompt as superseded_by_edict with a
+// disposition_reason naming the superseding cause and its timestamp, never
+// writes the answer, and surfaces the outcome to the enacting session and the
+// Tian ledger (Defect 5 defense in depth; absorbs e1037's deferred
+// approval-path guard). Returns true when the answer was refused.
+func (s *Court) refuseIneligibleApprovalTarget(requestID, answer string) bool {
+	if answer != tools.AnswerApproveEdict {
+		return false
+	}
+	var req storage.Zhengming
+	if err := s.db.First(&req, "request_id = ?", requestID).Error; err != nil {
+		return false
+	}
+	if req.EdictID == 0 {
+		return false // new_edict path: no target to guard
+	}
+	key := storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project}
+	status, err := s.GetSealService().GetEdictStatus(key)
+	if err != nil {
+		s.reportRefusedApproval(&req, key, "unknown", err)
+		return true
+	}
+	switch status {
+	case storage.EdictActive, storage.EdictBlocked:
+		return false
+	case storage.EdictCancelled:
+		when := "unknown time"
+		var edict storage.Edict
+		if e := s.db.First(&edict, "id = ? AND username = ? AND project = ?", key.ID, key.Username, key.Project).Error; e == nil && edict.CancelledAt != nil {
+			when = edict.CancelledAt.Format(time.RFC3339)
+		}
+		reason := fmt.Sprintf("court: target edict %d cancelled at %s; approval refused, use new_edict", key.ID, when)
+		s.retireRefusedApproval(&req, key, reason)
+		return true
+	case storage.EdictSealed:
+		reason := fmt.Sprintf("court: target edict %d is ruler-sealed; approval refused, use new_edict", key.ID)
+		s.retireRefusedApproval(&req, key, reason)
+		return true
+	}
+	return false
+}
+
+// retireRefusedApproval writes the terminal disposition (superseded_by_edict,
+// empty answer — the Ruler did not speak), releases any parked waiter, and
+// surfaces the outcome on the ledger and the enacting session.
+func (s *Court) retireRefusedApproval(req *storage.Zhengming, key storage.EdictKey, reason string) {
+	if err := s.DisposeZhengmingWithStatus(req.RequestID, storage.ZhengmingSupersededByEdict, reason); err != nil {
+		// Not pending (already answered or retired): report, never overwrite.
+		s.logger.Warn("refused approval could not retire the prompt", "request_id", req.RequestID, "error", err)
+	}
+	text := fmt.Sprintf("approval of request %s refused and retired: %s", req.RequestID, reason)
+	s.logger.Error("refused approval against ineligible edict target",
+		"request_id", req.RequestID, "edict_id", key.ID, "reason", reason)
+	s.PublishEvent(key, storage.EventZhengmingDismissed, storage.JSON{
+		"request_id": req.RequestID,
+		"status":     string(storage.ZhengmingSupersededByEdict),
+		"reason":     reason,
+	})
+	if req.SessionID != "" {
+		if err := s.AddSessionMessage(req.SessionID, "system", text); err != nil {
+			s.logger.Warn("could not surface refused approval on the enacting session",
+				"request_id", req.RequestID, "session_id", req.SessionID, "error", err)
+		}
+	}
 }
 
 // HandleZhengmingResponse dispatches a user's zhengming answer to the minister
@@ -2026,6 +2224,16 @@ func (s *Court) HandleZhengmingResponse(ctx context.Context, requestID, answer s
 	if s == nil {
 		return fmt.Errorf("court not initialized")
 	}
+
+	// Approval-time eligibility guard (Defect 5, absorbs e1037's deferred
+	// approval-path guard): an approval whose target edict is cancelled or
+	// ruler-sealed must be refused BEFORE the answer is recorded — a consumed
+	// approval must never be silently absorbed by a dead target (the observed
+	// failure: a design approved against cancelled edict 180 and lost).
+	if s.refuseIneligibleApprovalTarget(requestID, answer) {
+		return nil
+	}
+
 	type zhengmingHandler interface {
 		HandleZhengmingResponse(ctx context.Context, requestID, answer string) error
 	}

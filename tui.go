@@ -3327,7 +3327,7 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tools.EditorRequest:
 		// In handsoff mode, auto-approve without opening $EDITOR. The review
-		// helper (suggest_edict for large payloads) blocks on ResultChan, so we
+		// helper (new_edict/replace_edict for large payloads) blocks on ResultChan, so we
 		// must reply or the call hangs forever.
 		if m.handsoff {
 			msg.ResultChan <- tools.EditorResult{Content: msg.Content, Outcome: tools.EditorUnchanged}

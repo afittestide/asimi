@@ -214,7 +214,9 @@ func TestRegisterBuiltinToolsIntentWrite(t *testing.T) {
 func TestRegisterBuiltinToolsIntentExecute(t *testing.T) {
 	r := NewToolRegistry()
 	RegisterBuiltinTools(r, ToolRegistrationOpts{
-		Ctx: testCtx(),
+		Ctx:                testCtx(),
+		ZhengmingRequester: &mockRequester{},
+		NotifyFn:           func() func(any) { return nil },
 	})
 
 	// Sage: r--r--rwx — has intent Execute
@@ -222,10 +224,15 @@ func TestRegisterBuiltinToolsIntentExecute(t *testing.T) {
 	tools := r.ForPermissions(sagePerm)
 	names := toolNames(tools)
 
-	// record_precedent is the remaining intent-execute builtin.
+	// record_precedent is the remaining intent-execute builtin; the edict
+	// suggestion tools (new_edict, replace_edict) sit at the same tier.
 	assertHas(t, names, "record_precedent")
-	// approve_doc is demoted to an unexported helper of suggest_edict: it is
-	// no longer a registered tool, so nothing can dispatch it.
+	assertHas(t, names, "new_edict")
+	assertHas(t, names, "replace_edict")
+	// suggest_edict is gone — split into the two honest names (e873).
+	assertNotHas(t, names, "suggest_edict")
+	// approve_doc is demoted to an unexported helper of the edict tools: it
+	// is no longer a registered tool, so nothing can dispatch it.
 	assertNotHas(t, names, "approve_doc")
 }
 

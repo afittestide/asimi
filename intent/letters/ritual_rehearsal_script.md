@@ -3,7 +3,7 @@
 Your Majesty's ruling of this day (zhengming request `8cd7fcfbd9cc9e58`):
 **"New dedicated edict for the ritual rehearsal script fix."**
 
-Propose this edict via `suggest_edict` and proceed through swift-strike. The
+Propose this edict via `new_edict` and proceed through swift-strike. The
 reference implementation already sits in the borderlands (`court/ritual.go`,
 `court/ritual_test.go`) — the forge should verify, not rediscover.
 

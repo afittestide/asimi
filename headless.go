@@ -275,7 +275,7 @@ func (s *headlessSink) handle(msg any) {
 		}
 
 	case tools.EditorRequest:
-		// An editor review request (e.g. from suggest_edict for payloads >500
+		// An editor review request (e.g. from new_edict/replace_edict for payloads >500
 		// chars) blocks on ResultChan. Headless has no interactive editor, so
 		// always report the content as reviewed unchanged. Print it to stdout so
 		// the ruler still sees what was proposed.
@@ -656,8 +656,11 @@ func (s *headlessSink) handsoffAwaitingLanding(edictID uint) bool {
 }
 
 // isEdictSuggestion reports whether a zhengming request is an edict
-// suggestion (as created by the suggest_edict tool): a single question whose
+// suggestion (as created by the new_edict tool): a single question whose
 // first option approves edict creation and that targets a brand-new edict.
+// A replace_edict suggestion (same options but a non-zero target) is NOT
+// auto-approved in handsoff — replacing an existing edict's intent needs the
+// Ruler's explicit decision.
 func isEdictSuggestion(msg court.ZhengmingPendingMsg) bool {
 	return len(msg.Questions) > 0 &&
 		len(msg.Questions[0].Options) > 0 &&
