@@ -221,3 +221,21 @@ func TestResumeRebuildBatch_NoSession_Deactivates(t *testing.T) {
 	assert.Nil(t, cmd)
 	assert.False(t, model.resumeRebuildActive, "pager should deactivate when session is nil")
 }
+
+// TestHandleSessionSelected_NonEmptyTabOpensNewTab verifies that resuming a
+// session while the active tab has history opens a new tab rather than
+// restoring over the active one.
+func TestHandleSessionSelected_NonEmptyTabOpensNewTab(t *testing.T) {
+	model := newTestModel(t)
+	origIdx := model.tabs.activeTab
+	model.tabs.Content().Chat.AddUserMessage("hard question")
+	before := len(model.tabs.tabs)
+
+	session := testSession("resume-new-tab", "Hard nut", time.Now(), "answer")
+	session.TabType = "forge"
+	model.handleSessionSelected(session)
+
+	assert.Len(t, model.tabs.tabs, before+1, "resume should open a new tab")
+	assert.Equal(t, TabType("forge"), model.tabs.ActiveTab().Type, "session should land on the new tab")
+	assert.Len(t, model.tabs.tabs[origIdx].Content.Chat.Messages, 1, "original tab must keep its history")
+}
