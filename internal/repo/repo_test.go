@@ -385,7 +385,8 @@ func TestProjectSlug_OriginFirstIgnoresTrackedRemote(t *testing.T) {
 	require.NoError(t, err)
 
 	// origin is the fork; upstream is the canonical remote the branch tracks.
-	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
+	originOwner := "daonb"
+	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/"+originOwner+"/data-poisoning-benchmark.git")
 	require.NoError(t, err)
 	_, err = runGitCommand(dir, "remote", "add", "upstream", "https://github.com/OCT7-IO/data-poisoning-benchmark.git")
 	require.NoError(t, err)
@@ -399,9 +400,9 @@ func TestProjectSlug_OriginFirstIgnoresTrackedRemote(t *testing.T) {
 	slug, err := ResolveProjectSlug(dir, true)
 	require.NoError(t, err)
 	require.Equal(t, user+"/data-poisoning-benchmark", slug)
-	// The remote owner must be dropped, not passed through: 'daonb' is the
-	// origin owner here and is not the first segment.
-	require.NotEqual(t, "daonb/data-poisoning-benchmark", slug)
+	// The remote owner must be dropped, not passed through: the slug's
+	// first segment is always the verified OS user, never the origin owner.
+	require.Equal(t, user, strings.SplitN(slug, "/", 2)[0], "first slug segment must be the OS user")
 
 	// Switching the tracked remote must not change the slug (branch-invariance).
 	_, err = runGitCommand(dir, "config", "branch.main.remote", "origin")
@@ -422,7 +423,7 @@ func TestProjectSlug_OriginFirstIgnoresTrackedRemote(t *testing.T) {
 	require.ErrorContains(t, err, "other-repo")
 
 	// With origin present the resolver never errors, whatever the other remotes.
-	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
+	_, err = runGitCommand(dir, "remote", "add", "origin", "https://github.com/"+originOwner+"/data-poisoning-benchmark.git")
 	require.NoError(t, err)
 	slug, err = ResolveProjectSlug(dir, true)
 	require.NoError(t, err)

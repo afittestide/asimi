@@ -150,6 +150,30 @@ func parseContextOverflowLimit(err error) int {
 	return n
 }
 
+// parseMaxOutputLimit extracts the provider-reported output cap from an
+// error of the form "max_completion_token (262144) exceeds model maximum
+// (131072)". The capture is the model's true maximum. It returns 0 when the
+// message does not carry a well-formed count.
+var maxOutputLimitPattern = regexp.MustCompile(`max_completion_tokens? \(\d+\) exceeds model maximum \((\d+)\)`)
+
+// parseMaxOutputLimit extracts the provider-reported output token cap from a
+// max-completion-token rejection. It returns 0 when the message does not
+// carry a well-formed count, so a malformed message never fabricates a cap.
+func parseMaxOutputLimit(err error) int {
+	if err == nil {
+		return 0
+	}
+	m := maxOutputLimitPattern.FindStringSubmatch(strings.ToLower(err.Error()))
+	if len(m) < 2 {
+		return 0
+	}
+	n, convErr := strconv.Atoi(m[1])
+	if convErr != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
 // autoRecoveryCompactPrompt is the summarisation instruction used when Asimi
 // auto-recovers from a context-overflow rejection. The interactive :compact
 // command supplies its own prompt.
@@ -477,6 +501,20 @@ type Session struct {
 	// issues cannot itself trigger another recursive recovery.
 	contextRecoveryDone bool
 	atifRecorder        atifRecorder // ATIF trajectory recorder (non-nil when --atif is set)
+
+	// maxOutputLearned guards the single max-completion-token retry per call:
+	// after a provider rejection teaches the true output cap, the request is
+	// re-sent once; a second rejection is a hard failure.
+	maxOutputLearned bool
+
+	// Per-session output-cap memo. maxOut is the resolved cap for the current
+	// provider:model (0 = provider reports none); maxOutSet guards it so the
+	// unresolved case is memoized per session instead of re-probing bifrost on
+	// every keystroke. Only a provider-reported value ever reaches
+	// modelMaxOutputByKey; a "none" answer stays session-local.
+	maxOutKey string
+	maxOut    int
+	maxOutSet bool
 	tools               []Tool
 	messages            []schemas.ChatMessage
 	notify              internal.NotifyFunc
@@ -1158,13 +1196,26 @@ func ApproximateContextSize(provider, model string) int {
 // per model.
 var modelContextByKey sync.Map // map[string]int
 
-// resolveContextSizeFromBifrost queries the LLM provider for the configured
-// model's context length and returns the resolved int. Best-effort: on any
-// error, empty result, or model without a resolvable context window, it
-// returns defaultUnknownContextRef.
-func (s *Session) resolveContextSizeFromBifrost(provider, modelName string) int {
+// modelMaxOutputByKey caches provider-reported output caps, keyed
+// "provider:model". Lazily populated on first miss from the provider probe
+// or from a value parsed out of a max-completion-token rejection. It holds
+// exact provider-reported values only — never a registry estimate. Shared
+// across all sessions — one network call per model.
+var modelMaxOutputByKey sync.Map // map[string]int
+
+// providerModelInfo is the result of a list-models probe: the advertised
+// context window and output cap, either of which may be 0 (unreported).
+type providerModelInfo struct {
+	ContextLength int
+	MaxOutput     int
+}
+
+// listProviderModel queries the LLM provider for the named model's metadata
+// (context window and output cap). Best-effort: on any error, empty result,
+// or unknown model it returns zero values.
+func (s *Session) listProviderModel(provider, modelName string) providerModelInfo {
 	if s.model == nil || s.config == nil || s.config.Provider == "" || s.config.Model == "" {
-		return defaultUnknownContextRef
+		return providerModelInfo{}
 	}
 
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
@@ -1174,26 +1225,31 @@ func (s *Session) resolveContextSizeFromBifrost(provider, modelName string) int 
 	})
 	if bifrostErr != nil {
 		slog.Debug("failed to list models from bifrost", "error", bifrostErrorToGoError(bifrostErr))
-		return defaultUnknownContextRef
+		return providerModelInfo{}
 	}
 	if resp == nil {
-		return defaultUnknownContextRef
+		return providerModelInfo{}
 	}
 
 	for _, m := range resp.Data {
 		if m.ID != modelName {
 			continue
 		}
+		info := providerModelInfo{}
 		if m.ContextLength != nil && *m.ContextLength > 0 {
-			return *m.ContextLength
-		}
-		if m.MaxInputTokens != nil && m.MaxOutputTokens != nil &&
+			info.ContextLength = *m.ContextLength
+		} else if m.MaxInputTokens != nil && m.MaxOutputTokens != nil &&
 			*m.MaxInputTokens > 0 && *m.MaxOutputTokens > 0 {
-			return *m.MaxInputTokens + *m.MaxOutputTokens
+			info.ContextLength = *m.MaxInputTokens + *m.MaxOutputTokens
 		}
+		if m.MaxOutputTokens != nil && *m.MaxOutputTokens > 0 {
+			info.MaxOutput = *m.MaxOutputTokens
+		}
+		return info
 	}
-	return defaultUnknownContextRef
+	return providerModelInfo{}
 }
+
 
 // currentContextKey returns the normalized "<provider>:<model>" cache key
 // for the active session model, with any routing tag (":nitro", ":free")
@@ -1234,10 +1290,15 @@ func (s *Session) getModelContextSize() int {
 	// Provider-reported window first — the authoritative source of truth.
 	// The registry can overestimate for self-hosted OpenAI-compatible
 	// proxies, so it must never win over what the endpoint advertises.
-	if size := s.resolveContextSizeFromBifrost(provider, modelName); size != defaultUnknownContextRef {
-		modelContextByKey.Store(key, size) // real provider value, safe to share
-		s.rememberContextSize(key, size, false)
-		return size
+	// The same probe carries the advertised output cap; seed it into
+	// modelMaxOutputByKey so maxCompletionTokens never re-probes.
+	if info := s.listProviderModel(provider, modelName); info.ContextLength > 0 {
+		if info.MaxOutput > 0 {
+			modelMaxOutputByKey.Store(key, info.MaxOutput)
+		}
+		modelContextByKey.Store(key, info.ContextLength) // real provider value, safe to share
+		s.rememberContextSize(key, info.ContextLength, false)
+		return info.ContextLength
 	}
 
 	// Provider reported nothing: fall back to the deterministic registry and
@@ -1397,9 +1458,29 @@ const (
 )
 
 // maxCompletionTokens returns the output cap applied to chat requests. Kept in
-// one place so the compaction budget and generateLLMResponse agree.
+// one place so the compaction budget and generateLLMResponse agree. Cap order:
+// provider-reported MaxOutputTokens (exact, shared via modelMaxOutputByKey),
+// else the hardcoded modelMaxOutputTokens map, else the 262144 default —
+// always the minimum of what applies.
 func (s *Session) maxCompletionTokens() int {
 	maxTokens := 262144
+	if s.config != nil {
+		key, provider, modelName := s.currentContextKey()
+		// Per-session fast path: already resolved for this provider:model.
+		if !s.maxOutSet || s.maxOutKey != key {
+			out := 0
+			if v, ok := modelMaxOutputByKey.Load(key); ok {
+				out = v.(int)
+			} else if info := s.listProviderModel(provider, modelName); info.MaxOutput > 0 {
+				out = info.MaxOutput
+				modelMaxOutputByKey.Store(key, out) // real provider value, safe to share
+			}
+			s.maxOutKey, s.maxOut, s.maxOutSet = key, out, true
+		}
+		if s.maxOut > 0 && s.maxOut < maxTokens {
+			maxTokens = s.maxOut
+		}
+	}
 	if cap, ok := modelMaxOutputTokens[s.Model]; ok && cap < maxTokens {
 		maxTokens = cap
 	}
@@ -1910,6 +1991,25 @@ func (s *Session) generateLLMResponse(ctx context.Context, stream bool) (*respon
 		if err == nil {
 			return choice, nil
 		}
+		// A max-completion-token rejection carries the model's true output
+		// cap. Learn it, then retry the request once; a second rejection is
+		// a hard failure, not a loop.
+		if cap := parseMaxOutputLimit(err); cap > 0 {
+			if s.maxOutputLearned {
+				return nil, err
+			}
+			s.maxOutputLearned = true
+			defer func() { s.maxOutputLearned = false }()
+			key, _, _ := s.currentContextKey()
+			modelMaxOutputByKey.Store(key, cap)
+			s.maxOutKey, s.maxOut, s.maxOutSet = key, cap, true
+			slog.Info("learned output cap from provider error", "cap", cap)
+			// A partial streamed response must not be duplicated on the retry.
+			if stream {
+				s.resetStreamBuffer()
+			}
+			continue
+		}
 		// Context overflow keeps its dedicated recovery path; the transient
 		// retry loop must never swallow it.
 		if isContextOverflowError(err) {
@@ -2030,11 +2130,10 @@ func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*resp
 	}
 
 	autoStr := "auto"
-	// Default cap for MaxCompletionTokens when tools are enabled
-	maxTokens := 262144
-	if cap, ok := modelMaxOutputTokens[s.Model]; ok && cap < maxTokens {
-		maxTokens = cap
-	}
+	// Default cap for MaxCompletionTokens when tools are enabled — computed in
+	// one place (maxCompletionTokens) so the request and the compaction
+	// budget can never drift apart.
+	maxTokens := s.maxCompletionTokens()
 	params := &schemas.ChatParameters{}
 	if defs := s.toolDefsSnapshot(); len(defs) > 0 {
 		params.Tools = defs

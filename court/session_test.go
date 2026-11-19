@@ -4081,3 +4081,249 @@ func TestSetLingAttribution_ClearsWithBlankLingID(t *testing.T) {
 	assert.Empty(t, sess.lingID)
 	assert.Empty(t, sess.ministerID)
 }
+
+// --- e1069: provider-reported MaxOutputTokens caps MaxCompletionTokens ---
+
+// maxOutputProbeProvider advertises a model with the given output cap and
+// records every MaxCompletionTokens the session sends, so tests can assert
+// what the request actually carried.
+type maxOutputProbeProvider struct {
+	listCalls int
+	chatCalls int
+	maxOut    int // advertised MaxOutputTokens; 0 = advertise none
+	sent      []*int
+}
+
+func (p *maxOutputProbeProvider) ListModelsRequest(_ *schemas.BifrostContext, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	p.listCalls++
+	m := schemas.Model{ID: "e1069-cap-model"}
+	if p.maxOut > 0 {
+		ctxLen := 1_000_000
+		m.ContextLength = &ctxLen
+		m.MaxOutputTokens = &p.maxOut
+	}
+	return &schemas.BifrostListModelsResponse{Data: []schemas.Model{m}}, nil
+}
+
+func (p *maxOutputProbeProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return p.ListModelsRequest(ctx, req)
+}
+
+func (p *maxOutputProbeProvider) ChatCompletionRequest(_ *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	p.chatCalls++
+	if req.Params != nil && req.Params.MaxCompletionTokens != nil {
+		v := *req.Params.MaxCompletionTokens
+		p.sent = append(p.sent, &v)
+	}
+	content := "ok"
+	return &schemas.BifrostChatResponse{
+		Choices: []schemas.BifrostResponseChoice{{
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+				Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+			},
+			FinishReason: strPtr("stop"),
+		}},
+	}, nil
+}
+
+func (p *maxOutputProbeProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	// Record the cap through the same path as the non-streaming request.
+	_, _ = p.ChatCompletionRequest(ctx, req)
+	ch := make(chan *schemas.BifrostStreamChunk)
+	go func() {
+		defer close(ch)
+		content := "ok"
+		ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{{
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+				},
+				FinishReason: strPtr("stop"),
+			}},
+		}}
+	}()
+	return ch, nil
+}
+
+
+// e1069: a model whose provider metadata reports MaxOutputTokens below the
+// 262144 blanket default must send that advertised value in
+// params.MaxCompletionTokens instead of the default.
+func TestMaxCompletionTokens_UsesProviderReportedCap(t *testing.T) {
+	// Not t.Parallel(): asserts on the shared modelMaxOutputByKey cache.
+	modelMaxOutputByKey.Delete("openai:e1069-cap-model")
+
+	prov := &maxOutputProbeProvider{maxOut: 131_072}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1069-cap-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	sess.RegisterCourtTools([]Tool{&mockTool{name: "e1069-tool"}})
+
+	assert.Equal(t, 131_072, sess.maxCompletionTokens())
+
+	_, err = sess.AskWithStreaming(context.Background(), "ping", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, prov.sent, "the request must carry MaxCompletionTokens when tools are enabled")
+	assert.Equal(t, 131_072, *prov.sent[0])
+
+	// The provider-reported cap is shared and cached per provider:model: a
+	// second session must not re-probe for the cap.
+	listCallsBefore := prov.listCalls
+	sess2, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1069-cap-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, 131_072, sess2.maxCompletionTokens())
+	assert.Equal(t, listCallsBefore, prov.listCalls, "provider-reported cap is shared; second session must not re-probe")
+}
+
+// e1069: with no provider-reported cap, the hardcoded map wins; with neither,
+// the 262144 default applies.
+func TestMaxCompletionTokens_FallbackChain(t *testing.T) {
+	// Not t.Parallel(): asserts on the shared modelMaxOutputByKey cache.
+	modelMaxOutputByKey.Delete("openai:e1069-cap-model")
+
+	prov := &maxOutputProbeProvider{maxOut: 0} // provider advertises no cap
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1069-cap-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// No provider cap, model unknown to the map: the blanket default.
+	assert.Equal(t, 262_144, sess.maxCompletionTokens())
+
+	// No provider cap, model in the hardcoded map: the map wins.
+	mapped, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "minimax.minimax-m2.5",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, 8_192, mapped.maxCompletionTokens())
+
+	// The unanswered probe is memoized per session, not shared: a later call
+	// must not re-probe, but a fresh session may probe again.
+	_ = sess.maxCompletionTokens()
+	callsAfterFirst := prov.listCalls
+	_ = sess.maxCompletionTokens()
+	assert.Equal(t, callsAfterFirst, prov.listCalls, "unanswered probe must not re-probe per keystroke")
+}
+
+// e1069: a provider rejection carrying "max_completion_tokens (...) exceeds
+// model maximum (N)" teaches the true cap; the request is retried once with N.
+func TestMaxCompletionTokens_LearnsCapFromErrorAndRetries(t *testing.T) {
+	// Not t.Parallel(): asserts on the shared modelMaxOutputByKey cache.
+	modelMaxOutputByKey.Delete("openai:e1069-cap-model")
+
+	// The provider rejects the first request with the vertex-style message
+	// and accepts the retry once the cap is learned.
+	prov := &rejectThenAcceptProvider{}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1069-cap-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	sess.RegisterCourtTools([]Tool{&mockTool{name: "e1069-tool"}})
+
+	_, err = sess.AskWithStreaming(context.Background(), "ping", nil)
+	require.NoError(t, err)
+
+	// The retry sent the cap parsed out of the rejection.
+	require.Len(t, prov.sent, 2, "first request rejected, retry accepted")
+	assert.Equal(t, 262_144, *prov.sent[0])
+	assert.Equal(t, 131_072, *prov.sent[1])
+
+	// The learned cap is shared for the provider:model.
+	v, ok := modelMaxOutputByKey.Load("openai:e1069-cap-model")
+	require.True(t, ok, "learned cap must be shared")
+	assert.Equal(t, 131_072, v)
+}
+
+// rejectThenAcceptProvider rejects the first chat request with a vertex-style
+// max-completion-token error, records the requested caps, and accepts the
+// retry.
+type rejectThenAcceptProvider struct {
+	calls int
+	sent  []*int
+}
+
+func (p *rejectThenAcceptProvider) ListModelsRequest(_ *schemas.BifrostContext, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (p *rejectThenAcceptProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return p.ListModelsRequest(ctx, req)
+}
+
+func (p *rejectThenAcceptProvider) ChatCompletionRequest(_ *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	p.calls++
+	if req.Params != nil && req.Params.MaxCompletionTokens != nil {
+		v := *req.Params.MaxCompletionTokens
+		p.sent = append(p.sent, &v)
+	}
+	if p.calls == 1 {
+		status := 400
+		return nil, &schemas.BifrostError{
+			StatusCode: &status,
+			Error: &schemas.ErrorField{
+				Message: "max_completion_tokens (262144) exceeds model maximum (131072)",
+				Type:    strPtr("invalid_request_error"),
+			},
+		}
+	}
+	content := "ok"
+	return &schemas.BifrostChatResponse{
+		Choices: []schemas.BifrostResponseChoice{{
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+				Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+			},
+			FinishReason: strPtr("stop"),
+		}},
+	}, nil
+}
+
+func (p *rejectThenAcceptProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	_, bifrostErr := p.ChatCompletionRequest(ctx, req)
+	if bifrostErr != nil {
+		ch := make(chan *schemas.BifrostStreamChunk, 1)
+		ch <- &schemas.BifrostStreamChunk{BifrostError: bifrostErr}
+		close(ch)
+		return ch, nil
+	}
+	ch := make(chan *schemas.BifrostStreamChunk, 1)
+	content := "ok"
+	ch <- &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+		Choices: []schemas.BifrostResponseChoice{{
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+				Delta: &schemas.ChatStreamResponseChoiceDelta{Content: &content},
+			},
+			FinishReason: strPtr("stop"),
+		}},
+	}}
+	close(ch)
+	return ch, nil
+}
+
+// e1069: parseMaxOutputLimit extracts the model maximum from a rejection
+// message and rejects malformed input.
+func TestParseMaxOutputLimit(t *testing.T) {
+	err := errors.New("max_completion_tokens (262144) exceeds model maximum (131072)")
+	assert.Equal(t, 131_072, parseMaxOutputLimit(err))
+
+	// Case-insensitive and plural-tolerant.
+	upper := errors.New("Max_Completion_Token (1000) EXCEEDS MODEL MAXIMUM (900)")
+	assert.Equal(t, 900, parseMaxOutputLimit(upper))
+
+	// Malformed messages never fabricate a cap.
+	for _, m := range []string{
+		"exceeds model maximum",
+		"max_completion_tokens exceeds model maximum (abc)",
+		"max_completion_tokens (5) exceeds model maximum (0)",
+	} {
+		assert.Equalf(t, 0, parseMaxOutputLimit(errors.New(m)), "malformed %q", m)
+	}
+	assert.Equal(t, 0, parseMaxOutputLimit(nil))
+}
