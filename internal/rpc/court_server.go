@@ -173,6 +173,29 @@ func RegisterCourtHandlers(c *Conn, impl courtapi.Client) {
 		return nil, nil
 	})
 
+	c.Handle(MethodDismissZhengming, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p DismissZhengmingParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		if err := impl.DismissZhengming(p.RequestID, p.Reason); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+
+	c.Handle(MethodGetZhengming, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p GetZhengmingParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		req, err := impl.GetZhengming(p.RequestID)
+		if err != nil {
+			return nil, err
+		}
+		return wire.Encode(GetZhengmingResult{Request: req})
+	})
+
 	c.Handle(MethodAllowRunnerFallback, func(ctx context.Context, params []byte) ([]byte, error) {
 		var p AllowRunnerFallbackParams
 		if err := wire.Decode(params, &p); err != nil {

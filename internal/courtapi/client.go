@@ -65,6 +65,8 @@ type Client interface {
 
 	// Zhengming.
 	HandleZhengmingResponse(ctx context.Context, requestID, answer string) error
+	DismissZhengming(requestID, reason string) error
+	GetZhengming(requestID string) (*storage.Zhengming, error)
 	CancelZhengming(requestID string)
 
 	// Shell runner.

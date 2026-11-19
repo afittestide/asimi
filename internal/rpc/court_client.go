@@ -184,6 +184,22 @@ func (c *CourtClient) HandleZhengmingResponse(ctx context.Context, requestID, an
 	return err
 }
 
+func (c *CourtClient) DismissZhengming(requestID, reason string) error {
+	return c.callVoid(context.Background(), MethodDismissZhengming, DismissZhengmingParams{RequestID: requestID, Reason: reason})
+}
+
+func (c *CourtClient) GetZhengming(requestID string) (*storage.Zhengming, error) {
+	raw, err := c.conn.Call(context.Background(), MethodGetZhengming, GetZhengmingParams{RequestID: requestID})
+	if err != nil {
+		return nil, err
+	}
+	var r GetZhengmingResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return nil, fmt.Errorf("rpc: decode GetZhengming result: %w", err)
+	}
+	return r.Request, nil
+}
+
 func (c *CourtClient) AllowRunnerFallback(allow bool) {
 	_ = c.callVoid(context.Background(), MethodAllowRunnerFallback, AllowRunnerFallbackParams{Allow: allow})
 }

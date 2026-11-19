@@ -510,6 +510,34 @@ func (rc *ReconnectingClient) HandleZhengmingResponse(ctx context.Context, reque
 	return err
 }
 
+func (rc *ReconnectingClient) DismissZhengming(requestID, reason string) error {
+	client := rc.getClient()
+	if client == nil {
+		return ErrClosed
+	}
+	err := client.DismissZhengming(requestID, reason)
+	if rc.reconnectIfError(err, rc.shouldRetry) {
+		if client = rc.getClient(); client != nil {
+			return client.DismissZhengming(requestID, reason)
+		}
+	}
+	return err
+}
+
+func (rc *ReconnectingClient) GetZhengming(requestID string) (*storage.Zhengming, error) {
+	client := rc.getClient()
+	if client == nil {
+		return nil, ErrClosed
+	}
+	req, err := client.GetZhengming(requestID)
+	if rc.reconnectIfError(err, rc.shouldRetryReadOnly) {
+		if client = rc.getClient(); client != nil {
+			return client.GetZhengming(requestID)
+		}
+	}
+	return req, err
+}
+
 func (rc *ReconnectingClient) AllowRunnerFallback(allow bool) {
 	client := rc.getClient()
 	if client != nil {

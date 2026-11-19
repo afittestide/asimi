@@ -72,6 +72,15 @@ type TUIModel struct {
 	creatingTab   string
 	pendingPrompt string
 
+	// pendingGateDismiss is non-nil while the operator is typing the reason
+	// for dismissing one gate from the :gates selection view.
+	pendingGateDismiss *GateItem
+
+	// gateAnsweredRequests records requests whose answering dialog was opened
+	// from the :gates selection view, so answering them opens the session tab
+	// (the Ruler's amendment of 2026-11-17).
+	gateAnsweredRequests map[string]bool
+
 	// Prompt history and rollback management
 	// sessionPromptHistory stores prompts with snapshots for current session rollback
 	sessionPromptHistory          []promptHistoryEntry
@@ -3227,7 +3236,17 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if edictID, ok := parseEdictActionRequestID(msg.RequestID); ok {
 			return m, dispatchEdictAction(&m, edictID, msg.Answers)
 		}
+		// The Ruler answered from the :gates selection view: open the tab
+		// where the asking session resumes and watches the answer land.
+		var gateCmd tea.Cmd
+		if m.gateAnsweredRequests[msg.RequestID] {
+			delete(m.gateAnsweredRequests, msg.RequestID)
+			gateCmd = resumeGateSession(&m, msg.RequestID)
+		}
 		go m.handleAnsweringComplete(msg)
+		if gateCmd != nil {
+			return m, gateCmd
+		}
 		return m, nil
 
 	case AnsweringCancelMsg:
@@ -3567,6 +3586,22 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case inputResponseMsg:
+		// Handle a gate dismissal reason from the :gates view
+		if m.pendingGateDismiss != nil {
+			gate := *m.pendingGateDismiss
+			m.pendingGateDismiss = nil
+			reason := strings.TrimSpace(msg.text)
+			if reason == "" {
+				reason = "court: dismissed by ruler from the :gates view"
+			}
+			court := m.court
+			requestID := gate.RequestID
+			return m, func() tea.Msg {
+				err := court.DismissZhengming(requestID, reason)
+				return gateDismissedMsg{requestID: requestID, err: err}
+			}
+		}
+
 		// Handle API key input if pending
 		if m.pendingAPIKeyProvider != "" {
 			provider := m.pendingAPIKeyProvider
@@ -3733,6 +3768,31 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case edictsLoadedMsg:
 		return m, m.tabs.Content().ShowEdictSelection(msg.edicts)
+
+	case gatesLoadedMsg:
+		return m, m.tabs.Content().ShowGateSelection(msg.gates)
+
+	case gateSelectedMsg:
+		// Open the existing answering dialog with this request's real
+		// questions, routed the way a native ZhengmingPendingMsg would be.
+		return m, openGateAnswering(&m, msg.gate)
+
+	case gateDismissRequestedMsg:
+		// Dismiss one gate at a time, with an operator-typed reason (empty
+		// names the view). Never bulk, never an answer.
+		gate := msg.gate
+		m.pendingGateDismiss = &gate
+		return m, m.commandLine.EnterInputMode(fmt.Sprintf(
+			"Dismiss %s — reason (empty = dismissed from :gates):", msg.gate.RequestID))
+
+	case gateDismissedMsg:
+		if msg.err != nil {
+			m.commandLine.AddToast(fmt.Sprintf("Gate not dismissed: %v", msg.err), "warning", 4*time.Second)
+		} else {
+			m.commandLine.AddToast(fmt.Sprintf("Gate %s dismissed", msg.requestID), "info", 3*time.Second)
+		}
+		// Return to the refreshed list either way.
+		return m, handleGatesCommand(&m, nil)
 
 	case edictSelectedMsg:
 		// Show the edict action menu for the selected edict
@@ -4858,6 +4918,84 @@ func (m *TUIModel) handleAnsweringComplete(msg AnsweredMsg) {
 	if err := m.court.HandleZhengmingResponse(context.Background(), msg.RequestID, answer); err != nil {
 		slog.Error("failed to handle zhengming response", "error", err)
 	}
+}
+
+// openGateAnswering opens the existing answering dialog for a gate selected in
+// the :gates view, routed the way a native ZhengmingPendingMsg would be: the
+// gate's tab (or the minister's tab) receives it, so the answer flows through
+// the AnsweredMsg path exactly as if the dialog had opened natively.
+func openGateAnswering(m *TUIModel, gate GateItem) tea.Cmd {
+	// Only a Court-pending request can be fetched and answered. A gate the
+	// prompts hold but the Court no longer has as pending was answered or
+	// retired elsewhere; the refreshed list is the truth.
+	req, err := m.court.GetZhengming(gate.RequestID)
+	if err != nil {
+		if m.commandLine != nil {
+			m.commandLine.AddToast(fmt.Sprintf("Gate %s is no longer pending: %v", gate.RequestID, err), "warning", 4*time.Second)
+		}
+		return handleGatesCommand(m, nil)
+	}
+
+	msg := court.ZhengmingPendingMsg{
+		RequestID:  req.RequestID,
+		EdictKey:   storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project},
+		MinisterID: req.MinisterID,
+		ChannelID:  gate.ChannelID,
+		Questions:  req.Questions,
+		Priority:   req.Priority,
+	}
+	if m.gateAnsweredRequests == nil {
+		m.gateAnsweredRequests = make(map[string]bool)
+	}
+	m.gateAnsweredRequests[req.RequestID] = true
+	return deliverGateDialog(m, msg)
+}
+
+// deliverGateDialog routes a gate dialog to its tab and marks the request as
+// pending there, the same two steps the ZhengmingPendingMsg handler performs
+// for a native dialog.
+func deliverGateDialog(m *TUIModel, msg court.ZhengmingPendingMsg) tea.Cmd {
+	target := m.tabs.SwitchToZhengmingTarget(msg.ChannelID, msg.MinisterID)
+	if target != "" {
+		m.setPendingZhengming(target, msg.RequestID)
+		if chat := m.tabs.ChatByTab(target); chat != nil {
+			chat.ScrollToBottom()
+		}
+	}
+	m.prompt().HandleZhengmingPending(msg)
+	return nil
+}
+
+// resumeGateSession is the Ruler's amendment (2026-11-17): after all questions
+// are answered from the :gates view, a new tab opens where the asking session
+// is resumed so the Ruler watches the unblocked work continue.
+func resumeGateSession(m *TUIModel, requestID string) tea.Cmd {
+	req, err := m.court.GetZhengming(requestID)
+	if err != nil {
+		return handleGatesCommand(m, nil)
+	}
+
+	channelID := fmt.Sprintf("e%d", req.EdictID)
+	if m.tabs.TabByTarget(channelID) == nil {
+		m.addTab(ritualTabLabel(channelID), "ritual", channelID, nil)
+	} else {
+		m.tabs.SwitchToTarget(channelID)
+	}
+	if chat := m.tabs.ChatByTab(channelID); chat != nil {
+		chat.AddMessage(fmt.Sprintf("%sAnswer delivered from the gates view — resuming the session awaiting it…", systemPrefix))
+	}
+
+	if req.SessionID == "" || m.sessionStore == nil {
+		// No birth session to restore (or no store in this mode); the tab is
+		// still where the unblocked ritual's step output will stream to.
+		return nil
+	}
+
+	m.creatingTab = channelID
+	if loadFn := m.tabs.Content().loadSessionFn; loadFn != nil {
+		return loadFn(req.SessionID)
+	}
+	return nil
 }
 
 // parseEdictActionRequestID checks if a RequestID is a synthetic edict action

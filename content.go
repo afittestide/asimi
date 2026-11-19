@@ -720,6 +720,7 @@ const (
 	ViewModels
 	ViewResume
 	ViewEdict
+	ViewGate
 )
 
 // NavigationMode represents how navigation works in the current view
@@ -742,6 +743,7 @@ type ContentComponent struct {
 	models      ModelsWindow
 	resume      ResumeWindow
 	edictSelect EdictSelectWindow
+	gateSelect  GateSelectWindow
 
 	// edictDashboard holds the rendered text for the ViewEdict dashboard.
 	edictDashboard string
@@ -754,6 +756,7 @@ type ContentComponent struct {
 	navMode      NavigationMode
 	activeList   ListNavigator           // current list view for NavList mode
 	onSelect     func(index int) tea.Cmd // called on enter in list mode
+	onDismiss    func(index int) tea.Cmd // called on the dismiss key in list mode (gates)
 	viewport     viewport.Model          // For text navigation
 	selectedItem int                     // For list navigation
 	scrollOffset int                     // For list navigation
@@ -774,6 +777,7 @@ func NewContentComponent(width, height int, markdownEnabled bool) ContentCompone
 		models:      NewModelsWindow(),
 		resume:      NewResumeWindow(),
 		edictSelect: NewEdictSelectWindow(),
+		gateSelect:  NewGateSelectWindow(),
 		navMode:     NavText,
 		viewport:    viewport.New(width, height),
 	}
@@ -792,6 +796,7 @@ func (c *ContentComponent) SetSize(width, height int) {
 	c.models.SetSize(width, height-1)
 	c.resume.SetSize(width, height-1)
 	c.edictSelect.SetSize(width, height-1)
+	c.gateSelect.SetSize(width, height-1)
 }
 
 // GetActiveView returns the current view type
@@ -804,6 +809,7 @@ func (c *ContentComponent) ShowChat() tea.Cmd {
 	c.activeView = ViewChat
 	c.navMode = NavText
 	c.edictListActive = false
+	c.onDismiss = nil
 	return func() tea.Msg {
 		return ChangeModeMsg{NewMode: "insert"}
 	}
@@ -881,6 +887,7 @@ func (c *ContentComponent) ShowEdictSelection(edicts []storage.ActiveEdict) tea.
 	c.navMode = NavList
 	c.edictListActive = true
 	c.activeList = &c.edictSelect.SelectWindow
+	c.onDismiss = nil
 	c.edictSelect.SetItems(edicts)
 	c.selectedItem = 0
 	c.scrollOffset = 0
@@ -891,6 +898,39 @@ func (c *ContentComponent) ShowEdictSelection(edicts []storage.ActiveEdict) tea.
 		}
 		return func() tea.Msg {
 			return edictSelectedMsg{edictID: edict.ID}
+		}
+	}
+
+	return func() tea.Msg {
+		return ChangeModeMsg{NewMode: "select"}
+	}
+}
+
+// ShowGateSelection switches to the gate selection view (:gates). Enter opens
+// the answering dialog for the selected gate; "d" dismisses it with a reason.
+func (c *ContentComponent) ShowGateSelection(gates []GateItem) tea.Cmd {
+	c.activeView = ViewGate
+	c.navMode = NavList
+	c.activeList = &c.gateSelect.SelectWindow
+	c.gateSelect.SetItems(gates)
+	c.selectedItem = 0
+	c.scrollOffset = 0
+	c.onSelect = func(index int) tea.Cmd {
+		gate := c.gateSelect.GetSelectedItem(index)
+		if gate == nil {
+			return nil
+		}
+		return func() tea.Msg {
+			return gateSelectedMsg{gate: *gate}
+		}
+	}
+	c.onDismiss = func(index int) tea.Cmd {
+		gate := c.gateSelect.GetSelectedItem(index)
+		if gate == nil {
+			return nil
+		}
+		return func() tea.Msg {
+			return gateDismissRequestedMsg{gate: *gate}
 		}
 	}
 
@@ -1111,6 +1151,12 @@ func (c *ContentComponent) handleListNavigation(msg tea.KeyMsg) tea.Cmd {
 		scrollInfoCmd = c.getScrollInfoCmd()
 	case "enter":
 		return c.handleListSelect()
+	case "d":
+		// Dismiss (one at a time) in views that offer it (the gate list).
+		if c.onDismiss == nil {
+			return nil
+		}
+		return c.handleListDismiss()
 	case "n":
 		// Next match in current search direction
 		if c.activeView == ViewModels && c.models.HasSearch() {
@@ -1154,6 +1200,16 @@ func (c *ContentComponent) handleListSelect() tea.Cmd {
 	return tea.Batch(c.ShowChat(), cmd)
 }
 
+// handleListDismiss fires the active list view's dismiss action on the
+// selected item (the gate list's "d"). Unlike selection it stays in the view:
+// the dismissal is confirmed before the gate goes anywhere.
+func (c *ContentComponent) handleListDismiss() tea.Cmd {
+	if c.onDismiss == nil {
+		return nil
+	}
+	return c.onDismiss(c.selectedItem)
+}
+
 // getScrollInfoCmd returns a command that sends scroll info as a message
 func (c *ContentComponent) getScrollInfoCmd() tea.Cmd {
 	return nil
@@ -1175,6 +1231,8 @@ func (c *ContentComponent) View() string {
 			return c.renderEdictSelectView()
 		}
 		return c.renderEdictView()
+	case ViewGate:
+		return c.renderGateSelectView()
 	}
 	return ""
 }
@@ -1227,6 +1285,17 @@ func (c *ContentComponent) renderResumeView() string {
 // renderEdictSelectView renders the edict selection list view
 func (c *ContentComponent) renderEdictSelectView() string {
 	content := c.edictSelect.RenderList(c.selectedItem, c.scrollOffset, c.edictSelect.GetVisibleSlots())
+
+	// Apply height constraint to prevent overflow clipping from the top
+	return lipgloss.NewStyle().
+		Height(c.height).
+		MaxHeight(c.height).
+		Render(content)
+}
+
+// renderGateSelectView renders the gate selection list view (:gates)
+func (c *ContentComponent) renderGateSelectView() string {
+	content := c.gateSelect.RenderList(c.selectedItem, c.scrollOffset, c.gateSelect.GetVisibleSlots())
 
 	// Apply height constraint to prevent overflow clipping from the top
 	return lipgloss.NewStyle().

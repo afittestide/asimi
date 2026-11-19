@@ -24,6 +24,8 @@ const (
 	MethodSubmitPrompt           = "SubmitPrompt"
 	MethodRestoreMinisterSess    = "RestoreMinisterSession"
 	MethodHandleZhengming        = "HandleZhengmingResponse"
+	MethodDismissZhengming      = "DismissZhengming"
+	MethodGetZhengming           = "GetZhengming"
 	MethodCancelZhengming        = "CancelZhengming"
 	MethodAllowRunnerFallback    = "AllowRunnerFallback"
 	MethodRunShellCommand        = "RunShellCommand"

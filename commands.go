@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1062,66 +1063,106 @@ func handleAbortCommand(model *TUIModel, args []string) tea.Cmd {
 	return nil
 }
 
-// handleGatesCommand lists the Ruler gates the TUI is holding open. It answers
-// "what is still waiting for me?" without relying on a single prompt slot: it
-// reports every gate held by each tab's prompt — active or queued — plus any
-// request the Court persisted as pending that this session never surfaced
-// (e.g. a suggestion raised while the TUI was reconnecting). The prompt is the
-// authoritative record: a gate open on a minister tab is listed even though no
-// ritual channel ever registered it.
+// firstGateSummary returns the first question's display summary, or "".
+func firstGateSummary(questions []string) string {
+	if len(questions) == 0 {
+		return ""
+	}
+	return questions[0]
+}
+
+// handleGatesCommand shows the Ruler gates as a selection view, on the same
+// pattern as :edicts (edictsLoadedMsg → ShowEdictSelection): it returns
+// gatesLoadedMsg, which the TUI turns into ShowGateSelection. Each entry shows
+// the request ID's summary, edict, minister, priority and age; enter opens the
+// existing answering dialog; "d" dismisses one gate at a time.
 //
-// Nothing is marked answered here — a pending request stays pending until the
-// Ruler acts on it or the Court dismisses it with a named reason.
+// The gate set is the union of what the UI holds (each tab's prompt — active or
+// queued) and what the Court persisted as pending (requests this session never
+// surfaced, e.g. raised while the TUI was reconnecting). Nothing is answered by
+// listing: a pending request stays pending until the Ruler acts on it or the
+// Court dismisses it with a named reason.
 func handleGatesCommand(model *TUIModel, args []string) tea.Cmd {
 	if model.court == nil {
 		model.commandLine.AddToast("Court not active", "error", 3*time.Second)
 		return nil
 	}
 
-	var b strings.Builder
-	b.WriteString(systemPrefix + "Ruler requests awaiting an answer:")
-	b.WriteString("\n")
+	now := time.Now()
+	var gates []GateItem
+	// seen indexes gates by request ID. Indices, not pointers: append
+	// reallocates the backing array, so a stored pointer would go stale and
+	// the snapshot's enrichment would write into the old array.
+	seen := make(map[string]int)
 
 	// Gates held in the UI, per tab's prompt.
-	open := 0
-	listed := make(map[string]bool)
 	for target, p := range model.prompts {
 		if p == nil {
 			continue
 		}
 		active := p.ActiveAnsweringRequest()
 		for _, requestID := range p.OpenRulerRequests() {
-			if listed[requestID] {
+			if i, ok := seen[requestID]; ok {
+				// Already listed via another prompt — keep the earlier entry,
+				// but remember the channel it is held on.
+				if gates[i].ChannelID == "" {
+					gates[i].ChannelID = target
+					gates[i].OnScreen = requestID == active
+				}
 				continue
 			}
-			listed[requestID] = true
-			open++
-			marker := "  "
-			if requestID == active {
-				marker = "▶ "
-			}
-			b.WriteString(fmt.Sprintf("  %s%s  (channel %s)", marker, requestID, target))
-			b.WriteString("\n")
+			gates = append(gates, GateItem{
+				RequestID: requestID,
+				ChannelID: target,
+				OnScreen:  requestID == active,
+				Priority:  string(storage.PriorityNormal),
+			})
+			seen[requestID] = len(gates) - 1
 		}
 	}
 
 	// Requests the Court still holds as pending that no prompt is showing.
 	if snap := model.court.TakeSnapshot(); len(snap.Zhengming) > 0 {
 		for _, z := range snap.Zhengming {
-			if listed[z.RequestID] {
+			if i, ok := seen[z.RequestID]; ok {
+				// The prompt knows this gate; enrich the entry with the
+				// Court's own record (edict, minister, age, summary).
+				gates[i].EdictID = z.EdictID
+				gates[i].MinisterID = z.MinisterID
+				gates[i].Priority = z.Priority
+				gates[i].Age = now.Sub(z.CreatedAt)
+				if len(z.Questions) > 0 {
+					gates[i].Summary = z.Questions[0]
+				}
 				continue
 			}
-			listed[z.RequestID] = true
-			open++
-			b.WriteString(fmt.Sprintf("  · %s  %s asks: %s", z.RequestID, z.MinisterID, strings.Join(z.Questions, "; ")))
-			b.WriteString("\n")
+			gates = append(gates, GateItem{
+				RequestID:  z.RequestID,
+				EdictID:    z.EdictID,
+				MinisterID: z.MinisterID,
+				Priority:   z.Priority,
+				Age:        now.Sub(z.CreatedAt),
+				Summary:    firstGateSummary(z.Questions),
+			})
+			seen[z.RequestID] = len(gates) - 1
 		}
 	}
 
-	if open == 0 {
-		return func() tea.Msg { return showSystemMsg("No Ruler requests awaiting an answer.") }
+	// Sort like the snapshot query: urgent first, then oldest first.
+	sort.SliceStable(gates, func(i, j int) bool {
+		pi, pj := gates[i].Priority == string(storage.PriorityUrgent), gates[j].Priority == string(storage.PriorityUrgent)
+		if pi != pj {
+			return pi
+		}
+		if gates[i].Age != gates[j].Age {
+			return gates[i].Age > gates[j].Age
+		}
+		return gates[i].RequestID < gates[j].RequestID
+	})
+
+	return func() tea.Msg {
+		return gatesLoadedMsg{gates: gates}
 	}
-	return func() tea.Msg { return showSystemMsg(b.String()) }
 }
 
 // resolveSwitchTarget maps a `:switch` target to its branch and worktree.

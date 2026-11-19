@@ -3903,6 +3903,9 @@ type mockCourtClient struct {
 
 	setIntentFn             func(uint, string) error
 	snapshot                court.Snapshot
+	getZhengmingFn          func(string) (*storage.Zhengming, error)
+	dismissZhengmingFn      func(string, string) error
+	dismissedZhengming      []dismissedZhengming
 	submitPromptTarget      string
 	submitPromptMsg         string
 	submitPromptChanID      string
@@ -3926,6 +3929,11 @@ type publishedEvent struct {
 type zhengmingResponse struct {
 	requestID string
 	answer    string
+}
+
+type dismissedZhengming struct {
+	requestID string
+	reason    string
 }
 
 func (m *mockCourtClient) EdictKey(edictID uint) storage.EdictKey {
@@ -4039,6 +4047,21 @@ func (m *mockCourtClient) SessionState(target string) court.SessionState {
 
 func (m *mockCourtClient) TakeSnapshot() court.Snapshot {
 	return m.snapshot
+}
+
+func (m *mockCourtClient) GetZhengming(requestID string) (*storage.Zhengming, error) {
+	if m.getZhengmingFn != nil {
+		return m.getZhengmingFn(requestID)
+	}
+	return nil, fmt.Errorf("zhengming request not found: %s", requestID)
+}
+
+func (m *mockCourtClient) DismissZhengming(requestID, reason string) error {
+	if m.dismissZhengmingFn != nil {
+		return m.dismissZhengmingFn(requestID, reason)
+	}
+	m.dismissedZhengming = append(m.dismissedZhengming, dismissedZhengming{requestID: requestID, reason: reason})
+	return nil
 }
 
 // repoSwitchedMsgRefresh verifies the TUI swallows the switch completion
@@ -5456,6 +5479,78 @@ func TestMinisterTabGateIsAnswerableByTyping(t *testing.T) {
 // TestGatesCommandDeduplicatesSnapshot verifies a gate the session already holds
 // is listed once even when the Court also reports it as pending. Double-counting
 // would overstate what is waiting for the Ruler.
+// TestGatesCommandEnrichesPromptHeldGatesFromSnapshot is the regression test
+// for a slice-aliasing bug in handleGatesCommand: the seen map stored pointers
+// into the gates slice, but append reallocates the backing array, so a gate
+// held by a prompt was enriched through a stale pointer and the snapshot's
+// edict/minister/priority/age/summary never reached the displayed entry.
+// The reallocation is the point: with two prompt-held gates the first pointer
+// is captured in the cap-1 backing array and the second append moves it.
+// A gate held by the session AND pending in the Court must carry the Court's
+// own record (edict, minister, age, summary) in the selection view.
+func TestGatesCommandEnrichesPromptHeldGatesFromSnapshot(t *testing.T) {
+	model := newTestModel(t)
+	old := time.Now().Add(-3 * time.Hour)
+	model.court = &mockCourtClient{
+		snapshot: court.Snapshot{
+			Zhengming: []court.ZhengmingEntry{
+				{RequestID: "gate-a", EdictID: 42, MinisterID: "forge",
+					Priority: string(storage.PriorityUrgent), CreatedAt: old,
+					Questions: []string{"rotate the key?"}},
+				{RequestID: "gate-b", EdictID: 43, MinisterID: "forge",
+					Priority: string(storage.PriorityNormal), CreatedAt: time.Now().Add(-time.Minute),
+					Questions: []string{"prune the worktree?"}},
+				{RequestID: "gate-c", EdictID: 44, MinisterID: "secretary",
+					Priority: string(storage.PriorityNormal), CreatedAt: time.Now()},
+			},
+		},
+	}
+	model.tabs.DismissWelcome()
+	model.tabs.Add("forge", "minister", "forge")
+	model.tabs.SwitchToTabType("minister")
+	for _, id := range []string{"gate-a", "gate-b"} {
+		model.setPendingZhengming("forge", id)
+		model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
+			RequestID:  id,
+			ChannelID: "forge",
+			MinisterID: "forge",
+			Priority:   storage.PriorityNormal,
+			Questions:  storage.ZhengmingQuestions{{Text: id, Summary: id, Options: []string{"Yes", "No"}}},
+		})
+	}
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(gatesLoadedMsg)
+	require.True(t, ok, ":gates must return gatesLoadedMsg so the TUI shows the selection view")
+
+	byID := map[string]*GateItem{}
+	for i := range msg.gates {
+		byID[msg.gates[i].RequestID] = &msg.gates[i]
+	}
+	require.Len(t, byID, 3, "all three gates must be listed exactly once")
+
+	gateA := byID["gate-a"]
+	require.NotNil(t, gateA, "a gate held by the session must be listed")
+	assert.Equal(t, uint(42), gateA.EdictID,
+		"a gate held by the session must carry the Court's edict for it")
+	assert.Equal(t, "forge", gateA.MinisterID,
+		"a gate held by the session must carry the Court's minister for it")
+	assert.Equal(t, string(storage.PriorityUrgent), gateA.Priority,
+		"a gate held by the session must carry the Court's priority for it")
+	assert.Equal(t, "rotate the key?", gateA.Summary,
+		"a gate held by the session must carry the Court's question summary")
+	assert.True(t, gateA.Age > 2*time.Hour,
+		"a gate held by the session must carry the Court's created-at age")
+	assert.Equal(t, "forge", gateA.ChannelID,
+		"a gate held by the session keeps the tab that is holding it")
+
+	gateB := byID["gate-b"]
+	require.NotNil(t, gateB)
+	assert.Equal(t, uint(43), gateB.EdictID, "the second prompt-held gate must be enriched too")
+	assert.Equal(t, "prune the worktree?", gateB.Summary)
+}
+
 func TestGatesCommandDeduplicatesSnapshot(t *testing.T) {
 	model := newTestModel(t)
 	model.court = &mockCourtClient{
@@ -5479,11 +5574,14 @@ func TestGatesCommandDeduplicatesSnapshot(t *testing.T) {
 
 	cmd := handleGatesCommand(model, nil)
 	require.NotNil(t, cmd)
-	msg, ok := cmd().(showContextMsg)
-	require.True(t, ok)
-	assert.Equal(t, 1, strings.Count(msg.content, "gate-known"),
-		"a gate held by the session must be listed once, not twice: %s", msg.content)
-	assert.Contains(t, msg.content, "gate-daemon-only",
+	msg, ok := cmd().(gatesLoadedMsg)
+	require.True(t, ok, ":gates must return gatesLoadedMsg so the TUI shows the selection view")
+	ids := map[string]int{}
+	for _, g := range msg.gates {
+		ids[g.RequestID]++
+	}
+	assert.Equal(t, 1, ids["gate-known"], "a gate held by the session must be listed once, not twice")
+	assert.Equal(t, 1, ids["gate-daemon-only"],
 		"a request only the Court knows about must still be listed")
 }
 
@@ -5508,10 +5606,15 @@ func TestGatesCommandListsNonRitualChannelGates(t *testing.T) {
 
 	cmd := handleGatesCommand(model, nil)
 	require.NotNil(t, cmd)
-	msg, ok := cmd().(showContextMsg)
+	msg, ok := cmd().(gatesLoadedMsg)
 	require.True(t, ok)
-	assert.Contains(t, msg.content, "gate-ask-ruler",
-		"a gate open in the prompt must be listed even when it is not on a ritual channel")
+	var listed bool
+	for _, g := range msg.gates {
+		if g.RequestID == "gate-ask-ruler" {
+			listed = true
+		}
+	}
+	assert.True(t, listed, "a gate open in the prompt must be listed even when it is not on a ritual channel")
 	assert.Contains(t, model.prompt().OpenAnsweringRequests(), "gate-ask-ruler",
 		"listing gates must not answer anything")
 }
@@ -8138,10 +8241,16 @@ func TestGatesCommandSurfacesEveryOpenRequest(t *testing.T) {
 
 	cmd := handleGatesCommand(model, nil)
 	require.NotNil(t, cmd)
-	msg, ok := cmd().(showContextMsg)
-	require.True(t, ok, "expected the gate list to render as a system message")
+	msg, ok := cmd().(gatesLoadedMsg)
+	require.True(t, ok, "expected the gate list to render as a selection view")
 	for _, want := range []string{"gate-1", "gate-2", "daemon-only-gate"} {
-		assert.Contains(t, msg.content, want, "every open gate must be listed")
+		var listed bool
+		for _, g := range msg.gates {
+			if g.RequestID == want {
+				listed = true
+			}
+		}
+		assert.True(t, listed, "every open gate must be listed: %s", want)
 	}
 
 	// Listing must not answer anything: both gates remain open.
@@ -8150,7 +8259,8 @@ func TestGatesCommandSurfacesEveryOpenRequest(t *testing.T) {
 		"listing gates must not change which gate is active")
 }
 
-// TestGatesCommandReportsNonePending covers the clean case.
+// TestGatesCommandReportsNonePending covers the clean case: the empty list
+// still opens the selection view, showing its friendly empty state.
 func TestGatesCommandReportsNonePending(t *testing.T) {
 	model := newTestModel(t)
 	model.court = &mockCourtClient{}
@@ -8158,9 +8268,18 @@ func TestGatesCommandReportsNonePending(t *testing.T) {
 
 	cmd := handleGatesCommand(model, nil)
 	require.NotNil(t, cmd)
-	msg, ok := cmd().(showContextMsg)
+	msg, ok := cmd().(gatesLoadedMsg)
+	require.True(t, ok, ":gates must return gatesLoadedMsg, not a text dump")
+	assert.Empty(t, msg.gates)
+
+	// The TUI handler must show the selection view with its empty state, not
+	// a message on the current tab.
+	newModel, _ := model.handleCustomMessages(msg)
+	updated, ok := newModel.(TUIModel)
 	require.True(t, ok)
-	assert.Contains(t, msg.content, "No Ruler requests awaiting an answer")
+	content := updated.tabs.Content()
+	assert.Equal(t, ViewGate, content.GetActiveView())
+	assert.Contains(t, content.View(), "No Ruler requests awaiting an answer.")
 }
 
 // TestAnsweringEditDone_UnchangedKeepsGateOpen verifies an editor round-trip
@@ -10534,4 +10653,223 @@ func TestZhengmingTriageMsg_SurvivesMissingCommandLine(t *testing.T) {
 	require.Equal(t, before+1, len(updatedChat.Messages),
 		"the chat line must still record the summary when the toast cannot be shown")
 	assert.Contains(t, updatedChat.Messages[before].Content, "1 retired")
+}
+
+// --- :gates as a selection view (e1057) ---
+
+// gateViewFixture is a model whose court reports two pending gates and can
+// fetch either one.
+func gateViewFixture(t *testing.T, requestIDs ...string) (*TUIModel, *mockCourtClient) {
+	t.Helper()
+	model := newTestModel(t)
+	entries := make([]court.ZhengmingEntry, 0, len(requestIDs))
+	stored := make(map[string]*storage.Zhengming, len(requestIDs))
+	for i, id := range requestIDs {
+		entries = append(entries, court.ZhengmingEntry{
+			RequestID:  id,
+			EdictID:    42,
+			MinisterID: "forge",
+			Priority:   string(storage.PriorityNormal),
+			Questions:  []string{"Proceed?"},
+			CreatedAt:  time.Now().Add(-time.Duration(i+1) * time.Minute),
+		})
+		stored[id] = &storage.Zhengming{
+			RequestID: id, EdictID: 42, Username: "test", Project: "test",
+			MinisterID: "forge",
+			Questions:  storage.ZhengmingQuestions{{Text: "Proceed?", Summary: "Proceed?", Options: []string{"Yes", "No"}}},
+			Priority:   storage.PriorityNormal,
+			Status:     storage.ZhengmingPending,
+			SessionID:  "sess-42",
+		}
+	}
+	mock := &mockCourtClient{
+		snapshot:       court.Snapshot{Zhengming: entries},
+		getZhengmingFn: func(id string) (*storage.Zhengming, error) { return stored[id], nil },
+	}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	model.tabs.Add("forge", "minister", "forge")
+	model.tabs.SwitchToTabType("minister")
+	return model, mock
+}
+
+// TestGatesCommandShowsSelectionView pins requirement 1: :gates returns
+// gatesLoadedMsg and the TUI shows the gate selection view — the same mechanics
+// as :edicts, not a text dump on the current tab.
+func TestGatesCommandShowsSelectionView(t *testing.T) {
+	model, _ := gateViewFixture(t, "gate-a", "gate-b")
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(gatesLoadedMsg)
+	require.True(t, ok, ":gates must return gatesLoadedMsg so the TUI shows the selection view")
+	require.Len(t, msg.gates, 2)
+
+	newModel, _ := model.handleCustomMessages(msg)
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	content := updated.tabs.Content()
+	assert.Equal(t, ViewGate, content.GetActiveView(),
+		"the gates message must show the selection view, not a text dump")
+	view := content.View()
+	assert.Contains(t, view, "gate-a")
+	assert.Contains(t, view, "gate-b")
+}
+
+// TestGateSelectedOpensAnsweringDialog pins requirement 2: selecting a gate
+// opens the existing answering dialog with that request's real questions.
+func TestGateSelectedOpensAnsweringDialog(t *testing.T) {
+	model, _ := gateViewFixture(t, "gate-a")
+
+	newModel, _ := model.handleCustomMessages(gateSelectedMsg{gate: GateItem{
+		RequestID: "gate-a", ChannelID: "forge", MinisterID: "forge",
+	}})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	p := updated.prompt()
+	require.NotNil(t, p.answering, "selecting a gate must open the answering dialog")
+	assert.Equal(t, "gate-a", p.answering.RequestID)
+	require.Len(t, p.answering.Questions, 1)
+	assert.Equal(t, "Proceed?", p.answering.Questions[0].Text)
+	assert.Contains(t, p.answering.Questions[0].Options, "Yes")
+	assert.Equal(t, []string{"gate-a"}, updated.pendingZhengmingOn("forge"),
+		"the gate must be recorded on its tab so a typed reply is delivered as the answer")
+}
+
+// TestGateAnsweredOpensSessionTab is the regression test for the Ruler's
+// amendment (2026-11-17): after all questions are answered from the view, a new
+// tab opens where the asking session is resumed, and the selection is appended
+// as the answer to the pending request.
+func TestGateAnsweredOpensSessionTab(t *testing.T) {
+	model, mock := gateViewFixture(t, "gate-a")
+
+	// Selecting the gate marks it as answered-from-the-view.
+	newModel, _ := model.handleCustomMessages(gateSelectedMsg{gate: GateItem{
+		RequestID: "gate-a", ChannelID: "forge", MinisterID: "forge",
+	}})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+
+	// Answer all its questions: AnsweredMsg flows through the existing path
+	// (the answer is appended on a goroutine, as everywhere else).
+	newModel, cmd := updated.handleCustomMessages(AnsweredMsg{RequestID: "gate-a", Answers: []string{"Yes"}})
+	final, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	_ = cmd
+
+	// The answer was appended (existing path, unchanged).
+	require.Eventually(t, func() bool { return len(mock.zhengmingResponses) == 1 }, time.Second, 5*time.Millisecond)
+	assert.Equal(t, "gate-a", mock.zhengmingResponses[0].requestID)
+	assert.Equal(t, "Yes", mock.zhengmingResponses[0].answer)
+
+	// And a new tab for the asking edict opened and became active.
+	assert.NotNil(t, final.tabs.TabByTarget("e42"),
+		"ansering from the view must open the asking session's tab")
+	assert.Equal(t, "e42", final.tabs.ActiveTab().Target)
+}
+
+// TestGateDismissWritesDisposition pins requirement 4: the dismiss action
+// routes through Court.DismissZhengming with a reason; an error is reported
+// without retiring anything.
+func TestGateDismissWritesDisposition(t *testing.T) {
+	model, mock := gateViewFixture(t, "gate-a")
+
+	// The dismiss key asks for a reason.
+	newModel, _ := model.handleCustomMessages(gateDismissRequestedMsg{gate: GateItem{RequestID: "gate-a"}})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	require.NotNil(t, updated.pendingGateDismiss, "the dismiss action must record which gate it is retiring")
+	require.True(t, updated.commandLine.IsInInputMode(), "the dismiss action must collect a reason")
+
+	// The typed reason reaches the Court (the returned Cmd carries the write).
+	newModel, cmd := updated.handleCustomMessages(inputResponseMsg{text: "superseded, ignore"})
+	final, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	require.NotNil(t, cmd, "the reason input must produce the dismissal command")
+	if m := cmd(); m != nil {
+		// Drain any message the dismissal produces; the mock has already
+		// recorded the write.
+		_ = m
+	}
+	require.Nil(t, final.pendingGateDismiss)
+	require.Len(t, mock.dismissedZhengming, 1)
+	assert.Equal(t, "gate-a", mock.dismissedZhengming[0].requestID)
+	assert.Equal(t, "superseded, ignore", mock.dismissedZhengming[0].reason)
+
+	// An empty reason names the view.
+	newModel, _ = final.handleCustomMessages(gateDismissRequestedMsg{gate: GateItem{RequestID: "gate-b"}})
+	updated, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	newModel, cmd = updated.handleCustomMessages(inputResponseMsg{text: ""})
+	final, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	if cmd != nil {
+		_ = cmd()
+	}
+	require.Len(t, mock.dismissedZhengming, 2)
+	assert.Equal(t, "court: dismissed by ruler from the :gates view", mock.dismissedZhengming[1].reason)
+
+	// A failed dismissal is reported, never silent.
+	mock.dismissZhengmingFn = func(string, string) error { return fmt.Errorf("already retired") }
+	newModel, _ = final.handleCustomMessages(gateDismissRequestedMsg{gate: GateItem{RequestID: "gate-c"}})
+	updated, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	newModel, cmd = updated.handleCustomMessages(inputResponseMsg{text: "why not"})
+	final, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	var dismissedMsg tea.Msg
+	if cmd != nil {
+		dismissedMsg = cmd()
+	}
+	require.IsType(t, gateDismissedMsg{}, dismissedMsg,
+		"the dismissal command must report the outcome")
+	assert.Error(t, dismissedMsg.(gateDismissedMsg).err)
+
+	// Feeding the outcome back reports it as a toast.
+	newModel, _ = final.handleCustomMessages(dismissedMsg)
+	final, ok = newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Len(t, final.commandLine.toasts, 1, "a failed dismissal must be reported")
+	assert.Contains(t, final.commandLine.toasts[0].Message, "already retired")
+}
+
+// TestGateListOrderedByPriorityThenAge pins the ordering: urgent first, then
+// oldest first — the same order as the snapshot query.
+func TestGateListOrderedByPriorityThenAge(t *testing.T) {
+	model := newTestModel(t)
+	model.court = &mockCourtClient{snapshot: court.Snapshot{Zhengming: []court.ZhengmingEntry{
+		{RequestID: "old-normal", MinisterID: "forge", Priority: string(storage.PriorityNormal), CreatedAt: time.Now().Add(-2 * time.Hour)},
+		{RequestID: "new-urgent", MinisterID: "forge", Priority: string(storage.PriorityUrgent), CreatedAt: time.Now().Add(-time.Minute)},
+		{RequestID: "old-urgent", MinisterID: "forge", Priority: string(storage.PriorityUrgent), CreatedAt: time.Now().Add(-3 * time.Hour)},
+		{RequestID: "new-normal", MinisterID: "forge", Priority: string(storage.PriorityNormal), CreatedAt: time.Now().Add(-time.Minute)},
+	}}}
+	model.tabs.DismissWelcome()
+
+	cmd := handleGatesCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(gatesLoadedMsg)
+	require.True(t, ok)
+	var got []string
+	for _, g := range msg.gates {
+		got = append(got, g.RequestID)
+	}
+	assert.Equal(t, []string{"old-urgent", "new-urgent", "old-normal", "new-normal"}, got,
+		"urgent first, then oldest first — the snapshot query's order")
+}
+
+// TestGateSelectionNoLongerPendingRefreshesList covers selecting a gate that
+// was answered or retired elsewhere: the view says so and reloads.
+func TestGateSelectionNoLongerPendingRefreshesList(t *testing.T) {
+	model, mock := gateViewFixture(t, "gate-a")
+	mock.getZhengmingFn = func(string) (*storage.Zhengming, error) {
+		return nil, fmt.Errorf("record not found")
+	}
+
+	newModel, _ := model.handleCustomMessages(gateSelectedMsg{gate: GateItem{RequestID: "gate-a", ChannelID: "forge"}})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.Nil(t, updated.prompt().answering, "a dead gate must not open a dialog")
+	assert.Len(t, updated.commandLine.toasts, 1, "the dead gate must be reported")
+	assert.Contains(t, updated.commandLine.toasts[0].Message, "no longer pending")
 }

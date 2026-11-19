@@ -151,6 +151,19 @@ type HandleZhengmingParams struct {
 	Answer    string `msgpack:"answer"`
 }
 
+type DismissZhengmingParams struct {
+	RequestID string `msgpack:"request_id"`
+	Reason    string `msgpack:"reason"`
+}
+
+type GetZhengmingParams struct {
+	RequestID string `msgpack:"request_id"`
+}
+
+type GetZhengmingResult struct {
+	Request *storage.Zhengming `msgpack:"request"`
+}
+
 type AllowRunnerFallbackParams struct {
 	Allow bool `msgpack:"allow"`
 }

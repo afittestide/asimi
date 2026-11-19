@@ -739,6 +739,41 @@ type edictIntentUpdatedMsg struct {
 // in the edict dashboard to return to the edicts list.
 type reloadEdictsMsg struct{}
 
+// gatesLoadedMsg carries the full gate list to the selection view, the same
+// shape as edictsLoadedMsg → ShowEdictSelection.
+type gatesLoadedMsg struct {
+	gates []GateItem
+}
+
+// gateSelectedMsg is emitted when the Ruler selects a gate in the :gates view.
+type gateSelectedMsg struct {
+	gate GateItem
+}
+
+// gateDismissRequestedMsg is emitted when the Ruler presses the dismiss key on
+// a gate in the :gates view. One gate at a time, never bulk.
+type gateDismissRequestedMsg struct {
+	gate GateItem
+}
+
+// gateDismissedMsg reports the outcome of a dismissal from the :gates view.
+type gateDismissedMsg struct {
+	requestID string
+	err       error
+}
+
+// GateItem is one pending Ruler gate as listed by the :gates selection view.
+type GateItem struct {
+	RequestID  string
+	EdictID    uint
+	MinisterID string
+	ChannelID  string // tab the gate is held on, "" when only the Court knows it
+	Priority   string
+	Age        time.Duration
+	Summary    string
+	OnScreen   bool // true when a tab prompt is currently showing this gate
+}
+
 // EdictSelectWindow displays a selectable list of active edicts
 type EdictSelectWindow struct {
 	SelectWindow[storage.ActiveEdict]
@@ -797,6 +832,97 @@ func (s *EdictSelectWindow) RenderList(selectedIndex, scrollOffset, visibleSlots
 				style = style.Foreground(globalTheme.SuccessColor).Bold(true)
 			}
 			sb.WriteString(style.Render(linePrefix+intent) + "\n")
+		},
+	}
+
+	return s.Render(selectedIndex, scrollOffset, config)
+}
+
+// GateSelectWindow displays a selectable list of pending Ruler gates (:gates).
+type GateSelectWindow struct {
+	SelectWindow[GateItem]
+}
+
+// NewGateSelectWindow creates a new gate selection window
+func NewGateSelectWindow() GateSelectWindow {
+	sw := NewSelectWindow[GateItem]()
+	sw.Height = 15
+	sw.SetSize(70, 15)
+	return GateSelectWindow{SelectWindow: sw}
+}
+
+// gateAge renders a gate's created-at age compactly.
+func gateAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// shortGateID keeps the line readable: a full request ID plus the summary
+// would not fit in the window, so at most the first 8 runes are shown.
+func shortGateID(id string) string {
+	runes := []rune(id)
+	if len(runes) <= 8 {
+		return id
+	}
+	return string(runes[:8])
+}
+
+// RenderList renders the gate selection list
+func (s *GateSelectWindow) RenderList(selectedIndex, scrollOffset, visibleSlots int) string {
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(globalTheme.PromptBorder).
+		Background(globalTheme.PaneBackground).
+		Padding(0, 1)
+
+	config := RenderConfig[GateItem]{
+		ConstructTitle: func(selectedIndex, totalItems int) string {
+			return titleStyle.Render(fmt.Sprintf("Ruler gates awaiting an answer [%3d/%3d]:", selectedIndex+1, totalItems))
+		},
+		OnEmpty: func(sb *strings.Builder) {
+			sb.WriteString("No Ruler requests awaiting an answer.\n")
+		},
+		RenderItem: func(i int, gate GateItem, isSelected bool, sb *strings.Builder) {
+			prefix := "  "
+			if isSelected {
+				prefix = "▶ "
+			}
+
+			marker := " "
+			if gate.OnScreen {
+				marker = "◉"
+			}
+			priority := " "
+			if gate.Priority == string(storage.PriorityUrgent) {
+				priority = "!"
+			}
+
+			linePrefix := fmt.Sprintf("%s%s%s %-8s [e%d] %-9s %5s ",
+				prefix, marker, priority, shortGateID(gate.RequestID), gate.EdictID, gate.MinisterID, gateAge(gate.Age))
+
+			summary := gate.Summary
+			if gate.ChannelID != "" && gate.ChannelID != gate.MinisterID {
+				summary = fmt.Sprintf("(%s) %s", gate.ChannelID, summary)
+			}
+			summaryWidth := s.Width - lipgloss.Width(linePrefix)
+			if summaryWidth < 0 {
+				summaryWidth = 0
+			}
+			summary = lipgloss.NewStyle().Inline(true).MaxWidth(summaryWidth).Render(" " + summary)
+
+			style := lipgloss.NewStyle().Inline(true).MaxWidth(s.Width)
+			if isSelected {
+				style = style.Foreground(globalTheme.SuccessColor).Bold(true)
+			}
+			sb.WriteString(style.Render(linePrefix+summary) + "\n")
 		},
 	}
 

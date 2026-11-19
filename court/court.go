@@ -2324,6 +2324,22 @@ func (s *Court) DisposeZhengmingWithStatus(requestID string, status storage.Zhen
 	return s.disposeZhengming(requestID, status, reason)
 }
 
+// GetZhengming fetches a stored zhengming request by ID, scoped to this
+// Court's username and project. It is the read side of the :gates selection
+// view: the list comes from TakeSnapshot, and the answering dialog for a
+// selected gate needs the full record (questions, options, priority, edict).
+func (s *Court) GetZhengming(requestID string) (*storage.Zhengming, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("court not initialized")
+	}
+	var req storage.Zhengming
+	if err := s.db.Where("request_id = ? AND username = ? AND project = ?",
+		requestID, s.username, s.config.Project).First(&req).Error; err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
 // disposeZhengming writes a request's terminal disposition with a recorded
 // reason, releases its in-process wait (if one exists), and only then announces
 // the retirement on the ledger. The record is written before the side effect
