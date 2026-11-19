@@ -297,6 +297,52 @@ func TestCIUploadsTestArtifactsAlways(t *testing.T) {
 	assert.Contains(t, body, "path: heaven/tests/", "artifact must upload heaven/tests/")
 }
 
+// TestCIBuildCacheWarmupUngated guards e1074: the Test job must run an
+// unconditional `go build -tags containers_image_openpgp .` before
+// `just test`. buildAsimiBinary (headless_test.go) compiles the module from a
+// cold cache inside the suite and can blow the hard 5m `go test -timeout`
+// budget (justfile `test` recipe). The warm-up must never be gated on a cache
+// hit — a `if: cache hit` or `continue-on-error` style condition reintroduces
+// the failure it exists to prevent.
+func TestCIBuildCacheWarmupUngated(t *testing.T) {
+	content := readRootFile(t, ".github/workflows/ci.yml")
+	lines := strings.Split(content, "\n")
+
+	stepStart := func(name string) int {
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "- name: "+name {
+				return i
+			}
+		}
+		return -1
+	}
+
+	runTests := stepStart("Run tests")
+	require.NotEqual(t, -1, runTests, "ci.yml must have a `Run tests` step")
+
+	warmup := stepStart("Warm up Go build cache")
+	require.NotEqual(t, -1, warmup, "ci.yml must have a `Warm up Go build cache` step (e1074)")
+	assert.Less(t, warmup, runTests,
+		"the build-cache warm-up must run before `Run tests`")
+
+	// Isolate the warm-up step: from its `- name:` to the next `- name:`.
+	end := len(lines)
+	for i := warmup + 1; i < len(lines); i++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "- name: ") {
+			end = i
+			break
+		}
+	}
+	body := strings.Join(lines[warmup:end], "\n")
+
+	assert.Contains(t, body, "go build -tags containers_image_openpgp .",
+		"warm-up must run the exact build buildAsimiBinary performs in tests")
+	assert.NotContains(t, body, "if:",
+		"warm-up must be unconditional — never gate it on a cache hit (e1074)")
+	assert.NotContains(t, body, "continue-on-error",
+		"warm-up failures must fail the job, not be swallowed")
+}
+
 // dependabotConfig mirrors the subset of .github/dependabot.yml the invariant
 // guards. Only fields the invariant depends on are modelled; unknown keys are
 // ignored by yaml.v3, so the config stays free to grow.

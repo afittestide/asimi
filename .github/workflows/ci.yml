@@ -67,6 +67,15 @@ jobs:
           exit 0
       - name: Run linting
         run: just lint
+      - name: Warm up Go build cache
+        # Populate the module build cache before the test suite runs. The
+        # Harbor integration test compiles the module via `go build` (see
+        # buildAsimiBinary, headless_test.go); on a cold cache that compile
+        # eats into the hard 5m `go test -timeout` budget and can blow it.
+        # Always run this step — never gate it on a cache hit: with a warm
+        # cache it's cheap, with a cold cache it's exactly the work that
+        # would otherwise happen inside the test.
+        run: go build -tags containers_image_openpgp .
       - name: Run tests
         run: just test
       - name: Upload test artifacts
