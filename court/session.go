@@ -496,6 +496,11 @@ type Session struct {
 	ctxSizeSet    bool
 	ctxSizeApprox bool
 
+	// providerWatchdog bounds a single provider request (chat or list-models
+	// probe) so a wedged provider surfaces as a context error instead of
+	// hanging the run forever (e1075). Zero disables it (tests).
+	providerWatchdog time.Duration
+
 	// contextRecoveryDone guards the single context-overflow recovery and
 	// retry per turn. It is set while recovering so the compaction request it
 	// issues cannot itself trigger another recursive recovery.
@@ -512,14 +517,14 @@ type Session struct {
 	// unresolved case is memoized per session instead of re-probing bifrost on
 	// every keystroke. Only a provider-reported value ever reaches
 	// modelMaxOutputByKey; a "none" answer stays session-local.
-	maxOutKey string
-	maxOut    int
-	maxOutSet bool
-	tools               []Tool
-	messages            []schemas.ChatMessage
-	notify              internal.NotifyFunc
-	systemPrompt        string
-	channelID           string
+	maxOutKey    string
+	maxOut       int
+	maxOutSet    bool
+	tools        []Tool
+	messages     []schemas.ChatMessage
+	notify       internal.NotifyFunc
+	systemPrompt string
+	channelID    string
 
 	// lingID / ministerID attribute this session's stream messages to the ling
 	// that owns them. They are set on every per-ling ignition session — the court
@@ -1210,6 +1215,78 @@ type providerModelInfo struct {
 	MaxOutput     int
 }
 
+// The provider-model probe is a network-touching, runtime provider-queue
+// creation risk (e1075): an unsupported provider must never be probed, and a
+// failed or empty probe must never be retried on a render loop. isProbedProvider
+// short-circuits unsupported keys (no network call, no bifrost provider
+// queue), and providerModelInfoByKey memoizes failed probes per provider:model
+// so they are never repeated.
+var providerModelInfoByKey sync.Map // map[string]providerModelInfo
+
+// isProbedProvider reports whether a provider key can possibly answer a
+// list-models probe: a bifrost standard provider, or a custom provider
+// configured via its <PROVIDER>_BASE_URL environment variable. Any other key
+// is unsupported — probing it would make bifrost lazily create a provider
+// queue for an uninitialized provider, and the resulting queue send wedges
+// the request forever (e1075).
+func isProbedProvider(provider string) bool {
+	if provider == "" {
+		return false
+	}
+	if isStandardProvider(schemas.ModelProvider(provider)) {
+		return true
+	}
+	return getBaseURLFromEnv(provider) != ""
+}
+
+// lookupProviderModel resolves the providerModelInfo for a provider:model,
+// probing the provider at most once. An unsupported provider resolves to
+// zeros without touching the network or creating a bifrost provider queue;
+// a failed/empty probe is memoized so the key is never re-probed; a
+// successful probe's exact values are shared via modelContextByKey /
+// modelMaxOutputByKey by the callers.
+func (s *Session) lookupProviderModel(provider, modelName string) providerModelInfo {
+	if !isProbedProvider(provider) {
+		// Unsupported provider: resolved without probing. Bifrost would
+		// lazily create a provider queue for an uninitialized provider, and
+		// the resulting queue send wedges the request forever — fail fast
+		// with zeros and never touch the network (e1075).
+		return providerModelInfo{}
+	}
+	if s.model == nil || s.config == nil {
+		return providerModelInfo{}
+	}
+	key := provider + ":" + modelName
+	if v, ok := providerModelInfoByKey.Load(key); ok {
+		return v.(providerModelInfo)
+	}
+	info := s.listProviderModel(provider, modelName)
+	if info.ContextLength == 0 && info.MaxOutput == 0 {
+		// Failed/empty probe: memoize the failure so this key is never
+		// re-probed — a bogus or unreachable provider must never trigger a
+		// second probe (and, for unsupported keys, a runtime provider-queue
+		// creation) (e1075).
+		providerModelInfoByKey.Store(key, info)
+	}
+	return info
+}
+
+// defaultProviderWatchdog bounds a single provider request when the config
+// supplies no explicit value. Generous against slow-but-alive providers;
+// finite so a wedged provider never hangs a headless run forever (e1075).
+const defaultProviderWatchdog = 10 * time.Minute
+
+// watchdogCtx derives the request context for a provider call. A zero
+// providerWatchdog uses the default. The derived context keeps the parent's
+// values (slog etc.) and cancellation while adding the watchdog deadline.
+func (s *Session) watchdogCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	d := s.providerWatchdog
+	if d <= 0 {
+		d = defaultProviderWatchdog
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 // listProviderModel queries the LLM provider for the named model's metadata
 // (context window and output cap). Best-effort: on any error, empty result,
 // or unknown model it returns zero values.
@@ -1218,7 +1295,9 @@ func (s *Session) listProviderModel(provider, modelName string) providerModelInf
 		return providerModelInfo{}
 	}
 
-	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	probeCtx, cancelProbe := s.watchdogCtx(context.Background())
+	defer cancelProbe()
+	ctx := schemas.NewBifrostContext(probeCtx, schemas.NoDeadline)
 	prov := schemas.ModelProvider(asimiProviderToBifrostCourt(strings.ToLower(provider)))
 	resp, bifrostErr := s.model.ListModelsRequest(ctx, &schemas.BifrostListModelsRequest{
 		Provider: prov,
@@ -1249,7 +1328,6 @@ func (s *Session) listProviderModel(provider, modelName string) providerModelInf
 	}
 	return providerModelInfo{}
 }
-
 
 // currentContextKey returns the normalized "<provider>:<model>" cache key
 // for the active session model, with any routing tag (":nitro", ":free")
@@ -1292,7 +1370,9 @@ func (s *Session) getModelContextSize() int {
 	// proxies, so it must never win over what the endpoint advertises.
 	// The same probe carries the advertised output cap; seed it into
 	// modelMaxOutputByKey so maxCompletionTokens never re-probes.
-	if info := s.listProviderModel(provider, modelName); info.ContextLength > 0 {
+	// An unsupported provider resolves to zeros here without any probe
+	// (e1075): no network call, no bifrost runtime provider queue.
+	if info := s.lookupProviderModel(provider, modelName); info.ContextLength > 0 {
 		if info.MaxOutput > 0 {
 			modelMaxOutputByKey.Store(key, info.MaxOutput)
 		}
@@ -1471,7 +1551,7 @@ func (s *Session) maxCompletionTokens() int {
 			out := 0
 			if v, ok := modelMaxOutputByKey.Load(key); ok {
 				out = v.(int)
-			} else if info := s.listProviderModel(provider, modelName); info.MaxOutput > 0 {
+			} else if info := s.lookupProviderModel(provider, modelName); info.MaxOutput > 0 {
 				out = info.MaxOutput
 				modelMaxOutputByKey.Store(key, out) // real provider value, safe to share
 			}
@@ -2153,8 +2233,12 @@ func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*resp
 	}
 
 	if stream {
-		// Streaming path
-		bifrostCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+		// Streaming path. The watchdog bounds the whole stream: a wedged
+		// provider (queue send that never completes, chunk that never
+		// arrives) surfaces as a context error instead of a hang (e1075).
+		watchdogCtx, cancelWatchdog := s.watchdogCtx(ctx)
+		defer cancelWatchdog()
+		bifrostCtx := schemas.NewBifrostContext(watchdogCtx, schemas.NoDeadline)
 		ch, bifrostErr := s.model.ChatCompletionStreamRequest(bifrostCtx, req)
 		if bifrostErr != nil {
 			return nil, s.wrapBifrostError(bifrostErr)
@@ -2291,8 +2375,10 @@ func (s *Session) doGenerateLLMResponse(ctx context.Context, stream bool) (*resp
 		}, nil
 	}
 
-	// Non-streaming path
-	bifrostCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+	// Non-streaming path, under the same watchdog.
+	watchdogCtx, cancelWatchdog := s.watchdogCtx(ctx)
+	defer cancelWatchdog()
+	bifrostCtx := schemas.NewBifrostContext(watchdogCtx, schemas.NoDeadline)
 	resp, bifrostErr := s.model.ChatCompletionRequest(bifrostCtx, req)
 	if bifrostErr != nil {
 		return nil, s.wrapBifrostError(bifrostErr)

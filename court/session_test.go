@@ -1541,10 +1541,18 @@ func TestModelContextSize_NoNetworkOnInit(t *testing.T) {
 func TestModelContextSize_UnknownNotCached(t *testing.T) {
 	t.Parallel()
 
+	// UnknownNotCached asserts on the shared providerModelInfoByKey failure
+	// memo; reset it so the test passes regardless of run order and of
+	// -count > 1.
+	providerModelInfoByKey.Delete("cohere:truly-unknown-not-cached")
+	defer providerModelInfoByKey.Delete("cohere:truly-unknown-not-cached")
+
 	// A model resolvable by neither bifrost nor the regex registry must not
-	// grow or reuse the shared cache: the defaultUnknownContextRef guess is
-	// never stored, so a second session for the same provider:model re-probes
-	// bifrost instead of inheriting a fabricated value.
+	// grow the shared modelContextByKey cache: the defaultUnknownContextRef
+	// guess is never stored, so no session inherits a fabricated window.
+	// e1075: the failed probe itself IS memoized per provider:model, so a
+	// second session reuses the failure instead of re-probing — a bogus or
+	// unreachable provider must never be probed twice.
 	prov := &networkTrackingProvider{}
 	cfg := &SessionConfig{LLM: internalconfig.LLMConfig{
 		Provider: "cohere",
@@ -1556,10 +1564,14 @@ func TestModelContextSize_UnknownNotCached(t *testing.T) {
 	assert.Equal(t, defaultUnknownContextRef, sess.getModelContextSize())
 	assert.Equal(t, 1, prov.listCalls, "first unresolved lookup probes bifrost")
 
+	// The guessed default must never enter the shared size cache.
+	_, ok := modelContextByKey.Load("cohere:truly-unknown-not-cached")
+	require.False(t, ok, "unresolved guess must never enter the shared size cache")
+
 	sess2, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
 	assert.Equal(t, defaultUnknownContextRef, sess2.getModelContextSize())
-	assert.Equal(t, 2, prov.listCalls, "unresolved size must not be cached; second session re-probes")
+	assert.Equal(t, 1, prov.listCalls, "e1075: the failed probe is memoized per provider:model; second session does not re-probe")
 }
 
 func TestModelContextSize_RepeatedCallsNoReProbe(t *testing.T) {
@@ -1601,6 +1613,11 @@ func TestModelContextSize_RepeatedCallsNoReProbe(t *testing.T) {
 func TestModelContextSize_RegistryCachedNoReProbe(t *testing.T) {
 	t.Parallel()
 
+	// This test asserts on the shared providerModelInfoByKey failure memo;
+	// reset it so it passes regardless of run order and of -count > 1.
+	providerModelInfoByKey.Delete("anthropic:claude-3-5-sonnet-latest")
+	defer providerModelInfoByKey.Delete("anthropic:claude-3-5-sonnet-latest")
+
 	// Regression for the registry fallback path: when the provider reports no
 	// window, the registry estimate is memoized per session (so a fresh
 	// session re-probes once, not per call) but must never be stored in the
@@ -1627,18 +1644,20 @@ func TestModelContextSize_RegistryCachedNoReProbe(t *testing.T) {
 	_, ok := modelContextByKey.Load(key)
 	require.False(t, ok, "registry estimate must never enter the shared cache")
 
-	// A fresh session re-probes the provider (the per-session memo does not
-	// leak), then falls back to the same estimate.
+	// A fresh session does not re-probe: the failed probe is memoized per
+	// provider:model (e1075), and the estimate is never committed to the
+	// shared modelContextByKey cache — only provider-reported or
+	// error-parsed values are exact enough to share.
 	sess2, err := NewSession(prov, cfg, nil, nil, func(any) {}, "", "")
 	require.NoError(t, err)
 	assert.Equal(t, 200_000, sess2.getModelContextSize())
-	assert.Equal(t, 2, prov.listCalls, "estimate is not shared; second session re-probes")
+	assert.Equal(t, 1, prov.listCalls, "e1075: failed probe is memoized; second session does not re-probe")
 
 	// Repeated calls on the second session must stay memoized.
 	for i := 0; i < 10; i++ {
 		assert.Equal(t, 200_000, sess2.getModelContextSize())
 	}
-	assert.Equal(t, 2, prov.listCalls, "per-session memo prevents re-probing")
+	assert.Equal(t, 1, prov.listCalls, "per-session memo prevents re-probing")
 }
 
 func TestSession_GetContextInfo_WithContextFiles(t *testing.T) {
@@ -4145,7 +4164,6 @@ func (p *maxOutputProbeProvider) ChatCompletionStreamRequest(ctx *schemas.Bifros
 	return ch, nil
 }
 
-
 // e1069: a model whose provider metadata reports MaxOutputTokens below the
 // 262144 blanket default must send that advertised value in
 // params.MaxCompletionTokens instead of the default.
@@ -4326,4 +4344,136 @@ func TestParseMaxOutputLimit(t *testing.T) {
 		assert.Equalf(t, 0, parseMaxOutputLimit(errors.New(m)), "malformed %q", m)
 	}
 	assert.Equal(t, 0, parseMaxOutputLimit(nil))
+}
+
+// e1075 regression: an unsupported provider must never be probed at session
+// init or on a render-loop context-size lookup — the probe made bifrost
+// lazily create a provider queue for a provider that failed to initialize,
+// and the subsequent chat request wedged forever in that queue's send.
+func TestProviderProbe_UnsupportedNeverProbed(t *testing.T) {
+	t.Setenv("HARBOR_BOGUS_PROVIDER_BASE_URL", "")
+	t.Setenv("GOOGLEAI_BASE_URL", "")
+	t.Setenv("GEMINI_BASE_URL", "")
+
+	prov := &networkTrackingProvider{}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "harbor-bogus-provider",
+		Model:    "harbor-bogus-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// Context-size lookups (the TUI's per-render path) must never probe the
+	// bogus provider: no network call, and the fallback resolution applies.
+	assert.Equal(t, defaultUnknownContextRef, sess.getModelContextSize())
+	assert.Equal(t, 0, prov.listCalls, "unsupported provider must never be probed for context size")
+
+	// Repeated render-loop lookups stay at zero probes.
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, defaultUnknownContextRef, sess.getModelContextSize())
+	}
+	assert.Equal(t, 0, prov.listCalls, "unsupported provider must never be re-probed")
+
+	// The output-cap path shares the same guard.
+	assert.Equal(t, 262_144, sess.maxCompletionTokens())
+	assert.Equal(t, 0, prov.listCalls, "unsupported provider must never be probed for output cap")
+
+	// A second session for the same unsupported provider also never probes.
+	sess2, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "harbor-bogus-provider",
+		Model:    "harbor-bogus-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, defaultUnknownContextRef, sess2.getModelContextSize())
+	assert.Equal(t, 0, prov.listCalls, "unsupported provider must never be probed, in any session")
+}
+
+// e1075 regression: a supported provider whose probe fails or returns
+// nothing is memoized per provider:model — the failure is never re-probed,
+// so a bogus model on a real provider can't storm the provider with probes.
+func TestProviderProbe_FailureMemoizedPerKey(t *testing.T) {
+	// cohere is a standard bifrost provider, so it is probed; the provider
+	// returns an empty list (model unknown), which must be memoized as a
+	// failure and never re-probed.
+	key := "cohere:e1075-never-advertised"
+	providerModelInfoByKey.Delete(key)
+	defer providerModelInfoByKey.Delete(key)
+
+	prov := &networkTrackingProvider{}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "cohere",
+		Model:    "e1075-never-advertised",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, defaultUnknownContextRef, sess.getModelContextSize())
+	assert.Equal(t, 1, prov.listCalls, "first lookup probes once")
+
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, defaultUnknownContextRef, sess.getModelContextSize())
+	}
+	assert.Equal(t, 1, prov.listCalls, "failed probe is memoized per provider:model")
+
+	// A second session for the same key must not re-probe: the failed probe
+	// is shared, not just per-session.
+	sess2, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "cohere",
+		Model:    "e1075-never-advertised",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+	assert.Equal(t, defaultUnknownContextRef, sess2.getModelContextSize())
+	assert.Equal(t, 1, prov.listCalls, "failed probe must not be re-probed across sessions")
+}
+
+// e1075 regression: a provider request must be bounded by a watchdog context
+// so a wedged provider surfaces as a context error instead of blocking
+// forever in a NoDeadline bifrost context.
+//
+// watchdogBoundProvider blocks until the request context is done, then fails
+// the request — it honors the context, unlike hangingLLMProvider (which
+// ignores it). This pins the watchdog itself: with the watchdog removed, the
+// only cancellation left is the test's 5s parent budget, and the elapsed
+// assertion below fails.
+type watchdogBoundProvider struct{}
+
+func (watchdogBoundProvider) ChatCompletionRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	<-ctx.Done()
+	return nil, &schemas.BifrostError{Error: &schemas.ErrorField{Message: "provider wedged (chat)"}}
+}
+
+func (watchdogBoundProvider) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	<-ctx.Done()
+	return nil, &schemas.BifrostError{Error: &schemas.ErrorField{Message: "provider wedged (stream)"}}
+}
+
+func (watchdogBoundProvider) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (watchdogBoundProvider) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func TestGenerateLLMResponse_WatchdogBoundsWedgedProvider(t *testing.T) {
+	prov := &watchdogBoundProvider{}
+	sess, err := NewSession(prov, &SessionConfig{LLM: internalconfig.LLMConfig{
+		Provider: "openai",
+		Model:    "e1075-watchdog-model",
+	}}, nil, nil, func(any) {}, "", "")
+	require.NoError(t, err)
+
+	// 50ms watchdog vs the 5s parent budget: only the watchdog can fire in
+	// time. The 2s elapsed bound sits far above scheduler noise but far
+	// below the parent — a regression to the pre-e1075 unbounded context
+	// fails it.
+	sess.providerWatchdog = 50 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = sess.AskWithStreaming(ctx, "ping", nil)
+	elapsed := time.Since(start)
+	require.Error(t, err, "a wedged provider must surface as an error, not a hang")
+	assert.Less(t, elapsed, 2*time.Second,
+		"the provider watchdog (50ms) must bound the request, not the 5s parent budget")
 }

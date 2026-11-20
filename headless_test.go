@@ -1379,7 +1379,14 @@ func TestHarborIntegration_ASIMIHomeDBFallback(t *testing.T) {
 
 	// A deliberately bogus provider makes asimi stop at the provider gate
 	// (a provider-call attempt) rather than running against a real LLM.
-	cmd := exec.Command(binary,
+	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	// e1075: the runCtx was created but never attached to the command, so a
+	// wedged asimi blew the whole package's 5m go-test timeout instead of
+	// failing here at its own 2-minute budget. exec.CommandContext kills the
+	// process when the budget expires, so runErr surfaces as a context
+	// error and the test fails fast at its own boundary.
+	cmd := exec.CommandContext(runCtx, binary,
 		"--handsoff", "--atif", "--isolated-host",
 		"--provider", "harbor-bogus-provider", "--model", "harbor-bogus-model",
 		"-p", "harbor integration probe",
@@ -1393,8 +1400,6 @@ func TestHarborIntegration_ASIMIHomeDBFallback(t *testing.T) {
 	cmd.Stdout = output
 	cmd.Stderr = output
 
-	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	runErr := cmd.Run()
 	if ctxErr := runCtx.Err(); ctxErr == context.DeadlineExceeded {
 		t.Fatalf("asimi Harbor probe timed out\nOutput:\n%s", output.String())
@@ -1417,6 +1422,53 @@ func TestHarborIntegration_ASIMIHomeDBFallback(t *testing.T) {
 	assert.Contains(t, strings.ToLower(out), "provider",
 		"startup should reach the provider gate, not abort at storage init\nOutput:\n%s", out)
 	require.Error(t, runErr, "the bogus provider should make asimi exit non-zero\nOutput:\n%s", out)
+}
+
+// TestHeadless_BogusProviderFailsFast is the e1075 regression: a headless
+// run with an unsupported provider must exit non-zero promptly — the eager
+// provider ListModels probe used to create a runtime bifrost provider queue
+// for a provider that failed to initialize, and the subsequent chat request
+// blocked forever in that queue's send, wedging the whole run. This test
+// builds the real binary and asserts the pre-e1071 fast-fail contract.
+func TestHeadless_BogusProviderFailsFast(t *testing.T) {
+	skipIfNotCI(t)
+
+	binary := buildAsimiBinary(t)
+	homeDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".local", "share"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(homeDir, ".local", "share", "asimi"), []byte("x"), 0o644))
+	asimiHome := t.TempDir()
+
+	// The whole run must resolve (fail) well inside the 2-minute budget.
+	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, binary,
+		"--handsoff", "--atif", "--isolated-host",
+		"--provider", "harbor-bogus-provider", "--model", "harbor-bogus-model",
+		"-p", "bogus provider probe",
+	)
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(),
+		"HOME="+homeDir,
+		"ASIMI_HOME="+asimiHome,
+		// No base URL is configured for the bogus provider: it is neither a
+		// bifrost standard provider nor a <NAME>_BASE_URL custom provider,
+		// so it must never be probed or given a provider queue.
+	)
+	output := &lockBuffer{}
+	cmd.Stdout = output
+	cmd.Stderr = output
+
+	start := time.Now()
+	runErr := cmd.Run()
+	elapsed := time.Since(start)
+
+	if ctxErr := runCtx.Err(); ctxErr == context.DeadlineExceeded {
+		t.Fatalf("asimi with a bogus provider hung instead of failing fast\nOutput:\n%s", output.String())
+	}
+	require.Error(t, runErr, "the bogus provider must make asimi exit non-zero\nOutput:\n%s", output.String())
+	assert.Less(t, elapsed, 2*time.Minute,
+		"a bogus provider must fail fast, not burn the whole budget\nOutput:\n%s", output.String())
 }
 
 // TestActivation_ATIF_E2E is a terminal-bench readiness smoke test.

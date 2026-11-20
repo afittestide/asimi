@@ -23,6 +23,11 @@ import (
 	"go.uber.org/fx"
 )
 
+// headlessRunWatchdog bounds the whole headless run (e1075): a wedged
+// provider (or a stuck court event chain) must surface as a non-zero exit
+// instead of hanging the process forever.
+const headlessRunWatchdog = 60 * time.Minute
+
 // runHeadlessMode executes a prompt non-interactively: initializes the
 // Court via fx DI, sends the prompt to the secretary, streams plain text
 // to stdout, and waits for the ritual (or chat) to complete.
@@ -73,6 +78,19 @@ func runHeadlessModeImpl() int {
 	defer cancelSub()
 	events := c.Subscribe(subCtx)
 	go sink.drain(events)
+
+	// Headless watchdog (e1075): a headless run must never hang forever on a
+	// wedged provider request. When the overall budget expires, the sink is
+	// finished with a non-zero exit so the process exits instead of blocking
+	// forever. Generous by design: a legitimate swift-strike run with
+	// landings takes many minutes; the guard exists only against a wedged
+	// run, and composes with the per-request provider watchdogs in the
+	// Session.
+	watchdog := time.AfterFunc(headlessRunWatchdog, func() {
+		fmt.Fprintf(os.Stderr, "asimi: headless watchdog fired after %s; aborting\n", headlessRunWatchdog)
+		sink.finish(1)
+	})
+	defer watchdog.Stop()
 
 	// Submit the prompt to the secretary (same as TUI's SubmitPromptMsg path)
 	prompt := &court.Prompt{
