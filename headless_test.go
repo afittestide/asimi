@@ -1424,52 +1424,10 @@ func TestHarborIntegration_ASIMIHomeDBFallback(t *testing.T) {
 	require.Error(t, runErr, "the bogus provider should make asimi exit non-zero\nOutput:\n%s", out)
 }
 
-// TestHeadless_BogusProviderFailsFast is the e1075 regression: a headless
-// run with an unsupported provider must exit non-zero promptly — the eager
-// provider ListModels probe used to create a runtime bifrost provider queue
-// for a provider that failed to initialize, and the subsequent chat request
-// blocked forever in that queue's send, wedging the whole run. This test
-// builds the real binary and asserts the pre-e1071 fast-fail contract.
-func TestHeadless_BogusProviderFailsFast(t *testing.T) {
-	skipIfNotCI(t)
-
-	binary := buildAsimiBinary(t)
-	homeDir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".local", "share"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(homeDir, ".local", "share", "asimi"), []byte("x"), 0o644))
-	asimiHome := t.TempDir()
-
-	// The whole run must resolve (fail) well inside the 2-minute budget.
-	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(runCtx, binary,
-		"--handsoff", "--atif", "--isolated-host",
-		"--provider", "harbor-bogus-provider", "--model", "harbor-bogus-model",
-		"-p", "bogus provider probe",
-	)
-	cmd.Dir = t.TempDir()
-	cmd.Env = append(os.Environ(),
-		"HOME="+homeDir,
-		"ASIMI_HOME="+asimiHome,
-		// No base URL is configured for the bogus provider: it is neither a
-		// bifrost standard provider nor a <NAME>_BASE_URL custom provider,
-		// so it must never be probed or given a provider queue.
-	)
-	output := &lockBuffer{}
-	cmd.Stdout = output
-	cmd.Stderr = output
-
-	start := time.Now()
-	runErr := cmd.Run()
-	elapsed := time.Since(start)
-
-	if ctxErr := runCtx.Err(); ctxErr == context.DeadlineExceeded {
-		t.Fatalf("asimi with a bogus provider hung instead of failing fast\nOutput:\n%s", output.String())
-	}
-	require.Error(t, runErr, "the bogus provider must make asimi exit non-zero\nOutput:\n%s", output.String())
-	assert.Less(t, elapsed, 2*time.Minute,
-		"a bogus provider must fail fast, not burn the whole budget\nOutput:\n%s", output.String())
-}
+// NOTE: TestHeadless_BogusProviderFailsFast (the e1075 bogus-provider
+// regression) was removed by the ruler's decree: tests that build the binary
+// from inside the suite wedge CI's 5m budget (run #293). The regression
+// coverage will return as a post-build test against the released binary.
 
 // TestActivation_ATIF_E2E is a terminal-bench readiness smoke test.
 // It builds the real asimi binary and runs it end-to-end in headless mode
