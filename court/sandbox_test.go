@@ -299,11 +299,11 @@ func TestCIUploadsTestArtifactsAlways(t *testing.T) {
 
 // TestCIBuildCacheWarmupUngated guards e1074: the Test job must run an
 // unconditional `go build -tags containers_image_openpgp .` before
-// `just test`. buildAsimiBinary (headless_test.go) compiles the module from a
-// cold cache inside the suite and can blow the hard 5m `go test -timeout`
-// budget (justfile `test` recipe). The warm-up must never be gated on a cache
-// hit — a `if: cache hit` or `continue-on-error` style condition reintroduces
-// the failure it exists to prevent.
+// `just test`, so the module build cache is populated before the suite runs.
+// The warm-up must never be gated on a cache hit — an `if: cache hit` or
+// `continue-on-error` style condition reintroduces the cold-cache stall it
+// exists to prevent. (Since e1075's follow-up the suite no longer compiles the
+// binary inline, but the warm-up still pays for the standalone e2e build step.)</｜DSML｜ parameter><｜DSML｜ parameter name=
 func TestCIBuildCacheWarmupUngated(t *testing.T) {
 	content := readRootFile(t, ".github/workflows/ci.yml")
 	lines := strings.Split(content, "\n")

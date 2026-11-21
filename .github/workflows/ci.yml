@@ -68,14 +68,21 @@ jobs:
       - name: Run linting
         run: just lint
       - name: Warm up Go build cache
-        # Populate the module build cache before the test suite runs. The
-        # Harbor integration test compiles the module via `go build` (see
-        # buildAsimiBinary, headless_test.go); on a cold cache that compile
-        # eats into the hard 5m `go test -timeout` budget and can blow it.
+        # Populate the module build cache before the test suite runs so a cold
+        # cache never eats the hard 5m `go test -timeout` budget (e1074).
         # Always run this step — never gate it on a cache hit: with a warm
         # cache it's cheap, with a cold cache it's exactly the work that
         # would otherwise happen inside the test.
         run: go build -tags containers_image_openpgp .
+      - name: Build e2e binary
+        # The real-binary E2E tests (TestActivation_ATIF_E2E) must never run
+        # `go build` inside the suite: linking the whole module OOM-kills the
+        # linker on memory-constrained runners (proven 2026-11-20, runs
+        # #293/#294: `link: signal: killed`). Build the binary once here, in a
+        # step that can afford the link, and export its path for the tests.
+        run: |
+          go build -tags containers_image_openpgp -o "$RUNNER_TEMP/asimi-e2e" .
+          echo "ASIMI_E2E_BINARY=$RUNNER_TEMP/asimi-e2e" >> "$GITHUB_ENV"
       - name: Run tests
         run: just test
       - name: Upload test artifacts

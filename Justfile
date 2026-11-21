@@ -126,6 +126,45 @@ test:
     [ -n "${CI:-}" ] && just test-race
     echo "<<< test output stored to $outfile"
 
+# Diagnose a hang: run the suite serially (-p 1, no test cache) and, on
+# timeout, preserve the goroutine dump and the SQLite sidecar/LOCK state of any
+# database the failing test touched. Motivated by CI runs #293/#294: three
+# distinct tests hung in exec/SQLite waits, none reproduced locally. This
+# recipe converts the anomaly into evidence instead of guessing.
+test-diagnose:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    stamp="{{now}}"
+    dir="heaven/runs/diagnose-$stamp"
+    mkdir -p "$dir"
+    echo ">>> diagnosing; artifacts to $dir"
+    # -p 1 serializes packages; -count=1 defeats the test cache so every test
+    # actually runs. A serial run isolates inter-test HOME/SQLite contention.
+    set +e
+    go test -tags containers_image_openpgp -count=1 -p 1 -timeout 5m ./... > "$dir/go-test.out" 2>&1
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+      echo "=== go test exited $rc; preserving artifacts ==="
+      # Goroutine dumps are already in the output (Go prints them on the
+      # watchdog panic). Surface the hung test and its stack for triage.
+      grep -nE 'panic: test timed out|^[[:space:]]+[A-Za-z].*\([0-9]+(m|s)\)' "$dir/go-test.out" || true
+      # Preserve any SQLite database + WAL/SHM/LOCK sidecars a test left in the
+      # temp-dir fallback, the shared path that 124 HOME-mutating tests hit.
+      tmpdb="${TMPDIR:-/tmp}/asimi"
+      if [ -d "$tmpdb" ]; then
+        cp -a "$tmpdb" "$dir/asimi-tmpdb" 2>/dev/null || true
+        ls -la "$dir/asimi-tmpdb" > "$dir/asimi-tmpdb.state" 2>&1 || true
+        lsof +D "$tmpdb" > "$dir/asimi-tmpdb.lsof" 2>&1 || true
+      fi
+      # Snapshot any stray sqlite artifacts in the working tree too.
+      find . -name '*.sqlite*' -o -name '*-wal' -o -name '*-shm' 2>/dev/null | head -50 > "$dir/sqlite-artifacts.txt" || true
+      echo "=== artifacts in $dir ==="
+      ls -la "$dir"
+      exit $rc
+    fi
+    echo "<<< serial suite passed; no hang to diagnose ($dir/go-test.out)"
+
 # Run tests under the race detector, tee-ing output to `./heaven/tests/test-race-<datetime>.out`
 test-race *packages="./court/":
     #!/usr/bin/env bash
