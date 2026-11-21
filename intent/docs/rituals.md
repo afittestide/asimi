@@ -139,15 +139,18 @@ steps:
 
 ### Ministers
 
-Each minister has a specific role:
+Each minister has a specific role. These are the *actual* minister ids used in
+ritual steps — see `internal/ministers/userconf/ministers.yaml` for the canonical
+roster:
 
-| Minister | Role |
-|----------|------|
-| `chancellor` | Coordinates the court, reports status, requests guidance |
-| `strategist` | Analyzes requirements, produces technical plans |
-| `forge` | Implements changes, writes code |
-| `judge` | Runs tests, verifies correctness |
-| `sage` | Reviews code quality, records precedents |
+| Minister | Chinese | Role |
+|----------|---------|------|
+| `secretary` | 中書令 | Distills intent into edicts; court business |
+| `chancellor` | 門下侍中 | Reviews code quality, holds the veto (封駁), records precedents |
+| `war` | 兵部 | Analyzes requirements, produces technical plans, creates lings |
+| `forge` | 工部 | Implements changes, writes code (地) |
+| `judge` | 刑部 | Runs tests, verifies correctness, renders verdicts (天) |
+| `rites` | 禮部 | Owns documentation and the written word (典籍) |
 
 ### Step Fields
 
@@ -252,7 +255,7 @@ A step's Act result is automatically published under its name and is reachable f
 ```yaml
 steps:
   - name: summarize
-    minister: strategist
+    minister: war
     given:
       - the earth status
     act: |
@@ -262,7 +265,7 @@ steps:
       {{ .earth_capital }}
 
   - name: next
-    minister: chancellor
+    minister: secretary
     act: |
       Court briefing:
       {{ .summarize }}
@@ -273,7 +276,7 @@ steps:
 
 Ritual Acts dispatched to a minister run in a throwaway session created per step — their conversation history is discarded once the step completes, so large `given:` payloads (diffs, DB dumps) do not leak into any user-facing chat.
 
-`chancellor` is intentionally different: Acts targeting the chancellor run inside its persistent interactive session, so their prompts and outputs become part of the user's chat history. This lets rituals weave context into the ongoing conversation, but it also means anything you put in a chancellor Act will burn user-facing context window. Keep chancellor Acts short — pre-digest heavy data in a `strategist` (or `sage`) step and pass the summary in via `{{ .priorStep }}`, as in the example above.
+`chancellor` is intentionally different: Acts targeting the chancellor run inside its persistent interactive session, so their prompts and outputs become part of the user's chat history. This lets rituals weave context into the ongoing conversation, but it also means anything you put in a chancellor Act will burn user-facing context window. Keep chancellor Acts short — pre-digest heavy data in a `war` (or `judge`) step and pass the summary in via `{{ .priorStep }}`, as in the example above.
 
 ---
 
@@ -351,36 +354,36 @@ This is used when requirements are unclear and the minister needs guidance to pr
 
 ## Full Example
 
-Here's `swift-strike`, one of the built-in rituals — a tight forge/judge/sage loop for small changes:
+Here's `swift-strike`, one of the built-in rituals — a tight forge/judge/chancellor loop for small changes:
 
 ```yaml
 - name: swift-strike
-  description: A tight loop for enacting small changes in 地
+  description: A tight loop for implementing edicts
   inputs:
     edict_id:
       type: string
       required: true
   max_retries: 3
   background:
+    - an edict's worktree
     - the edict details
   steps:
     - name: forging
       minister: forge
+      effort: low
       act: |
-        Implement the changes for the edict below.
+        Implement the changes for the edict:
         {{ .edict }}
-        Focus on minimal, targeted changes to fulfill the intent.
+      then:
+        - "!just test"
       on_failure: retry
 
     - name: judging
       minister: judge
-      given:
-        - the manifests
-        - "!just test"
       act: |
         If any tests were changed, verify they were not weakened.
-        {{ .manifests }}
         If tests fail, provide clear feedback for the Forge.
+        When judgement is done, call record_verdict.
       then:
         - the verdicts are passed
         - record the judge's seal
@@ -388,14 +391,15 @@ Here's `swift-strike`, one of the built-in rituals — a tight forge/judge/sage 
       on_failure_target: forging
 
     - name: reviewing
-      minister: sage
-      given:
-        - the manifests
-        - the verdicts
+      minister: chancellor
       act: |
         Review the code changes for the edict.
         Check for style violations, security concerns, and architectural issues.
         Record your insights using record_precedent.
+        {{ .edict }}
+      then:
+        - the precedent is approved
+        - record the chancellor's seal
       on_failure: goto
       on_failure_target: forging
   then:
@@ -406,43 +410,49 @@ Here's `swift-strike`, one of the built-in rituals — a tight forge/judge/sage 
 
 ## Built-in Rituals
 
-Asimi ships with seven built-in rituals in [`builtin_rituals.yaml`](../../court/builtin_rituals.yaml).
+Asimi ships with built-in rituals in [`builtin_rituals.yaml`](../../court/builtin_rituals.yaml).
 
 ### swift-strike
 
-A tight forge/judge/sage loop for small, targeted changes. The forge implements the edict, the judge runs tests and verifies coverage, and the sage reviews for style and security. On failure, control loops back to forging.
+A tight forge/judge/chancellor loop for small, targeted changes. The forge implements the edict and runs the tests, the judge verifies coverage and renders a verdict, and the chancellor reviews for style and security. On failure, control loops back to forging. The ritual ends with the edict awaiting the ruler's seal.
 
 **Steps:** forging → judging → reviewing
 
 ### castle-siege
 
-A medium-complexity workflow that adds a strategist planning phase before forging. The strategist analyzes the edict and produces a Battle Plan with phases and dependencies. The forge then executes the plan, followed by judging and reviewing.
+A medium-complexity workflow that adds a War planning phase before forging. War analyzes the edict and produces a Battle Plan, recording its lings via `insert_ling`; the implementing step then **forks** over those lings (batch size 1), before judging and reviewing.
 
-**Steps:** strategizing → forging → judging → reviewing
+**Steps:** strategizing → implementing (fork over lings) → judging → reviewing
+
+### merge-worktree
+
+Lands a sealed edict's worktree as a single squash commit into the blessed branch. Triggered by the `seal_granted` event for the ruler's seal; the forge resolves any conflicts.
+
+**Steps:** landing
 
 ### dawn-audience
 
-The startup ritual, triggered automatically by the `court_started` event. It pings the model, checks sandbox health, checks for Asimi updates, then the strategist condenses the state of the three realms into a short briefing, and finally the chancellor presents that briefing and requests zhengming for the next step. The summarize step runs in a throwaway session so the raw diffs/edicts don't pollute the chancellor's interactive history; only the condensed briefing reaches the user-facing session. Contains system steps (no minister) for sandbox and version checks.
+The startup ritual. It pings the model, checks sandbox health, checks for Asimi updates, has War condense the state of the three realms into a short briefing, and finally has the secretary present that briefing and request zhengming for the next step. Contains system steps (no minister) for sandbox and version checks.
 
 **Steps:** ping-model → check-sandbox → check-asimi-version → summarize → next
 
-### review-borderland
-
-A code review ritual for unstaged changes. The judge verifies test coverage for the borderlands, then the sage reviews for style, security, and architecture. Neither step stages or commits — the ruler decides what to do after review.
-
-**Steps:** judging → reviewing
-
 ### clean-slate
 
-Reviews all uncommitted changes (staged and unstaged), splits them into logical commits, determines if any should amend HEAD, and links commits to edicts for the seal chain. The strategist surveys the changes and produces a commit plan. The chancellor executes the commits, then links edict-tagged commits to their edicts by creating manifests.
+Reviews all uncommitted changes (staged and unstaged), splits them into logical commits, determines if any should amend HEAD, and links commits to edicts for the seal chain. War surveys the changes and produces a commit plan; the secretary executes the commits.
 
-**Steps:** survey → commit → link-edicts
+**Steps:** survey → commit
+
+### fix-lint
+
+Fixes linter errors in parallel using fork/join. The forge runs the linter and parses its output into a JSON list of files with errors; the `fix-all-files` step forks over that list (batch size 5), fixing and verifying each file.
+
+**Steps:** lint → fix-all-files (fork) → commit-all
 
 ### project-init
 
-Initializes a project for Asimi. The forge customizes infrastructure templates (Justfile, Dockerfile, bashrc, asimi.conf, AGENTS.md) for the detected language. The judge verifies the sandbox is operational (must return Linux from `uname -a`). The sage reviews the infrastructure files for quality. Accepts an optional `clearMode` boolean and `agentsFile` string input.
+Initializes a project for Asimi. The forge customizes infrastructure templates (Justfile, Dockerfile, bashrc, asimi.conf, AGENTS.md) for the detected language. The judge verifies the sandbox is operational (must return Linux from `uname -a`). The chancellor reviews the infrastructure files for quality and seals the review. Accepts optional `clearMode` and `agentsFile` inputs.
 
-**Steps:** establish-infrastructure → sandbox-ready → sage-reviews
+**Steps:** establish-infrastructure → sandbox-ready → chancellor-reviews
 
 ---
 
