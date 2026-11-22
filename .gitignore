@@ -25,5 +25,4 @@ intent/issues
 # subdirectory; root-level declarations (e.g. heaven.conf) stay tracked.                                                 
 heaven/
 # mdBook generated sites — never commit build output (run `just serve-book <name>` to preview).
-intent/**/book/**
 intent/guides/*/book/
