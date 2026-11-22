@@ -1,0 +1,2145 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The Ruler&#x27;s Guide</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A sandboxed imperial court for your project — the user&#x27;s guide">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-7dc712a2.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-983cb4c3.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">The Ruler&#x27;s Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/afittestide/asimi" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="the-rulers-guide"><a class="header" href="#the-rulers-guide">The Ruler’s Guide</a></h1>
+<p>🎂 <em>For <code>vi</code>’s fiftieth birthday — the tool that will live forever.</em> 🎂</p>
+<p>Welcome. In Asimi, <strong>you are the Ruler</strong> (君主). The AI ministers work for you:
+you speak intent, they execute. This book is your guide — from installation to
+running a small government over your own project.</p>
+<p>This guide is for <strong>users</strong> who have installed Asimi via brew, the one-liner
+installer, or a binary. If you want to work on Asimi itself, see the
+<a href="https://github.com/afittestide/asimi">README</a> → Development.</p>
+<h2 id="what-asimi-is"><a class="header" href="#what-asimi-is">What Asimi is</a></h2>
+<p>Asimi is an opinionated, multi-model coding agent with an unusual interface:
+a <strong>government</strong>. You don’t prompt an unopinionated agent — you rule a small court
+of specialist ministers, each with their own domain, their own tools, and their
+own limits. They translate your intent into working code, and you hold the seal
+that authorizes it.</p>
+<p>This is not a costume. The structure is lifted from the <em>three departments and
+six ministries</em> (三省六部) of imperial China — a division of labour that ran an
+empire for a millennium. Its principles turn out to be exactly what a careful
+coding agent needs: separated powers, named roles, written rulings, and a ruler
+who is allowed to be wrong.</p>
+<p>If you have never heard of the Tang dynasty or its bureaucracy, do not worry —
+that is precisely why <strong>Part I</strong> exists. By the end of it you will understand
+what the court <em>is</em>, why it is shaped this way, and why a government beats an
+unopinionated agent for serious work. Only then do we install the tool.</p>
+<h2 id="how-to-read-this-book"><a class="header" href="#how-to-read-this-book">How to read this book</a></h2>
+<p>Read it in order the first time. The ideas build on one another, starting with
+the metaphor itself.</p>
+<ol>
+<li><strong>The Court</strong> — what Asimi is, the three departments, the three realms, the
+seal chain, and the ministers. <em>Start here, even if you’re eager.</em></li>
+<li><strong>Getting Started</strong> — install Asimi and issue your first edict.</li>
+<li><strong>The Machinery</strong> — edicts, lings, rituals, and zhengming in depth.</li>
+<li><strong>The TUI</strong> — tabs, modes, and the vi keys you already know.</li>
+<li><strong>Working with Models</strong> — providers, login, and model selection.</li>
+<li><strong>Configuration</strong> — config files, sessions, context, the sandbox.</li>
+<li><strong>Reference</strong> — troubleshooting, and the philosophy underneath.</li>
+</ol>
+<blockquote>
+<p><strong>Prefer the terminal?</strong> Much of the command and keybinding detail is also
+available offline with the built-in help — try <code>:help edicts</code>,
+<code>:help modes</code>, or <code>:help rituals</code> inside Asimi.</p>
+</blockquote>
+<p>Ready? Turn the page.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-court"><a class="header" href="#the-court">The Court</a></h1>
+<p>Before you install anything or run a single command, you must understand <em>what</em>
+Asimi is. This chapter builds the mental model the rest of the book depends on:
+why Asimi is shaped like a government rather than an unopinionated agent, where the
+idea comes from, and how its parts fit together.</p>
+<p>Read it in order. Its five sections build on one another.</p>
+<ol>
+<li><strong><a href="#what-is-asimi">What Is Asimi?</a></strong> — why a court, not an unopinionated agent.</li>
+<li><strong><a href="#the-three-departments-and-six-ministries">The Three Departments and Six Ministries</a></strong> — the
+thousand-year-old system Asimi borrows from.</li>
+<li><strong><a href="#the-three-realms-三界">The Three Realms (三界)</a></strong> — the jurisdictions in which
+everything lives: 人, 地, 天.</li>
+<li><strong><a href="#the-seal-chain">The Seal Chain</a></strong> — how a change ascends from proposal to law.</li>
+<li><strong><a href="#the-ministers">The Ministers</a></strong> — who serves the court, and what each is
+forbidden to do.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="what-is-asimi"><a class="header" href="#what-is-asimi">What Is Asimi?</a></h1>
+<blockquote>
+<p><em>“The beginning of wisdom is to call things by their right names.”</em>
+— attributed to Confucius (孔子)</p>
+</blockquote>
+<p>Before we install anything, we must agree on what we are building, and why it
+is shaped the way it is. Everything else in this book — every command, every
+concept, every ritual — follows from a single design decision:</p>
+<p><strong>Asimi is not an unopinionated agent. It is a court.</strong></p>
+<h2 id="the-problem-with-unopinionated-agents"><a class="header" href="#the-problem-with-unopinionated-agents">The problem with unopinionated agents</a></h2>
+<p>Most coding agents are one mind with one job: you type a request, a model
+writes code, and you check the result. They are <strong>unopinionated</strong> — they impose
+no structure on how the work is done, leave the division of labour to you, and
+have no separation of powers of their own. This works until it doesn’t. An
+unopinionated agent can:</p>
+<ul>
+<li>write code that breaks a test it also wrote,</li>
+<li>declare success on a change nobody verified,</li>
+<li>drift from your intent and never tell you,</li>
+<li>and, worst of all, <em>guess</em> when it should have asked.</li>
+</ul>
+<p>These are not model failures. They are <strong>institutional</strong> failures. Unstructured
+work cannot check itself, and a system that trusts one actor trusts it
+completely or not at all.</p>
+<h2 id="the-institutional-answer"><a class="header" href="#the-institutional-answer">The institutional answer</a></h2>
+<p>Asimi’s answer is ancient and well-tested: <strong>divide the work, separate the
+powers, and require a seal at every gate.</strong> Instead of one unopinionated agent, you get a
+small government:</p>
+<ul>
+<li>A <strong>Secretary</strong> who talks to you and distills your intent into work orders.</li>
+<li>A <strong>strategist</strong> who plans how the work should be done.</li>
+<li>A <strong>Forge</strong> that shapes the code.</li>
+<li>A <strong>Judge</strong> that weighs the result against evidence.</li>
+<li>A <strong>Chancellor</strong> who reviews against the law of the codebase.</li>
+</ul>
+<p>No single minister can both write the change and approve it. If the Forge fakes
+a test, the Judge catches it. If the Judge misses something, the Chancellor’s
+review catches it. If all three agree but the work has drifted from your intent,
+your <strong>seal</strong> — the final gate — is still yours to grant or withhold.</p>
+<h2 id="why-this-works"><a class="header" href="#why-this-works">Why this works</a></h2>
+<p>Two thousand years ago, in a different domain, the same problem appeared: how
+do you run a large enterprise without trusting any single official with
+absolute power? The imperial Chinese answer — refined across dynasties — was
+<em>checks within the bureaucracy itself</em>. Asimi borrows that answer wholesale.</p>
+<p>The result is a system with an unusual property for an AI tool: <strong>it is
+accountable.</strong> Every change is proposed by one minister, verified by another,
+reviewed by a third, and authorized by you. The record of all of it is written
+down.</p>
+<p>Throughout this book you will see three ideas recur — the <strong>realms</strong>, the
+<strong>seal chain</strong>, and <strong>rituals</strong>. They are not decoration. They are the machine.
+The next three chapters teach each of them in turn, from the ground up.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-three-departments-and-six-ministries"><a class="header" href="#the-three-departments-and-six-ministries">The Three Departments and Six Ministries</a></h1>
+<blockquote>
+<p><em>“If names be not correct, language is not in accordance with the truth of
+things. If language be not in accordance with the truth of things, affairs
+cannot be carried on to success.”</em>
+— Confucius, <em>Analects</em> 13.3 (名不正，則言不順；言不順，則事不成)</p>
+</blockquote>
+<p>Asimi’s structure is named after a real system of government. To understand why
+Asimi is shaped the way it is, it helps to know what that system was, and which
+of its ideas Asimi kept.</p>
+<h2 id="the-real-thing-三省六部"><a class="header" href="#the-real-thing-三省六部">The real thing: 三省六部</a></h2>
+<p>For much of the Tang dynasty (7th–10th century), the Chinese empire was run by
+<strong>three departments and six ministries</strong> (三省六部). The design was a machine for
+turning the emperor’s will into governed action without letting any one official
+accumulate unchecked power. The three departments each had a different job:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Department</th><th>Chinese</th><th>Job</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Secretariat</strong></td><td>中書省</td><td><strong>Drafts.</strong> Turns the emperor’s intent into formal documents (edicts).</td></tr>
+<tr><td><strong>Chancellery</strong></td><td>門下省</td><td><strong>Review and veto (封駁).</strong> Reads what the Secretariat drafted and may reject it.</td></tr>
+<tr><td><strong>Department of State Affairs</strong></td><td>尚書省</td><td><strong>Executes.</strong> Carries out the approved document through the six ministries.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The third department ran <strong>six ministries</strong>, each with a domain:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Ministry</th><th>Chinese</th><th>Domain</th></tr>
+</thead>
+<tbody>
+<tr><td>Personnel</td><td>吏部</td><td>Appointments</td></tr>
+<tr><td>Revenue</td><td>戶部</td><td>Taxation, census</td></tr>
+<tr><td><strong>Rites</strong></td><td>禮部</td><td>Ritual, records, the written word</td></tr>
+<tr><td><strong>War</strong></td><td>兵部</td><td>Military affairs</td></tr>
+<tr><td><strong>Justice</strong></td><td>刑部</td><td>Law, judgment</td></tr>
+<tr><td><strong>Works</strong></td><td>工部</td><td>Construction, engineering</td></tr>
+</tbody>
+</table>
+</div>
+<p>The genius of the system was the <strong>veto</strong>: the Chancellery could reject the
+Secretariat’s draft <em>before</em> the ministries ever acted on it. Drafting, review,
+and execution were separate hands. No edict became law on one official’s say-so.</p>
+<h2 id="what-asimi-kept"><a class="header" href="#what-asimi-kept">What Asimi kept</a></h2>
+<p>Asimi takes this very seriously, but it is a simplification — a working court for
+one person’s project, not a replication of a medieval empire. Here is the honest
+mapping:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tang role</th><th>Asimi minister</th><th>What they do here</th></tr>
+</thead>
+<tbody>
+<tr><td>Secretariat 中書省</td><td><strong>Secretary</strong> (中書令)</td><td>Talks to you; distills intent into edicts</td></tr>
+<tr><td>Chancellery 門下省</td><td><strong>Chancellor</strong> (門下侍中)</td><td>Reviews every change; holds the veto (封駁)</td></tr>
+<tr><td>Ministry of War 兵部</td><td><strong>War</strong> (兵部)</td><td>Plans the work; decomposes it into lings</td></tr>
+<tr><td>Ministry of Works 工部</td><td><strong>Forge</strong> (工部)</td><td>Shapes the code (地)</td></tr>
+<tr><td>Ministry of Justice 刑部</td><td><strong>Judge</strong> (刑部)</td><td>Runs tests; renders verdicts</td></tr>
+<tr><td>Ministry of Rites 禮部</td><td><strong>Rites</strong> (禮部)</td><td>Owns the documentation</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>A note on the veto.</strong> In Asimi the Chancellor’s 封駁 is real: it can reject a
+change against the <em>Imperial Code</em> — the accumulated laws and conventions of
+your codebase — and every ruling it makes is recorded as <strong>precedent</strong>, so the
+law grows case by case.</p>
+</blockquote>
+<h2 id="why-any-of-this-matters-to-your-code"><a class="header" href="#why-any-of-this-matters-to-your-code">Why any of this matters to your code</a></h2>
+<p>The Tang bureaucracy was not invented for elegance. It solved a coordination
+problem: <em>how to act decisively without trusting any single actor completely.</em>
+That is the same problem a coding agent faces.</p>
+<ul>
+<li>An unopinionated agent is a <strong>tyrant</strong> — fast, but unchecked.</li>
+<li>A court of ministers is a <strong>government</strong> — slower at any one step, but each
+step is checked, and the whole is accountable.</li>
+</ul>
+<p>Asimi bets that for real work, on a real codebase, <strong>the government wins.</strong></p>
+<p>The next chapter begins the machinery: the <strong>three realms</strong>, the houses in
+which every document, decision, and line of code lives.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-three-realms-三界"><a class="header" href="#the-three-realms-三界">The Three Realms (三界)</a></h1>
+<blockquote>
+<p><em>“The Way that can be spoken of is not the constant Way.”</em>
+— Laozi, <em>Tao Te Ching</em>, opening line (道可道，非常道)</p>
+<p><em>“What I hear, I forget. What I see, I remember. What I do, I understand.”</em>
+— attributed to Confucius</p>
+</blockquote>
+<p>Every court is a mediator. Before anything happens in Asimi, three parties
+must be in the same room: <strong>you</strong>, the <strong>code</strong>, and the <strong>evidence</strong>. Asimi
+gives them names, and treats each as its own jurisdiction.</p>
+<p>The idea is simple: <em>a realm is whom a thing lives under</em> — which law governs
+it, not what it is made of. One filesystem, three jurisdictions.</p>
+<h2 id="the-three"><a class="header" href="#the-three">The three</a></h2>
+<pre><code>人 Ren (Humanity) — Your Will
+  │
+  ▼
+地 Di (Earth) — Code
+  │
+  ▼
+天 Tian (Heaven) — Truth — logs &amp; test runs
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Realm</th><th>What it is</th><th>In your terminal</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>人 Ren (Humanity)</strong></td><td>Your intent, issues, and decisions</td><td>You, at the keyboard</td></tr>
+<tr><td><strong>地 Earth (Earth)</strong></td><td>Source code, commits, uncommitted changes</td><td>The filesystem, git, your working tree</td></tr>
+<tr><td><strong>天 Tian (Heaven)</strong></td><td>Tests, logs, CI verdicts, the event ledger</td><td><code>/var/log</code>, test output, <code>dmesg</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Harmony</strong> = your intent (人) flows through verification (天) into code (地)
+without friction. When harmony breaks — ambiguity in your intent, gaps in the
+evidence, or errors in the code — the court stops and repairs it before
+proceeding.</p>
+<h2 id="ren-人--the-living-will"><a class="header" href="#ren-人--the-living-will">Ren (人) — the living will</a></h2>
+<p>Ren is <em>you</em>: your desires, requirements, and clarifications. It is the
+“why” of all action, and it flows downward through <strong>edicts</strong> and
+clarifications.</p>
+<p>The sovereign is the source of intent and the final authority. Nothing in the
+court can manufacture intent; ministers can only translate what you declare.</p>
+<blockquote>
+<p>Chinese has two homophones here. <strong>人</strong> (humanity — the realm, <em>who acts</em>) and
+<strong>仁</strong> (benevolence — the virtue, <em>how one acts</em>) are both pronounced <em>rén</em>.
+The Ruler’s 人 is the source of intent; the ministers’ 仁 gives that intent
+moral weight.</p>
+</blockquote>
+<h2 id="earth-地--one-filesystem-three-jurisdictions"><a class="header" href="#earth-地--one-filesystem-three-jurisdictions">Earth (地) — one filesystem, three jurisdictions</a></h2>
+<p>Earth is the ground under the court’s feet, and it has its own internal
+geography. Every change passes through three territories as it travels from
+your editor to permanent record:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Territory</th><th>Chinese</th><th>What it holds</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>The Borderlands</strong></td><td>—</td><td>Unstaged changes (edits not yet added)</td></tr>
+<tr><td><strong>The Middle Kingdom</strong></td><td>—</td><td>Staged changes (added, not yet committed)</td></tr>
+<tr><td><strong>The Capital</strong></td><td>—</td><td>Committed, unpushed changes</td></tr>
+</tbody>
+</table>
+</div>
+<p>Beyond the capital lies 現行 — <em>in force</em> — the released code running in
+production. Harmony in Earth is the <em>wu-wei</em> flow of a change from Borderlands
+through Middle Kingdom and Capital to In Force, without friction.</p>
+<p>Earth has a vocabulary for its citizens too:</p>
+<ul>
+<li>A <strong>民 (citizen)</strong> is a file.</li>
+<li>A <strong>邑 (settlement)</strong> is a directory — self-similar, to any depth.</li>
+<li>A <strong>州 (province)</strong> is a worktree: a branch seated on its own ground.</li>
+<li><strong>歸宗</strong> — “returning home” — is a merge.</li>
+</ul>
+<h2 id="tian-天--the-observed-sky-and-the-crowned-ledger"><a class="header" href="#tian-天--the-observed-sky-and-the-crowned-ledger">Tian (天) — the observed sky and the crowned ledger</a></h2>
+<p>Heaven is not the filesystem. It is a set of <strong>sources</strong> and a <strong>method for
+reading them</strong>. Heaven is <em>authoritative, but not infallible</em>.</p>
+<p>This distinction is the court’s most important subtlety:</p>
+<blockquote>
+<p><strong>Evidence is not verdict.</strong> Green CI is <em>testimony</em>, not reality. The
+runner banks testimony; only the Judge’s pen files a verdict. Keep the pen
+and the bench in different hands.</p>
+</blockquote>
+<p>Heaven has two registers:</p>
+<ul>
+<li><strong>史冊 — the immutable record</strong> (<code>seals/</code>): verdicts, precedents, seals.
+This is the court’s memory, and it is fixed.</li>
+<li><strong>現行 — in force</strong>: production, the living sky. This is alive.</li>
+</ul>
+<p>Heaven carries an <strong>irreducible seed</strong> with every verdict — the ruling, the
+commit, the source, the time range, the window hash — <em>and</em> a URL. The seed is
+the ground; the URL may rot. A verdict may cite a dead star and still stand.</p>
+<h2 id="why-three-realms-and-not-just-the-code"><a class="header" href="#why-three-realms-and-not-just-the-code">Why three realms and not just “the code”?</a></h2>
+<p>Because a change is not complete when the code compiles. It is complete when:</p>
+<ol>
+<li><strong>人</strong> — it still serves the intent that asked for it, and</li>
+<li><strong>天</strong> — the evidence says it is correct, and</li>
+<li><strong>地</strong> — the code is clean and in place.</li>
+</ol>
+<p>A court that only watches Earth is a code generator. A court that watches all
+three is a <strong>government</strong>.</p>
+<p>Deepen this in the authoritative internal reference:
+<a href="docs/the_three_realms.html">The Three Realms</a>.</p>
+<p>Next: the ritual that moves a change across all three realms and crowns it —
+<strong>the seal chain</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-seal-chain"><a class="header" href="#the-seal-chain">The Seal Chain</a></h1>
+<blockquote>
+<p><em>“If you want to know the road ahead, ask those coming back.”</em>
+— Chinese proverb</p>
+</blockquote>
+<p>A change is not finished when it is written. It is finished when it has been
+<strong>weighed, reviewed, and authorized</strong> — and the record of that authorization
+is a <strong>seal</strong>.</p>
+<p>The <strong>seal chain</strong> is the path an edict travels from <em>proposal</em> to <em>law</em>. At each
+gate a different minister — never the author — examines the work and either
+applies its seal or refuses. Only when the chain is complete does the change
+<em>ascend</em> into the land of the living (現行).</p>
+<h2 id="the-gates"><a class="header" href="#the-gates">The gates</a></h2>
+<pre><code>    Judge's Seal  ──►  Chancellor's Seal  ──►  Ruler's Seal  ──►  頒行
+    "It is sound"     "It is well-formed"     "It is my will"     (promulgation)
+       天                  人/法典                人                現行
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Gate</th><th>Who</th><th>What it certifies</th><th>Realm</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Judge’s Seal</strong></td><td>Judge (刑部)</td><td>The change is <em>sound</em> — tests pass, coverage holds</td><td>天</td></tr>
+<tr><td><strong>Chancellor’s Seal</strong></td><td>Chancellor (門下侍中)</td><td>The change is <em>well-formed</em> — it obeys the Imperial Code</td><td>人 / 法典</td></tr>
+<tr><td><strong>Ruler’s Seal</strong></td><td><strong>You</strong></td><td>The change is <em>willed</em> — you authorize it</td><td>人</td></tr>
+<tr><td><strong>頒行 (promulgation)</strong></td><td>the court</td><td>The change is <em>promulgated</em> into 現行</td><td>地 → 現行</td></tr>
+</tbody>
+</table>
+</div>
+<p>Each seal is a distinct act, made by a distinct hand. No minister can grant
+another’s seal. The Judge cannot declare the code beautiful; the Chancellor
+cannot declare the tests green; and <strong>nobody</strong> can grant your seal but you.</p>
+<h2 id="why-the-order-is-fixed"><a class="header" href="#why-the-order-is-fixed">Why the order is fixed</a></h2>
+<p>The chain is not arbitrary. Each gate depends on the last, because each
+<em>reasons about a different thing</em>:</p>
+<ul>
+<li>Testing a change that the code review will later reject is wasted effort — so
+<strong>soundness comes first</strong>.</li>
+<li>Reviewing a change whose tests don’t yet pass would mean reviewing a moving
+target — so <strong>you review what is proven</strong>.</li>
+<li>Authorizing a change nobody verified would be guesswork — and <strong>guessing is
+treason</strong>.</li>
+</ul>
+<blockquote>
+<p><strong>The pen and the bench live in different hands.</strong> The Judge’s verdict and
+the evidence it cites are separate: the runner banks testimony, only the
+Judge’s pen files. This is why the seal chain has <em>gates</em> and not a single
+stamp.</p>
+</blockquote>
+<h2 id="what-a-seal-is-technically"><a class="header" href="#what-a-seal-is-technically">What a seal is, technically</a></h2>
+<p>Every seal is recorded. The <code>seals</code> table in the court’s ledger is the <strong>only
+immutable history</strong> — once a seal is granted it is never rewritten. This is
+what makes the chain auditable: for any change in the repository, you can ask
+<em>who sealed it, when, and against what evidence.</em></p>
+<p>The record is not a convenience. It is the point. A court without a fixed
+memory of its own rulings cannot accumulate law — and law, built case by case,
+is how the Imperial Code grows.</p>
+<h2 id="guards-on-the-chain"><a class="header" href="#guards-on-the-chain">Guards on the chain</a></h2>
+<p>The chain is protected against the ways a naive pipeline fails:</p>
+<ul>
+<li><strong>A failed landing is never recorded as success.</strong> If the final merge into
+the blessed branch fails, the edict does <em>not</em> seal — it stays open and the
+failure is surfaced to you.</li>
+<li><strong>A sealed edict never silently strands.</strong> If a landing exhausts its retries,
+the court raises a <strong>zhengming</strong> to you rather than leaving the work
+unmerged and forgotten.</li>
+<li><strong>Your seal is not automatic.</strong> The court can <em>propose</em> that an edict awaits
+your seal, but only your authorization crowns it.</li>
+</ul>
+<h2 id="ascension"><a class="header" href="#ascension">Ascension</a></h2>
+<p>When the chain is complete, the edict <strong>ascends</strong>. Its sealed worktree is
+landed — squash-merged into one commit on the blessed branch. The change has
+left the realm of drafts and entered <strong>現行</strong>, the law in force.</p>
+<blockquote>
+<p>The word is deliberate. A citizen crossing a realm border is not merely
+<em>carried</em>; it is <strong>transfigured</strong>. Ascension is not migration.</p>
+</blockquote>
+<p>Now that you know the path, meet the travellers: <strong>the ministers</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-ministers"><a class="header" href="#the-ministers">The Ministers</a></h1>
+<blockquote>
+<p><em>“A man who has committed a mistake and doesn’t correct it is committing
+another mistake.”</em>
+— attributed to Confucius</p>
+</blockquote>
+<p>Asimi’s court is staffed by <strong>six ministers</strong>. Two of them you speak to
+directly; the other four work behind the scenes. Each has a <strong>domain</strong>, a set
+of <strong>tools</strong>, and a set of <strong>acts of treason</strong> — the things it must never do.</p>
+<p>The division of labour is the whole point. It is what lets the court check
+itself.</p>
+<h2 id="the-roster"><a class="header" href="#the-roster">The roster</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Minister</th><th>Chinese</th><th>Domain</th><th>You talk to them?</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Secretary</strong></td><td>中書令</td><td>Court business; distills your intent into edicts</td><td><strong>Yes — the Ruling tab</strong></td></tr>
+<tr><td><strong>Chancellor</strong></td><td>門下侍中</td><td>Review, veto (封駁), precedent — read-only</td><td><strong>Yes — the Hunting tab</strong></td></tr>
+<tr><td><strong>War</strong></td><td>兵部</td><td>Strategy: plans the work, decomposes it into lings</td><td>Indirectly</td></tr>
+<tr><td><strong>Forge</strong></td><td>工部</td><td>地 — shapes the code</td><td>Indirectly</td></tr>
+<tr><td><strong>Judge</strong></td><td>刑部</td><td>天 — tests, verdicts</td><td>Indirectly</td></tr>
+<tr><td><strong>Rites</strong></td><td>禮部</td><td>典籍 — documentation and the written word</td><td>Indirectly</td></tr>
+</tbody>
+</table>
+</div>
+<p>A minister is <em>defined in configuration</em>, not hard-coded. You can override any
+of them (see <a href="#config-files">Config Files</a>), but the shipped
+roster is the one above.</p>
+<h2 id="the-two-you-meet"><a class="header" href="#the-two-you-meet">The two you meet</a></h2>
+<h3 id="the-secretary-中書令"><a class="header" href="#the-secretary-中書令">The Secretary (中書令)</a></h3>
+<p>Your primary interface. The Secretary helps you <strong>plan new features, hunt bugs,
+and manage the court</strong>. It does not change code — its job is to take your
+intent and forge it into a clean <strong>edict</strong>: focused on <em>what</em> and <em>why</em>,
+leaving the <em>how</em> to War and the Forge.</p>
+<p>Its superpower is <code>asimisql</code> — direct, read-only queries against the court’s
+ledger. Anything you want to know about the state of the court, the Secretary
+can find.</p>
+<blockquote>
+<p><strong>Two acts of treason for the Secretary:</strong> guessing (it must <code>ask_ruler</code>
+when your intent is unclear) and <em>coding</em> (Earth is not its domain).</p>
+</blockquote>
+<h3 id="the-chancellor-門下侍中"><a class="header" href="#the-chancellor-門下侍中">The Chancellor (門下侍中)</a></h3>
+<p>Your advisor and your court’s conscience. The Chancellor <strong>sees everything and
+changes nothing</strong> — full read-only access to the code, the edicts, and every
+court record. It:</p>
+<ul>
+<li>distills fuzzy intent into sharp edicts,</li>
+<li>reviews every change against the <strong>Imperial Code</strong>, and</li>
+<li>holds the <strong>veto (封駁)</strong> — it can reject a change that falls short.</li>
+</ul>
+<p>Every ruling the Chancellor makes is recorded as <strong>precedent</strong>, searchable case
+law that grows the law of your codebase. And at its seal it performs an
+<strong>omission sweep</strong>: every <code>TODO</code>, <code>FIXME</code>, <code>XXX</code>, or <code>HACK</code> in the family of
+files under review must be <em>handled</em> (turned into a ling with a durable id) or
+<em>removed</em> (struck with a recorded reason). There is no holding pen, and removal
+is never silent.</p>
+<blockquote>
+<p><strong>Acts of treason for the Chancellor:</strong> guessing, <strong>modifying code</strong>
+(it is read-only), and issuing a ruling without written justification —
+every ruling becomes permanent precedent.</p>
+</blockquote>
+<h2 id="the-four-behind-the-scenes"><a class="header" href="#the-four-behind-the-scenes">The four behind the scenes</a></h2>
+<h3 id="war-兵部--the-strategist"><a class="header" href="#war-兵部--the-strategist">War (兵部) — the strategist</a></h3>
+<p>War’s domain is <strong>strategy and sequence</strong>. Summoned to plan, it decomposes an
+edict into executable <strong>lings</strong> (令, task orders) with clear dependencies, and
+enforces their order. All changes to a single file belong in a single ling.</p>
+<blockquote>
+<p><strong>Treason for War:</strong> guessing; a ling that is not atomic, clear, and
+testable; introducing cycles in the dependency graph; using shorthand ling
+IDs.</p>
+</blockquote>
+<h3 id="forge-工部--the-maker"><a class="header" href="#forge-工部--the-maker">Forge (工部) — the maker</a></h3>
+<p>Forge’s domain is <strong>地</strong> — simple, clear code forged into existence. It writes
+the code, and records every change as a <strong>manifest</strong>. Inside an edict’s
+worktree, Forge commits its finished work on the worktree branch; those commits
+never touch the main tree, because the Ruler’s seal squash-merges the edict
+into a single commit at ascension.</p>
+<blockquote>
+<p><strong>Treason for Forge:</strong> non-idiomatic code; changing tests (that is the
+Judge’s dispatch); committing on the main tree (the court must approve first);
+and finishing without recording a manifest.</p>
+</blockquote>
+<h3 id="judge-刑部--the-weigher"><a class="header" href="#judge-刑部--the-weigher">Judge (刑部) — the weigher</a></h3>
+<p>Judge’s domain is <strong>天</strong> — test results and testing code. It reviews the
+Forge’s manifests against the working tree, and presides over the <strong>verdicts</strong>
+table. Tests pass → the manifest is <em>quenched</em>. Tests fail → it is <em>rejected</em>,
+with clear feedback for the Forge.</p>
+<p>The Judge is <strong>adversarial and data-driven</strong>. Its word is final — but
+<em>authoritative, not infallible</em>. It renders verdicts from evidence, cites that
+evidence by coordinates, and never treats raw test output as a verdict.</p>
+<blockquote>
+<p><strong>Treason for the Judge:</strong> guessing; rendering a verdict without evidence;
+mutating a verdict once rendered; presuming code innocent — <em>code is guilty
+until proven innocent</em>.</p>
+</blockquote>
+<h3 id="rites-禮部--the-pen"><a class="header" href="#rites-禮部--the-pen">Rites (禮部) — the pen</a></h3>
+<p>Rites’ domain is <strong>典籍</strong> — the declared word made legible. It owns all
+documentation: the guides you are reading, the in-terminal help, and the
+developer internals. Where the Forge shapes 地 and the Judge weighs 天, Rites
+renders the court’s craft into <strong>人</strong> for the sovereign.</p>
+<blockquote>
+<p><strong>Treason for Rites:</strong> guessing; and <em>letting a document describe behavior
+the code no longer has.</em></p>
+</blockquote>
+<h2 id="permissions-the-realm-model"><a class="header" href="#permissions-the-realm-model">Permissions: the realm model</a></h2>
+<p>Every minister’s tools derive from a <strong>9-character permission string</strong> — three
+triplets following Unix <code>rwx</code> notation, one triplet per realm:</p>
+<pre><code>  r  w  x   r  w  x   r  -  -    
+  └──地──┘  └──天──┘  └──人──┘    
+  Earth     Heaven    Intent      
+</code></pre>
+<p>Read a minister’s string and you know exactly what it can touch. Examples from
+the real roster:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Minister</th><th>Permission</th><th>地</th><th>天</th><th>人</th><th>Reading</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Forge</strong></td><td><code>rwxr---w-</code></td><td>rwx</td><td>r–</td><td>-w-</td><td>Full Earth; read Heaven; append Intent</td></tr>
+<tr><td><strong>Judge</strong></td><td><code>rwxrwxr--</code></td><td>rwx</td><td>rwx</td><td>r–</td><td>Full Earth &amp; Heaven; read Intent</td></tr>
+<tr><td><strong>Chancellor</strong></td><td><code>r--r--rwx</code></td><td>r–</td><td>r–</td><td>rwx</td><td>Read all; <strong>write only Intent</strong></td></tr>
+<tr><td><strong>War</strong></td><td><code>r-----rw-</code></td><td>r–</td><td>—</td><td>rw-</td><td>Read Earth; <strong>no Heaven</strong>; write Intent</td></tr>
+<tr><td><strong>Secretary</strong></td><td><code>r-xrwxrwx</code></td><td>r-x</td><td>rwx</td><td>rwx</td><td>Broad; append-only on Earth</td></tr>
+<tr><td><strong>Rites</strong></td><td><code>rw-r--rw-</code></td><td>rw-</td><td>r–</td><td>rw-</td><td>Write Earth &amp; Intent; read Heaven</td></tr>
+</tbody>
+</table>
+</div>
+<p>This is the whole separation of powers, expressible in nine characters. The
+Chancellor can write <strong>only</strong> to Intent — it literally cannot modify code. War
+cannot touch Heaven — it cannot run tests. Forge cannot freely write Intent —
+only append to it.</p>
+<p>The court is not <em>trusting</em> its ministers. It is <em>handicapping</em> them.</p>
+<p>Next: with the court understood, we install it and issue your first edict.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<p>With the court understood, this chapter brings it to life on your own machine:
+install Asimi, initialize your project, and issue your first edict from start to
+seal.</p>
+<ol>
+<li><strong><a href="#installation">Installation</a></strong> — the binary, the sandbox, and the first run.</li>
+<li><strong><a href="#your-first-edict">Your First Edict</a></strong> — issue an edict and watch the seal
+chain close.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
+<blockquote>
+<p><em>“A journey of a thousand miles begins with a single step.”</em>
+— Laozi, <em>Tao Te Ching</em> (千里之行，始於足下)</p>
+</blockquote>
+<p>Asimi is a single binary plus two supporting tools. This chapter gets you from
+nothing to a running court.</p>
+<h2 id="what-you-need"><a class="header" href="#what-you-need">What you need</a></h2>
+<p>Two tools are required on your system before Asimi will work well:</p>
+<ul>
+<li><strong><a href="https://podman.io/docs/installation">Podman</a></strong> — for the sandbox. Asimi
+runs the agent’s shell commands in its own container. Podman is used instead
+of Docker because it is more secure (on Linux it needs no daemon).</li>
+<li><strong><a href="https://github.com/casey/just">Just</a></strong> — a command runner, used by your
+project’s <code>Justfile</code> to collect its scripts.</li>
+</ul>
+<p>You will also need access to at least one AI provider — locally hosted
+(Ollama), or a hosted API (Anthropic, OpenAI, Google, and others). See
+<a href="#providers--login">Providers &amp; Login</a>.</p>
+<h2 id="installing-asimi"><a class="header" href="#installing-asimi">Installing Asimi</a></h2>
+<p>Choose one of these paths.</p>
+<h3 id="one-liner-recommended"><a class="header" href="#one-liner-recommended">One-liner (recommended)</a></h3>
+<p>The installer downloads the right binary for your system and copies it into
+place:</p>
+<pre><code class="language-bash">curl -fsSL https://asimi.dev/installer | bash
+</code></pre>
+<p>Options:</p>
+<ul>
+<li><code>ASIMI_INSTALL_DIR=/path/to/dir</code> — custom installation directory</li>
+<li><code>ASIMI_VERSION=v0.1.0</code> — install a specific version</li>
+</ul>
+<h3 id="homebrew"><a class="header" href="#homebrew">Homebrew</a></h3>
+<pre><code class="language-bash">brew tap afittestide/tap
+brew install asimi
+</code></pre>
+<h3 id="go"><a class="header" href="#go">Go</a></h3>
+<pre><code class="language-bash">go install github.com/afittestide/asimi@latest
+</code></pre>
+<h3 id="prebuilt-binary"><a class="header" href="#prebuilt-binary">Prebuilt binary</a></h3>
+<p>Download the binary for your platform from the
+<a href="https://github.com/afittestide/asimi/releases/latest">latest releases</a> and
+copy it to a directory on your <code>PATH</code> (e.g. <code>/usr/local/bin</code>).</p>
+<h2 id="first-run"><a class="header" href="#first-run">First run</a></h2>
+<p>Start Asimi in interactive mode by typing:</p>
+<pre><code class="language-bash">asimi
+</code></pre>
+<p>You will land in the <strong>Ruling</strong> tab, in INSERT mode, facing the Secretary.
+(If this is your very first launch, the court boots with a <strong>dawn-audience</strong> —
+a short briefing on the state of the three realms. See
+<a href="#rituals">Rituals</a>.)</p>
+<p>Two commands orient you before any real work:</p>
+<ol>
+<li>
+<p><strong>Initialize your repo</strong></p>
+<pre><code>:init
+</code></pre>
+<p>Creates <code>AGENTS.md</code> and a <code>Justfile</code> if missing, and prepares the sandbox
+image definition under <code>.agents/</code>.</p>
+</li>
+<li>
+<p><strong>Check your container</strong></p>
+<pre><code>:!uname -a
+:!pwd
+</code></pre>
+<p>The <code>:!</code> prefix runs a shell command <strong>inside the sandbox</strong>. <code>uname -a</code>
+should report <code>Linux</code> (the sandbox is Linux, even on macOS), and <code>pwd</code>
+should match your host project path.</p>
+</li>
+</ol>
+<p>You are now ready. The next chapter issues your first edict.</p>
+<h2 id="where-asimi-keeps-things"><a class="header" href="#where-asimi-keeps-things">Where Asimi keeps things</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Path</th><th>What lives there</th></tr>
+</thead>
+<tbody>
+<tr><td><code>.agents/</code></td><td>Asimi’s project files: sandbox definition, rituals, config</td></tr>
+<tr><td><code>.agents/asimi.conf</code></td><td>Project-level configuration</td></tr>
+<tr><td><code>~/.config/asimi/asimi.conf</code></td><td>User-level configuration</td></tr>
+<tr><td><code>~/.local/share/asimi/</code></td><td>Logs and saved sessions</td></tr>
+<tr><td><code>AGENTS.md</code></td><td>Your project’s conventions, taught to the ministers</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>Note on <code>AGENTS.md</code>.</strong> This file is how you teach the ministers your
+project’s conventions — how to build, how to test, the coding style. When you
+write conventions here, every minister reads them as standing law.</p>
+</blockquote>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="your-first-edict"><a class="header" href="#your-first-edict">Your First Edict</a></h1>
+<blockquote>
+<p><em>“I hear and I forget. I see and I remember. I do and I understand.”</em>
+— attributed to Confucius</p>
+</blockquote>
+<p>An <strong>Edict</strong> (詔令) is a work order. You issue it; the court executes it through
+a <strong>Ritual</strong>. This chapter walks you through issuing one and watching the seal
+chain close.</p>
+<h2 id="the-two-tabs-you-live-in"><a class="header" href="#the-two-tabs-you-live-in">The two tabs you live in</a></h2>
+<p>Asimi’s TUI opens with two tabs:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tab</th><th>You talk to</th><th>Tempo</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Ruling</strong></td><td>the <strong>Secretary</strong> (中書令)</td><td>Campaign — issuing and managing edicts</td></tr>
+<tr><td><strong>Hunting</strong></td><td>the <strong>Chancellor</strong> (門下侍中)</td><td>Skirmish — exploring, distilling intent</td></tr>
+</tbody>
+</table>
+</div>
+<p>Switch tabs with <code>gt</code> (next) and <code>gT</code> (previous). Your first edict is easiest
+from the <strong>Ruling</strong> tab, with the Secretary.</p>
+<blockquote>
+<p><strong>Ruling vs. Hunting.</strong> The Ruling tab is the court at work: edicts flow
+through their phases. The Hunting tab is where fuzzy intent gets sharpened
+into a proper edict through conversation. If you know exactly what you want,
+start in Ruling; if you are still thinking, start in Hunting.</p>
+</blockquote>
+<h2 id="issue-an-edict"><a class="header" href="#issue-an-edict">Issue an edict</a></h2>
+<p>From the Ruling tab, simply <strong>describe what you want</strong> in natural language:</p>
+<pre><code>Add a --version flag that prints the build version and exits
+</code></pre>
+<p>The Secretary will:</p>
+<ol>
+<li>Distill your intent into a clean <strong>edict</strong>.</li>
+<li>Have the court <strong>classify</strong> its scope (S, M, L, XL).</li>
+<li>Enact the appropriate <strong>ritual</strong>.</li>
+</ol>
+<p>For a small, focused change like this, the court enacts <strong>swift-strike</strong> — a
+tight Forge → Judge → Chancellor loop. You will see the ministers work through
+the tab as their steps execute.</p>
+<h2 id="watch-the-seal-chain-close"><a class="header" href="#watch-the-seal-chain-close">Watch the seal chain close</a></h2>
+<p>The edict travels through phases as the ritual runs:</p>
+<pre><code>brewing → planning → forging → judging → reviewing → sealed
+</code></pre>
+<ul>
+<li><strong>forging</strong> — the Forge implements the change.</li>
+<li><strong>judging</strong> — the Judge runs the tests and renders a verdict.</li>
+<li><strong>reviewing</strong> — the Chancellor reviews against the Imperial Code.</li>
+</ul>
+<p>When the ritual finishes, the edict <strong>awaits your seal</strong>. This is the final
+gate, and it is yours alone (see <a href="#the-seal-chain">The Seal Chain</a>).</p>
+<h2 id="review-and-grant-the-seal"><a class="header" href="#review-and-grant-the-seal">Review and grant the seal</a></h2>
+<p>Before you seal, look at what changed:</p>
+<pre><code>:!git diff
+</code></pre>
+<p>(Runs <code>git diff</code> inside the sandbox.) When you are satisfied, <strong>grant the seal</strong>.</p>
+<p>Granting your seal is what <strong>ascends</strong> the edict: the court lands the work as a
+single squash-commit on the main branch, and the change enters <strong>現行</strong> — the
+code in force.</p>
+<h2 id="check-what-happened"><a class="header" href="#check-what-happened">Check what happened</a></h2>
+<p>Ask the court anything about the edict:</p>
+<pre><code>What's the status of edict-123456?
+</code></pre>
+<p>The Secretary answers with the phase, the lings, and the test results. To see
+the raw ledger behind that answer, ask for the events:</p>
+<pre><code>What happened during that edict?
+</code></pre>
+<h2 id="when-the-court-asks-you"><a class="header" href="#when-the-court-asks-you">When the court asks <em>you</em></a></h2>
+<p>Sometimes the court will <strong>stop and ask</strong> rather than guess. That is
+<strong>Zhengming</strong> (正名), and it is a feature, not a snag — see
+<a href="#zhengming">Zhengming</a>. An answer is appended to the edict’s
+intent and work resumes.</p>
+<h2 id="a-larger-edict"><a class="header" href="#a-larger-edict">A larger edict</a></h2>
+<p>For medium work (say, 50–200 lines), the court enacts <strong>castle-siege</strong> instead:</p>
+<pre><code>Add a user logout endpoint
+</code></pre>
+<p>Here the <strong>War</strong> ministry first plans the work into <strong>lings</strong> (task orders with
+dependencies), then the Forge implements each in sequence, before judging and
+reviewing. See <a href="#lings">Lings</a> and <a href="#rituals">Rituals</a>.</p>
+<h2 id="the-court-serves-you"><a class="header" href="#the-court-serves-you">The court serves you</a></h2>
+<p>You can always:</p>
+<ul>
+<li><strong>Cancel an edict</strong> — via the <code>:edicts</code> command’s actions, or by asking.</li>
+<li><strong>Take over</strong> — fix the code yourself, commit, and ask the Chancellor to
+review; or open a fresh edict with corrected scope.</li>
+</ul>
+<p>Next, we go deeper into the machinery: <strong>edicts, lings, rituals, and zhengming</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-machinery"><a class="header" href="#the-machinery">The Machinery</a></h1>
+<p>This chapter goes deep on the four moving parts that make the court work — the
+words and structures you will see every time you rule.</p>
+<ol>
+<li><strong><a href="#edicts">Edicts</a></strong> — the unit of intent, and its four statuses.</li>
+<li><strong><a href="#lings">Lings</a></strong> — the sub-tasks an edict decomposes into.</li>
+<li><strong><a href="#rituals">Rituals</a></strong> — the workflows that orchestrate the ministers.</li>
+<li><strong><a href="#zhengming">Zhengming</a></strong> — how the court stops and asks instead of
+guessing.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="edicts"><a class="header" href="#edicts">Edicts</a></h1>
+<blockquote>
+<p><em>“The superior man is modest in his speech, but exceeds in his actions.”</em>
+— Confucius, <em>Analects</em> 4.24</p>
+</blockquote>
+<p>An <strong>Edict</strong> (詔令) is a work order. It is the unit of intent in Asimi: when you
+want something done, you issue an edict, and the court carries it through to a
+seal.</p>
+<h2 id="what-an-edict-is-made-of"><a class="header" href="#what-an-edict-is-made-of">What an edict is made of</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Intent</strong></td><td>What you want done — the <em>what</em> and <em>why</em></td></tr>
+<tr><td><strong>Summary</strong></td><td>A one-line title for the docket</td></tr>
+<tr><td><strong>Issue reference</strong></td><td>Optional link to a GitHub issue (<code>owner/repo#N</code>)</td></tr>
+<tr><td><strong>Session</strong></td><td>The conversation the edict was born in</td></tr>
+<tr><td><strong>Status</strong></td><td>Where it stands: <code>active</code>, <code>blocked</code>, <code>sealed</code>, or <code>cancelled</code></td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-four-statuses"><a class="header" href="#the-four-statuses">The four statuses</a></h2>
+<p>The court is honest about state, and an edict has exactly four legal states:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong><code>active</code></strong></td><td>In flight — a ritual is running, or work waits to begin</td></tr>
+<tr><td><strong><code>blocked</code></strong></td><td>Halted — waiting on <em>you</em> (a pending Zhengming), or on a gate</td></tr>
+<tr><td><strong><code>sealed</code></strong></td><td>Crowned — the full seal chain was granted</td></tr>
+<tr><td><strong><code>cancelled</code></strong></td><td>Abandoned before completion</td></tr>
+</tbody>
+</table>
+</div>
+<p>Status is <strong>derived</strong> from the seals and zhengming records, not stored on the
+edict itself. An edict is <code>sealed</code> precisely because the seal chain is complete
+— see <a href="#the-seal-chain">The Seal Chain</a>.</p>
+<blockquote>
+<p><strong>A note on “phases.”</strong> You may see the sequence
+<code>brewing → planning → forging → judging → reviewing</code> in older material. That
+is the <em>shape of a ritual’s steps</em>, not an edict’s status. The status you act
+on is always one of the four above.</p>
+</blockquote>
+<h2 id="the-seal-chain-at-the-edict-level"><a class="header" href="#the-seal-chain-at-the-edict-level">The seal chain, at the edict level</a></h2>
+<p>Every edict ascends through the same gates:</p>
+<ol>
+<li><strong>Judge’s Seal</strong> — the change is sound (tests pass).</li>
+<li><strong>Chancellor’s Seal</strong> — the change is well-formed (obeys the Imperial Code).</li>
+<li><strong>Ruler’s Seal</strong> — <em>you</em> authorize it.</li>
+<li><strong>頒行 (promulgation)</strong> — the work lands, the edict seals.</li>
+</ol>
+<p>A seal is recorded once and never rewritten. If you later change an edict’s
+intent, its existing seals are <strong>invalidated</strong> — the work must be re-sealed
+against the new intent. This is why changing intent is a serious act.</p>
+<h2 id="issuing-inspecting-and-cancelling"><a class="header" href="#issuing-inspecting-and-cancelling">Issuing, inspecting, and cancelling</a></h2>
+<p>You issue an edict by describing your intent to the Secretary. You inspect one
+by asking, or via the <code>:edicts</code> command:</p>
+<pre><code>:edicts          - Manage edicts (read, enact, seal, resume, cancel)
+</code></pre>
+<p>You can always cancel an edict that has not sealed:</p>
+<pre><code>Cancel edict-123
+</code></pre>
+<blockquote>
+<p><strong>Edicts are not rewritten silently.</strong> Replacing an edict’s intent overwrites
+it and voids its seals. A <strong>cancelled or sealed</strong> edict is not a valid target
+for replacement — for those, issue a new edict.</p>
+</blockquote>
+<h2 id="where-edicts-are-remembered"><a class="header" href="#where-edicts-are-remembered">Where edicts are remembered</a></h2>
+<p>The event ledger (<strong>天</strong>) records every edict’s life: creation, assignment,
+phase changes, ritual steps, seals, and cancellation. To reconstruct what
+happened to any edict, read its events — never rely on memory. See
+<a href="#court-status--troubleshooting">Court Status &amp; Troubleshooting</a>.</p>
+<p>Next: the sub-tasks an edict decomposes into — <strong>lings</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="lings"><a class="header" href="#lings">Lings</a></h1>
+<blockquote>
+<p><em>“Divide and conquer.”</em> — attributed to Philip II of Macedon</p>
+</blockquote>
+<p>A <strong>Ling</strong> (令) is a task order — a sub-task inside an edict’s execution plan.
+When an edict is large enough to need planning, the <strong>War</strong> ministry decomposes
+it into lings with dependencies, and the Forge executes them.</p>
+<h2 id="why-lings-exist"><a class="header" href="#why-lings-exist">Why lings exist</a></h2>
+<p>A single edict can be a large piece of work. Rather than hand a wall of work
+to one minister, the court breaks it into <strong>atomic, ordered</strong> pieces, each of
+which can be tracked, retried, and sealed on its own.</p>
+<p>A typical decomposition:</p>
+<pre><code>Edict: "Add user authentication"
+  |
+  +-- Ling 1: "Create user model"
+  +-- Ling 2: "Add login endpoint"   (depends on Ling 1)
+  +-- Ling 3: "Add logout endpoint"  (depends on Ling 1)
+  +-- Ling 4: "Write auth tests"     (depends on Lings 2, 3)
+</code></pre>
+<p>The dependencies form a <strong>DAG</strong> — a directed graph with no cycles. The court
+refuses a plan with a cycle (you cannot wait on yourself).</p>
+<h2 id="the-four-statuses-1"><a class="header" href="#the-four-statuses-1">The four statuses</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong><code>pending</code></strong></td><td>Not yet started</td></tr>
+<tr><td><strong><code>in_progress</code></strong></td><td>Being worked on</td></tr>
+<tr><td><strong><code>done</code></strong></td><td>Completed successfully</td></tr>
+<tr><td><strong><code>blocked</code></strong></td><td>Waiting on a dependency, or on Zhengming</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong><code>done</code>, not <code>completed</code>.</strong> The code’s vocabulary is exact: a finished ling
+is <strong><code>done</code></strong>. If you see “completed” in older material, read it as <code>done</code>.</p>
+</blockquote>
+<h2 id="rules-for-a-good-ling"><a class="header" href="#rules-for-a-good-ling">Rules for a good ling</a></h2>
+<p>The War ministry lives under strict constraints when it plans:</p>
+<ul>
+<li><strong>All changes to one file belong in one ling.</strong> Do not split a file’s edits
+across lings — it invites conflicts and muddles the seal.</li>
+<li><strong>A ling must be atomic, clear, and testable.</strong> A ling that cannot be
+verified is not a ling.</li>
+<li><strong>No cycles.</strong> Dependencies must form a DAG.</li>
+<li><strong>Exact ids.</strong> Lings are addressed by their full id (e.g.
+<code>74183c66ba0507ba</code>), never by shorthand.</li>
+</ul>
+<h2 id="watching-lings-run"><a class="header" href="#watching-lings-run">Watching lings run</a></h2>
+<p>In a fork-capable ritual like <strong>castle-siege</strong>, the implementing step <strong>forks
+over the lings</strong> — each ling is implemented in turn (batch size 1 by default),
+and completion is recorded as each finishes. You see this as the edict’s work
+progressing, step by step.</p>
+<p>You can ask about an edict’s lings at any time through the Secretary, or via
+the event ledger (lings emit <code>ling_created</code>, <code>ling_started</code>, <code>ling_completed</code>,
+and <code>ling_failed</code> events).</p>
+<p>Next: the workflows that orchestrate the ministers — <strong>rituals</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="rituals"><a class="header" href="#rituals">Rituals</a></h1>
+<blockquote>
+<p><em>“Ritual is the way of Heaven, the righteousness of Earth, and the conduct of
+the people.”</em> — paraphrase of the <em>Book of Rites</em> (禮記)</p>
+</blockquote>
+<p>A <strong>Ritual</strong> is a workflow: a named sequence of steps that ministers execute to
+accomplish a task. Where an edict is <em>what</em> you want done, a ritual is <em>how</em> the
+court does it — a reusable pattern that weaves together prompts, setup, and
+guardrails.</p>
+<p>Rituals are how the court keeps its <strong>礼</strong> (propriety): the same careful shape,
+onevery time, no matter who runs it.</p>
+<h2 id="why-rituals"><a class="header" href="#why-rituals">Why rituals</a></h2>
+<p>A coding task is rarely a single action. Fixing a bug means implementing it,
+<em>then</em> testing it, <em>then</em> reviewing it — in that order, with a gate at each
+step. A ritual makes that order explicit and repeatable. It is the court’s
+answer to <em>“but did you remember to run the tests?”</em> — the ritual does.</p>
+<p>The full reference for authoring rituals lives in
+<a href="docs/rituals.html"><code>intent/docs/rituals.md</code></a>; this chapter is the user’s view.</p>
+<h2 id="what-a-ritual-is-made-of"><a class="header" href="#what-a-ritual-is-made-of">What a ritual is made of</a></h2>
+<p>Each ritual is a YAML document with ordered <strong>steps</strong>. Each step names:</p>
+<ul>
+<li>the <strong>minister</strong> who executes it,</li>
+<li>the <strong>act</strong> — the instruction the minister performs,</li>
+<li>optional <strong>given</strong> context to hand the minister, and</li>
+<li>optional <strong>then</strong> outcomes the step must produce to pass.</li>
+</ul>
+<p>Here is the shape of <strong>swift-strike</strong>, the small-change ritual:</p>
+<pre><code class="language-yaml">- name: swift-strike
+  steps:
+    - name: forging
+      minister: forge
+      act: Implement the changes for the edict.
+      on_failure: retry
+
+    - name: judging
+      minister: judge
+      act: Run the tests; render a verdict.
+      then:
+        - the verdicts are passed
+      on_failure: goto
+      on_failure_target: forging
+
+    - name: reviewing
+      minister: chancellor
+      act: Review against the Imperial Code; record precedent.
+  then:
+    - the edict awaits ruler's seal
+</code></pre>
+<p>Read it top to bottom: Forge implements → Judge tests → Chancellor reviews →
+the edict <strong>awaits your seal</strong>. If judging fails, control <strong>goes back</strong> to
+forging (<code>goto</code>). The ritual drives the seal chain; it never short-circuits it.</p>
+<h2 id="the-context-pattern-background--given--act--then"><a class="header" href="#the-context-pattern-background--given--act--then">The context pattern: background / given / act / then</a></h2>
+<p>Rituals follow a Gherkin-inspired rhythm, borrowed from behaviour-driven
+development:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Part</th><th>Runs</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>background</strong></td><td>once, before steps</td><td>Shared context every step needs</td></tr>
+<tr><td><strong>given</strong></td><td>before a step’s act</td><td>Gather context for this step</td></tr>
+<tr><td><strong>act</strong></td><td>the step</td><td>The minister’s instruction</td></tr>
+<tr><td><strong>then</strong></td><td>after a step</td><td>Validate the outcome</td></tr>
+</tbody>
+</table>
+</div>
+<p>A <code>given</code> or <code>then</code> entry starting with <code>!</code> is a shell command; anything else is
+matched against a library of step definitions (e.g. <em>“the manifests”</em>,
+<em>“the edict details”</em>).</p>
+<h2 id="failure-handling"><a class="header" href="#failure-handling">Failure handling</a></h2>
+<p>Every step declares what to do when it fails:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>on_failure</code></th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><strong><code>retry</code></strong></td><td>Try the same step again (up to <code>max_retries</code>)</td></tr>
+<tr><td><strong><code>goto</code></strong></td><td>Jump to a named step (<code>on_failure_target</code>)</td></tr>
+<tr><td><strong><code>zhengming</code></strong></td><td>Stop and ask you (see <a href="#zhengming">Zhengming</a>)</td></tr>
+</tbody>
+</table>
+</div>
+<p>When all retries are exhausted, the court invokes a <strong>report_failure</strong> ritual
+to summarise what went wrong and distill a question for you. The court never
+silently gives up.</p>
+<h2 id="the-built-in-rituals"><a class="header" href="#the-built-in-rituals">The built-in rituals</a></h2>
+<p>Asimi ships a set of rituals. These are the ones you will meet first:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Ritual</th><th>For</th><th>Steps</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>swift-strike</strong></td><td>Small, focused changes</td><td>forging → judging → reviewing</td></tr>
+<tr><td><strong>castle-siege</strong></td><td>Medium work needing a plan</td><td>strategizing → implementing (fork over lings) → judging → reviewing</td></tr>
+<tr><td><strong>merge-worktree</strong></td><td>Landing a sealed edict</td><td>landing</td></tr>
+<tr><td><strong>dawn-audience</strong></td><td>Court startup briefing</td><td>ping → sandbox check → version check → summarize → next</td></tr>
+<tr><td><strong>clean-slate</strong></td><td>Splitting uncommitted work into commits</td><td>survey → commit</td></tr>
+<tr><td><strong>fix-lint</strong></td><td>Repairing linter errors in parallel</td><td>lint → fix-all-files (fork) → commit-all</td></tr>
+<tr><td><strong>project-init</strong></td><td>Setting up a project for Asimi</td><td>establish-infrastructure → sandbox-ready → chancellor-reviews</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="the-two-you-choose-between-most"><a class="header" href="#the-two-you-choose-between-most">The two you choose between most</a></h3>
+<ul>
+<li><strong>swift-strike</strong> — a tight Forge/Judge/Chancellor loop. Good for a bug fix or
+a small feature. Fast, with a gate at every step.</li>
+<li><strong>castle-siege</strong> — adds a <strong>War</strong> planning phase up front, which records the
+work as <strong>lings</strong>; the implementing step then forks over those lings. Good
+when the work has parts that must happen in order.</li>
+</ul>
+<p>You rarely call a ritual by name. The court selects one from your edict’s scope.</p>
+<h2 id="custom-rituals"><a class="header" href="#custom-rituals">Custom rituals</a></h2>
+<p>You can extend the court with your own rituals in <code>.agents/rituals.yaml</code>. The
+full grammar — triggers, inputs, the fork/join pattern, system steps, every
+context variable — is documented in
+<a href="docs/rituals.html"><code>intent/docs/rituals.md</code></a>.</p>
+<h2 id="rituals-and-the-seal-chain"><a class="header" href="#rituals-and-the-seal-chain">Rituals and the seal chain</a></h2>
+<p>A ritual does not seal an edict by itself. It drives the work <em>to</em> the gates
+and produces the evidence each gate weighs — then the edict <strong>awaits the
+ruler’s seal</strong>. The ritual serves the seal chain; it cannot replace it.</p>
+<p>Next: how the court stops and asks when it is unsure — <strong>Zhengming</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="zhengming"><a class="header" href="#zhengming">Zhengming</a></h1>
+<blockquote>
+<p><em>“If names be not correct, language is not in accordance with the truth of
+things. If language be not in accordance with the truth of things, affairs
+cannot be carried on to success.”</em>
+— Confucius, <em>Analects</em> 13.3</p>
+</blockquote>
+<p><strong>Zhengming</strong> (正名) — “rectification of names” — is the protocol by which the
+court stops and asks you when something is unclear. It is not an error handler
+or a failure mode. It is a way of working.</p>
+<h2 id="the-principle"><a class="header" href="#the-principle">The principle</a></h2>
+<p>From the court’s founding:</p>
+<blockquote>
+<p><strong>Guessing is treason.</strong> A minister that proceeds without clarity betrays the
+Ruler’s trust.</p>
+</blockquote>
+<p>This is the opposite of how most tools behave. A conventional assistant, faced
+with an ambiguous request, quietly picks an interpretation and proceeds. Asimi
+refuses. When a name is not correct — when an instruction could mean two things
+— the court <strong>halts</strong> and requests clarification.</p>
+<h2 id="how-a-zhengming-works"><a class="header" href="#how-a-zhengming-works">How a Zhengming works</a></h2>
+<ol>
+<li>A minister detects genuine ambiguity and calls <strong><code>ask_ruler</code></strong> with a
+question and a small set of concrete options.</li>
+<li>The edict moves to <strong><code>blocked</code></strong> — it will not proceed until answered.</li>
+<li>The <strong>Secretary</strong> (or Chancellor, depending on the path) receives the
+question and may answer from wider context.</li>
+<li>If it cannot, the question <strong>escalates to you</strong>.</li>
+<li><strong>Your answer</strong> is appended to the edict’s intent, and the edict resumes.</li>
+</ol>
+<p>You are presented with options (typically two to four), so answering is fast and
+precise rather than open-ended.</p>
+<h2 id="why-the-court-asks"><a class="header" href="#why-the-court-asks">Why the court asks</a></h2>
+<p>The cost of asking is a moment of your attention. The cost of guessing is
+<em>days</em> — a change built on the wrong assumption, tested, reviewed, and sealed
+before anyone notices it is the wrong thing. The court front-loads the question
+to avoid the rework.</p>
+<p>This is also why the court is designed to keep the <em>number</em> of questions low:
+the Secretary’s job is to <strong>free you to hunt</strong> — to distill intent so sharply
+that the questions that reach you are the few that genuinely matter.</p>
+<blockquote>
+<p><strong>Healthy tension.</strong> There is a deliberate pull between <em>never guessing</em> and
+<em>not bothering the Ruler</em>. That tension keeps the Secretary on his toes.</p>
+</blockquote>
+<h2 id="the-life-of-a-zhengming"><a class="header" href="#the-life-of-a-zhengming">The life of a Zhengming</a></h2>
+<p>A clarification request has a status, just as an edict does. It is usually
+<strong><code>pending</code></strong> until answered, but the court may also retire one:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong><code>pending</code></strong></td><td>Awaiting an answer</td></tr>
+<tr><td><strong><code>answered</code></strong></td><td>You replied; the edict resumed</td></tr>
+<tr><td><strong><code>expired</code></strong></td><td>The deadline elapsed unanswered</td></tr>
+<tr><td><strong><code>dismissed</code></strong></td><td>The court retired it — superseded by newer work</td></tr>
+<tr><td><strong><code>superseded_by_edict</code></strong></td><td>The target edict ended (sealed or cancelled)</td></tr>
+</tbody>
+</table>
+</div>
+<p>By design, a court-authored retirement is <strong>never recorded as <code>answered</code></strong> —
+the ledger must never claim you spoke when you did not.</p>
+<h2 id="where-questions-surface"><a class="header" href="#where-questions-surface">Where questions surface</a></h2>
+<p>The court’s event ledger (<strong>天</strong>) records every request
+(<code>zhengming_needed</code>) and every answer (<code>zhengming_answered</code>). Pending questions
+are visible through the Secretary. When you see an edict sitting in <code>blocked</code>,
+the first thing to check is whether it is waiting on <strong>you</strong>.</p>
+<p>See <a href="#court-status--troubleshooting">Court Status &amp; Troubleshooting</a> for the
+practical commands that surface pending questions.</p>
+<p>Next, we leave the machinery and meet the interface: <strong>the TUI</strong>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-tui"><a class="header" href="#the-tui">The TUI</a></h1>
+<p>Asimi’s interface is a vi-family terminal UI. If you know vim, you already know
+most of it. This chapter is the guided tour of tabs, modes, keys, and commands.</p>
+<ol>
+<li><strong><a href="#tabs">Tabs</a></strong> — Ruling and Hunting, and the minister logs.</li>
+<li><strong><a href="#modes">Modes</a></strong> — INSERT, NORMAL, COMMAND-LINE, SCROLL, and Asimi’s own.</li>
+<li><strong><a href="#keybindings">Keybindings</a></strong> — the keys you already know, collected.</li>
+<li><strong><a href="#commands">Commands</a></strong> — the full command list.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="tabs"><a class="header" href="#tabs">Tabs</a></h1>
+<blockquote>
+<p><em>“There is a time for everything, and a season for every activity.”</em>
+— Ecclesiastes 3:1</p>
+</blockquote>
+<p>Asimi’s TUI (terminal user interface) is built around <strong>tabs</strong>, in the spirit of
+vim’s own. A tab is a workspace: it has its own chat history and its own input
+buffer, so switching tabs never loses your place.</p>
+<h2 id="the-two-tabs-you-start-with"><a class="header" href="#the-two-tabs-you-start-with">The two tabs you start with</a></h2>
+<p>Asimi opens with two tabs:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Tab</th><th>Counterpart</th><th>Tempo</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Ruling</strong></td><td>the <strong>Secretary</strong> (中書令)</td><td>Campaign</td><td>Issue and manage edicts</td></tr>
+<tr><td><strong>Hunting</strong></td><td>the <strong>Chancellor</strong> (門下侍中)</td><td>Skirmish</td><td>Explore, and distill intent</td></tr>
+</tbody>
+</table>
+</div>
+<p>The names are the whole idea:</p>
+<ul>
+<li><strong>Ruling</strong> is the court at deliberate work. Edicts flow through their steps,
+rituals orchestrate the ministers. This is where you <em>govern</em>.</li>
+<li><strong>Hunting</strong> is agility — knight moves, L-shaped thinking. You talk with the
+Chancellor, who sits outside the daily hierarchy and sees everything
+read-only. This is where you <em>spot openings</em>.</li>
+</ul>
+<p>The image is Cao Cao’s <em>«running the empire is like hunting»</em> — the ruler
+sweeps the hunting grounds, the court handles the bureaucracy so the ruler can
+stay in skirmish tempo.</p>
+<h2 id="moving-between-tabs"><a class="header" href="#moving-between-tabs">Moving between tabs</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key / command</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>gt</code></td><td>Next tab</td></tr>
+<tr><td><code>gT</code></td><td>Previous tab</td></tr>
+<tr><td><code>1gt</code>, <code>2gt</code></td><td>Jump to tab 1, 2, …</td></tr>
+<tr><td><code>Tab</code> / <code>Shift+Tab</code></td><td>Cycle tabs</td></tr>
+<tr><td><code>:tabnew &lt;minister&gt;</code></td><td>Open a read-only view of a minister’s work log</td></tr>
+<tr><td><code>:tabclose</code></td><td>Close the current tab</td></tr>
+<tr><td><code>:q</code></td><td>Close the current tab (quit the app if it was the last)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="minister-tabs--observation-not-conversation"><a class="header" href="#minister-tabs--observation-not-conversation">Minister tabs — observation, not conversation</a></h2>
+<p><code>:tabnew &lt;minister&gt;</code> opens a <strong>read-only</strong> tab showing that minister’s work log.
+It is for watching, not for talking:</p>
+<ul>
+<li><code>:tabnew forge</code> — file changes, manifests, commit history</li>
+<li><code>:tabnew judge</code> — test runs and verdicts</li>
+<li><code>:tabnew war</code> — battle plans and lings</li>
+<li><code>:tabnew chancellor</code> — review outcomes and precedents</li>
+</ul>
+<p>This is how you monitor what a minister is doing without interrupting the
+court.</p>
+<h2 id="moving-the-court-between-grounds"><a class="header" href="#moving-the-court-between-grounds">Moving the court between grounds</a></h2>
+<p>A tab can be re-pointed at a different branch or worktree with <code>:switch</code>:</p>
+<pre><code>:switch e123    -&gt; edict 123's worktree (branch asimi/e123); created if missing
+:switch main    -&gt; the main working tree
+:switch &lt;branch&gt; -&gt; a named branch, resolved to its worktree when one exists
+</code></pre>
+<p><code>:switch</code> is refused while a tab is streaming, and resets tabs to their
+defaults. See <a href="#commands">Commands</a>.</p>
+<p>Next: the vi modes you already know, and the two Asimi adds.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="modes"><a class="header" href="#modes">Modes</a></h1>
+<blockquote>
+<p><em>“Everything has beauty, but not everyone sees it.”</em> — attributed to Confucius</p>
+</blockquote>
+<p>Asimi speaks vi. If you have ever used vim or neovim, you are already at home:
+the same <strong>modal</strong> editing, the same muscle memory. Asimi extends the set with
+two modes of its own.</p>
+<p>Each mode has a <strong>status line</strong> and a <strong>colour</strong>, so you always know where you
+are without thinking about it.</p>
+<h2 id="insert-mode--default"><a class="header" href="#insert-mode--default">INSERT mode — default</a></h2>
+<p>Where you compose messages.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Status</strong></td><td><code>-- INSERT --</code></td></tr>
+<tr><td><strong>Border</strong></td><td>Green</td></tr>
+<tr><td><strong>Enter it</strong></td><td><code>i</code>, <code>I</code>, <code>a</code>, <code>A</code>, <code>o</code>, <code>O</code></td></tr>
+<tr><td><strong>Leave it</strong></td><td><code>Esc</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Press <code>Enter</code> to submit; press <code>Alt+Enter</code> (Option+Enter on macOS) to insert a
+newline without sending.</p>
+<h2 id="normal-mode"><a class="header" href="#normal-mode">NORMAL mode</a></h2>
+<p>Where you navigate and issue commands.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Status</strong></td><td><code>-- NORMAL --</code></td></tr>
+<tr><td><strong>Border</strong></td><td>Yellow</td></tr>
+<tr><td><strong>Enter it</strong></td><td><code>Esc</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>From NORMAL you can navigate with <code>h j k l</code>, enter commands with <code>:</code>, return to
+INSERT with <code>i</code>/<code>a</code>/<code>o</code>, and show quick help with <code>?</code>.</p>
+<h2 id="command-line-mode"><a class="header" href="#command-line-mode">COMMAND-LINE mode</a></h2>
+<p>Where you run Asimi commands.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Status</strong></td><td><code>:</code></td></tr>
+<tr><td><strong>Border</strong></td><td>Magenta</td></tr>
+<tr><td><strong>Enter it</strong></td><td><code>:</code> from NORMAL</td></tr>
+</tbody>
+</table>
+</div>
+<p>Type a command and press <code>Enter</code>. <code>Esc</code> cancels. <code>Tab</code> completes.</p>
+<h2 id="scroll-mode"><a class="header" href="#scroll-mode">SCROLL mode</a></h2>
+<p>Where you read the conversation without disturbing the prompt.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Status</strong></td><td><code>-- SCROLL --</code></td></tr>
+<tr><td><strong>Border</strong></td><td>Cyan</td></tr>
+<tr><td><strong>Enter it</strong></td><td><code>Ctrl+b</code>, or scroll the mouse wheel up</td></tr>
+</tbody>
+</table>
+</div>
+<p>While scrolling: <code>j</code>/<code>k</code> line by line, <code>Ctrl+d</code>/<code>Ctrl+u</code> half page, <code>Ctrl+f</code>/
+<code>Ctrl+b</code> full page, <code>G</code> to the bottom. <code>:</code> re-enters COMMAND-LINE while staying
+in history; <code>Esc</code> or <code>i</code> returns you to INSERT.</p>
+<h2 id="learning-mode--asimis-own"><a class="header" href="#learning-mode--asimis-own">LEARNING mode — Asimi’s own</a></h2>
+<p>A mode for teaching the court about your project, in place.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Status</strong></td><td><code>-- LEARNING --</code></td></tr>
+<tr><td><strong>Border</strong></td><td>Purple</td></tr>
+<tr><td><strong>Enter it</strong></td><td><code>#</code> from NORMAL</td></tr>
+</tbody>
+</table>
+</div>
+<p>Type a note and press <code>Enter</code> to <strong>append it to <code>AGENTS.md</code></strong>. This is how you
+feed the court a convention without leaving the terminal:</p>
+<pre><code># We use snake_case for function names in this project
+</code></pre>
+<p>Every minister reads <code>AGENTS.md</code> as standing law, so what you write here
+becomes a rule the whole court follows. <code>Esc</code> cancels.</p>
+<h2 id="select-mode--asimis-own"><a class="header" href="#select-mode--asimis-own">Select mode — Asimi’s own</a></h2>
+<p>Some actions open a <strong>selection list</strong> rather than a prompt: choosing a session
+to resume, a model to connect to, a file to reference. In a selection list:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>j</code>/<code>k</code> or <code>↓</code>/<code>↑</code></td><td>Move through the list</td></tr>
+<tr><td><code>/</code></td><td>Search forward (<code>?</code> backward)</td></tr>
+<tr><td><code>Enter</code></td><td>Select</td></tr>
+<tr><td><code>Esc</code> / <code>q</code></td><td>Cancel</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="the-modes-at-a-glance"><a class="header" href="#the-modes-at-a-glance">The modes at a glance</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Status</th><th>Border</th><th>How to enter</th></tr>
+</thead>
+<tbody>
+<tr><td>INSERT</td><td><code>-- INSERT --</code></td><td>Green</td><td><code>i a o</code> … (default)</td></tr>
+<tr><td>NORMAL</td><td><code>-- NORMAL --</code></td><td>Yellow</td><td><code>Esc</code></td></tr>
+<tr><td>COMMAND-LINE</td><td><code>:</code></td><td>Magenta</td><td><code>:</code></td></tr>
+<tr><td>SCROLL</td><td><code>-- SCROLL --</code></td><td>Cyan</td><td><code>Ctrl+b</code></td></tr>
+<tr><td>LEARNING</td><td><code>-- LEARNING --</code></td><td>Purple</td><td><code>#</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Next: the keys themselves.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="keybindings"><a class="header" href="#keybindings">Keybindings</a></h1>
+<blockquote>
+<p><em>“He who moves not forward, goes backward.”</em> — Goethe</p>
+</blockquote>
+<p>Asimi’s keys are vi’s keys. This chapter collects the ones you will use most,
+grouped by what you are doing.</p>
+<h2 id="moving-the-cursor-normal-mode"><a class="header" href="#moving-the-cursor-normal-mode">Moving the cursor (NORMAL mode)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>h</code> <code>j</code> <code>k</code> <code>l</code></td><td>Left, down, up, right</td></tr>
+<tr><td><code>←</code> <code>↓</code> <code>↑</code> <code>→</code></td><td>Arrow keys work too</td></tr>
+<tr><td><code>w</code> <code>b</code> <code>e</code></td><td>Word forward / back / end of word</td></tr>
+<tr><td><code>0</code> <code>^</code> <code>$</code></td><td>Line start / first non-blank / line end</td></tr>
+<tr><td><code>gg</code> <code>G</code></td><td>Document start / end</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="history"><a class="header" href="#history">History</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>↑</code></td><td>Previous prompt (on the first line)</td></tr>
+<tr><td><code>↓</code></td><td>Next prompt (on the last line)</td></tr>
+<tr><td><code>k</code> / <code>j</code></td><td>Previous / next prompt (NORMAL mode, at the line’s edge)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="tabs-1"><a class="header" href="#tabs-1">Tabs</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>gt</code> / <code>gT</code></td><td>Next / previous tab</td></tr>
+<tr><td><code>1gt</code>, <code>2gt</code></td><td>Jump to a numbered tab</td></tr>
+<tr><td><code>Tab</code> / <code>Shift+Tab</code></td><td>Cycle tabs</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="editing-the-prompt-normal-mode"><a class="header" href="#editing-the-prompt-normal-mode">Editing the prompt (NORMAL mode)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>i</code> <code>I</code> <code>a</code> <code>A</code></td><td>Enter INSERT (before, line-start, after, line-end)</td></tr>
+<tr><td><code>o</code> <code>O</code></td><td>Open a new line below / above and insert</td></tr>
+<tr><td><code>x</code> <code>X</code></td><td>Delete character under / before the cursor</td></tr>
+<tr><td><code>dw</code> <code>dd</code> <code>D</code></td><td>Delete word / line / to end of line</td></tr>
+<tr><td><code>p</code> <code>P</code></td><td>Paste after / before</td></tr>
+<tr><td><code>u</code> <code>Ctrl+r</code></td><td>Undo / redo</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="searching"><a class="header" href="#searching">Searching</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>/pattern</code></td><td>Search forward</td></tr>
+<tr><td><code>?pattern</code></td><td>Search backward</td></tr>
+<tr><td><code>n</code> / <code>N</code></td><td>Next / previous match</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="submitting-and-newlines-insert-mode"><a class="header" href="#submitting-and-newlines-insert-mode">Submitting and newlines (INSERT mode)</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Enter</code></td><td>Submit the prompt</td></tr>
+<tr><td><code>Alt+Enter</code> (<code>Option+Enter</code> on macOS)</td><td>Insert a newline without submitting</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="special-keys"><a class="header" href="#special-keys">Special keys</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>@</code></td><td>Reference a file (opens completion)</td></tr>
+<tr><td><code>#</code></td><td>Comment a line (and in NORMAL mode, enter LEARNING mode)</td></tr>
+<tr><td><code>?</code></td><td>Quick help (NORMAL mode)</td></tr>
+<tr><td><code>Ctrl+C</code> twice</td><td>Quit</td></tr>
+<tr><td><code>Ctrl+Z</code></td><td>Background Asimi</td></tr>
+<tr><td><code>Ctrl+O</code></td><td>Toggle the raw session view</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="referencing-files-with-"><a class="header" href="#referencing-files-with-">Referencing files with <code>@</code></a></h2>
+<p>Type <code>@</code> to open the file-completion dialog and load a file into context:</p>
+<pre><code>Can you review @main.go and suggest improvements?
+</code></pre>
+<p>Type to filter (<code>@mai</code>, <code>@src/</code>), navigate with <code>↓</code>/<code>↑</code>, select with <code>Enter</code>,
+cancel with <code>Esc</code>. Referenced files count against your context; see
+<a href="#context">Context</a>.</p>
+<h2 id="a-vi-fluent-cheat-line"><a class="header" href="#a-vi-fluent-cheat-line">A vi-fluent cheat line</a></h2>
+<pre><code>Esc    normal      i a o   insert      :   command
+@file  reference   #note   teach court  ?   quick help
+gt gT  tabs        / n N   search      u   undo
+</code></pre>
+<p>Next: the full command list.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="commands"><a class="header" href="#commands">Commands</a></h1>
+<blockquote>
+<p><em>“Better a diamond with a flaw than a pebble without.”</em> — attributed to Confucius</p>
+</blockquote>
+<p>Commands are entered from <strong>COMMAND-LINE mode</strong>: press <code>:</code> in NORMAL mode,
+type the command, and press <code>Enter</code>.</p>
+<p>This is the authoritative command surface — the same list Asimi shows for
+<code>:help commands</code>.</p>
+<h2 id="court"><a class="header" href="#court">Court</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>:edicts</code></td><td>Manage edicts (read, enact, seal, resume, cancel)</td></tr>
+<tr><td><code>:continue</code></td><td>Resume a paused ritual on the current tab</td></tr>
+<tr><td><code>:abort</code></td><td>Abort a paused ritual on the current tab</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="navigation"><a class="header" href="#navigation">Navigation</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>:switch &lt;target&gt;</code></td><td>Move the Court to a branch or edict worktree in place</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>:switch</code> targets:</p>
+<pre><code>:switch e123     -&gt; edict 123's worktree (branch asimi/e123); created if missing
+:switch main     -&gt; the main working tree
+:switch &lt;branch&gt; -&gt; a named branch, resolved to its worktree when one exists
+</code></pre>
+<p>It is refused while a tab is streaming, and resets tabs to their defaults.</p>
+<h2 id="session--information"><a class="header" href="#session--information">Session &amp; information</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>:new</code></td><td>Start a new conversation</td></tr>
+<tr><td><code>:resume</code></td><td>Resume a previous session</td></tr>
+<tr><td><code>:help [topic]</code></td><td>Show help, optionally for a specific topic</td></tr>
+<tr><td><code>:context</code></td><td>Show context usage and token information</td></tr>
+<tr><td><code>:export [type]</code></td><td>Export the conversation to a file and open it in <code>$EDITOR</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>:export</code> types: <code>conversation</code> (default), <code>full</code>.</p>
+<h2 id="tabs-2"><a class="header" href="#tabs-2">Tabs</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>:tabnew &lt;minister&gt;</code></td><td>Open a read-only view of a minister’s work log</td></tr>
+<tr><td><code>:tabclose</code></td><td>Close the current tab</td></tr>
+<tr><td><code>:quit</code> / <code>:q</code></td><td>Close the current tab (quit the app if last)</td></tr>
+<tr><td><code>:qa</code> / <code>:quitall</code></td><td>Quit the application (all tabs)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>:init [clean]</code></td><td>Initialize the project: creates <code>AGENTS.md</code>, <code>Justfile</code>, <code>.agents/sandbox/</code></td></tr>
+<tr><td><code>:models</code></td><td>Select an AI model (alias <code>:model</code>)</td></tr>
+<tr><td><code>:login</code></td><td>Authenticate with an AI provider</td></tr>
+<tr><td><code>:update</code></td><td>Check for and install updates</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong><code>:models</code> is not <code>:login</code>.</strong> <code>:models</code> opens the model picker; <code>:login</code>
+authenticates a provider. Older material may conflate the two — it is wrong.
+See <a href="#providers--login">Providers &amp; Login</a>.</p>
+</blockquote>
+<h2 id="examples"><a class="header" href="#examples">Examples</a></h2>
+<pre><code>:help modes      Show help about vi modes
+:new             Start a fresh conversation
+:export          Export and edit the conversation
+:context         Check token usage
+:tabnew forge    Watch the Forge at work
+:switch main     Return the court to the main tree
+:edicts          Open the edict manager
+</code></pre>
+<p>Next: connecting Asimi to a model.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="working-with-models"><a class="header" href="#working-with-models">Working with Models</a></h1>
+<p>Asimi is multi-model. This short chapter connects it to a provider and helps you
+choose the model best suited to the task at hand.</p>
+<ol>
+<li><strong><a href="#providers--login">Providers &amp; Login</a></strong> — authenticate with a provider.</li>
+<li><strong><a href="#selecting-a-model">Selecting a Model</a></strong> — the picker, and how Asimi learns each
+model’s true context window.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="providers--login"><a class="header" href="#providers--login">Providers &amp; Login</a></h1>
+<blockquote>
+<p><em>“The wise man does not lay up his own treasures.”</em> — Laozi</p>
+</blockquote>
+<p>Asimi is multi-model: it can talk to several AI providers, and you can switch
+between them per session. This chapter covers connecting to one. Selecting a
+specific model is the next chapter.</p>
+<h2 id="the-two-commands"><a class="header" href="#the-two-commands">The two commands</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>What it does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>:login</code></td><td>Authenticate with a provider (store credentials)</td></tr>
+<tr><td><code>:models</code></td><td>Pick from the models you can already access</td></tr>
+</tbody>
+</table>
+</div>
+<p>They are <strong>separate</strong>. <code>:login</code> establishes access; <code>:models</code> chooses a model
+among the providers you have access to.</p>
+<h2 id="supported-providers"><a class="header" href="#supported-providers">Supported providers</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Provider</th><th>Auth</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Anthropic</strong> (Claude)</td><td>OAuth, API key (env or keyring)</td></tr>
+<tr><td><strong>OpenAI</strong> (GPT)</td><td>Codex OAuth, or <code>OPENAI_API_KEY</code></td></tr>
+<tr><td><strong>Google AI / Gemini</strong></td><td>API key</td></tr>
+<tr><td><strong>Vertex AI</strong> (Google Cloud)</td><td>gcloud Application Default Credentials</td></tr>
+<tr><td><strong>Ollama</strong> (local)</td><td>none — auto-detected</td></tr>
+<tr><td><strong>OpenRouter</strong>, <strong>Bedrock</strong>, <strong>Azure</strong>, <strong>custom</strong></td><td>provider-specific</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="logging-in"><a class="header" href="#logging-in">Logging in</a></h2>
+<p>Run <code>:login</code> to open the provider list:</p>
+<pre><code>:login
+</code></pre>
+<ul>
+<li><strong>Login with OpenAI (Codex OAuth)</strong> — opens a browser; a local callback server
+on port <code>1455</code> receives the authorization. Requires a browser and port 1455
+to be free.</li>
+<li><strong>Set API key for Anthropic / Google AI / OpenRouter</strong> — prompts for a key,
+which is stored in your <strong>OS keyring</strong> (never in plaintext config).</li>
+</ul>
+<p>After a successful login, the model list is refreshed.</p>
+<h2 id="logging-out"><a class="header" href="#logging-out">Logging out</a></h2>
+<pre><code>:logout
+</code></pre>
+<p>Clears the stored credentials for the current provider.</p>
+<h2 id="vertex-ai--no-login-inside-asimi"><a class="header" href="#vertex-ai--no-login-inside-asimi">Vertex AI — no login inside Asimi</a></h2>
+<p>Vertex authenticates <strong>out-of-band</strong> using gcloud Application Default
+Credentials. There is no <code>:login</code> step and no <code>VERTEX_API_KEY</code>:</p>
+<pre><code class="language-bash">gcloud auth application-default login
+gcloud config set project &lt;your-project-id&gt;
+</code></pre>
+<p>The project is read from <code>GOOGLE_CLOUD_PROJECT</code> when set, otherwise from
+<code>gcloud config get-value project</code>. Optionally set <code>GOOGLE_CLOUD_REGION</code>
+(default <code>global</code>) and <code>GOOGLE_APPLICATION_CREDENTIALS</code>.</p>
+<h2 id="environment-variables-as-an-alternative"><a class="header" href="#environment-variables-as-an-alternative">Environment variables as an alternative</a></h2>
+<p>Instead of <code>:login</code>, you may set API keys in the environment:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Provider</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ANTHROPIC_API_KEY</code></td><td>Anthropic</td></tr>
+<tr><td><code>ANTHROPIC_OAUTH_TOKEN</code></td><td>Anthropic (priority over keyring)</td></tr>
+<tr><td><code>OPENAI_API_KEY</code></td><td>OpenAI</td></tr>
+<tr><td><code>GEMINI_API_KEY</code></td><td>Google Gemini</td></tr>
+<tr><td><code>OPENROUTER_API_KEY</code></td><td>OpenRouter</td></tr>
+<tr><td><code>GOOGLE_CLOUD_PROJECT</code></td><td>Vertex AI (gcloud ADC)</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>Full env-var catalog:</strong> the environment variable list also includes
+system variables (<code>EDITOR</code>, <code>SHELL</code>), OAuth overrides, and development
+switches. See <a href="#config-files">Config Files</a>.</p>
+</blockquote>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<ul>
+<li><strong>OAuth times out</strong> — ensure port <code>1455</code> is free and the browser opened.</li>
+<li><strong>API key not accepted</strong> — check for trailing whitespace; try <code>:logout</code> then
+<code>:login</code> again.</li>
+<li><strong>Ollama not detected</strong> — ensure <code>ollama serve</code> is running and you have pulled
+at least one model; check <code>OLLAMA_HOST</code>.</li>
+</ul>
+<p>Next: choosing the model itself.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="selecting-a-model"><a class="header" href="#selecting-a-model">Selecting a Model</a></h1>
+<blockquote>
+<p><em>“The right tool for the right task.”</em></p>
+</blockquote>
+<p>Asimi can talk to many providers, each offering many models. This chapter is
+about choosing one — and about how Asimi learns each model’s true size.</p>
+<h2 id="the-model-picker"><a class="header" href="#the-model-picker">The model picker</a></h2>
+<pre><code>:models          Open the live model picker (alias :model)
+:models refresh  Force a live refetch, bypassing the session cache
+</code></pre>
+<p>The picker enumerates models <strong>live</strong> from each configured provider, shows
+useful metadata per row (context window, price), and lists the current
+provider’s models first.</p>
+<p>Navigation:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>↓</code>/<code>↑</code></td><td>Move through models</td></tr>
+<tr><td><code>/</code></td><td>Search forward (<code>?</code> backward)</td></tr>
+<tr><td><code>Enter</code></td><td>Select</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="selecting-directly"><a class="header" href="#selecting-directly">Selecting directly</a></h2>
+<pre><code>:model openrouter/anthropic/claude-3.5-sonnet   provider/name
+:model openai gpt-4o                             provider and name, space-separated
+:model gpt-4o                                    a name, using the current provider
+</code></pre>
+<h2 id="reading-the-picker"><a class="header" href="#reading-the-picker">Reading the picker</a></h2>
+<ul>
+<li>A leading <strong><code>~</code></strong> marks an <strong>estimate</strong>: <code>~200K ctx</code> means the provider did not
+report a context length, so Asimi filled one in from its local registry. A
+plain <code>200K ctx</code> is provider-reported and exact.</li>
+<li>Unreachable providers appear as a diagnostic line, e.g.
+<code>unavailable: openrouter (401)</code>, rather than disappearing — the picker still
+shows every model from the providers that did respond.</li>
+<li>Plain OpenAI-compatible endpoints report only model ids; the picker shows
+fewer columns rather than warning.</li>
+<li>The picker always ends with a <strong>“Type a model name…”</strong> row, as a last resort.</li>
+</ul>
+<h2 id="the-cache"><a class="header" href="#the-cache">The cache</a></h2>
+<p>The catalog is fetched once and cached <strong>in memory for the session</strong>, so
+reopening the picker is instant and makes no network calls. Use
+<code>:models refresh</code> after a provider adds models, or after a provider that was
+briefly unreachable recovers.</p>
+<h2 id="how-the-context-window-is-learned"><a class="header" href="#how-the-context-window-is-learned">How the context window is learned</a></h2>
+<p>Asimi prefers <strong>provider-reported</strong> context windows and treats them as the
+source of truth. When a provider reports nothing, Asimi falls back to a local
+registry <em>estimate</em>, always rendered with a leading <code>~</code> so an estimate is never
+shown as exact. See <a href="#context">Context</a>.</p>
+<h2 id="switching-providers"><a class="header" href="#switching-providers">Switching providers</a></h2>
+<p>The provider follows the model. Selecting a model from a different provider
+switches the court to it. You can also set it in config:</p>
+<pre><code class="language-toml">[llm]
+provider = "openai"
+</code></pre>
+<h2 id="troubleshooting-1"><a class="header" href="#troubleshooting-1">Troubleshooting</a></h2>
+<ul>
+<li><strong>No models available</strong> — check <code>:login</code> or your API keys, and network access.</li>
+<li><strong>Model not found</strong> — use <code>:models</code> to see what is actually available; check
+the provider’s naming; confirm your key has access to that model.</li>
+</ul>
+<p>Next: configuration.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h1>
+<p>How to shape Asimi to your project and your preferences: config files, saved
+sessions, the context window, and the containerized sandbox in which the agent’s
+shell runs.</p>
+<ol>
+<li><strong><a href="#config-files">Config Files</a></strong> — where settings live, and the ones you’ll touch.</li>
+<li><strong><a href="#sessions">Sessions</a></strong> — saving, resuming, and exporting conversations.</li>
+<li><strong><a href="#context">Context</a></strong> — the model’s memory budget, and what to do when it
+fills.</li>
+<li><strong><a href="#the-sandbox">The Sandbox</a></strong> — the isolated container the court works in.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="config-files"><a class="header" href="#config-files">Config Files</a></h1>
+<blockquote>
+<p><em>“To know what you know and what you do not know, that is true knowledge.”</em>
+— Confucius, <em>Analects</em> 2.17</p>
+</blockquote>
+<p>Asimi reads configuration from files and environment variables. This chapter
+covers where configuration lives and the settings you are most likely to
+touch.</p>
+<h2 id="configuration-files"><a class="header" href="#configuration-files">Configuration files</a></h2>
+<p>Asimi looks for configuration in this order (later overrides earlier):</p>
+<ol>
+<li><code>.agents/asimi.conf</code> — <strong>project-level</strong></li>
+<li><code>~/.config/asimi/asimi.conf</code> — <strong>user-level</strong></li>
+</ol>
+<p>After first run, your user file is loaded with all the defaults.</p>
+<h2 id="the-settings-you-will-touch"><a class="header" href="#the-settings-you-will-touch">The settings you will touch</a></h2>
+<pre><code class="language-toml">[llm]
+provider = "anthropic"                 # AI provider
+model = "claude-sonnet-4-20250514"     # Model name
+max_turns = 50                         # Max conversation turns
+max_thinking_tokens = 10000            # Extended-reasoning budget
+max_tool_output = 50000                # Max tool output, bytes
+
+[session]
+enabled = true                         # Persist sessions
+auto_save = true                       # Save after each message
+max_sessions = 50                      # Sessions to keep
+max_age_days = 30                      # Delete older sessions
+list_limit = 20                        # Sessions shown in :resume
+</code></pre>
+<h2 id="the-court-settings"><a class="header" href="#the-court-settings">The court settings</a></h2>
+<p>Court behavior is configured under <code>[court]</code>:</p>
+<pre><code class="language-toml">[court]
+poll_interval = "5s"               # Ritual Guard polling interval
+step_idle_timeout = "5m"           # Max *silence* before aborting a step
+runner_flatline_timeout = "15m"    # Stop/remove idle per-edict containers (0 disables)
+</code></pre>
+<p>Two of these deserve explanation:</p>
+<ul>
+<li><strong><code>step_idle_timeout</code></strong> is an <strong>idle</strong> timer, not a wall-clock deadline. It
+resets on <em>every</em> notification from the minister — stream chunks, tool calls,
+and so on. A minister actively producing output (even slowly) never trips it;
+only a truly stuck step is aborted.</li>
+<li><strong><code>runner_flatline_timeout</code></strong> extends the same idle metaphor to per-edict
+containers. Each edict gets its own runner and container; after this long with
+no activity, that container is stopped and removed (a later ritual recreates
+it against the same on-disk worktree). An edict with a running or queued
+ritual is never flatlined.</li>
+</ul>
+<h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
+<h3 id="system"><a class="header" href="#system">System</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>EDITOR</code></td><td>Editor used by <code>:export</code></td></tr>
+<tr><td><code>SHELL</code></td><td>Shell for container sessions (default <code>/bin/bash</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="api-keys--authentication"><a class="header" href="#api-keys--authentication">API keys &amp; authentication</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ANTHROPIC_API_KEY</code></td><td>Anthropic API key</td></tr>
+<tr><td><code>ANTHROPIC_OAUTH_TOKEN</code></td><td>Anthropic OAuth token (priority over keyring)</td></tr>
+<tr><td><code>ANTHROPIC_BASE_URL</code></td><td>Custom Anthropic endpoint</td></tr>
+<tr><td><code>OPENAI_API_KEY</code></td><td>OpenAI API key</td></tr>
+<tr><td><code>GEMINI_API_KEY</code></td><td>Google Gemini API key</td></tr>
+<tr><td><code>GOOGLE_CLOUD_PROJECT</code></td><td>Vertex AI GCP project</td></tr>
+<tr><td><code>GOOGLE_CLOUD_REGION</code></td><td>Vertex AI region (default <code>global</code>)</td></tr>
+<tr><td><code>GOOGLE_APPLICATION_CREDENTIALS</code></td><td>Service-account JSON path or JSON</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="development--testing"><a class="header" href="#development--testing">Development &amp; testing</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ASIMI_KEYRING_SERVICE</code></td><td>Override keyring service name (default <code>asimi-cli</code>)</td></tr>
+<tr><td><code>ASIMI_SKIP_GIT_STATUS</code></td><td>Skip git status checks</td></tr>
+<tr><td><code>ASIMI_VERSION</code></td><td>Override version string for testing</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>The full catalog</strong>, including OAuth endpoint overrides
+(<code>GOOGLE_CLIENT_ID</code>, <code>OPENAI_AUTH_URL</code>, …) and the sandbox-specific
+variables, lives in <code>intent/docs/</code> and the in-terminal <code>:help config</code>.</p>
+</blockquote>
+<h2 id="logging"><a class="header" href="#logging">Logging</a></h2>
+<p>Logs are rotated and stored under <code>~/.local/share/asimi/</code>. When running with
+<code>--debug</code>, logs are instead written to <code>asimi.log</code> in the project root for
+quick inspection.</p>
+<h2 id="applying-changes"><a class="header" href="#applying-changes">Applying changes</a></h2>
+<p>Restart Asimi for configuration changes to take effect.</p>
+<p>Next: how sessions are saved and resumed.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sessions"><a class="header" href="#sessions">Sessions</a></h1>
+<blockquote>
+<p><em>“What is past is prologue.”</em> — Shakespeare, <em>The Tempest</em></p>
+</blockquote>
+<p>Asimi can save and resume your coding sessions, preserving the entire
+conversation history and context.</p>
+<h2 id="starting-fresh"><a class="header" href="#starting-fresh">Starting fresh</a></h2>
+<pre><code>:new             Start a fresh conversation
+</code></pre>
+<p><code>:new</code> clears the chat history and context. Start a new session whenever you
+begin a genuinely new task.</p>
+<h2 id="resuming"><a class="header" href="#resuming">Resuming</a></h2>
+<pre><code>:resume          Show recent sessions; pick one to resume
+</code></pre>
+<p>The session list shows:</p>
+<ul>
+<li>the <strong>first prompt</strong> from each session,</li>
+<li><strong>time since last update</strong>, and</li>
+<li>the <strong>project</strong>/directory.</li>
+</ul>
+<p>Navigation:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>↓</code>/<code>↑</code></td><td>Move through sessions</td></tr>
+<tr><td><code>Enter</code></td><td>Resume the selected session</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="auto-save"><a class="header" href="#auto-save">Auto-save</a></h2>
+<p>Sessions are saved automatically when:</p>
+<ul>
+<li>you send a message,</li>
+<li>you quit Asimi, or</li>
+<li>you start a new session.</li>
+</ul>
+<h2 id="session-configuration"><a class="header" href="#session-configuration">Session configuration</a></h2>
+<pre><code class="language-toml">[session]
+enabled = true           # Enable session persistence
+auto_save = true         # Auto-save after each message
+max_sessions = 50        # Maximum sessions to keep
+max_age_days = 30        # Delete sessions older than this
+list_limit = 20          # Number shown in :resume
+</code></pre>
+<h2 id="where-sessions-live"><a class="header" href="#where-sessions-live">Where sessions live</a></h2>
+<pre><code>~/.local/share/asimi/sessions/
+</code></pre>
+<p>Each session includes the full conversation history, context files, the model
+and provider in use, and timestamps.</p>
+<h2 id="exporting"><a class="header" href="#exporting">Exporting</a></h2>
+<pre><code>:export              Export the conversation
+:export conversation Export just the conversation
+:export full         Export with full context
+</code></pre>
+<p>The exported file opens in your <code>$EDITOR</code> for review or sharing.</p>
+<p>Next: keeping an eye on the context window.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="context"><a class="header" href="#context">Context</a></h1>
+<blockquote>
+<p><em>“The eye is not satisfied with seeing, nor the ear filled with hearing.”</em>
+— Ecclesiastes 1:8</p>
+</blockquote>
+<p>Every model has a limited <strong>context window</strong> — the amount of text it can hold in
+mind at once. Asimi tracks token usage so you stay within that limit and manage
+the conversation deliberately.</p>
+<h2 id="viewing-context"><a class="header" href="#viewing-context">Viewing context</a></h2>
+<pre><code>:context         Show detailed context information
+</code></pre>
+<p>The context view shows token usage, the maximum limit, the percentage used,
+the number of messages, and the files currently loaded.</p>
+<h2 id="where-the-window-comes-from"><a class="header" href="#where-the-window-comes-from">Where the window comes from</a></h2>
+<p>The window is <strong>provider-reported when available</strong> — Asimi asks the provider for
+the model’s real context length and treats that as the source of truth. When
+the provider reports nothing, Asimi falls back to a local registry <em>estimate</em>,
+always rendered with a leading <code>~</code> (e.g. <code>~128.0k</code>) so an estimate is never
+shown as exact. See <a href="#selecting-a-model">Selecting a Model</a>.</p>
+<h2 id="automatic-overflow-recovery"><a class="header" href="#automatic-overflow-recovery">Automatic overflow recovery</a></h2>
+<p>If a request is rejected because the prompt exceeds the model’s window, Asimi
+does <strong>not</strong> halt. It:</p>
+<ol>
+<li>learns the true window from the provider’s error message,</li>
+<li>compacts the conversation with a bounded summary (older and large messages
+are trimmed as needed), and</li>
+<li>re-sends your message once.</li>
+</ol>
+<p>If recovery still cannot fit, the session stays alive and you get an actionable
+hint: <code>context window N exceeded — use :compact or :new</code>.</p>
+<h2 id="managing-context"><a class="header" href="#managing-context">Managing context</a></h2>
+<p>When context grows large:</p>
+<ol>
+<li><strong>Compact</strong> the conversation: <code>:compact</code></li>
+<li><strong>Start fresh</strong>: <code>:new</code></li>
+<li><strong>Export</strong> before you do either: <code>:export</code></li>
+<li><strong>Reference only essential files</strong> with <code>@</code></li>
+<li><strong>Be concise</strong> in your requests</li>
+</ol>
+<h2 id="context-files"><a class="header" href="#context-files">Context files</a></h2>
+<p>Files referenced with <code>@</code> are loaded into context. <code>:context</code> lists them.</p>
+<h2 id="what-asimi-counts"><a class="header" href="#what-asimi-counts">What Asimi counts</a></h2>
+<p>Tokens are counted for your prompts, the AI’s responses, system messages, file
+contents, and tool calls and results.</p>
+<h2 id="best-practices"><a class="header" href="#best-practices">Best practices</a></h2>
+<ol>
+<li>Watch usage with <code>:context</code></li>
+<li>Start a fresh session for each new task</li>
+<li>Reference files only when needed</li>
+<li>Export important conversations before starting new ones</li>
+</ol>
+<p>Next: the sandbox.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="the-sandbox"><a class="header" href="#the-sandbox">The Sandbox</a></h1>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="reference"><a class="header" href="#reference">Reference</a></h1>
+<p>Two closing pieces: a practical guide to reading the court’s state and
+unblocking it, and the philosophy that gives the whole design its shape.</p>
+<ol>
+<li><strong><a href="#court-status--troubleshooting">Court Status &amp; Troubleshooting</a></strong> — how to see what is
+happening, and what to do when something is stuck.</li>
+<li><strong><a href="#philosophy">Philosophy</a></strong> — the Five Constant Virtues and the ideas
+underneath the metaphor.</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="court-status--troubleshooting"><a class="header" href="#court-status--troubleshooting">Court Status &amp; Troubleshooting</a></h1>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="philosophy"><a class="header" href="#philosophy">Philosophy</a></h1>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "__livereload";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-09f2665d.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>

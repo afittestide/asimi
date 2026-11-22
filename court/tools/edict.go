@@ -145,13 +145,38 @@ func (t ListEdictsTool) Call(ctx context.Context, input string) (string, error) 
 		return "", fmt.Errorf("database connection not initialized")
 	}
 
+	// in_scope means the size of the scope itself, never the size of whatever
+	// a LIMIT happened to return (e1080).
+	var inScope int64
+	if err := t.DB.Model(&storage.Edict{}).
+		Where("username = ? AND project = ?", t.Username, t.Project).
+		Count(&inScope).Error; err != nil {
+		return "", fmt.Errorf("count edicts: %w", err)
+	}
+
+	// Only a genuinely empty scope may raise the fail-loud scope report. A
+	// populated scope whose filter excludes every row is reported below with
+	// true numbers (e968).
+	if inScope == 0 {
+		return emptyScopeReport(t.DB, &storage.Edict{}, "", nil, t.Username, t.Project), nil
+	}
+
+	query := t.DB.Where("username = ? AND project = ?", t.Username, t.Project).Order("created_at DESC")
+	// Status is derived outside SQL, so a status filter must see the whole
+	// scope: limiting the query first would truncate the candidate set and
+	// manufacture false "none match" answers. The LIMIT is applied to the
+	// matched set instead, below.
+	if params.Status == "" {
+		query = query.Limit(params.Limit)
+	}
+
 	var edicts []storage.Edict
-	query := t.DB.Where("username = ? AND project = ?", t.Username, t.Project).Order("created_at DESC").Limit(params.Limit)
 	if err := query.Find(&edicts).Error; err != nil {
 		return "", fmt.Errorf("list edicts: %w", err)
 	}
 
-	// Filter by status if specified (using derived status)
+	// Filter by status if specified (using derived status), then apply Limit
+	// to the matched set.
 	sealService := storage.NewSealService(t.DB)
 	var results []map[string]any
 	var rows [][]string
@@ -176,20 +201,18 @@ func (t ListEdictsTool) Call(ctx context.Context, input string) (string, error) 
 			string(status),
 			tableCell(e.Intent, tableCellMaxLen),
 		})
+
+		if params.Status != "" && len(results) >= params.Limit {
+			break
+		}
 	}
 
-	// Only a genuinely empty scope may raise the fail-loud scope report. When
-	// the scope holds rows and the optional status filter excluded them all,
-	// return a message that says so — never the false "0 rows" report (e968).
-	if len(edicts) == 0 {
-		return emptyScopeReport(t.DB, &storage.Edict{}, "", nil, t.Username, t.Project), nil
-	}
 	if len(results) == 0 {
 		resultJSON, _ := json.Marshal(map[string]any{
-			"in_scope": len(edicts),
+			"in_scope": inScope,
 			"matched":  0,
 			"status":   params.Status,
-			"message":  fmt.Sprintf("%d edicts in scope for username=%q project=%q, none match status=%q", len(edicts), t.Username, t.Project, params.Status),
+			"message":  fmt.Sprintf("%d edicts in scope for username=%q project=%q, none match status=%q", inScope, t.Username, t.Project, params.Status),
 		})
 		return string(resultJSON), nil
 	}

@@ -452,6 +452,183 @@ func TestListEdictsTool_StatusFilterMissDoesNotLie(t *testing.T) {
 	}
 }
 
+// TestListEdictsTool_FilterAppliesBeforeLimit covers edict 1080: the derived
+// status filter must run over the whole scope, not over whatever LIMIT rows
+// the SQL happened to return first. With more cancelled edicts than Limit, all
+// up to Limit are returned; with Limit above the count, all are returned.
+func TestListEdictsTool_FilterAppliesBeforeLimit(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := 1; i <= 4; i++ {
+		cancelled := base.Add(time.Duration(i) * time.Hour)
+		e := storage.Edict{
+			ID:          uint(i),
+			Username:    "testuser",
+			Project:     "testproject",
+			Intent:      fmt.Sprintf("Cancelled edict %d", i),
+			CancelledAt: &cancelled,
+			CreatedAt:   base.Add(time.Duration(i) * time.Minute),
+		}
+		if err := db.Create(&e).Error; err != nil {
+			t.Fatalf("failed to create edict: %v", err)
+		}
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "testuser", Project: "testproject"}
+
+	// Limit below the number of matches: all up to Limit are returned.
+	result, err := tool.Call(context.Background(), `{"status": "cancelled", "limit": 2}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	env, ok := isMarkdownTableEnvelope(result)
+	if !ok {
+		t.Fatalf("result is not a table envelope: %s", result)
+	}
+	if len(env.Rows) != 2 {
+		t.Fatalf("Rows = %d, want 2 (Limit)", len(env.Rows))
+	}
+	for _, row := range env.Rows {
+		if row[1] != "cancelled" {
+			t.Errorf("row = %v, want status cancelled", row)
+		}
+	}
+
+	// Limit above the number of matches: all are returned.
+	result, err = tool.Call(context.Background(), `{"status": "cancelled", "limit": 10}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	env, ok = isMarkdownTableEnvelope(result)
+	if !ok {
+		t.Fatalf("result is not a table envelope: %s", result)
+	}
+	if len(env.Rows) != 4 {
+		t.Errorf("Rows = %d, want 4 (all cancelled edicts)", len(env.Rows))
+	}
+}
+
+// TestListEdictsTool_FilterFindsCancelledBehindNewerRows is the regression from
+// edict 1080: the newest rows are not cancelled, yet cancelled edicts must
+// still be found instead of a false "none match".
+func TestListEdictsTool_FilterFindsCancelledBehindNewerRows(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	cancelled := base.Add(time.Hour)
+	oldCancelled := storage.Edict{
+		ID: 1, Username: "testuser", Project: "testproject", Intent: "Old cancelled edict",
+		CancelledAt: &cancelled, CreatedAt: base,
+	}
+	if err := db.Create(&oldCancelled).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+	for i := 2; i <= 3; i++ {
+		e := storage.Edict{
+			ID: uint(i), Username: "testuser", Project: "testproject",
+			Intent:    fmt.Sprintf("Newer active edict %d", i),
+			CreatedAt: base.Add(time.Duration(i) * time.Hour),
+		}
+		if err := db.Create(&e).Error; err != nil {
+			t.Fatalf("failed to create edict: %v", err)
+		}
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "testuser", Project: "testproject"}
+
+	// Limit 1 inspects only the newest row, which is active — yet the cancelled
+	// edict must be returned, not a false none-match.
+	result, err := tool.Call(context.Background(), `{"status": "cancelled", "limit": 1}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	env, ok := isMarkdownTableEnvelope(result)
+	if !ok {
+		t.Fatalf("result is not a table envelope (filter reported nothing?): %s", result)
+	}
+	if len(env.Rows) != 1 {
+		t.Fatalf("Rows = %d, want 1", len(env.Rows))
+	}
+	if env.Rows[0][0] != "1" || env.Rows[0][1] != "cancelled" {
+		t.Errorf("row = %v, want [1 cancelled ...]", env.Rows[0])
+	}
+}
+
+// TestListEdictsTool_InScopeIsScopeSizeNotLimit covers edict 1080: in_scope
+// must be the scope size computed independently, never len(edicts) — so it is
+// unaffected by Limit and by the status filter.
+func TestListEdictsTool_InScopeIsScopeSizeNotLimit(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	for i := 1; i <= 3; i++ {
+		e := storage.Edict{
+			ID: uint(i), Username: "testuser", Project: "testproject",
+			Intent: fmt.Sprintf("Active edict %d", i),
+		}
+		if err := db.Create(&e).Error; err != nil {
+			t.Fatalf("failed to create edict: %v", err)
+		}
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "testuser", Project: "testproject"}
+	result, err := tool.Call(context.Background(), `{"status": "blocked", "limit": 1}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	var payload struct {
+		InScope int    `json:"in_scope"`
+		Matched int    `json:"matched"`
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		t.Fatalf("filter-miss result is not the expected shape: %v\n%s", err, result)
+	}
+	if payload.InScope != 3 {
+		t.Errorf("in_scope = %d, want 3 (the scope size, not the Limit)", payload.InScope)
+	}
+	if payload.Matched != 0 || payload.Status != "blocked" {
+		t.Errorf("payload = %+v, want matched=0 status=blocked", payload)
+	}
+	if !containsSubstring(payload.Message, "3 edicts in scope") {
+		t.Errorf("message %q should name the true in-scope count", payload.Message)
+	}
+}
+
+// TestListEdictsTool_EmptyScopeWithFilterStillReportsScope covers edict 1080
+// acceptance 3: a genuinely empty scope keeps the fail-loud scope report even
+// when a status filter is supplied.
+func TestListEdictsTool_EmptyScopeWithFilterStillReportsScope(t *testing.T) {
+	db := setupEdictTestDB(t)
+
+	edict := storage.Edict{ID: 927, Username: "daonb", Project: "oct7-io/data-poisoning-benchmark", Intent: "Give the sandbox gh CLI"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("failed to create edict: %v", err)
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "daonb", Project: "daonb/data-poisoning-benchmark"}
+	result, err := tool.Call(context.Background(), `{"status": "cancelled"}`)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	var report ScopeReport
+	if err := json.Unmarshal([]byte(result), &report); err != nil {
+		t.Fatalf("empty-scope result is not the scope-report shape: %v\n%s", err, result)
+	}
+	if report.Rows != 0 {
+		t.Errorf("report.Rows = %d, want 0", report.Rows)
+	}
+	if report.Project != "daonb/data-poisoning-benchmark" {
+		t.Errorf("report queried project = %q, want daonb/data-poisoning-benchmark", report.Project)
+	}
+	if len(report.Nearby) != 1 || report.Nearby[0].Project != "oct7-io/data-poisoning-benchmark" {
+		t.Errorf("report.Nearby = %+v, want the oct7-io scope", report.Nearby)
+	}
+}
+
 // TestListEdictsTool_FormatCoversEnvelope covers the populated table-envelope
 // branch added to Format in edict 988 while the scope-report path stays intact.
 func TestListEdictsTool_FormatCoversEnvelope(t *testing.T) {

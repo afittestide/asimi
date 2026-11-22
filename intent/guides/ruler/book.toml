@@ -1,0 +1,13 @@
+[book]
+title = "The Ruler's Guide"
+authors = ["The Asimi Court"]
+description = "A sandboxed imperial court for your project — the user's guide"
+src = "src"
+language = "en"
+# mdBook writes the generated site to book/ (gitignored; built in CI).
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/afittestide/asimi"
+edit-url-template = "https://github.com/afittestide/asimi/edit/main/intent/guides/ruler/{path}"
+site-url = "/"
