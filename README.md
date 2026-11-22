@@ -16,7 +16,7 @@ Here are those that are key for Asimi:
 - Rituals - Asimi replaces the artistic rituals with workflows that weave prompts, setup and guardrails.
 - The ruler can be wrong
 
-> **New to Asimi?** Start with the [Ruler's Guide](intent/docs/RULER_GUIDE.md) — a 10-minute walkthrough from installation to your first edict.
+> **New to Asimi?** Start with [The Ruler's Guide](intent/guides/ruler/) — a walkthrough from installation to your first edict.
 
 ![Asimi Demo](demo.gif)
 

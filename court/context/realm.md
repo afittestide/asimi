@@ -17,6 +17,7 @@ It is managed by git which divides it into:
    - tests/ test output
    - runs/ CI pipelines output
    - logs/ logs from runs to be analyzed
+   - valn/ security vulnerabilities 
 地 earth program's code
    - Raw code, files, directories
    - Program's development infrastructure

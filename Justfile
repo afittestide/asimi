@@ -185,6 +185,10 @@ test-coverage:
 test-intent:
     go test -mod=mod -run TestIntentGherkin -timeout 30s .
 
+# Serve a guide book with live reload (mdbook serve intent/guides/<name>), e.g. `just serve-book ruler`
+serve-book name:
+    mdbook serve intent/guides/{{name}}
+
 # Run the terminal-bench activation E2E test with a real LLM.
 # Requires CI=1, LLM_E2E=1, and a provider API key in the environment
 # (ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY).
@@ -316,7 +320,7 @@ bootstrap:
     go install golang.org/x/vuln/cmd/govulncheck@latest
 
 # Run vulnerability scanning, save output to ./heaven/threats/<tool>-<datetime>.out
-get-threats:
+get-vuln:
     #!/usr/bin/env bash
     set -o pipefail
     tool="govulncheck"
@@ -325,7 +329,7 @@ get-threats:
         exit 1
     fi
     allowlist="security/vuln-allowlist.txt"
-    report_dir="heaven/threats"
+    report_dir="heaven/vulns"
     mkdir -p "$report_dir"
     report="$report_dir/${tool}-{{now}}.out"
     go build -tags containers_image_openpgp -o /tmp/asimi-vuln .

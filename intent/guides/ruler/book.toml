@@ -4,7 +4,7 @@ authors = ["The Asimi Court"]
 description = "A sandboxed imperial court for your project — the user's guide"
 src = "src"
 language = "en"
-# mdBook writes the generated site to book/ (gitignored; built in CI).
+# mdBook writes the generated site to book/, which is gitignored — never commit it.
 
 [output.html]
 default-theme = "navy"

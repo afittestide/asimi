@@ -24,3 +24,6 @@ intent/issues
 # logs. Local evidence, never committed (intent/docs/the_three_realms.md). Ignore every                                         
 # subdirectory; root-level declarations (e.g. heaven.conf) stay tracked.                                                 
 heaven/
+# mdBook generated sites — never commit build output (run `just serve-book <name>` to preview).
+intent/**/book/**
+intent/guides/*/book/

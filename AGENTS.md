@@ -33,7 +33,7 @@ Use `just <recipe>` to manage the project:
 - fmt                            # Format code
 - freeze-logs                    # Freeze the log files to `./heaven/logs/asimi[-deamon]-<datetime>.log`
 - get-runs                       # Fetch failed CI runs since the last success, with their entire logs, to heaven/runs.
-- get-threats                    # Run vulnerability scanning, save output to ./heaven/threats/<tool>-<datetime>.out
+- get-vulns                      # Run vulnerability scanning, save output to ./heaven/vuln/<tool>-<datetime>.out
 - hello-harbor *args             # Recipe: build the latest asimi for linux, then hand it to Harbor
 - init-podman                    # Init and start the podman machine
 - install                        # Install dependencies
@@ -42,6 +42,7 @@ Use `just <recipe>` to manage the project:
 - nvim                           # Start neovim with the asimi plugin loaded (interactive dev session)
 - prune-branches                 # Li 礼), so resolve those by hand.
 - run                            # Run with debug logging
+- serve-book *name               # Serve a guide book with live reload (mdbook serve), e.g. `just serve-book ruler`
 - test                           # Run the test suite, tee-ing output to `./heaven/tests/test-<datetime>.out`
 - test-atif                      # ASIMI_PROVIDER) — the test does not force a model.
 - test-coverage                  # Run tests with coverage
