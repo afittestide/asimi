@@ -10,7 +10,6 @@ import (
 
 	"al.essio.dev/pkg/shellescape"
 
-	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
 	"github.com/afittestide/asimi/internal/worktree"
@@ -27,10 +26,10 @@ const defaultLingMinister = "forge"
 // lings — the scheduler cannot verify that (accepted risk, ruler ruling
 // 2026-10-25).
 func (s *Court) lingBatchSize() int {
-	if s != nil && s.config != nil && s.config.LingParallelism > 0 {
-		return s.config.LingParallelism
+	if s != nil && s.config != nil && s.config.MaxParallelLings > 0 {
+		return s.config.MaxParallelLings
 	}
-	return config.DefaultLingParallelism
+	return 1
 }
 
 // PublishLingCreated records a ling_created event for observability. It never
@@ -85,7 +84,7 @@ func (s *Court) TriggerLingIgnition(key storage.EdictKey) {
 	}
 	// Nil-config safe: bootstrap fills config lazily, so a nil or absent
 	// config must behave as "disabled" and still record the skip in the ledger.
-	if s.config == nil || !s.config.LingIgnitionEnabled {
+	if s.config == nil || s.config.MaxParallelLings <= 0 {
 		s.logger.Info("ling ignition disabled by config", "edict_id", key.ID)
 		s.PublishEvent(key, storage.EventLingIgnitionSkipped, storage.JSON{
 			"reason":       "ling_ignition_disabled_by_config",

@@ -4,7 +4,7 @@
 
 ### Full Parallelism (rolled forward from 0.17.0 — unbuilt, not abandoned)
 - Ling ignition on by default — the engine already runs each ling in the edict's
-  worktree (e923); flipping `court.ling_ignition_enabled` on is the remaining ruling
+  worktree (e923); flipping `court.max_parallel_lings` above 0 is the remaining ruling
 - Drafting ritual — mints its own edict at step 0, long-lived per-minister sessions,
   serialized lings (e1009; the Ruler's mechanism and its four open forks are recorded
   in `intent/letters/e940.md`, Letter 4)

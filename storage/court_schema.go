@@ -305,7 +305,7 @@ const (
 	EventLingCompleted     CourtEvent = "ling_completed"
 	EventLingFailed        CourtEvent = "ling_failed"
 	// EventLingIgnitionSkipped records that ignition was suppressed by config
-	// (court.ling_ignition_enabled=false); the ling itself is untouched and
+	// (court.max_parallel_lings<=0); the ling itself is untouched and
 	// remains pending.
 	EventLingIgnitionSkipped CourtEvent = "ling_ignition_skipped"
 	EventZhengmingNeeded     CourtEvent = "zhengming_needed"

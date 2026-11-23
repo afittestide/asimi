@@ -117,47 +117,25 @@ func TestDockerfileThrottleIsEnvDefault(t *testing.T) {
 func TestLiveDockerfileInstallsGoogleCloudCLI(t *testing.T) {
 	dockerfile := readRootFile(t, ".agents/sandbox/Dockerfile")
 
-	rawLayer, layer := gcloudDockerfileLayer(t, dockerfile)
-
-	assert.Contains(t, layer, "packages.cloud.google.com/apt",
-		"gcloud must come from Google's auditable apt repo, not a hand-rolled tarball")
-	assert.Regexp(t, `apt-get install -y --no-install-recommends[^\n]*\bgoogle-cloud-cli\b`, layer,
-		"the gcloud layer must actually install google-cloud-cli — a mention in the header comment is not an install")
-	assert.Regexp(t, `(?m)^ENV\s+CLOUDSDK_CORE_DISABLE_PROMPTS=1`, layer,
-		"non-interactive exec would stall on a gcloud prompt without this ENV")
-
-	// The gcloud layer must not use sudo: the image runs as root already.
-	assert.NotContains(t, rawLayer, "sudo",
-		"the gcloud layer must not use sudo — the image runs as root")
-}
-
-// gcloudDockerfileLayer returns the gcloud install block of a sandbox
-// Dockerfile: raw includes the comment header, code has the comment lines
-// stripped. Assertions run against code so prose in the header comment (which
-// names google-cloud-cli and CLOUDSDK_CORE_DISABLE_PROMPTS) cannot satisfy a
-// guard whose real subject — the RUN/ENV instruction — has been deleted.
-func gcloudDockerfileLayer(t *testing.T, dockerfile string) (raw, code string) {
-	t.Helper()
-	start := strings.Index(dockerfile, "# Google Cloud CLI")
-	require.NotEqual(t, -1, start, "Dockerfile must carry the gcloud install layer")
-	end := strings.Index(dockerfile[start:], "# install gh")
-	require.NotEqual(t, -1, end, "gcloud layer must sit with its own comment header")
-	// Slice only after the guard: a reworded "# install gh" header must fail
-	// with the message above, never panic on a negative index.
-	raw = dockerfile[start:]
-	if end >= 0 {
-		raw = dockerfile[start : start+end]
-	}
-
-	var b strings.Builder
-	for _, line := range strings.Split(raw, "\n") {
+	var codeLines []string
+	for _, line := range strings.Split(dockerfile, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
 		}
-		b.WriteString(line)
-		b.WriteString("\n")
+		codeLines = append(codeLines, line)
 	}
-	return raw, b.String()
+	code := strings.Join(codeLines, "\n")
+
+	assert.Contains(t, code, "packages.cloud.google.com/apt",
+		"gcloud must come from Google's auditable apt repo, not a hand-rolled tarball")
+	assert.Regexp(t, `apt-get install -y --no-install-recommends(?:[^\n]*\\\n)*[^\n]*\bgoogle-cloud-cli\b`, code,
+		"the Dockerfile must actually install google-cloud-cli — a mention in a comment is not an install")
+	assert.Regexp(t, `(?m)^ENV\s+CLOUDSDK_CORE_DISABLE_PROMPTS=1`, code,
+		"non-interactive exec would stall on a gcloud prompt without this ENV")
+
+	// The Dockerfile must not use sudo: the image runs as root already.
+	assert.NotContains(t, dockerfile, "sudo",
+		"the Dockerfile must not use sudo — the image runs as root")
 }
 
 // goFixFloor is the toolchain version that fixes GO-2026-6809
@@ -445,7 +423,7 @@ func TestDependabotIgnoresOnlyUnsatisfiableDependency(t *testing.T) {
 // vulnScanFixFloors maps each module bumped for edict 1032 to the release that
 // fixes the advisory the 0.16.0 threat scan reported (GO-2026-6865 for
 // klauspost/compress, GO-2026-6888 for andybalholm/brotli). Pinning below a
-// floor reopens the finding and reddens `just get-threats`.
+// floor reopens the finding and reddens `just get-vuln`.
 var vulnScanFixFloors = map[string]semver.Version{
 	"github.com/klauspost/compress": semver.MustParse("1.20.2"),
 	"github.com/andybalholm/brotli": semver.MustParse("1.2.7"),
@@ -489,7 +467,7 @@ func recipeInvocations(text string) []string {
 }
 
 // TestRitualAndDocInvocationsNameExistingRecipes guards the first defect of
-// edict 1032: `0e6f61f15` renamed `vuln:` to `get-threats:` and the release
+// edict 1032: `0e6f61f15` renamed `vuln:` to `get-vuln:` and the release
 // ritual kept invoking the dead name. A `!`-prefixed given step that exits
 // non-zero hard-fails the step, and `verify-release-readiness` loops back to
 // `prepare-changelog`, so the ritual could never reach `commit-and-tag`. Every
@@ -512,8 +490,8 @@ func TestRitualAndDocInvocationsNameExistingRecipes(t *testing.T) {
 	require.NoError(t, yaml.Unmarshal([]byte(rituals), &defs), "parse .agents/rituals.yaml")
 	readiness := findStep(defs, "release-version", "verify-release-readiness")
 	require.NotNil(t, readiness, "release-version has no verify-release-readiness step")
-	assert.Contains(t, strings.Join(readiness.Given, "\n"), "!just get-threats",
-		"verify-release-readiness must invoke the real `just get-threats` gate (edict 1032)")
+	assert.Contains(t, strings.Join(readiness.Given, "\n"), "!just get-vuln",
+		"verify-release-readiness must invoke the real `just get-vuln` gate (edict 1032)")
 
 	for _, doc := range []string{"intent/docs/release-management.md", "intent/docs/security.md"} {
 		for _, name := range recipeInvocations(readRootFile(t, doc)) {
@@ -545,19 +523,19 @@ func findStep(rituals Rituals, ritualName, stepName string) *RitualStep {
 // to a directory that does not exist. Derive both facts from the recipe itself so
 // the doc cannot drift from it again.
 func TestSecurityDocNamesTheThreatReportPath(t *testing.T) {
-	body := recipeBody(readRootFile(t, "Justfile"), "get-threats:")
-	require.NotEmpty(t, body, "could not read the get-threats recipe body")
+	body := recipeBody(readRootFile(t, "Justfile"), "get-vuln:")
+	require.NotEmpty(t, body, "could not read the get-vuln recipe body")
 
 	dir := regexp.MustCompile(`(?m)^\s*report_dir="([^"]+)"`).FindStringSubmatch(body)
-	require.Len(t, dir, 2, "get-threats defines no report_dir=\"...\" — update this guard")
+	require.Len(t, dir, 2, "get-vuln defines no report_dir=\"...\" — update this guard")
 	dirName := dir[1]
 
 	require.Regexp(t, `report="\$report_dir/\$\{tool\}-\{\{now\}\}\.out"`, body,
-		"get-threats uses a report filename other than ${tool}-{{now}}.out — update this guard")
+		"get-vuln uses a report filename other than ${tool}-{{now}}.out — update this guard")
 
 	doc := readRootFile(t, "intent/docs/security.md")
 	assert.Contains(t, doc, dirName+"/",
-		"intent/docs/security.md must name the real report directory %q the get-threats recipe writes", dirName)
+		"intent/docs/security.md must name the real report directory %q the get-vuln recipe writes", dirName)
 	assert.Contains(t, doc, "<tool>-<datetime>.out",
 		"intent/docs/security.md must give the real report extension (.out), not the old .txt")
 }
@@ -713,7 +691,7 @@ func TestThreatScanModulesMeetFixFloor(t *testing.T) {
 }
 
 // TestAllowlistEntriesAreJustifiedAndLive enforces the contract that
-// `just get-threats` and intent/docs/security.md promise: the allowlist carries only
+// `just get-vuln` and intent/docs/security.md promise: the allowlist carries only
 // govulncheck IDs, each ID has a written justification section, and an ID whose
 // section is marked retired is no longer listed. Edict 1032 retired
 // GO-2026-5932 exactly this way rather than leaving a stale entry behind.

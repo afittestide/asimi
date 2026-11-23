@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestCourtConfigHasNoUsernameField enforces edict 1006's Ruler ruling: the
@@ -139,4 +140,92 @@ func TestDefaultConfig_DiskMinFreeMiB(t *testing.T) {
 	if DefaultDiskMinFreeMiB <= 0 {
 		t.Fatalf("DefaultDiskMinFreeMiB must be positive to guard the store, got %d", DefaultDiskMinFreeMiB)
 	}
+}
+
+func TestDefaultConfig_CourtDefaults(t *testing.T) {
+	got := DefaultConfig().Court
+	want := *DefaultCourtConfig()
+	if got != want {
+		t.Fatalf("DefaultConfig().Court = %+v, want %+v", got, want)
+	}
+	if got.MaxParallelLings != 0 {
+		t.Errorf("default MaxParallelLings = %d, want 0", got.MaxParallelLings)
+	}
+}
+
+func TestCourtConfigResolved(t *testing.T) {
+	defaults := DefaultCourtConfig()
+
+	t.Run("zero config fills positive-only defaults and preserves explicit zero sweep and ling gate", func(t *testing.T) {
+		got := (CourtConfig{}).Resolved("user/repo", false)
+		if got.StepIdleTimeout != defaults.StepIdleTimeout {
+			t.Errorf("StepIdleTimeout = %v, want %v", got.StepIdleTimeout, defaults.StepIdleTimeout)
+		}
+		if got.OutputLimit != defaults.OutputLimit {
+			t.Errorf("OutputLimit = %d, want %d", got.OutputLimit, defaults.OutputLimit)
+		}
+		if got.RunnerFlatlineTimeout != 0 {
+			t.Errorf("RunnerFlatlineTimeout = %v, want 0 (sweep disabled)", got.RunnerFlatlineTimeout)
+		}
+		if got.MaxParallelLings != 0 {
+			t.Errorf("MaxParallelLings = %d, want 0 (ignition disabled)", got.MaxParallelLings)
+		}
+		if got.Project != "user/repo" {
+			t.Errorf("Project = %q, want %q", got.Project, "user/repo")
+		}
+		if got.IsolatedHost {
+			t.Error("IsolatedHost = true, want false")
+		}
+	})
+
+	t.Run("negative positive-only fields fall back to defaults", func(t *testing.T) {
+		in := CourtConfig{
+			StepIdleTimeout:  -1 * time.Minute,
+			OutputLimit:      -10,
+			MaxParallelLings: -2,
+		}
+		got := in.Resolved("user/repo", true)
+		if got.StepIdleTimeout != defaults.StepIdleTimeout {
+			t.Errorf("StepIdleTimeout = %v, want %v", got.StepIdleTimeout, defaults.StepIdleTimeout)
+		}
+		if got.OutputLimit != defaults.OutputLimit {
+			t.Errorf("OutputLimit = %d, want %d", got.OutputLimit, defaults.OutputLimit)
+		}
+		if got.MaxParallelLings > 0 {
+			t.Errorf("MaxParallelLings = %d, want <= 0", got.MaxParallelLings)
+		}
+		if !got.IsolatedHost {
+			t.Error("IsolatedHost = false, want true")
+		}
+	})
+
+	t.Run("custom fields flow through while caller authority overwrites Project and IsolatedHost", func(t *testing.T) {
+		in := CourtConfig{
+			Project:               "pinned/evil",
+			IsolatedHost:          true,
+			StepIdleTimeout:       2 * time.Minute,
+			OutputLimit:           1200,
+			RunnerFlatlineTimeout: 7 * time.Minute,
+			MaxParallelLings:      4,
+		}
+		got := in.Resolved("caller/verified", false)
+		if got.Project != "caller/verified" {
+			t.Errorf("Project = %q, want %q", got.Project, "caller/verified")
+		}
+		if got.IsolatedHost {
+			t.Error("IsolatedHost = true, want false")
+		}
+		if got.StepIdleTimeout != 2*time.Minute {
+			t.Errorf("StepIdleTimeout = %v, want 2m", got.StepIdleTimeout)
+		}
+		if got.OutputLimit != 1200 {
+			t.Errorf("OutputLimit = %d, want 1200", got.OutputLimit)
+		}
+		if got.RunnerFlatlineTimeout != 7*time.Minute {
+			t.Errorf("RunnerFlatlineTimeout = %v, want 7m", got.RunnerFlatlineTimeout)
+		}
+		if got.MaxParallelLings != 4 {
+			t.Errorf("MaxParallelLings = %d, want 4", got.MaxParallelLings)
+		}
+	})
 }

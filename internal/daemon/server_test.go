@@ -1170,6 +1170,65 @@ func TestCreateCourtIgnoresHandshakeSlug(t *testing.T) {
 	}
 }
 
+// TestCreateCourtForwardsCourtConfig verifies that [court] fields such as
+// MaxParallelLings and StepIdleTimeout reach the constructed Court while
+// Project stays checkout-derived and projectCfg.Court.IsolatedHost is ignored
+// when the handshake isolatedHost argument is false.
+func TestCreateCourtForwardsCourtConfig(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	runGit(t, projectRoot, "init")
+	runGit(t, projectRoot, "remote", "add", "origin", "https://github.com/daonb/data-poisoning-benchmark.git")
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".agents"), 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+	projectCfg, err := config.LoadProjectConfig(projectRoot, false)
+	if err != nil {
+		t.Fatalf("LoadProjectConfig: %v", err)
+	}
+	projectCfg.Court.Project = "pinned/project"
+	projectCfg.Court.MaxParallelLings = 4
+	projectCfg.Court.StepIdleTimeout = 2 * time.Minute
+	projectCfg.Court.IsolatedHost = true
+
+	c, _, err := createCourt(
+		context.Background(),
+		shared,
+		1,
+		types.SetContextParams{
+			Project:     "attacker/evil-repo",
+			Username:    testUsername(),
+			ProjectRoot: projectRoot,
+		},
+		testUsername(),
+		projectCfg,
+		repo.GetRepoInfoForRoot(projectRoot),
+		nil,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("createCourt: %v", err)
+	}
+	defer c.Stop()
+
+	got := c.Config()
+	wantProject := repo.SanitizeSegment(config.OSUsername()) + "/data-poisoning-benchmark"
+	if got.Project != wantProject {
+		t.Errorf("Court project = %q, want %q", got.Project, wantProject)
+	}
+	if got.MaxParallelLings != 4 {
+		t.Errorf("Court MaxParallelLings = %d, want 4", got.MaxParallelLings)
+	}
+	if got.StepIdleTimeout != 2*time.Minute {
+		t.Errorf("Court StepIdleTimeout = %v, want 2m", got.StepIdleTimeout)
+	}
+	if got.IsolatedHost {
+		t.Error("Court IsolatedHost = true, want false (committed isolated_host must be ignored when handshake arg is false)")
+	}
+}
+
 // TestCreateCourtRefusesOriginlessAmbiguity covers edict 1005 acceptance 5: a
 // checkout with no origin remote whose remotes name different repos has nothing
 // deterministic to scope to, so the session must refuse to boot rather than

@@ -400,28 +400,19 @@ type CourtParams struct {
 // ProvideCourt creates the Court coordinator with lifecycle management
 func ProvideCourt(params CourtParams) (*court.Court, error) {
 
-	// Start with defaults, then overlay config file values. The Court
-	// username is never taken from config — it is resolved from the OS user
-	// inside NewCourt so a committed [court] username cannot re-scope the
-	// session onto another user's ledger (edict 1006).
-	cfg := config.DefaultCourtConfig()
 	// The project scope always comes from the checkout: a committed
 	// [court] project is client-controlled data and must not choose scope
 	// (edict 1005). ResolveProjectSlug errors only when origin is absent and
 	// the remotes name different repos, in which case boot must refuse rather
 	// than silently pick a scope that can receive writes.
+	// The Court username is never taken from config — it is resolved from the
+	// OS user inside NewCourt so a committed [court] username cannot re-scope
+	// the session onto another user's ledger (edict 1006).
 	project, err := repo.ResolveProjectSlug(params.RepoInfo.ProjectRoot, params.RepoInfo.HasVCS)
 	if err != nil {
 		return nil, fmt.Errorf("resolve project scope: %w", err)
 	}
-	cfg.Project = project
-	cfg.IsolatedHost = params.Config.Court.IsolatedHost
-	if params.Config.Court.OutputLimit > 0 {
-		cfg.OutputLimit = params.Config.Court.OutputLimit
-	}
-	// Copy explicitly: RunnerFlatlineTimeout is resolved to the default by the
-	// loader when unset, so an explicit 0 disables the sweep.
-	cfg.RunnerFlatlineTimeout = params.Config.Court.RunnerFlatlineTimeout
+	cfg := params.Config.Court.Resolved(project, params.Config.Court.IsolatedHost)
 	params.Logger.Info("initializing Court", "project", cfg.Project)
 
 	s := court.NewCourt(params.GormDB, cfg, params.Runner, params.Logger)

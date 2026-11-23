@@ -77,7 +77,7 @@
         - "!just test-race  # race_results"
         - "!just lint  # lint_results"
         - "!just build  # build_result"
-        - "!just get-threats  # vuln_results"
+        - "!just get-vuln  # vuln_results"
       act: |
         Verify that tests pass, linter is clean, and the project builds.
         Confirm the CHANGELOG version matches the version in asimi_version.go.
@@ -90,9 +90,9 @@
         not use -race, so this invocation is the load-bearing concurrency gate.
 
         Release gate — vulnerability scan. The release MUST NOT proceed if
-        `just get-threats` reports any reachable vulnerabilities. Note that
+        `just get-vuln` reports any reachable vulnerabilities. Note that
         `just test` does not run the scan at all (it runs `just test-race` when
-        CI is set), so this explicit `just get-threats` invocation is the
+        CI is set), so this explicit `just get-vuln` invocation is the
         load-bearing gate. Treat a non-zero govulncheck exit as a FAILED
         gate even if the test/build results above are clean.
 

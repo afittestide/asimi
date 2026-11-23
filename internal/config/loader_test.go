@@ -1629,7 +1629,6 @@ func TestLoadProjectConfig_ShogunateBackwardCompat(t *testing.T) {
 	// Old-format config with [shogunate] instead of [court]
 	projectConfig := `[shogunate]
 project = "legacy-project"
-ritual_timeout = "10m"
 step_idle_timeout = "3m"
 `
 	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
@@ -1639,8 +1638,37 @@ step_idle_timeout = "3m"
 	require.NotNil(t, cfg)
 
 	assert.Equal(t, "legacy-project", cfg.Court.Project)
-	assert.Equal(t, 10*time.Minute, cfg.Court.RitualTimeout)
 	assert.Equal(t, 3*time.Minute, cfg.Court.StepIdleTimeout)
+}
+
+func TestLoadProjectConfig_MaxParallelLingsAndFlatlineZero(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	t.Run("unset defaults to 0", func(t *testing.T) {
+		projectDir := t.TempDir()
+		cfg, err := LoadProjectConfig(projectDir, false)
+		require.NoError(t, err)
+		assert.Equal(t, 0, cfg.Court.MaxParallelLings)
+		assert.Equal(t, DefaultRunnerFlatlineTimeout, cfg.Court.RunnerFlatlineTimeout)
+	})
+
+	t.Run("max_parallel_lings = 5 and runner_flatline_timeout = 0s", func(t *testing.T) {
+		projectDir := t.TempDir()
+		agentsDir := filepath.Join(projectDir, ".agents")
+		require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+
+		projectConfig := `[court]
+max_parallel_lings = 5
+runner_flatline_timeout = "0s"
+`
+		require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+		cfg, err := LoadProjectConfig(projectDir, false)
+		require.NoError(t, err)
+		assert.Equal(t, 5, cfg.Court.MaxParallelLings)
+		assert.Equal(t, time.Duration(0), cfg.Court.RunnerFlatlineTimeout)
+	})
 }
 
 // TestLoadProjectConfig_CourtOverridesShogunate verifies that [court] takes

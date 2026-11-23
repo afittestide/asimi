@@ -54,7 +54,6 @@ func createCourt(
 		runner = runners.NewPodmanRunner(&projectCfg.Sandbox, repoInfo, strconv.FormatUint(connID, 10), nil)
 	}
 
-	courtCfg := config.DefaultCourtConfig()
 	// The Court username is the socket-verified peer identity — never the
 	// committed [court] username and never the client handshake slug. A
 	// repository carrying [court] username = "<victim>" must have no effect
@@ -74,14 +73,7 @@ func createCourt(
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve project scope: %w", err)
 	}
-	courtCfg.Project = project
-	if projectCfg.Court.OutputLimit > 0 {
-		courtCfg.OutputLimit = projectCfg.Court.OutputLimit
-	}
-	// The loader resolves this to the 15m default when unset, so an explicit 0
-	// (disabling the sweep) is preserved.
-	courtCfg.RunnerFlatlineTimeout = projectCfg.Court.RunnerFlatlineTimeout
-	courtCfg.IsolatedHost = isolatedHost
+	courtCfg := projectCfg.Court.Resolved(project, isolatedHost)
 
 	ct := court.NewCourt(shared.DB, courtCfg, runner, shared.Logger)
 	ct.SetRepoInfo(repoInfo)

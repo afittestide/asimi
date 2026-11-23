@@ -1162,6 +1162,14 @@ func (s *Court) Ministers() []Minister {
 	return active
 }
 
+// Config returns a copy of the Court's resolved configuration.
+func (s *Court) Config() config.CourtConfig {
+	if s == nil || s.config == nil {
+		return config.CourtConfig{}
+	}
+	return *s.config
+}
+
 // EdictKey returns the current context as an EdictKey with the given edict ID.
 func (s *Court) EdictKey(edictID uint) storage.EdictKey {
 	return storage.EdictKey{ID: edictID, Username: s.username, Project: s.config.Project}

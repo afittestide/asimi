@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -321,6 +322,32 @@ func TestProvideCourtDerivesScopeFromCheckout(t *testing.T) {
 	if got := c.EdictKey(1).Project; got != want {
 		t.Errorf("Court project = %q, want checkout-derived %q (committed pin must be ignored)", got, want)
 	}
+}
+
+// TestProvideCourtForwardsCourtConfig verifies that [court] fields such as
+// MaxParallelLings and StepIdleTimeout reach the constructed Court while
+// Project stays checkout-derived.
+func TestProvideCourtForwardsCourtConfig(t *testing.T) {
+	dir := t.TempDir()
+	runProviderGit(t, dir, "init")
+	runProviderGit(t, dir, "remote", "add", "origin", "https://github.com/afittestide/asimi-cli.git")
+	t.Setenv("ASIMI_SKIP_GIT_STATUS", "1")
+
+	params := provideCourtParams(t, dir, true)
+	params.Config.Court.Project = "pinned/project"
+	params.Config.Court.MaxParallelLings = 4
+	params.Config.Court.StepIdleTimeout = 2 * time.Minute
+
+	c, err := ProvideCourt(params)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	defer c.Stop()
+
+	got := c.Config()
+	wantProject := repo.SanitizeSegment(config.OSUsername()) + "/asimi-cli"
+	assert.Equal(t, wantProject, got.Project)
+	assert.Equal(t, 4, got.MaxParallelLings)
+	assert.Equal(t, 2*time.Minute, got.StepIdleTimeout)
 }
 
 // nopLifecycle is a do-nothing fx.Lifecycle for tests that never start the app.

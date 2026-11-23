@@ -123,6 +123,7 @@ func DefaultConfig() Config {
 			CacheVolumes:    DefaultCacheVolumes(),
 			DiskMinFreeMiB:  DefaultDiskMinFreeMiB,
 		},
+		Court: *DefaultCourtConfig(),
 	}
 }
 
@@ -277,9 +278,6 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	// from [shogunate] so existing user configs keep working.
 	if !k.Exists("court.project") && k.Exists("shogunate.project") {
 		config.Court.Project = k.String("shogunate.project")
-	}
-	if !k.Exists("court.ritual_timeout") && k.Exists("shogunate.ritual_timeout") {
-		config.Court.RitualTimeout = k.Duration("shogunate.ritual_timeout")
 	}
 	// Step idle timeout: aborts a ritual step after N seconds of silence.
 	if !k.Exists("court.step_idle_timeout") && k.Exists("shogunate.step_idle_timeout") {

@@ -3329,7 +3329,7 @@ func newLingTestCourt(t *testing.T, db *gorm.DB) (*Court, *recordingProvider) {
 	// Enable ignition explicitly: these tests exercise the engine; the
 	// production default is off (separate ruling, e923).
 	cfg := config.DefaultCourtConfig()
-	cfg.LingIgnitionEnabled = true
+	cfg.MaxParallelLings = 5
 	s := &Court{
 		db:             db,
 		ministers:      ministers,
@@ -3461,7 +3461,7 @@ func newLingTestCourtPerMinister(t *testing.T, db *gorm.DB) (*Court, map[string]
 	// Enable ignition explicitly: these tests exercise the engine; the
 	// production default is off (flip is a separate ruling, e923).
 	cfg := config.DefaultCourtConfig()
-	cfg.LingIgnitionEnabled = true
+	cfg.MaxParallelLings = 5
 	s := &Court{
 		db:        db,
 		ministers: ministers,
@@ -3620,14 +3620,14 @@ func TestRunLing_FailingMinisterPublishesLingFailed(t *testing.T) {
 }
 
 // TestTriggerLingIgnition_GateOffSkipsAndStaysPending verifies the off state
-// of the gate: a trigger with LingIgnitionEnabled=false must (a) spawn no
+// of the gate: a trigger with MaxParallelLings=0 must (a) spawn no
 // minister session (no ling_started event), (b) record a ling_ignition_skipped
 // event carrying the reason, and (c) leave the ling pending and listable
 // (e923 gate; the recorded blocker used to name e531, which is sealed).
 func TestTriggerLingIgnition_GateOffSkipsAndStaysPending(t *testing.T) {
 	db := setupCourtTestDB(t)
 	s, provider := newLingTestCourt(t, db)
-	s.config.LingIgnitionEnabled = false
+	s.config.MaxParallelLings = 0
 
 	key := storage.EdictKey{ID: 46, Username: "testuser", Project: "testproject"}
 	require.NoError(t, db.Create(&storage.Ling{
@@ -3665,7 +3665,7 @@ func TestTriggerLingIgnition_GateOffSkipsAndStaysPending(t *testing.T) {
 }
 
 // TestTriggerLingIgnition_GateOnIgnites verifies the on state of the gate:
-// with LingIgnitionEnabled=true the trigger processes pending lings.
+// with MaxParallelLings>0 the trigger processes pending lings.
 func TestTriggerLingIgnition_GateOnIgnites(t *testing.T) {
 	db := setupCourtTestDB(t)
 	s, provider := newLingTestCourt(t, db)
@@ -3969,12 +3969,12 @@ func TestIgniteLings_ParallelCommitsSerialized(t *testing.T) {
 }
 
 // TestIgniteLings_BatchSizeBound verifies the configured parallelism bound is
-// honoured: with LingParallelism=1 two independent lings never run at the same
+// honoured: with MaxParallelLings=1 two independent lings never run at the same
 // time (e923 §3).
 func TestIgniteLings_BatchSizeBound(t *testing.T) {
 	db := setupCourtTestDB(t)
 	s, provider, _ := newLingWorktreeCourt(t, db, 53)
-	s.config.LingParallelism = 1
+	s.config.MaxParallelLings = 1
 	assert.Equal(t, 1, s.lingBatchSize())
 
 	for _, id := range []string{"ling-b1", "ling-b2"} {
@@ -3991,6 +3991,46 @@ func TestIgniteLings_BatchSizeBound(t *testing.T) {
 	require.Len(t, prompts, 2, "both lings must still run")
 	assert.Contains(t, prompts[0], "bounded ling-b1", "with a bound of 1 the lings run one after the other")
 	assert.Contains(t, prompts[1], "bounded ling-b2")
+}
+
+func TestCourtConfigAndLingBatchSizeGuards(t *testing.T) {
+	var nilCourt *Court
+	assert.Equal(t, config.CourtConfig{}, nilCourt.Config())
+	assert.Equal(t, 1, nilCourt.lingBatchSize())
+
+	noCfg := &Court{}
+	assert.Equal(t, config.CourtConfig{}, noCfg.Config())
+	assert.Equal(t, 1, noCfg.lingBatchSize())
+
+	zeroBound := &Court{config: &config.CourtConfig{MaxParallelLings: 0, OutputLimit: 777}}
+	assert.Equal(t, 1, zeroBound.lingBatchSize())
+	copied := zeroBound.Config()
+	assert.Equal(t, 777, copied.OutputLimit)
+	copied.OutputLimit = 1
+	assert.Equal(t, 777, zeroBound.config.OutputLimit, "Config() must return a copy")
+
+	negBound := &Court{config: &config.CourtConfig{MaxParallelLings: -3}}
+	assert.Equal(t, 1, negBound.lingBatchSize())
+
+	posBound := &Court{config: &config.CourtConfig{MaxParallelLings: 4}}
+	assert.Equal(t, 4, posBound.lingBatchSize())
+
+	// Negative MaxParallelLings must also keep TriggerLingIgnition gated off.
+	db := setupCourtTestDB(t)
+	s, provider := newLingTestCourt(t, db)
+	s.config.MaxParallelLings = -1
+	key := storage.EdictKey{ID: 55, Username: "testuser", Project: "testproject"}
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "ling-neg", EdictID: 55, Username: "testuser", Project: "testproject",
+		Description: "negative gate", Status: storage.LingPending,
+	}).Error)
+	s.TriggerLingIgnition(key)
+	assert.Empty(t, provider.promptsSnapshot(), "negative MaxParallelLings must not ignite lings")
+	var skipCount int64
+	require.NoError(t, db.Model(&storage.TianEvent{}).
+		Where("edict_id = ? AND event_type = ?", 55, storage.EventLingIgnitionSkipped).
+		Count(&skipCount).Error)
+	assert.Equal(t, int64(1), skipCount)
 }
 
 // TestCleanup_CascadesLingWorktrees verifies the seal-time sweep removes a

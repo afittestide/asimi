@@ -2,11 +2,11 @@
 
 ## Vulnerability scanning
 
-The release gate runs `just get-threats` (see `intent/docs/release-management.md`), which
+The release gate runs `just get-vuln` (see `intent/docs/release-management.md`), which
 builds the binary and runs `govulncheck -mode=binary` against it. The gate fails
 the release if the scan reports any *new* reachable vulnerability.
 
-Every run archives its full output under `heaven/threats/` as
+Every run archives its full output under `heaven/vulns/` as
 `<tool>-<datetime>.out` (e.g. `govulncheck-20261109T142655.out`). Reports are
 append-only evidence — each run writes a new timestamped file and never
 overwrites one — and `heaven/` is gitignored. Failed CI runs are a different
@@ -15,7 +15,7 @@ archive, fetched on demand by `just get-runs` into `heaven/runs/`.
 ### Accepted findings
 
 A finding may be accepted only when it is present in `security/vuln-allowlist.txt`
-with a written justification. The `just get-threats` recipe subtracts the allowlist
+with a written justification. The `just get-vuln` recipe subtracts the allowlist
 from the scan output, so an accepted finding no longer fails the gate — but any
 finding **not** on the allowlist, or any allowlist entry that stops matching,
 is reported. This keeps the gate honest: it fails on the unknown, not on the
