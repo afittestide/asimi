@@ -412,3 +412,160 @@
       then:
         - record the chancellor's seal
         - the infrastructure is staged
+
+- name: review-contribution
+  description: "Review a foreign contributor's GitHub pull request, post inline and summary findings, and approve or request changes"
+  inputs:
+    pr:
+      type: string
+      required: true
+      description: "GitHub PR number, URL, or branch accepted by gh pr"
+  max_retries: 2
+  background:
+    - "!gh pr view '{{ .pr }}' --json number,title,author,state,isDraft,baseRefName,headRefName,headRefOid,additions,deletions,changedFiles,commits,body,comments,reviews,url  # pr_details"
+    - "!gh pr diff '{{ .pr }}'  # pr_diff"
+  steps:
+    - name: judging
+      minister: judge
+      act: |
+        A foreign contributor submitted a GitHub pull request. Review the PR
+        metadata and diff below from the Judge's perspective without checking
+        out or executing untrusted foreign code.
+
+        Inspect the surrounding codebase with read_file/grep/glob as needed to
+        verify:
+        - Correctness, edge cases, error handling, and potential regressions
+        - Test coverage: whether new or changed behavior is tested and whether
+          existing tests were weakened or deleted without justification
+        - Safety of any changes to build, CI, sandbox, or dependency files
+          (Justfile, .agents/, Dockerfile, go.mod, workflows)
+
+        {{- if ne (printf "%v" .edict_id) "0" }}
+        Record your verdict for edict {{ .edict_id }} with record_verdict.
+        {{- else }}
+        This review runs without an edict (edict_id is 0) — do NOT call
+        record_verdict.
+        {{- end }}
+
+        Organize your findings into two sections so the Secretary can post
+        GitHub inline review comments accurately:
+        1. **Inline Comments** — ONLY for lines that appear inside the diff
+           hunks below. For each item include:
+           - `path` (repo-relative path from the diff)
+           - `line` (integer line number inside the diff hunk; optional
+             `start_line` and `start_side` for a multi-line range in the same hunk)
+           - `side` (`RIGHT` for added or context lines, `LEFT` for deleted lines)
+           - `severity` (`blocking` or `suggestion`)
+           - concise comment body
+        2. **Summary Findings** — broader observations, missing tests in
+           untouched files, or anything outside the diff hunks (with file:line
+           references).
+
+        End your report with a single verdict line:
+        VERDICT: PASS
+        or
+        VERDICT: FAIL
+
+        ## PR Details
+        {{ .pr_details }}
+
+        ## PR Diff
+        {{ .pr_diff }}
+
+    - name: censoring
+      minister: chancellor
+      act: |
+        Review this foreign contributor's GitHub pull request against the
+        Imperial Code (AGENTS.md and project conventions). You are read-only;
+        use read_file/grep/glob and query_precedents as needed to inspect
+        surrounding context and past rulings.
+
+        Check:
+        - Adherence to project architecture, idioms, and naming conventions
+        - Clarity, maintainability, and backward compatibility
+        - Security implications (input validation, secrets, privilege boundaries)
+        - Omission markers (TODO/FIXME/XXX/HACK) introduced by the PR
+
+        {{- if ne (printf "%v" .edict_id) "0" }}
+        Record your ruling for edict {{ .edict_id }} with record_precedent.
+        {{- else }}
+        This review runs without an edict (edict_id is 0) — do NOT call
+        record_precedent.
+        {{- end }}
+
+        Organize your findings into two sections so the Secretary can post
+        GitHub inline review comments accurately:
+        1. **Inline Comments** — ONLY for lines that appear inside the diff
+           hunks below. For each item include:
+           - `path` (repo-relative path from the diff)
+           - `line` (integer line number inside the diff hunk; optional
+             `start_line` and `start_side` for a multi-line range in the same hunk)
+           - `side` (`RIGHT` for added or context lines, `LEFT` for deleted lines)
+           - `severity` (`blocking` or `suggestion`)
+           - concise comment body
+        2. **Summary Findings** — broader architectural notes, convention
+           checks, or anything outside the diff hunks (with file:line
+           references), separating blocking issues from non-blocking
+           suggestions.
+
+        ## PR Details
+        {{ .pr_details }}
+
+        ## PR Diff
+        {{ .pr_diff }}
+
+    - name: posting
+      minister: secretary
+      act: |
+        Synthesize the Judge's (`judging`) and Chancellor's (`censoring`)
+        findings from Previous Step Results into a clear, courteous GitHub pull
+        request review for PR {{ .pr }}, then post it directly with inline line
+        comments (do NOT call ask_ruler).
+
+        Decision rule:
+        - If BOTH the Judge ended with `VERDICT: PASS` AND the Chancellor ruled
+          `APPROVE` (or `WAIVE` with no blocking issues), set `event` to
+          `"APPROVE"`.
+        - Otherwise (Judge ended with `VERDICT: FAIL` or Chancellor ruled
+          `REJECT` / raised blocking issues), set `event` to
+          `"REQUEST_CHANGES"`.
+
+        Build the review payload using `number` and `headRefOid` from PR Details:
+        - `commit_id`: `<headRefOid>`
+        - `event`: `"APPROVE"` or `"REQUEST_CHANGES"`
+        - `body`: top-level Markdown summary with (1) a brief welcome thanking
+          the contributor and stating the verdict, (2) any out-of-diff blocking
+          issues with file:line references, and (3) non-blocking summary notes
+          from the Judge and Chancellor.
+        - `comments`: array of inline diff comments from the Judge and
+          Chancellor (`{"path": "...", "line": N, "side": "RIGHT"|"LEFT", "body": "..."}`,
+          with optional `start_line`/`start_side` for multi-line ranges). Merge
+          duplicate comments targeting the same `(path, line, side)` and keep
+          every inline comment concise. Omit `comments` (or pass `[]`) if there
+          are no inline findings.
+
+        Post atomically with `gh api` (extract `<owner>/<repo>` from
+        `pr_details.url` if targeting another repo, otherwise use
+        `{owner}/{repo}`):
+
+        ```bash
+        gh api repos/{owner}/{repo}/pulls/<number>/reviews --method POST --input - <<'EOF'
+        { ...valid JSON... }
+        EOF
+        ```
+
+        Always pass JSON via a single-quoted heredoc (`<<'EOF'`) so backticks
+        and quotes are never expanded by the shell.
+
+        Fallback on HTTP 422: if GitHub rejects a comment coordinate (for
+        example, a line outside a diff hunk), move the rejected inline
+        comment(s) into the top-level `body` (preserving their `path:line`
+        reference) and retry the `gh api` call. If `gh api` still fails, fall
+        back to `gh pr review '{{ .pr }}' --approve` or `--request-changes`
+        with `--body-file - <<'EOF'` containing all findings.
+
+        Do NOT merge or close the PR. Report the posted review outcome, inline
+        comment count, and PR URL when done.
+
+        ## PR Details
+        {{ .pr_details }}

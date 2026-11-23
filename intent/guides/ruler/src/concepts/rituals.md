@@ -102,6 +102,7 @@ Asimi ships a set of rituals. These are the ones you will meet first:
 | **clean-slate** | Splitting uncommitted work into commits | survey → commit |
 | **fix-lint** | Repairing linter errors in parallel | lint → fix-all-files (fork) → commit-all |
 | **project-init** | Setting up a project for Asimi | establish-infrastructure → sandbox-ready → chancellor-reviews |
+| **review-contribution** | Reviewing a foreign contributor's GitHub PR | judging → censoring → posting |
 
 ### The two you choose between most
 

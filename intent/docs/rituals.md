@@ -454,6 +454,12 @@ Initializes a project for Asimi. The forge customizes infrastructure templates (
 
 **Steps:** establish-infrastructure → sandbox-ready → chancellor-reviews
 
+### review-contribution
+
+Reviews a foreign contributor's GitHub pull request without checking out or executing untrusted foreign code. Fetches PR metadata (including `headRefOid`) and diff once in `background` via `gh pr view` and `gh pr diff` (using the required `pr` input — PR number, URL, or branch). The judge checks correctness, test coverage, and build/config safety; the chancellor reviews against the Imperial Code and precedents; both separate diff-hunk inline comments from broader summary findings. The secretary synthesizes both reports and posts the review atomically via `gh api repos/{owner}/{repo}/pulls/<number>/reviews` with inline line comments and `APPROVE` (only if both pass) or `REQUEST_CHANGES` (otherwise), folding rejected coordinates into the summary on HTTP 422 or falling back to `gh pr review`, and leaving merging to the ruler.
+
+**Steps:** judging → censoring → posting
+
 ---
 
 ## See Also
