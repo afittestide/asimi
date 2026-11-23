@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/ministers"
 	"github.com/afittestide/asimi/storage"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -284,19 +285,37 @@ func (m *TUIModel) handleSessionSelected(session *court.Session) tea.Cmd {
 	}
 
 	if m.creatingTab == "" {
-		// Normal resume: clear edict key, switch to session's tab type
+		// Normal resume: clear the edict key and resolve the destination tab
+		// before deciding whether the session needs a new tab.
 		m.currentEdictKey = storage.EdictKey{}
-		if len(m.tabs.Content().Chat.Messages) > 0 {
-			// The active tab has history: restore into a fresh tab instead of
-			// overwriting it.
-			tabType := session.TabType
-			if tabType == "" {
-				tabType = "secretary"
+		tabType := session.TabType
+		if tabType == "" {
+			tabType = ministers.Secretary
+		}
+		var destination *Tab
+		for i := range m.tabs.tabs {
+			if m.tabs.tabs[i].Type == TabType(tabType) {
+				destination = &m.tabs.tabs[i]
+				break
 			}
-			label := strings.ToUpper(tabType[:1]) + tabType[1:]
-			m.tabs.Add(label, TabType(tabType), m.tabs.UniqueTarget(tabType))
-		} else if session.TabType != "" {
-			m.tabs.SwitchToTabType(TabType(session.TabType))
+		}
+		hasHistory := false
+		if destination != nil {
+			for _, message := range destination.Content.Chat.Messages {
+				if message.Type != MessageTypeGreeting {
+					hasHistory = true
+					break
+				}
+			}
+		}
+		if destination == nil || destination.Streaming || hasHistory {
+			label := ministers.LookupByID(m.tabs.defs, tabType).Label()
+			if label == "" {
+				label = tabType
+			}
+			destination = m.tabs.Add(label, TabType(tabType), m.tabs.UniqueTarget(tabType))
+		} else {
+			m.tabs.SwitchToTarget(destination.Target)
 		}
 	} else {
 		// Edict tab restore: set edict key, stay on the tab
@@ -314,14 +333,10 @@ func (m *TUIModel) handleSessionSelected(session *court.Session) tea.Cmd {
 	if m.court != nil {
 		tabType := session.TabType
 		if tabType == "" {
-			tabType = "secretary"
+			tabType = ministers.Secretary
 		}
 		tab := m.tabs.ActiveTab()
-		if m.creatingTab == "" {
-			m.court.RestoreMinisterSession(tabType, session.GetMessages())
-		} else {
-			m.court.RestoreMinisterSession(tabType, session.GetMessages(), tab.Target)
-		}
+		m.court.RestoreMinisterSession(tabType, session.GetMessages(), tab.Target)
 	}
 
 	// Reset in-session prompt history state to prevent rollback issues
