@@ -133,3 +133,74 @@ func TestSession_ExtractFirstPrompt_UserMessageWithContent(t *testing.T) {
 
 	assert.Equal(t, "The actual prompt", sess.ExtractFirstPrompt())
 }
+
+// --- Transient scratchpad buffer (e723) ---
+//
+// The scratchpad is a one-shot buffer on Session: the Court loads court
+// history into it before a ritual step, prepareUserMessage prepends it to the
+// next user message, and it is cleared in the same breath. The system prompt
+// (messages[0]) never changes, so the provider cache stays valid and the
+// minister sees the history on every turn including tool calls.
+
+func TestSession_ScratchpadSetGet(t *testing.T) {
+	t.Parallel()
+	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "system", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "", sess.GetScratchpad(), "a fresh session must have an empty scratchpad")
+
+	sess.SetScratchpad("## Court Precedents\n- rejected: no wrappers")
+	assert.Contains(t, sess.GetScratchpad(), "Court Precedents")
+}
+
+func TestSession_PrepareUserMessage_InjectsScratchpadOnce(t *testing.T) {
+	t.Parallel()
+	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "system prompt", "")
+	require.NoError(t, err)
+
+	sess.SetScratchpad("## Ritual Script\n▶ step 1")
+	sess.prepareUserMessage("Implement the edict", nil)
+
+	// The first user message carries the scratchpad as a prefix.
+	last := sess.messages[len(sess.messages)-1]
+	content := msgContentStr(last)
+	assert.True(t, strings.HasPrefix(content, "## Ritual Script"),
+		"scratchpad must be prepended to the user message, got: %q", content)
+	assert.Contains(t, content, "Implement the edict")
+
+	// The buffer is cleared after one use.
+	assert.Equal(t, "", sess.GetScratchpad(), "scratchpad must be cleared after injection")
+
+	// The next message is untouched — the scratchpad is one-shot.
+	sess.prepareUserMessage("second prompt", nil)
+	second := msgContentStr(sess.messages[len(sess.messages)-1])
+	assert.Equal(t, "second prompt", second,
+		"a cleared scratchpad must not leak into later messages")
+}
+
+func TestSession_PrepareUserMessage_EmptyScratchpadIsNoOp(t *testing.T) {
+	t.Parallel()
+	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "system", "")
+	require.NoError(t, err)
+
+	sess.prepareUserMessage("plain prompt", nil)
+
+	last := sess.messages[len(sess.messages)-1]
+	assert.Equal(t, "plain prompt", msgContentStr(last),
+		"an empty scratchpad must not alter the user message")
+}
+
+// TestSession_ScratchpadNeverTouchesSystemPrompt pins the cache-validity
+// property: the scratchpad rides on the user message, never messages[0].
+func TestSession_ScratchpadNeverTouchesSystemPrompt(t *testing.T) {
+	t.Parallel()
+	sess, err := NewSession(nil, &SessionConfig{}, nil, nil, func(any) {}, "immutable system", "")
+	require.NoError(t, err)
+
+	sess.SetScratchpad("transient court history")
+	sess.prepareUserMessage("work", nil)
+
+	system := msgContentStr(sess.messages[0])
+	assert.Equal(t, "immutable system", system,
+		"the system prompt must never carry scratchpad content")
+}

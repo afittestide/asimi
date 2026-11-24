@@ -5347,6 +5347,113 @@ func TestBuildStepScratchpad_EmptySealsLings(t *testing.T) {
 	require.Empty(t, scratchpad, "expected empty scratchpad when no court history exists")
 }
 
+// TestBuildStepScratchpad_RetryHighlightsRejectedPrecedent verifies retry
+// awareness (e723): on a goto retry after a Chancellor rejection, the rejected
+// precedent is surfaced with its principle and justification, so the Forge sees
+// a fresh "here's what went wrong" instead of a stale system prompt.
+func TestBuildStepScratchpad_RetryHighlightsRejectedPrecedent(t *testing.T) {
+	db := setupRitualTestDB(t)
+	key := testEK(44)
+
+	require.NoError(t, db.AutoMigrate(&storage.CensorPrecedent{}))
+
+	manifest := storage.ForgeManifest{
+		ManifestID: uuid.New().String(),
+		EdictID:    key.ID,
+		Username:   key.Username,
+		Project:    key.Project,
+		FilePath:   "court/session.go",
+		Status:     storage.ManifestRejected,
+	}
+	require.NoError(t, db.Create(&manifest).Error)
+
+	precedent := storage.CensorPrecedent{
+		PrecedentID:   uuid.New().String(),
+		ManifestID:    manifest.ManifestID,
+		Username:      key.Username,
+		Project:       key.Project,
+		Principle:     "no wrappers",
+		Ruling:        storage.PrecedentRejected,
+		Justification: "the helper only forwards calls",
+	}
+	require.NoError(t, db.Create(&precedent).Error)
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, nil, repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		ID:          "test-retry",
+		RitualName:  "test-retry",
+		EdictID:     key.ID,
+		Username:    key.Username,
+		Project:     key.Project,
+		State:       RitualStateRunning,
+		CurrentStep: 0,
+		stepStates:  []RitualStepState{{Name: "forging", RetryCount: 1}},
+	}
+
+	step := RitualStep{Name: "forging", Minister: "forge"}
+
+	scratchpad := runner.buildStepScratchpad(exec, step)
+
+	require.Contains(t, scratchpad, "Rejected",
+		"a rejected precedent must be highlighted on retry")
+	require.Contains(t, scratchpad, "no wrappers", "principle must be shown")
+	require.Contains(t, scratchpad, "the helper only forwards calls",
+		"justification must be shown")
+}
+
+// TestBuildStepScratchpad_NoRetryRendersRejectedInline verifies that on a first
+// attempt (RetryCount == 0) a rejected precedent is still listed, but not under
+// the prominent retry heading.
+func TestBuildStepScratchpad_NoRetryRendersRejectedInline(t *testing.T) {
+	db := setupRitualTestDB(t)
+	key := testEK(45)
+
+	require.NoError(t, db.AutoMigrate(&storage.CensorPrecedent{}))
+
+	manifest := storage.ForgeManifest{
+		ManifestID: uuid.New().String(),
+		EdictID:    key.ID,
+		Username:   key.Username,
+		Project:    key.Project,
+		FilePath:   "court/session.go",
+		Status:     storage.ManifestRejected,
+	}
+	require.NoError(t, db.Create(&manifest).Error)
+
+	precedent := storage.CensorPrecedent{
+		PrecedentID:   uuid.New().String(),
+		ManifestID:    manifest.ManifestID,
+		Username:      key.Username,
+		Project:       key.Project,
+		Principle:     "no wrappers",
+		Ruling:        storage.PrecedentRejected,
+		Justification: "the helper only forwards calls",
+	}
+	require.NoError(t, db.Create(&precedent).Error)
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, nil, repo.RepoInfo{})
+
+	exec := &RitualExecution{
+		ID:          "test-first",
+		RitualName:  "test-first",
+		EdictID:     key.ID,
+		Username:    key.Username,
+		Project:     key.Project,
+		State:       RitualStateRunning,
+		CurrentStep: 0,
+		stepStates:  []RitualStepState{{Name: "forging", RetryCount: 0}},
+	}
+
+	step := RitualStep{Name: "forging", Minister: "forge"}
+
+	scratchpad := runner.buildStepScratchpad(exec, step)
+
+	require.Contains(t, scratchpad, "rejected")
+	require.NotContains(t, scratchpad, "Rejected (manifest:",
+		"the retry-only heading must not appear on a first attempt")
+}
+
 // TestExecuteMinisterStep_SetsRitualScriptScratchpad verifies the integration:
 // when a step runs for a real edict (EdictID > 1), executeMinisterStep loads
 // the full ritual script (plus court history) into the step's act session as a
