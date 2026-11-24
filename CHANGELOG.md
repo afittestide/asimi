@@ -5,6 +5,26 @@ All [Semantic Versions](https://semver.org/spec/v2.0.0.html) of this project and
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`review-contribution` built-in ritual** — reviews a foreign contributor's GitHub pull request (`pr` input) without checking out or executing untrusted code: the Judge reviews correctness, test coverage, and build/CI safety, the Chancellor checks adherence to the Imperial Code, and the Secretary synthesizes both reports to post an atomic GitHub review (`APPROVE` or `REQUEST_CHANGES`) with inline diff comments (0bb5c5fa4)
+- **The Ruler's Guide (mdBook)** — added a structured, multi-chapter user guide under `intent/guides/ruler/` covering the Court, getting started, edicts, lings, rituals, zhengming, the TUI, models, configuration, and troubleshooting, linked from `README.md` with a `just serve-book <name>` recipe for live preview (e252441e8)
+
+### Changed
+
+- **`[court]` ling settings unified into `max_parallel_lings`** — replaced `ling_ignition_enabled` and `ling_parallelism` with a single `[court] max_parallel_lings` integer (`0` disables automatic ling ignition by default; `N > 0` runs up to `N` ready lings concurrently in the edict's worktree), and removed the unused legacy `ritual_timeout` config field (e1088)
+
+### Fixed
+
+- **All `[court]` config fields wired into Court construction** — both standalone (`ProvideCourt`) and daemon (`createCourt`) Court constructors previously cherry-picked only a subset of `[court]` settings and silently dropped fields like `step_idle_timeout` and ling configuration; they now forward all `[court]` fields via `CourtConfig.Resolved`, while keeping `project` checkout-derived and `isolated_host` caller-verified (e1088)
+- **`list_edicts` filtered by derived status after `LIMIT`** — filtered queries (such as `status="cancelled"` or `status="sealed"`) previously truncated to the newest `limit` rows before checking derived status, falsely reporting "none match" when matches lay beyond the limit, and reported the limit as `in_scope`; `list_edicts` now resolves and filters across the full scope before applying `limit` and reports the true scope size in `in_scope` (e1080)
+
+### Developer tooling
+
+- **Vulnerability scan recipe renamed to `just get-vuln`** — renamed `just get-threats` to `just get-vuln` (writing reports to `heaven/vulns/`), updated the `release-version` ritual and `intent/docs/release-management.md` to match, consolidated `.agents/sandbox/Dockerfile` apt installs into one layer, and ignored generated `intent/guides/*/book/` mdBook build output in `.gitignore` (a54332af6, 63249954f)
+
 ## [0.17.1] - 2026-11-21
 
 ### Added
