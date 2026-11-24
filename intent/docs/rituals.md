@@ -420,7 +420,7 @@ A tight forge/judge/chancellor loop for small, targeted changes. The forge imple
 
 ### castle-siege
 
-A medium-complexity workflow that adds a War planning phase before forging. War analyzes the edict and produces a Battle Plan, recording its lings via `insert_ling`; the implementing step then **forks** over those lings (batch size 1), before judging and reviewing.
+A medium-complexity workflow that adds a War planning phase before forging. War analyzes the edict and produces a Battle Plan, recording its lings via `insert_ling`; the implementing step then **forks** over those lings (batch size 1), before judging and reviewing. When judging or reviewing fails, the ritual loops back to `strategizing` with the failure feedback so War inserts targeted pending fix lings, and `implementing` executes only the new pending lings while skipping already-completed ones.
 
 **Steps:** strategizing → implementing (fork over lings) → judging → reviewing
 

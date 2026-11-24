@@ -108,15 +108,25 @@
     - name: strategizing
       minister: war
       act: |
+        {{- if .error }}
+        A downstream judging or reviewing step failed. Here is the failure feedback:
+
+        {{ .error }}
+
+        Inspect the existing lings using list_ling, leave completed (done) lings intact,
+        and insert new targeted pending fix lings via insert_ling to resolve every reported issue.
+        {{- else }}
         Analyze the edict below and produce a technical Battle Plan.
 
         {{ .edict }}
 
         Break down the work into clear phases with dependencies.
         Use insert_ling to record the plan's lings.
+        {{- end }}
       then:
         - the lings form a valid DAG
-      on_failure: zhengming
+        - there are pending lings
+      on_failure: retry
 
     - name: implementing
       given:
@@ -146,7 +156,7 @@
         - the verdicts are passed
         - record the judge's seal
       on_failure: goto
-      on_failure_target: implementing
+      on_failure_target: strategizing
 
     - name: reviewing
       minister: chancellor
@@ -165,7 +175,7 @@
         - the precedent is approved
         - record the chancellor's seal
       on_failure: goto
-      on_failure_target: implementing
+      on_failure_target: strategizing
   then:
     - the edict awaits ruler's seal
 

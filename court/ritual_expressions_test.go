@@ -2978,6 +2978,64 @@ func TestCheckLingDAG_IsolatesByEdictKey(t *testing.T) {
 	assert.NoError(t, err, "Expected no error for edict 1 (valid DAG), despite edict 2 having a cycle")
 }
 
+// TestHasPendingLings verifies that has_pending_lings (matched by "there are pending lings")
+// passes when at least one pending ling exists, fails when none exist or all are done/blocked,
+// and isolates strictly by EdictKey (edict_id, username, project).
+func TestHasPendingLings(t *testing.T) {
+	// Verify cucumber expression registration.
+	stepReg := NewStepDefRegistry()
+	def, err := stepReg.Match("there are pending lings")
+	require.NoError(t, err)
+	require.NotNil(t, def)
+	assert.Equal(t, "has_pending_lings", def.HandlerKey)
+
+	db := setupRitualTestDB(t)
+	registry := NewRitualRegistry()
+	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
+
+	exec := &RitualExecution{
+		EdictID:  1,
+		Username: "testuser",
+		Project:  "testproject",
+	}
+
+	// 0 lings -> fails.
+	err = runner.runThen(context.Background(), exec, "has_pending_lings")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no pending lings for edict 1")
+
+	// Only done and blocked lings -> fails.
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "done-1", EdictID: 1, Username: "testuser", Project: "testproject", Status: storage.LingDone,
+	}).Error)
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "blocked-1", EdictID: 1, Username: "testuser", Project: "testproject", Status: storage.LingBlocked,
+	}).Error)
+	err = runner.runThen(context.Background(), exec, "has_pending_lings")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no pending lings for edict 1")
+
+	// Pending lings in other edict/user/project -> still fails for (1, testuser, testproject).
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "other-edict", EdictID: 2, Username: "testuser", Project: "testproject", Status: storage.LingPending,
+	}).Error)
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "other-user", EdictID: 1, Username: "otheruser", Project: "testproject", Status: storage.LingPending,
+	}).Error)
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "other-project", EdictID: 1, Username: "testuser", Project: "otherproject", Status: storage.LingPending,
+	}).Error)
+	err = runner.runThen(context.Background(), exec, "has_pending_lings")
+	require.Error(t, err, "pending lings from other EdictKeys must not satisfy edict 1")
+
+	// Add a pending ling for (1, testuser, testproject) alongside done/blocked -> passes.
+	require.NoError(t, db.Create(&storage.Ling{
+		LingID: "pending-1", EdictID: 1, Username: "testuser", Project: "testproject", Status: storage.LingPending,
+	}).Error)
+	err = runner.runThen(context.Background(), exec, "has_pending_lings")
+	assert.NoError(t, err)
+}
+
 // TestGetCourtStatus_ChancellorSealChecksChancellorMinisterID verifies that getCourtStatus
 // checks for minister_id = 'chancellor' (not the old 'sage'). An edict with a
 // chancellor seal should show status 'active' via the SQL CASE expression.

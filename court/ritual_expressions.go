@@ -95,6 +95,7 @@ func NewStepDefRegistry() *StepDefRegistry {
 		{"the unsealed edicts", "get_unsealed_edicts", "unsealed_edicts"},
 		{"the edict lings", "get_lings", "lings"},
 		{"the lings form a valid DAG", "check_ling_dag", ""},
+		{"there are pending lings", "has_pending_lings", ""},
 		{"a heaven's snapshot", "get_heaven_snapshot", "heaven_snapshot"},
 		{"Asimi's versions", "check_asimi_version", "asimi_version"},
 	}
@@ -1780,6 +1781,17 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 			return nil // no lings, nothing to validate
 		}
 		return checkLingDAG(lings)
+	case "has_pending_lings":
+		var count int64
+		if err := r.db.Model(&storage.Ling{}).
+			Where("edict_id = ? AND username = ? AND project = ? AND status = ?", thenKey.ID, thenKey.Username, thenKey.Project, storage.LingPending).
+			Count(&count).Error; err != nil {
+			return fmt.Errorf("failed to query pending lings: %w", err)
+		}
+		if count == 0 {
+			return fmt.Errorf("no pending lings for edict %d: strategizing must insert at least one pending ling", thenKey.ID)
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown then function: %s", fn)
 	}

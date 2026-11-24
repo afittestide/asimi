@@ -6446,3 +6446,328 @@ func TestIsRulerInterruptOnlyForRulerCause(t *testing.T) {
 	assert.False(t, isRulerInterrupt(context.Canceled, nil))
 	assert.False(t, isRulerInterrupt(errors.New("plain"), rulerCtx))
 }
+
+type callbackRitualMinister struct {
+	MinisterBase
+	id      string
+	tasksCh chan *Task
+	fn      func(call int, work string) (string, error)
+	calls   int
+	works   []string
+	mu      sync.Mutex
+}
+
+func (m *callbackRitualMinister) ID() string                  { return m.id }
+func (m *callbackRitualMinister) SystemPrompt() string        { return "" }
+func (m *callbackRitualMinister) Title() string               { return m.id }
+func (m *callbackRitualMinister) Tools() []Tool               { return nil }
+func (m *callbackRitualMinister) Tasks() chan<- *Task         { return m.tasksCh }
+func (m *callbackRitualMinister) Model() LLMProvider          { return nil }
+func (m *callbackRitualMinister) GetConfig() config.LLMConfig { return config.LLMConfig{} }
+func (m *callbackRitualMinister) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task := <-m.tasksCh:
+			m.mu.Lock()
+			m.calls++
+			call := m.calls
+			m.works = append(m.works, task.Work)
+			m.mu.Unlock()
+			out, err := m.fn(call, task.Work)
+			task.Done <- Result{Output: out, Err: err}
+		}
+	}
+}
+
+// TestCastleSiegeBuiltinRetryConfig verifies that the builtin castle-siege ritual
+// routes judging and reviewing failures back to strategizing, requires pending lings
+// before leaving strategizing, retries strategizing on failure, and renders .error on re-entry.
+func TestCastleSiegeBuiltinRetryConfig(t *testing.T) {
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+
+	var cs *RitualDef
+	for _, r := range rituals {
+		if r.Name == "castle-siege" {
+			cs = r
+			break
+		}
+	}
+	require.NotNil(t, cs, "castle-siege ritual not found")
+
+	stepsByName := make(map[string]RitualStep, len(cs.Steps))
+	for _, s := range cs.Steps {
+		stepsByName[s.Name] = s
+	}
+
+	strat, ok := stepsByName["strategizing"]
+	require.True(t, ok, "strategizing step not found")
+	assert.Equal(t, "retry", strat.OnFailure)
+	assert.Contains(t, strat.Then, "the lings form a valid DAG")
+	assert.Contains(t, strat.Then, "there are pending lings")
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, nil, nil, slog.Default(), repo.RepoInfo{})
+
+	// Render strategizing prompt on pass 1 (no error).
+	pass1 := runner.expandTemplate(strat.Act, &RitualExecution{
+		Data: storage.JSON{"edict": "build feature X"},
+	})
+	assert.Contains(t, pass1, "Analyze the edict below")
+	assert.Contains(t, pass1, "build feature X")
+
+	// Render strategizing prompt on re-entry (.error set).
+	reentry := runner.expandTemplate(strat.Act, &RitualExecution{
+		Data: storage.JSON{
+			"edict": "build feature X",
+			"error": "verdict failed: missing test",
+		},
+	})
+	assert.Contains(t, reentry, "verdict failed: missing test")
+	assert.Contains(t, reentry, "insert_ling")
+	assert.NotContains(t, reentry, "Analyze the edict below")
+
+	for _, name := range []string{"judging", "reviewing"} {
+		step, ok := stepsByName[name]
+		require.True(t, ok, "%s step not found", name)
+		assert.Equal(t, "goto", step.OnFailure, "%s on_failure", name)
+		assert.Equal(t, "strategizing", step.OnFailureTarget, "%s on_failure_target", name)
+	}
+}
+
+// TestCastleSiegeRetryRoutesThroughStrategizing verifies end-to-end that when judging
+// fails in castle-siege, control loops back to strategizing with .error rendered, War
+// inserts a new pending fix ling, implementing skips already-done lings and runs only
+// the new fix ling, and judging then passes.
+func TestCastleSiegeRetryRoutesThroughStrategizing(t *testing.T) {
+	db := setupRitualTestDB(t)
+	ek := testEK(1099)
+
+	// Load the builtin castle-siege and trim to strategizing -> implementing -> judging
+	// (removing background/reviewing/final-then so the test focuses purely on the retry loop).
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+	var builtinCS *RitualDef
+	for _, r := range rituals {
+		if r.Name == "castle-siege" {
+			builtinCS = r
+			break
+		}
+	}
+	require.NotNil(t, builtinCS)
+
+	var steps []RitualStep
+	for _, s := range builtinCS.Steps {
+		if s.Name == "strategizing" || s.Name == "implementing" {
+			steps = append(steps, s)
+		} else if s.Name == "judging" {
+			s.Then = nil // judge minister returns error on pass 1, nil on pass 2
+			steps = append(steps, s)
+		}
+	}
+	require.Len(t, steps, 3)
+
+	testRitual := &RitualDef{
+		Name:       "castle-siege-retry-test",
+		MaxRetries: 3,
+		Steps:      steps,
+	}
+	registry := NewRitualRegistry()
+	registry.Register(testRitual)
+
+	war := &callbackRitualMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "war",
+		tasksCh:      make(chan *Task, 4),
+		fn: func(call int, work string) (string, error) {
+			if call == 1 {
+				require.NoError(t, db.Create(&storage.Ling{
+					LingID:      "ling-a-001",
+					EdictID:     ek.ID,
+					Username:    ek.Username,
+					Project:     ek.Project,
+					Description: "implement feature A",
+					Status:      storage.LingPending,
+				}).Error)
+				return "planned ling-a", nil
+			}
+			require.NoError(t, db.Create(&storage.Ling{
+				LingID:      "ling-b-002",
+				EdictID:     ek.ID,
+				Username:    ek.Username,
+				Project:     ek.Project,
+				Description: "fix edge case B",
+				Status:      storage.LingPending,
+			}).Error)
+			return "planned fix ling-b", nil
+		},
+	}
+
+	forge := &callbackRitualMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 4),
+		fn: func(call int, work string) (string, error) {
+			return "forged", nil
+		},
+	}
+
+	judge := &callbackRitualMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "judge",
+		tasksCh:      make(chan *Task, 4),
+		fn: func(call int, work string) (string, error) {
+			if call == 1 {
+				return "", errors.New("missing edge-case handling in A")
+			}
+			return "verdict passed", nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go war.Run(ctx)
+	go forge.Run(ctx)
+	go judge.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{
+			"war":   war,
+			"forge": forge,
+			"judge": judge,
+		},
+		logger: slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+	exec, err := runner.Start(ctx, testRitual.Name, ek, map[string]string{"edict": "test edict"}, nil)
+	require.NoError(t, err)
+
+	err = runner.Run(ctx, exec)
+	require.NoError(t, err)
+
+	// War ran twice; second prompt included the judge failure feedback.
+	require.Equal(t, 2, war.calls)
+	assert.Contains(t, war.works[1], "missing edge-case handling in A")
+
+	// Forge ran twice: ling-a on pass 1, and ONLY ling-b on pass 2 (ling-a skipped).
+	require.Equal(t, 2, forge.calls)
+	assert.Contains(t, forge.works[0], "implement feature A")
+	assert.Contains(t, forge.works[1], "fix edge case B")
+
+	// Judge ran twice (failed pass 1, passed pass 2).
+	require.Equal(t, 2, judge.calls)
+
+	// Both lings are marked done.
+	var lings []storage.Ling
+	require.NoError(t, db.Where("edict_id = ? AND username = ? AND project = ?", ek.ID, ek.Username, ek.Project).Find(&lings).Error)
+	require.Len(t, lings, 2)
+	for _, l := range lings {
+		assert.Equal(t, storage.LingDone, l.Status, "ling %s should be done", l.LingID)
+	}
+}
+
+// TestCastleSiegeStrategizingGuardRejectsZeroPendingLings verifies that if War exits
+// strategizing on re-entry without inserting a pending ling, "there are pending lings"
+// fails strategizing instead of advancing to a 0-ling implementing pass.
+func TestCastleSiegeStrategizingGuardRejectsZeroPendingLings(t *testing.T) {
+	db := setupRitualTestDB(t)
+	ek := testEK(1100)
+
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+	var builtinCS *RitualDef
+	for _, r := range rituals {
+		if r.Name == "castle-siege" {
+			builtinCS = r
+			break
+		}
+	}
+	require.NotNil(t, builtinCS)
+
+	var steps []RitualStep
+	for _, s := range builtinCS.Steps {
+		if s.Name == "strategizing" || s.Name == "implementing" {
+			steps = append(steps, s)
+		} else if s.Name == "judging" {
+			s.Then = nil
+			steps = append(steps, s)
+		}
+	}
+	require.Len(t, steps, 3)
+
+	testRitual := &RitualDef{
+		Name:       "castle-siege-guard-test",
+		MaxRetries: 2,
+		Steps:      steps,
+	}
+	registry := NewRitualRegistry()
+	registry.Register(testRitual)
+
+	war := &callbackRitualMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "war",
+		tasksCh:      make(chan *Task, 4),
+		fn: func(call int, work string) (string, error) {
+			if call == 1 {
+				require.NoError(t, db.Create(&storage.Ling{
+					LingID:      "ling-a-001",
+					EdictID:     ek.ID,
+					Username:    ek.Username,
+					Project:     ek.Project,
+					Description: "implement feature A",
+					Status:      storage.LingPending,
+				}).Error)
+				return "planned ling-a", nil
+			}
+			// Re-entry: War forgets to insert any pending fix ling.
+			return "no new lings inserted", nil
+		},
+	}
+
+	forge := &callbackRitualMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "forge",
+		tasksCh:      make(chan *Task, 4),
+		fn: func(call int, work string) (string, error) {
+			return "forged", nil
+		},
+	}
+
+	judge := &callbackRitualMinister{
+		MinisterBase: MinisterBase{logger: slog.Default()},
+		id:           "judge",
+		tasksCh:      make(chan *Task, 4),
+		fn: func(call int, work string) (string, error) {
+			return "", errors.New("judge rejected")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go war.Run(ctx)
+	go forge.Run(ctx)
+	go judge.Run(ctx)
+
+	court := &Court{
+		ministers: map[string]Minister{
+			"war":   war,
+			"forge": forge,
+			"judge": judge,
+		},
+		logger: slog.Default(),
+	}
+
+	runner := NewRitualRunner(registry, court.GetMinister, court.PublishEvent, db, nil, slog.Default(), repo.RepoInfo{})
+	exec, err := runner.Start(ctx, testRitual.Name, ek, map[string]string{"edict": "test edict"}, nil)
+	require.NoError(t, err)
+
+	err = runner.Run(ctx, exec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no pending lings")
+
+	// Forge ran only once (pass 1); implementing was never entered with 0 pending lings.
+	assert.Equal(t, 1, forge.calls)
+	assert.Equal(t, 1, judge.calls)
+}
