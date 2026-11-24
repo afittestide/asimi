@@ -77,6 +77,7 @@ func createCourt(
 
 	ct := court.NewCourt(shared.DB, courtCfg, runner, shared.Logger)
 	ct.SetRepoInfo(repoInfo)
+	ct.SetMCPConfig(projectCfg.MCP)
 
 	// Wire session persister so daemon sessions are persisted to DB,
 	// same as the TUI path does via ProvideCourt.

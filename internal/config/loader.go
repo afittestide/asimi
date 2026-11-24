@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -62,6 +63,83 @@ func applyMountReadOnlyDefaults(k *koanf.Koanf, cfg *Config) {
 			cfg.Sandbox.AdditionalMounts[i].ReadOnly = v
 		}
 	}
+}
+
+// forbiddenMCPServerKeys are raw config keys that configure URL, HTTP, SSE, or
+// Streamable-HTTP MCP transports. All are rejected fail-closed due to
+// GO-2026-6911 (unfixed SSRF/credential leak in mcp-go StreamableHTTP).
+var forbiddenMCPServerKeys = map[string]bool{
+	"url":               true,
+	"endpoint":          true,
+	"connection_string": true,
+	"connection_type":   true,
+	"base_url":          true,
+	"server_url":        true,
+	"sse_url":           true,
+	"http_url":          true,
+	"http":              true,
+	"sse":               true,
+	"streamable_http":   true,
+	"streamable-http":   true,
+}
+
+// validateRawMCPConfig inspects the raw koanf mcp.servers entries before
+// struct unmarshaling so forbidden URL/HTTP/SSE keys that do not map to struct
+// fields (endpoint, connection_string, connection_type, etc.) fail closed with
+// an error citing GO-2026-6911.
+func validateRawMCPConfig(k *koanf.Koanf) error {
+	raw := k.Get("mcp.servers")
+	if raw == nil {
+		return nil
+	}
+
+	var entries []map[string]interface{}
+	switch v := raw.(type) {
+	case []interface{}:
+		entries = make([]map[string]interface{}, 0, len(v))
+		for i, item := range v {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("mcp.servers[%d]: invalid server entry", i)
+			}
+			entries = append(entries, m)
+		}
+	case []map[string]interface{}:
+		entries = v
+	default:
+		return fmt.Errorf("mcp.servers: expected array of server tables, got %T", raw)
+	}
+
+	for i, entry := range entries {
+		label := fmt.Sprintf("#%d", i)
+		if id, ok := entry["id"].(string); ok && strings.TrimSpace(id) != "" {
+			label = strings.TrimSpace(id)
+		}
+		keys := make([]string, 0, len(entry))
+		for key := range entry {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			val := entry[key]
+			lk := strings.ToLower(strings.TrimSpace(key))
+			if forbiddenMCPServerKeys[lk] {
+				if s, ok := val.(string); !ok || s != "" {
+					return fmt.Errorf("mcp.servers[%s]: forbidden key %q (only stdio transport is allowed due to GO-2026-6911)", label, key)
+				}
+			}
+			if lk == "transport" {
+				s, ok := val.(string)
+				if !ok {
+					return fmt.Errorf("mcp.servers[%s]: invalid transport %v (only \"stdio\" transport is allowed due to GO-2026-6911)", label, val)
+				}
+				if s != "" && !strings.EqualFold(strings.TrimSpace(s), "stdio") {
+					return fmt.Errorf("mcp.servers[%s]: transport %q is not supported (only \"stdio\" transport is allowed due to GO-2026-6911)", label, s)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // DefaultConfig returns the configuration populated with sensible defaults.
@@ -124,6 +202,7 @@ func DefaultConfig() Config {
 			DiskMinFreeMiB:  DefaultDiskMinFreeMiB,
 		},
 		Court: *DefaultCourtConfig(),
+		MCP:   DefaultMCPConfig(),
 	}
 }
 
@@ -199,6 +278,8 @@ func resolveAPIKeys(cfg *Config) {
 // keys via its APIKeys mechanism.
 func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	k := koanf.New(".")
+	userK := koanf.New(".")
+	projK := koanf.New(".")
 
 	// 1. User-level config
 	homeDir, err := os.UserHomeDir()
@@ -207,12 +288,18 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	}
 	userConfigPath := filepath.Join(homeDir, ".config", "asimi", "asimi.conf")
 	if _, statErr := os.Stat(userConfigPath); statErr == nil {
-		if err := k.Load(file.Provider(userConfigPath), koanftoml.Parser()); err != nil {
+		if err := userK.Load(file.Provider(userConfigPath), koanftoml.Parser()); err != nil {
 			var diag tomlDiagnostic
 			if errors.As(err, &diag) {
 				return nil, fmt.Errorf("failed to parse %s:\n%s", userConfigPath, diag.String())
 			}
 			return nil, fmt.Errorf("failed to load config from %s: %w", userConfigPath, err)
+		}
+		if err := validateRawMCPConfig(userK); err != nil {
+			return nil, err
+		}
+		if err := k.Merge(userK); err != nil {
+			return nil, fmt.Errorf("failed to merge user config: %w", err)
 		}
 	} else if !os.IsNotExist(statErr) {
 		slog.Warn("Unable to stat user config", "path", userConfigPath, "error", statErr)
@@ -222,12 +309,18 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	if projectRoot != "" {
 		projectConfigPath := filepath.Join(projectRoot, ".agents", "asimi.conf")
 		if _, statErr := os.Stat(projectConfigPath); statErr == nil {
-			if err := k.Load(file.Provider(projectConfigPath), koanftoml.Parser()); err != nil {
+			if err := projK.Load(file.Provider(projectConfigPath), koanftoml.Parser()); err != nil {
 				var diag tomlDiagnostic
 				if errors.As(err, &diag) {
 					return nil, fmt.Errorf("failed to parse %s:\n%s", projectConfigPath, diag.String())
 				}
 				return nil, fmt.Errorf("failed to load config from %s: %w", projectConfigPath, err)
+			}
+			if err := validateRawMCPConfig(projK); err != nil {
+				return nil, err
+			}
+			if err := k.Merge(projK); err != nil {
+				return nil, fmt.Errorf("failed to merge project config: %w", err)
 			}
 		} else if !os.IsNotExist(statErr) {
 			slog.Warn("Unable to stat project config", "path", projectConfigPath, "error", statErr)
@@ -238,6 +331,59 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	config := DefaultConfig()
 	if err := k.Unmarshal("", &config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// User vs. project MCP pre-classification isolation (edict 661):
+	// Only user config (~/.config/asimi/asimi.conf) may pre-classify MCP tools
+	// via default_permissions or [[mcp.servers.tools]] overrides without going
+	// through Rites + propose. Any pre-classification defined in project config
+	// (.agents/asimi.conf) is stripped.
+	if userK.Exists("mcp.servers") || projK.Exists("mcp.servers") {
+		var userMCP, projMCP MCPConfig
+		if userK.Exists("mcp.servers") {
+			if err := userK.Unmarshal("mcp", &userMCP); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal user mcp config: %w", err)
+			}
+		}
+		if projK.Exists("mcp.servers") {
+			if err := projK.Unmarshal("mcp", &projMCP); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal project mcp config: %w", err)
+			}
+			// Validate syntax (including strict 9-char permissions) before
+			// stripping so typos still surface a clear config error.
+			if err := ValidateMCPConfig(projMCP); err != nil {
+				return nil, err
+			}
+			for i := range projMCP.Servers {
+				if projMCP.Servers[i].DefaultPermissions != "" || len(projMCP.Servers[i].Tools) > 0 {
+					slog.Warn("ignoring project-level MCP pre-classifications (only user config may pre-classify)",
+						"server_id", projMCP.Servers[i].ID)
+					projMCP.Servers[i].DefaultPermissions = ""
+					projMCP.Servers[i].Tools = nil
+				}
+			}
+		}
+		merged := make([]MCPServerConfig, 0, len(userMCP.Servers)+len(projMCP.Servers))
+		userIndexByID := make(map[string]int, len(userMCP.Servers))
+		for _, srv := range userMCP.Servers {
+			id := strings.TrimSpace(srv.ID)
+			if id != "" {
+				if _, already := userIndexByID[id]; !already {
+					userIndexByID[id] = len(merged)
+				}
+			}
+			merged = append(merged, srv)
+		}
+		for _, srv := range projMCP.Servers {
+			id := strings.TrimSpace(srv.ID)
+			if idx, exists := userIndexByID[id]; id != "" && exists {
+				merged[idx] = srv
+				delete(userIndexByID, id)
+			} else {
+				merged = append(merged, srv)
+			}
+		}
+		config.MCP.Servers = merged
 	}
 
 	// Environment-variable overrides for model selection. These take
@@ -258,6 +404,12 @@ func LoadProjectConfig(projectRoot string, resolveKeys bool) (*Config, error) {
 	// medium, or high. Anything else is rejected to catch typos early,
 	// before the value silently reaches the daemon.
 	if err := ValidateReasoningEffort(config.LLM.ReasoningEffort); err != nil {
+		return nil, err
+	}
+
+	// Validate MCP configuration fail-closed (stdio-only policy, GO-2026-6911;
+	// unique IDs, non-empty commands, strict 9-char permission strings).
+	if err := ValidateMCPConfig(config.MCP); err != nil {
 		return nil, err
 	}
 

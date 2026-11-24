@@ -897,4 +897,20 @@ func (rc *ReconnectingClient) ApplyMandate(sel config.Selections) error {
 	return err
 }
 
+// MCPStatus returns a snapshot of configured MCP servers and their discovered
+// tools, retrying on a broken connection like other read-only methods.
+func (rc *ReconnectingClient) MCPStatus() ([]court.MCPServerStatus, error) {
+	client := rc.getClient()
+	if client == nil {
+		return nil, ErrClosed
+	}
+	servers, err := client.MCPStatus()
+	if rc.reconnectIfError(err, rc.shouldRetryReadOnly) {
+		if client = rc.getClient(); client != nil {
+			return client.MCPStatus()
+		}
+	}
+	return servers, err
+}
+
 var _ courtapi.Client = (*ReconnectingClient)(nil)

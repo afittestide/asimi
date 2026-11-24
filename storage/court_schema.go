@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // MalformedMarkerKey is the single JSON key used to represent a database value
@@ -560,4 +563,135 @@ type RitualGuardCheckpoint struct {
 // TableName returns the table name for RitualGuardCheckpoint
 func (RitualGuardCheckpoint) TableName() string {
 	return "ritual_guard_checkpoint"
+}
+
+// MCPToolClassification persists a Ruler-sealed Three Realms classification
+// for an MCP tool. Primary key is composite: (username, project, server_id, tool_name),
+// allowing per-project overrides while supporting user-wide cross-project reuse
+// on matching schema_hash and command_hash.
+type MCPToolClassification struct {
+	Username    string    `gorm:"primaryKey;column:username;index:idx_mcp_tool_class_reuse,priority:1"`
+	Project     string    `gorm:"primaryKey;column:project"`
+	ServerID    string    `gorm:"primaryKey;column:server_id;index:idx_mcp_tool_class_reuse,priority:2"`
+	ToolName    string    `gorm:"primaryKey;column:tool_name;index:idx_mcp_tool_class_reuse,priority:3"`
+	Permissions string    `gorm:"column:permissions"` // 9-char rwx Three Realms string (--------- = sealed deny)
+	SchemaHash  string    `gorm:"column:schema_hash;index:idx_mcp_tool_class_reuse,priority:4"`
+	CommandHash string    `gorm:"column:command_hash;index:idx_mcp_tool_class_reuse,priority:5"`
+	SealedAt    time.Time `gorm:"column:sealed_at;autoCreateTime"`
+	SealedBy    string    `gorm:"column:sealed_by"`
+}
+
+// TableName returns the table name for MCPToolClassification
+func (MCPToolClassification) TableName() string {
+	return "mcp_tool_classifications"
+}
+
+// LookupMCPToolClassification finds a sealed classification matching both
+// schemaHash and commandHash strictly within username (never crossing username
+// boundaries). It checks (username, project, server_id, tool_name) first so
+// per-project rows take precedence; if no row exists for the current project,
+// it falls back to the most recently sealed row for (username, server_id,
+// tool_name) with matching schema_hash and command_hash across the same user's
+// other projects.
+//
+// Returns (nil, nil) when no matching classification is found (or when the
+// current project's row has a different schema_hash or command_hash and must
+// be re-classified).
+func LookupMCPToolClassification(db *gorm.DB, username, project, serverID, toolName, schemaHash, commandHash string) (*MCPToolClassification, error) {
+	if db == nil {
+		return nil, fmt.Errorf("lookup mcp tool classification: nil database")
+	}
+	if username == "" {
+		return nil, fmt.Errorf("lookup mcp tool classification: username is required")
+	}
+	if serverID == "" || toolName == "" {
+		return nil, fmt.Errorf("lookup mcp tool classification: server_id and tool_name are required")
+	}
+	if schemaHash == "" || commandHash == "" {
+		return nil, nil
+	}
+
+	var current []MCPToolClassification
+	if err := db.Where(
+		"username = ? AND project = ? AND server_id = ? AND tool_name = ?",
+		username, project, serverID, toolName,
+	).Limit(1).Find(&current).Error; err != nil {
+		return nil, fmt.Errorf("lookup mcp tool classification (project): %w", err)
+	}
+	if len(current) > 0 {
+		if current[0].SchemaHash == schemaHash && current[0].CommandHash == commandHash {
+			return &current[0], nil
+		}
+		// Current project has an explicit row whose schema or command changed;
+		// do not return a stale classification or override it from another project.
+		return nil, nil
+	}
+
+	var fallback []MCPToolClassification
+	if err := db.Where(
+		"username = ? AND server_id = ? AND tool_name = ? AND schema_hash = ? AND command_hash = ?",
+		username, serverID, toolName, schemaHash, commandHash,
+	).Order("sealed_at DESC").Limit(1).Find(&fallback).Error; err != nil {
+		return nil, fmt.Errorf("lookup mcp tool classification (fallback): %w", err)
+	}
+	if len(fallback) == 0 {
+		return nil, nil
+	}
+	return &fallback[0], nil
+}
+
+// SaveMCPToolClassification upserts a sealed MCP tool classification under its
+// composite primary key (username, project, server_id, tool_name).
+func SaveMCPToolClassification(db *gorm.DB, c *MCPToolClassification) error {
+	if db == nil {
+		return fmt.Errorf("save mcp tool classification: nil database")
+	}
+	if c == nil {
+		return fmt.Errorf("save mcp tool classification: nil classification")
+	}
+	if c.Username == "" {
+		return fmt.Errorf("save mcp tool classification: username is required")
+	}
+	if c.ServerID == "" || c.ToolName == "" {
+		return fmt.Errorf("save mcp tool classification: server_id and tool_name are required")
+	}
+	if c.SealedAt.IsZero() {
+		c.SealedAt = time.Now()
+	}
+
+	err := db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "username"},
+			{Name: "project"},
+			{Name: "server_id"},
+			{Name: "tool_name"},
+		},
+		DoUpdates: clause.AssignmentColumns([]string{"permissions", "schema_hash", "command_hash", "sealed_at", "sealed_by"}),
+	}).Create(c).Error
+	if err != nil {
+		return fmt.Errorf("save mcp tool classification: %w", err)
+	}
+	return nil
+}
+
+// ListMCPToolClassifications returns sealed MCP tool classifications strictly
+// bounded to username. When project is non-empty, results are filtered to that
+// project; when project is empty, all projects for username are returned.
+func ListMCPToolClassifications(db *gorm.DB, username, project string) ([]MCPToolClassification, error) {
+	if db == nil {
+		return nil, fmt.Errorf("list mcp tool classifications: nil database")
+	}
+	if username == "" {
+		return nil, fmt.Errorf("list mcp tool classifications: username is required")
+	}
+
+	q := db.Where("username = ?", username)
+	if project != "" {
+		q = q.Where("project = ?", project)
+	}
+	var rows []MCPToolClassification
+	if err := q.Order("project ASC, server_id ASC, tool_name ASC").Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list mcp tool classifications: %w", err)
+	}
+	return rows, nil
 }

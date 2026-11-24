@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/afittestide/asimi/internal/config"
 	"github.com/blang/semver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -755,12 +756,15 @@ func nonVendorGoFiles(t *testing.T) []string {
 
 // TestGO20266911AcceptanceBasisStillHolds guards the premise the
 // GO-2026-6911 acceptance rests on. The finding has no upstream fix, so it is
-// accepted on the claim that Asimi's configuration never exercises bifrost's
-// MCP client: InitBifrost supplies only Account and Logger, leaving MCPConfig
-// nil, so no MCPManager and no StreamableHTTP transport is ever built. That is a
-// property of production code, not of this test — the moment Asimi configures
-// MCP the acceptance is void and the allowlist entry must be re-reviewed, so
-// this test fails loudly rather than letting a stale acceptance stand.
+// accepted on the stdio-only MCP boundary (edict 661):
+//  1. InitBifrost leaves schemas.BifrostConfig.MCPConfig nil so Bifrost never
+//     builds an internal MCPManager that bypasses Asimi's validation or seal gate.
+//  2. No production Go file references remote MCP transports
+//     (MCPConnectionTypeHTTP, MCPConnectionTypeSSE, or NewStreamableHTTP).
+//  3. config.ValidateMCPConfig rejects HTTP, SSE, Streamable-HTTP, and URL
+//     configs fail-closed citing GO-2026-6911.
+//  4. internal/config/default.conf documents the stdio-only policy citing
+//     GO-2026-6911.
 func TestGO20266911AcceptanceBasisStillHolds(t *testing.T) {
 	accepted := false
 	for _, line := range strings.Split(readRootFile(t, "security/vuln-allowlist.txt"), "\n") {
@@ -772,17 +776,35 @@ func TestGO20266911AcceptanceBasisStillHolds(t *testing.T) {
 		t.Skip("GO-2026-6911 is no longer accepted — nothing to guard")
 	}
 
-	// Scan the whole non-vendor tree rather than one file: a second BifrostConfig
-	// construction elsewhere would otherwise slip through while the single-site
-	// claim this acceptance rests on quietly stops being true.
+	// Scan the whole non-vendor tree: no BifrostConfig may wire MCPConfig, and
+	// no production file may construct HTTP/SSE/StreamableHTTP MCP transports.
 	for _, file := range nonVendorGoFiles(t) {
 		body := readRootFile(t, file)
 		if strings.Contains(body, "BifrostConfig") && strings.Contains(body, "MCPConfig") {
-			t.Errorf("%s wires MCPConfig into a BifrostConfig — bifrost would build an MCPManager "+
-				"and the StreamableHTTP symbols GO-2026-6911 is accepted for become exercised; "+
-				"re-review the acceptance", file)
+			t.Errorf("%s wires MCPConfig into a BifrostConfig — bifrost would build an internal MCPManager "+
+				"bypassing Asimi's stdio-only validation and seal gate; re-review GO-2026-6911", file)
+		}
+		for _, forbidden := range []string{"MCPConnectionTypeHTTP", "MCPConnectionTypeSSE", "NewStreamableHTTP"} {
+			if strings.Contains(body, forbidden) {
+				t.Errorf("%s references %s — remote MCP transports exercise the vulnerable mcp-go "+
+					"StreamableHTTP path covered by GO-2026-6911; re-review the acceptance", file, forbidden)
+			}
 		}
 	}
-	assert.NotContains(t, readRootFile(t, "internal/config/default.conf"), "[mcp]",
-		"default.conf gained an [mcp] section — MCP is now configurable and the GO-2026-6911 acceptance must be re-reviewed")
+
+	// Verify config validation actively rejects non-stdio transports citing GO-2026-6911.
+	for _, bad := range []config.MCPServerConfig{
+		{ID: "http-srv", Transport: "http", Command: []string{"mcp"}},
+		{ID: "sse-srv", Transport: "sse", Command: []string{"mcp"}},
+		{ID: "shttp-srv", Transport: "streamable-http", Command: []string{"mcp"}},
+		{ID: "url-srv", URL: "https://example.com/mcp", Command: []string{"mcp"}},
+	} {
+		err := config.ValidateMCPConfig(config.MCPConfig{Servers: []config.MCPServerConfig{bad}})
+		require.Error(t, err, "expected non-stdio MCP server %q to be rejected", bad.ID)
+		assert.Contains(t, err.Error(), "GO-2026-6911")
+	}
+
+	defaultConf := readRootFile(t, "internal/config/default.conf")
+	assert.Contains(t, defaultConf, "GO-2026-6911",
+		"default.conf must document the stdio-only MCP restriction citing GO-2026-6911")
 }

@@ -3,6 +3,7 @@ package storage
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -108,7 +109,7 @@ func setupCourtSchemaTestDB(t *testing.T) *gorm.DB {
 	if err := db.AutoMigrate(
 		&Edict{}, &Seal{}, &Zhengming{}, &TianEvent{}, &TianEventDLQ{},
 		&Ling{}, &ForgeManifest{}, &JudgeVerdict{}, &CensorPrecedent{},
-		&Incident{}, &RulerCouncil{},
+		&Incident{}, &RulerCouncil{}, &MCPToolClassification{},
 	); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
@@ -345,6 +346,12 @@ func TestMigrateProjectSlugs_CoversEveryCourtTable(t *testing.T) {
 	if err := db.Create(&RulerCouncil{CouncilID: "c1", EdictID: 1, Username: "daonb", Project: "bennydaon/idp"}).Error; err != nil {
 		t.Fatalf("seed ruler_councils: %v", err)
 	}
+	if err := db.Create(&MCPToolClassification{
+		Username: "daonb", Project: "afittestide/asimi-cli", ServerID: "lsp", ToolName: "hover",
+		Permissions: "r--------", SchemaHash: "sha256:abc", SealedBy: "daonb",
+	}).Error; err != nil {
+		t.Fatalf("seed mcp_tool_classifications: %v", err)
+	}
 
 	if err := PostGormMigrate(db, "daonb"); err != nil {
 		t.Fatalf("PostGormMigrate failed: %v", err)
@@ -355,6 +362,7 @@ func TestMigrateProjectSlugs_CoversEveryCourtTable(t *testing.T) {
 	for _, table := range []string{
 		"seals", "zhengming_requests", "tian_events", "tian_event_dlq", "lings",
 		"forge_manifests", "judge_verdicts", "censor_precedents", "incidents", "ruler_councils",
+		"mcp_tool_classifications",
 	} {
 		var stale int64
 		if err := db.Table(table).Where("project NOT LIKE ?", "daonb/%").Count(&stale).Error; err != nil {
@@ -370,5 +378,387 @@ func TestMigrateProjectSlugs_CoversEveryCourtTable(t *testing.T) {
 		if forge != 0 {
 			t.Errorf("%s: %d rows still under the 'forge' role identity", table, forge)
 		}
+	}
+}
+
+func setupMCPClassificationTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open test db: %v", err)
+	}
+	if err := db.AutoMigrate(&MCPToolClassification{}); err != nil {
+		t.Fatalf("failed to migrate mcp_tool_classifications: %v", err)
+	}
+	return db
+}
+
+// TestMCPToolClassification_AutoMigrateCompositePK verifies that AutoMigrate
+// creates mcp_tool_classifications with the composite primary key
+// (username, project, server_id, tool_name) and expected columns.
+func TestMCPToolClassification_AutoMigrateCompositePK(t *testing.T) {
+	db := setupMCPClassificationTestDB(t)
+
+	type colInfo struct {
+		Name string `gorm:"column:name"`
+		PK   int    `gorm:"column:pk"`
+	}
+	var cols []colInfo
+	if err := db.Raw("PRAGMA table_info('mcp_tool_classifications')").Scan(&cols).Error; err != nil {
+		t.Fatalf("PRAGMA table_info failed: %v", err)
+	}
+
+	seen := make(map[string]int, len(cols))
+	for _, c := range cols {
+		seen[c.Name] = c.PK
+	}
+
+	wantCols := []string{"username", "project", "server_id", "tool_name", "permissions", "schema_hash", "command_hash", "sealed_at", "sealed_by"}
+	for _, name := range wantCols {
+		if _, ok := seen[name]; !ok {
+			t.Errorf("missing expected column %q in mcp_tool_classifications", name)
+		}
+	}
+
+	wantPK := map[string]bool{
+		"username":  true,
+		"project":   true,
+		"server_id": true,
+		"tool_name": true,
+	}
+	for name, pk := range seen {
+		if wantPK[name] && pk == 0 {
+			t.Errorf("column %q must be part of composite primary key, got pk=0", name)
+		}
+		if !wantPK[name] && pk != 0 {
+			t.Errorf("column %q must not be part of primary key, got pk=%d", name, pk)
+		}
+	}
+
+	// Verify composite PK enforces uniqueness on (username, project, server_id, tool_name)
+	// while allowing variation in any of the four key columns.
+	base := MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "srv1", ToolName: "read",
+		Permissions: "r--------", SchemaHash: "h1", SealedBy: "alice",
+	}
+	if err := db.Create(&base).Error; err != nil {
+		t.Fatalf("insert base row: %v", err)
+	}
+	dup := base
+	if err := db.Create(&dup).Error; err == nil {
+		t.Fatalf("expected duplicate composite PK insert to fail, got nil")
+	}
+
+	variants := []MCPToolClassification{
+		{Username: "bob", Project: "alice/projA", ServerID: "srv1", ToolName: "read", Permissions: "r--------", SchemaHash: "h1", SealedBy: "bob"},
+		{Username: "alice", Project: "alice/projB", ServerID: "srv1", ToolName: "read", Permissions: "r--------", SchemaHash: "h1", SealedBy: "alice"},
+		{Username: "alice", Project: "alice/projA", ServerID: "srv2", ToolName: "read", Permissions: "r--------", SchemaHash: "h1", SealedBy: "alice"},
+		{Username: "alice", Project: "alice/projA", ServerID: "srv1", ToolName: "write", Permissions: "rw-------", SchemaHash: "h2", SealedBy: "alice"},
+	}
+	for i, v := range variants {
+		if err := db.Create(&v).Error; err != nil {
+			t.Fatalf("variant %d insert failed: %v", i, err)
+		}
+	}
+}
+
+// TestLookupMCPToolClassification_CurrentProjectPrecedence verifies that an
+// existing row for the current project takes precedence over a newer row for
+// the same (username, server_id, tool_name, schema_hash) in another project.
+func TestLookupMCPToolClassification_CurrentProjectPrecedence(t *testing.T) {
+	db := setupMCPClassificationTestDB(t)
+
+	t1 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "term", ToolName: "exec",
+		Permissions: "r--------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: t1, SealedBy: "alice",
+	}); err != nil {
+		t.Fatalf("save projA: %v", err)
+	}
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "alice", Project: "alice/projB", ServerID: "term", ToolName: "exec",
+		Permissions: "rwx------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: t2, SealedBy: "alice",
+	}); err != nil {
+		t.Fatalf("save projB: %v", err)
+	}
+
+	got, err := LookupMCPToolClassification(db, "alice", "alice/projA", "term", "exec", "hash-v1", "cmd-v1")
+	if err != nil {
+		t.Fatalf("LookupMCPToolClassification failed: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected current-project row, got nil")
+	}
+	if got.Project != "alice/projA" || got.Permissions != "r--------" {
+		t.Errorf("got (%q, %q), want (alice/projA, r--------)", got.Project, got.Permissions)
+	}
+}
+
+// TestLookupMCPToolClassification_CrossProjectFallbackLatestSealedAt verifies
+// that when the current project has no row, lookup reuses the most recently
+// sealed row for (username, server_id, tool_name) with matching schema_hash
+// and command_hash.
+func TestLookupMCPToolClassification_CrossProjectFallbackLatestSealedAt(t *testing.T) {
+	db := setupMCPClassificationTestDB(t)
+
+	tOld := time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)
+	tMid := time.Date(2026, 11, 15, 8, 0, 0, 0, time.UTC)
+	tLatest := time.Date(2026, 11, 22, 8, 0, 0, 0, time.UTC)
+
+	rows := []MCPToolClassification{
+		{
+			Username: "alice", Project: "alice/aaa", ServerID: "lsp", ToolName: "rename",
+			Permissions: "r--------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: tMid, SealedBy: "alice",
+		},
+		{
+			// Alphabetically later project name with latest SealedAt to prove
+			// ordering is by sealed_at DESC rather than project ASC.
+			Username: "alice", Project: "alice/zzz", ServerID: "lsp", ToolName: "rename",
+			Permissions: "rw-------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: tLatest, SealedBy: "alice",
+		},
+		{
+			Username: "alice", Project: "alice/mmm", ServerID: "lsp", ToolName: "rename",
+			Permissions: "rwx------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: tOld, SealedBy: "alice",
+		},
+	}
+	for i := range rows {
+		if err := SaveMCPToolClassification(db, &rows[i]); err != nil {
+			t.Fatalf("save row %d: %v", i, err)
+		}
+	}
+
+	got, err := LookupMCPToolClassification(db, "alice", "alice/brand-new", "lsp", "rename", "hash-v1", "cmd-v1")
+	if err != nil {
+		t.Fatalf("LookupMCPToolClassification failed: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected fallback row, got nil")
+	}
+	if got.Project != "alice/zzz" || got.Permissions != "rw-------" {
+		t.Errorf("got (%q, %q), want (alice/zzz, rw-------)", got.Project, got.Permissions)
+	}
+}
+
+// TestLookupMCPToolClassification_SchemaHashMismatchNoReuse verifies that
+// mismatched schema or command hashes never reuse an existing classification
+// (neither in the current project nor across projects).
+func TestLookupMCPToolClassification_SchemaHashMismatchNoReuse(t *testing.T) {
+	db := setupMCPClassificationTestDB(t)
+
+	t1 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "lsp", ToolName: "hover",
+		Permissions: "r--------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: t1, SealedBy: "alice",
+	}); err != nil {
+		t.Fatalf("save projA: %v", err)
+	}
+
+	// Same-project lookup with a different schema hash must miss.
+	got, err := LookupMCPToolClassification(db, "alice", "alice/projA", "lsp", "hover", "hash-v2", "cmd-v1")
+	if err != nil {
+		t.Fatalf("same-project mismatch lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil on same-project schema_hash mismatch, got %+v", got)
+	}
+
+	// Same-project lookup with a different command hash must miss.
+	got, err = LookupMCPToolClassification(db, "alice", "alice/projA", "lsp", "hover", "hash-v1", "cmd-v2")
+	if err != nil {
+		t.Fatalf("same-project command mismatch lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil on same-project command_hash mismatch, got %+v", got)
+	}
+
+	// Cross-project lookup with a different schema hash must miss.
+	got, err = LookupMCPToolClassification(db, "alice", "alice/projC", "lsp", "hover", "hash-v2", "cmd-v1")
+	if err != nil {
+		t.Fatalf("cross-project mismatch lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil on cross-project schema_hash mismatch, got %+v", got)
+	}
+
+	// Cross-project lookup with a different command hash (same server_id + schema_hash
+	// pointing to a different binary) must NEVER reuse another server's seal.
+	got, err = LookupMCPToolClassification(db, "alice", "alice/projC", "lsp", "hover", "hash-v1", "cmd-evil")
+	if err != nil {
+		t.Fatalf("cross-project command mismatch lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil on cross-project command_hash mismatch, got %+v", got)
+	}
+
+	// When projB has hash-v2, projA (which explicitly holds stale hash-v1) must
+	// still miss rather than silently inheriting projB's permissions.
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "alice", Project: "alice/projB", ServerID: "lsp", ToolName: "hover",
+		Permissions: "rwx------", SchemaHash: "hash-v2", CommandHash: "cmd-v1", SealedAt: t2, SealedBy: "alice",
+	}); err != nil {
+		t.Fatalf("save projB: %v", err)
+	}
+	got, err = LookupMCPToolClassification(db, "alice", "alice/projA", "lsp", "hover", "hash-v2", "cmd-v1")
+	if err != nil {
+		t.Fatalf("stale project override lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil when current project row has stale schema_hash, got %+v", got)
+	}
+
+	// Empty schema_hash or command_hash must never match.
+	got, err = LookupMCPToolClassification(db, "alice", "alice/projA", "lsp", "hover", "", "cmd-v1")
+	if err != nil {
+		t.Fatalf("empty schemaHash lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty schemaHash, got %+v", got)
+	}
+	got, err = LookupMCPToolClassification(db, "alice", "alice/projA", "lsp", "hover", "hash-v1", "")
+	if err != nil {
+		t.Fatalf("empty commandHash lookup error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty commandHash, got %+v", got)
+	}
+}
+
+// TestMCPToolClassification_StrictUsernameIsolation verifies that empty
+// usernames are rejected and queries never cross username boundaries.
+func TestMCPToolClassification_StrictUsernameIsolation(t *testing.T) {
+	db := setupMCPClassificationTestDB(t)
+
+	if _, err := LookupMCPToolClassification(db, "", "alice/projA", "srv", "tool", "h1", "c1"); err == nil {
+		t.Errorf("LookupMCPToolClassification with empty username must return error")
+	}
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "", Project: "alice/projA", ServerID: "srv", ToolName: "tool",
+		Permissions: "r--------", SchemaHash: "h1", CommandHash: "c1",
+	}); err == nil {
+		t.Errorf("SaveMCPToolClassification with empty username must return error")
+	}
+	if _, err := ListMCPToolClassifications(db, "", ""); err == nil {
+		t.Errorf("ListMCPToolClassifications with empty username must return error")
+	}
+
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "srv", ToolName: "tool",
+		Permissions: "rw-------", SchemaHash: "h1", CommandHash: "c1", SealedBy: "alice",
+	}); err != nil {
+		t.Fatalf("save alice projA: %v", err)
+	}
+	if err := SaveMCPToolClassification(db, &MCPToolClassification{
+		Username: "alice", Project: "alice/projB", ServerID: "srv", ToolName: "other",
+		Permissions: "r--------", SchemaHash: "h2", CommandHash: "c1", SealedBy: "alice",
+	}); err != nil {
+		t.Fatalf("save alice projB: %v", err)
+	}
+
+	// Another user must never see alice's classification via fallback or even
+	// with an identical project string.
+	for _, proj := range []string{"bob/projA", "alice/projA"} {
+		got, err := LookupMCPToolClassification(db, "bob", proj, "srv", "tool", "h1", "c1")
+		if err != nil {
+			t.Fatalf("lookup for bob (%s): %v", proj, err)
+		}
+		if got != nil {
+			t.Errorf("username isolation violated: bob (%s) saw %+v", proj, got)
+		}
+	}
+
+	// ListMCPToolClassifications must also isolate usernames and filter project.
+	bobRows, err := ListMCPToolClassifications(db, "bob", "")
+	if err != nil {
+		t.Fatalf("list bob: %v", err)
+	}
+	if len(bobRows) != 0 {
+		t.Errorf("expected 0 rows for bob, got %d", len(bobRows))
+	}
+
+	aliceProjA, err := ListMCPToolClassifications(db, "alice", "alice/projA")
+	if err != nil {
+		t.Fatalf("list alice projA: %v", err)
+	}
+	if len(aliceProjA) != 1 || aliceProjA[0].ToolName != "tool" {
+		t.Errorf("expected 1 row for alice/projA, got %+v", aliceProjA)
+	}
+
+	aliceAll, err := ListMCPToolClassifications(db, "alice", "")
+	if err != nil {
+		t.Fatalf("list alice all: %v", err)
+	}
+	if len(aliceAll) != 2 {
+		t.Errorf("expected 2 rows for alice across projects, got %d", len(aliceAll))
+	}
+}
+
+// TestSaveMCPToolClassification_Upsert verifies that saving an existing
+// (username, project, server_id, tool_name) updates permissions, schema_hash,
+// sealed_at, and sealed_by in place without duplicating rows.
+func TestSaveMCPToolClassification_Upsert(t *testing.T) {
+	db := setupMCPClassificationTestDB(t)
+
+	t1 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 11, 24, 15, 30, 0, 0, time.UTC)
+
+	initial := &MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "srv", ToolName: "tool",
+		Permissions: "rwx------", SchemaHash: "hash-v1", CommandHash: "cmd-v1", SealedAt: t1, SealedBy: "alice",
+	}
+	if err := SaveMCPToolClassification(db, initial); err != nil {
+		t.Fatalf("initial save failed: %v", err)
+	}
+
+	updated := &MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "srv", ToolName: "tool",
+		Permissions: "---------", SchemaHash: "hash-v2", CommandHash: "cmd-v2", SealedAt: t2, SealedBy: "ruler",
+	}
+	if err := SaveMCPToolClassification(db, updated); err != nil {
+		t.Fatalf("upsert save failed: %v", err)
+	}
+
+	var count int64
+	if err := db.Model(&MCPToolClassification{}).Count(&count).Error; err != nil {
+		t.Fatalf("count failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 row after upsert, got %d", count)
+	}
+
+	// Old hash must no longer match.
+	oldHit, err := LookupMCPToolClassification(db, "alice", "alice/projA", "srv", "tool", "hash-v1", "cmd-v1")
+	if err != nil {
+		t.Fatalf("lookup old hash: %v", err)
+	}
+	if oldHit != nil {
+		t.Errorf("expected old hash to miss after upsert, got %+v", oldHit)
+	}
+
+	// New hash returns updated fields including sealed deny --------- and command_hash.
+	got, err := LookupMCPToolClassification(db, "alice", "alice/projA", "srv", "tool", "hash-v2", "cmd-v2")
+	if err != nil {
+		t.Fatalf("lookup new hash: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected updated row, got nil")
+	}
+	if got.Permissions != "---------" || got.SchemaHash != "hash-v2" || got.CommandHash != "cmd-v2" || got.SealedBy != "ruler" || !got.SealedAt.Equal(t2) {
+		t.Errorf("unexpected upserted row: %+v", got)
+	}
+
+	// Zero SealedAt defaults to a non-zero timestamp.
+	autoTime := &MCPToolClassification{
+		Username: "alice", Project: "alice/projA", ServerID: "srv", ToolName: "auto-time",
+		Permissions: "r--------", SchemaHash: "hash-auto", CommandHash: "cmd-auto", SealedBy: "alice",
+	}
+	if err := SaveMCPToolClassification(db, autoTime); err != nil {
+		t.Fatalf("save with zero SealedAt: %v", err)
+	}
+	if autoTime.SealedAt.IsZero() {
+		t.Errorf("expected SaveMCPToolClassification to populate zero SealedAt")
 	}
 }

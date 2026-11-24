@@ -3970,6 +3970,9 @@ type mockCourtClient struct {
 	sessionSeamsErr error
 	appliedMandates []config.Selections
 	applyMandateFn  func(config.Selections) error
+
+	mcpStatus    []court.MCPServerStatus
+	mcpStatusErr error
 }
 
 type publishedEvent struct {
@@ -4166,6 +4169,10 @@ func (m *mockCourtClient) ApplyMandate(sel config.Selections) error {
 		return m.applyMandateFn(sel)
 	}
 	return nil
+}
+
+func (m *mockCourtClient) MCPStatus() ([]court.MCPServerStatus, error) {
+	return m.mcpStatus, m.mcpStatusErr
 }
 
 // --- Tests for pendingRitualEnact YESNO flow ---
@@ -10550,6 +10557,39 @@ func TestTrustDialog_HostExecNeedsItsOwnRow(t *testing.T) {
 		"the row must say the command runs outside the sandbox")
 	assert.NotContains(t, rendered, "on-host commands stay open either way",
 		"the dialog must not claim the seam is ungated now that it is gated")
+}
+
+func TestTrustDialog_MCPServerNeedsItsOwnRow(t *testing.T) {
+	seams := append(trustDialogSeams(), config.Seam{
+		Kind:  config.SeamMCPServer,
+		Label: "term (asimi-term-mcp) [env: TERM=xterm]",
+		MCPServer: config.MCPServerConfig{
+			ID:      "term",
+			Command: []string{"asimi-term-mcp"},
+			Env:     []string{"TERM=xterm"},
+		},
+	})
+	d := NewTrustDialog(seams)
+	mcpRow := len(seams) - 1
+
+	assert.Empty(t, d.Selections().MCPServers, "MCP servers must start ungranted")
+	assert.True(t, d.Covers("term"))
+
+	d.ToggleAllowAll()
+	assert.Empty(t, d.Selections().MCPServers, "Allow all must not grant unsandboxed MCP servers")
+	assert.False(t, d.granted[mcpRow], "the MCP server row must stay unticked under Allow all")
+	assert.True(t, d.granted[0], "ordinary sandbox seams are still granted by Allow all")
+
+	d.cursor = mcpRow
+	d.Toggle()
+	assert.True(t, d.Selections().MCPServers["term"], "ticking the MCP server row explicitly grants it")
+
+	d.Toggle()
+	assert.False(t, d.Selections().MCPServers["term"], "unticking the row revokes the grant")
+
+	rendered := NewTrustDialog(seams).Render(100)
+	assert.Contains(t, rendered, "mcp term (asimi-term-mcp)")
+	assert.Contains(t, rendered, "OFF the sandbox")
 }
 
 // TestLoadTrustSeams_RetriesPeerDisconnect pins the second transient branch:

@@ -35,27 +35,31 @@ justification in this document.
   only remedies are dropping the dependency or waiting for one; the module
   arrives transitively through `github.com/maximhq/bifrost/core/schemas`, which
   Asimi does not control.
-- **Where it comes from**: all three of today's findings arrive indirectly via
-  `github.com/maximhq/bifrost/core/schemas` (`go mod why -m` confirms the chain).
-  This one is *reachable* in the binary: govulncheck lists the
-  `transport.StreamableHTTP` symbols
-  (`NewStreamableHTTP`, `Close`, `SendNotification`, `SendRequest`,
-  `SetRequestHandler`), which bifrost's `core/mcp/clientmanager.go` calls.
-- **Why it is accepted**: the vulnerable code is **not exercised by Asimi's
-  configuration**. Those symbols are reached only when bifrost builds its MCP
-  client, which happens when a `MCPConfig` is supplied. Asimi constructs
-  `schemas.BifrostConfig` with only `Account` and `Logger`
-  (`court/llm_init.go`), leaving `MCPConfig` nil, so bifrost never creates an
-  `MCPManager` and never opens a Streamable-HTTP transport. There is also no
-  `[mcp]` key in `internal/config/default.conf`, and Asimi's own code — outside
-  the vendored tree — never mentions MCP at all. The honest basis for the
-  acceptance is therefore "linked and reachable in the call graph, but never
-  invoked by Asimi's configuration", **not** "unreachable".
+- **Where it comes from**: the module arrives transitively via Bifrost
+  (`github.com/maximhq/bifrost/core/mcp` and `core/schemas`; `go mod why -m`
+  confirms the chain). This finding is *reachable* in the binary: govulncheck
+  lists the `transport.StreamableHTTP` symbols (`NewStreamableHTTP`, `Close`,
+  `SendNotification`, `SendRequest`, `SetRequestHandler`), which bifrost's
+  `core/mcp/clientmanager.go` calls on the HTTP/Streamable-HTTP connection path.
+- **Why it is accepted**: the vulnerable `transport.StreamableHTTP` code path in
+  `mcp-go` is **not exercised by Asimi**. Asimi leaves
+  `schemas.BifrostConfig.MCPConfig` nil in `court/llm_init.go` so Bifrost never
+  auto-initializes an internal MCP client or bypasses Asimi's seal gate. Instead,
+  Asimi enables Bifrost's `MCPManager` directly via `court/mcp` **strictly for
+  `stdio` transport** (`schemas.MCPConnectionTypeSTDIO`). Any HTTP, SSE,
+  Streamable-HTTP, or URL-based MCP server configuration is explicitly rejected
+  both at config load and at bridge initialization in `court/mcp`, ensuring
+  `transport.StreamableHTTP` is never instantiated or invoked. The honest basis
+  for the acceptance is therefore "linked and reachable in the call graph, but
+  never invoked because Asimi restricts MCP strictly to `stdio`", **not**
+  "unreachable".
 - **Residual risk & follow-up**: this acceptance must be **re-reviewed when
-  bifrost next bumps mcp-go**. If the bump pulls in a fixed mcp-go, the entry is
-  removed; if Asimi ever gains MCP support (a configured `MCPConfig`), the
-  vulnerable transport becomes genuinely reachable and this acceptance no longer
-  holds. Bumping bifrost itself is tracked separately.
+  bifrost next bumps mcp-go** — if the bump pulls in a fixed `mcp-go`, remove
+  the allowlist entry. Until upstream fixes `GO-2026-6911`, `stdio` remains the
+  only permitted MCP transport: enabling HTTP, SSE, Streamable-HTTP, or
+  URL-based MCP servers (or wiring `schemas.BifrostConfig.MCPConfig`) would make
+  the vulnerable `transport.StreamableHTTP` code path genuinely reachable and
+  invalidate this acceptance. Bumping bifrost itself is tracked separately.
 
 ### GO-2026-5932 — retired
 

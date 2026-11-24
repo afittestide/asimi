@@ -144,8 +144,9 @@ Each minister is a specialized AI agent with a specific role:
 | **Forge** | Implements code changes according to plans | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `run_shell_command` | `create_manifest`, `update_manifest`, `commit_manifest` |
 | **Judge** | Writes tests and validates changes through test coverage | `read_file`, `write_file`, `edit_file`, `glob`, `run_shell_command` | `record_verdict`, `reject_manifest` |
 | **Chancellor** | Sees all state read-only, helps distill intent into edicts, performs code review with precedent tracking | `read_file`, `glob`, `grep` (all tables) | `create_edict`, `record_precedent` |
+| **Rites** (`rites`, tabless, `rw-r--rw-`) | Owns documentation (`README`, `help/`, `intent/docs/`) and foreign-envoy (MCP) tool classification | `read_file`, `write_file`, `replace_text`, `glob`, `grep` (write tools stripped via `ExcludeTools` during MCP classification) | `propose` (`kind: "mcp_classification"`), `ask_ruler` |
 
-**Core Tools** are the basic file system and shell tools needed for each minister's work. **Specialized Tools** are unique to each minister's role in the Court. All ministers share `ask_ruler` and `tian_ledger` as common tools — the Tian ledger is open to every minister. `consult_minister` is available only to the secretary via `extra_tools`.
+**Core Tools** are the basic file system and shell tools needed for each minister's work. **Specialized Tools** are unique to each minister's role in the Court. All ministers share `ask_ruler`, `tian_ledger`, `create_incident`, and `propose` as common tools — the Tian ledger is open to every minister, and `propose` enforces per-kind authorization via registered `ProposalHandler`s. `consult_minister` is available only to the secretary via `extra_tools`.
 
 ### Lings
 
@@ -543,6 +544,7 @@ When a step exhausts all `max_retries` attempts, the Court invokes the `report_f
 **Common Tools** (available to all ministers):
 - `ask_ruler(question)` — Request a clarification or decision from the Ruler
 - `tian_ledger(edict_id?, event_type?, limit?, offset?, since_id?, detail?)` — Query the Tian event ledger for a bird's eye view. `detail=summary` (default) tail-truncates `last_step_output` to the court-configured length; `detail=full` returns every payload key untruncated; `since_id` returns only events newer than the given id
+- `propose(kind, summary, payload, priority?, review_in_editor?)` — Submit a structured proposal backed by a registered `ProposalHandler` (such as `"mcp_classification"` for Rites). Validates the payload before bothering the Ruler, supports optional `$EDITOR` review (`ruler_modified` loop), raises a Zhengming prompt under `CourtEdictKey` (`edict_id = 0`), writes nothing itself, and commits ONLY when `HandleZhengmingResponse` receives `"Approve proposal"`.
 
 ### Secretary Tools
 
@@ -982,6 +984,59 @@ worktree is removed on the ruler's seal. `0` disables the sweep.
 ### Project Rituals
 
 Create custom rituals in `.agents/rituals/*.yaml` to define project-specific workflows.
+
+### MCP Foreign Envoys
+
+External MCP servers (`[mcp]` / `[[mcp.servers]]`) attach foreign envoy tools
+to the Court over **`stdio` transport only** (HTTP, SSE, Streamable-HTTP, and
+URL-based configs are rejected fail-closed due to `GO-2026-6911`; see
+`intent/docs/security.md`).
+
+```toml
+[mcp]
+timeout = 10000
+tool_timeout = 30000
+max_output_tokens = 10000
+
+[[mcp.servers]]
+id = "terminal"
+command = ["asimi-term-mcp"]
+env = ["TERM=xterm-256color"]
+# Pre-classification is honored ONLY in ~/.config/asimi/asimi.conf;
+# repo-level default_permissions / [[mcp.servers.tools]] in .agents/asimi.conf are ignored.
+# default_permissions = "--x------"
+```
+
+**Lifecycle & Security Boundaries:**
+1. **Trust-Dialog Gating (`SeamMCPServer`):** Because `stdio` MCP servers run
+   unsandboxed on the host, every `[[mcp.servers]]` entry appears in the
+   launch-time trust dialog, starts **off by default**, is **excluded from
+   "Allow all"**, and spawns zero servers under `RestrictiveMandate`
+   (headless / no-dialog).
+2. **Non-Blocking Boot & Reconciliation:** Once granted via `ApplyMandate`,
+   the Court boots Bifrost's `MCPManager` asynchronously and runs periodic
+   reconciliation over `GetToolPerClient` to detect added, modified, or
+   removed tools.
+3. **Isolated Rites Classification & `propose` Sealing:** Newly discovered or
+   changed tools stay withheld (`unclassified`) until the Minister of Rites
+   inspects them in a read-only isolated session (write/mutation tools stripped
+   via `ExcludeTools`) and submits a Three Realms classification table via
+   `propose` (`kind: "mcp_classification"`). The Ruler reviews (with optional
+   `$EDITOR` / `ruler_modified` loop) and seals via Zhengming; only
+   `HandleZhengmingResponse` persists and registers approved tools.
+4. **Subset Matching, Collision Rejection & Sealed Deny:** MCP tools are
+   namespaced (`<server_id>-<tool_name>`), rejected on collision with built-in
+   or extra tools, and matched by strict subset (`toolBits ⊆ ministerBits`)
+   both when building minister tool catalogs and on every live `Call()`.
+   Classifying a tool as `---------` seals it in the `denied` state (persisted,
+   never registered, not re-prompted until its schema or server command changes).
+5. **Persistence & Cross-Project Reuse:** Sealed classifications are stored in
+   `mcp_tool_classifications` keyed by `(username, project, server_id,
+   tool_name)` alongside `schema_hash` and `command_hash`. Lookups check the
+   current project first and otherwise fall back to the user's most recently
+   sealed row matching both `schema_hash` and `command_hash` strictly within
+   the same verified `username`. Inspect server and tool states via the
+   `MCPStatus` RPC method (also surfaced in `Snapshot.MCPServers`).
 
 ---
 

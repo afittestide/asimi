@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -43,6 +44,12 @@ const (
 	// never implied by another grant and never granted by default: only an
 	// explicit Selections.HostExec can grant it (edict 1036, seam 7).
 	SeamHostExec SeamKind = "host_exec"
+	// SeamMCPServer is an unsandboxed stdio MCP server subprocess spawned on
+	// the host (edict 661, seam 9). Like SeamHostExec, it executes outside the
+	// podman sandbox and can read host environment variables, so it is off by
+	// default, excluded from "Allow all", and only granted by an explicit
+	// Selections.MCPServers[id] entry.
+	SeamMCPServer SeamKind = "mcp_server"
 )
 
 // SeamHostRunner is the seam label of the single host-execution grant. One
@@ -73,6 +80,8 @@ type Seam struct {
 	Mount Mount
 	// EnvName is set for SeamEnv seams.
 	EnvName string
+	// MCPServer is set for SeamMCPServer seams (ID, Command, Env).
+	MCPServer MCPServerConfig
 }
 
 // Grant records the Ruler's decision about one concrete seam. Granted=false is
@@ -119,20 +128,24 @@ type Selections struct {
 	// into the sandbox, never the host. Without it, a pattern-matched host
 	// command is refused (edict 1036, seam 7).
 	HostExec bool
+	// MCPServers grants unsandboxed stdio MCP server subprocesses on the host
+	// (server ID -> granted, edict 661). Like HostExec, MCP servers are off by
+	// default and excluded from AllowAll.
+	MCPServers map[string]bool
 }
 
 // SessionSeams enumerates the concrete, grantable seams a session may request:
-// its additional mounts, its passthrough env vars and — when the committed
-// config requests any host pattern — host execution (seam 7). The working-tree
-// bind (always rw, structural) and the cache/overlay volumes are not listed
-// here; neither is HostBypassFlag, which is not a grantable seam — no committed
-// file can request it and the dialog never implies it is covered. See
-// intent/docs/sandbox-seams.md.
+// its additional mounts, its passthrough env vars, its configured MCP servers,
+// and — when the committed config requests any host pattern — host execution
+// (seam 7). The working-tree bind (always rw, structural) and the cache/overlay
+// volumes are not listed here; neither is HostBypassFlag, which is not a
+// grantable seam — no committed file can request it and the dialog never
+// implies it is covered. See intent/docs/sandbox-seams.md.
 func SessionSeams(cfg *Config) []Seam {
 	if cfg == nil {
 		return nil
 	}
-	seams := make([]Seam, 0, len(cfg.Sandbox.AdditionalMounts)+len(cfg.Sandbox.PassthroughEnv)+1)
+	seams := make([]Seam, 0, len(cfg.Sandbox.AdditionalMounts)+len(cfg.Sandbox.PassthroughEnv)+len(cfg.MCP.Servers)+1)
 	for _, m := range cfg.Sandbox.AdditionalMounts {
 		// A blank source names no asset: its row would be a checkbox with no
 		// label and its grant nothing to mount. The loader drops such entries;
@@ -152,6 +165,26 @@ func SessionSeams(cfg *Config) []Seam {
 			Kind:    SeamEnv,
 			Label:   name,
 			EnvName: name,
+		})
+	}
+	for _, srv := range cfg.MCP.Servers {
+		id := strings.TrimSpace(srv.ID)
+		if id == "" {
+			continue
+		}
+		cmdText := strings.Join(srv.Command, " ")
+		label := fmt.Sprintf("%s (%s)", id, cmdText)
+		if len(srv.Env) > 0 {
+			label = fmt.Sprintf("%s [env: %s]", label, strings.Join(srv.Env, ", "))
+		}
+		seams = append(seams, Seam{
+			Kind:  SeamMCPServer,
+			Label: label,
+			MCPServer: MCPServerConfig{
+				ID:      id,
+				Command: append([]string(nil), srv.Command...),
+				Env:     append([]string(nil), srv.Env...),
+			},
 		})
 	}
 	// Host execution is offered only when the config actually requests it: with
@@ -225,6 +258,24 @@ func BuildMandate(ownerPID int, requested *Config, sel Selections) *Mandate {
 	// repository's *request* to reach the host, and a request is not a grant.
 	// Declining records the decision so the refusal is auditable.
 	grants = append(grants, Grant{Kind: SeamHostExec, Target: SeamHostRunner, Granted: sel.HostExec})
+
+	// MCP servers (edict 661) execute unsandboxed on the host via stdio and
+	// can read host env vars. Like SeamHostExec, they are off by default,
+	// excluded from AllowAll, and stripped unless explicitly granted by ID.
+	mcpServers := make([]MCPServerConfig, 0, len(requested.MCP.Servers))
+	for _, srv := range requested.MCP.Servers {
+		id := strings.TrimSpace(srv.ID)
+		if id == "" {
+			continue
+		}
+		if !sel.MCPServers[id] {
+			grants = append(grants, Grant{Kind: SeamMCPServer, Target: id, Granted: false})
+			continue
+		}
+		mcpServers = append(mcpServers, srv)
+		grants = append(grants, Grant{Kind: SeamMCPServer, Target: id, Granted: true})
+	}
+	granted.MCP.Servers = mcpServers
 
 	return &Mandate{OwnerPID: ownerPID, Config: granted, Grants: grants}
 }

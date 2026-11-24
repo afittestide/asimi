@@ -2157,3 +2157,461 @@ func TestSessionSeams_SkipsBlankMountSources(t *testing.T) {
 	require.Len(t, seams, 1, "a blank or whitespace source must yield no seam row")
 	assert.Equal(t, "/home/u/.config/gh", seams[0].Label)
 }
+
+// =============================================================================
+// MCP Configuration & Validation Tests (Phase 1, Edict 661)
+// =============================================================================
+
+func TestDefaultMCPConfig(t *testing.T) {
+	got := DefaultMCPConfig()
+	assert.Equal(t, 10000, got.Timeout)
+	assert.Equal(t, 30000, got.ToolTimeout)
+	assert.Equal(t, 10000, got.MaxOutputTokens)
+	assert.Empty(t, got.Servers)
+	assert.NoError(t, ValidateMCPConfig(got))
+
+	cfg := DefaultConfig()
+	assert.Equal(t, got, cfg.MCP)
+}
+
+func TestDefaultConfContent_DocumentsMCPAndStdioPolicy(t *testing.T) {
+	content := DefaultConfContent()
+	assert.Contains(t, content, "#[mcp]")
+	assert.Contains(t, content, "#[[mcp.servers]]")
+	assert.Contains(t, content, "#[[mcp.servers.tools]]")
+	assert.Contains(t, content, "#timeout = 10000")
+	assert.Contains(t, content, "#tool_timeout = 30000")
+	assert.Contains(t, content, "#max_output_tokens = 10000")
+	assert.Contains(t, content, "GO-2026-6911")
+	assert.Contains(t, content, "stdio")
+}
+
+func TestLoadProjectConfig_MCPDefaults(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectDir := t.TempDir()
+
+	// Seed with default.conf to ensure the commented template loads cleanly.
+	require.NoError(t, EnsureProjectConfig(projectDir))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, DefaultMCPConfig(), cfg.MCP)
+}
+
+func TestLoadProjectConfig_MCPValidStdioServerAndToolOverrides(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	userConfDir := filepath.Join(home, ".config", "asimi")
+	require.NoError(t, os.MkdirAll(userConfDir, 0o755))
+
+	// User config (~/.config/asimi/asimi.conf) may pre-classify MCP tools.
+	userConfig := `[mcp]
+timeout = 15000
+max_output_tokens = 25000
+
+[[mcp.servers]]
+id = "filesystem"
+transport = "stdio"
+command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."]
+env = ["NODE_ENV=production", "LOG_LEVEL=warn"]
+default_permissions = "r--------"
+
+[[mcp.servers.tools]]
+name = "write_file"
+permissions = "rw-------"
+
+[[mcp.servers.tools]]
+name = "delete_file"
+permissions = "rwx------"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(userConfDir, "asimi.conf"), []byte(userConfig), 0o644))
+
+	// Project config (.agents/asimi.conf) may request MCP servers, but any
+	// repo-level default_permissions or [[mcp.servers.tools]] overrides MUST
+	// be stripped so only user config can pre-classify without Rites + propose.
+	projectDir := t.TempDir()
+	agentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+	projectConfig := `[[mcp.servers]]
+id = "terminal"
+command = ["asimi-term-mcp"]
+env = ["TERM=xterm-256color"]
+default_permissions = "rwxrwxrwx"
+
+[[mcp.servers.tools]]
+name = "exec"
+permissions = "rwxrwxrwx"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(projectConfig), 0o644))
+
+	cfg, err := LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, 15000, cfg.MCP.Timeout)
+	assert.Equal(t, 30000, cfg.MCP.ToolTimeout, "unset tool_timeout should keep default")
+	assert.Equal(t, 25000, cfg.MCP.MaxOutputTokens)
+	require.Len(t, cfg.MCP.Servers, 2)
+
+	fsSrv := cfg.MCP.Servers[0]
+	assert.Equal(t, "filesystem", fsSrv.ID)
+	assert.Equal(t, "stdio", fsSrv.Transport)
+	assert.Equal(t, []string{"npx", "-y", "@modelcontextprotocol/server-filesystem", "."}, fsSrv.Command)
+	assert.Equal(t, []string{"NODE_ENV=production", "LOG_LEVEL=warn"}, fsSrv.Env)
+	assert.Equal(t, "r--------", fsSrv.DefaultPermissions)
+	require.Len(t, fsSrv.Tools, 2)
+	assert.Equal(t, MCPToolOverride{Name: "write_file", Permissions: "rw-------"}, fsSrv.Tools[0])
+	assert.Equal(t, MCPToolOverride{Name: "delete_file", Permissions: "rwx------"}, fsSrv.Tools[1])
+
+	termSrv := cfg.MCP.Servers[1]
+	assert.Equal(t, "terminal", termSrv.ID)
+	assert.Equal(t, []string{"asimi-term-mcp"}, termSrv.Command)
+	assert.Equal(t, []string{"TERM=xterm-256color"}, termSrv.Env)
+	assert.Empty(t, termSrv.DefaultPermissions, "repo default_permissions must be stripped")
+	assert.Empty(t, termSrv.Tools, "repo per-tool overrides must be stripped")
+}
+
+func TestMandate_SeamMCPServer_OffByDefaultExcludedFromAllowAllAndStripped(t *testing.T) {
+	requested := &Config{
+		Sandbox: SandboxConfig{
+			PassthroughEnv: []string{"SAFE_ENV"},
+		},
+		MCP: MCPConfig{
+			Timeout:         10000,
+			ToolTimeout:     30000,
+			MaxOutputTokens: 10000,
+			Servers: []MCPServerConfig{
+				{ID: "term", Command: []string{"asimi-term-mcp", "--headless"}, Env: []string{"TERM=xterm"}},
+				{ID: "lsp", Command: []string{"gopls-mcp"}},
+			},
+		},
+	}
+
+	// SessionSeams enumerates each [[mcp.servers]] entry with ID, command, and env.
+	seams := SessionSeams(requested)
+	var mcpSeams []Seam
+	for _, s := range seams {
+		if s.Kind == SeamMCPServer {
+			mcpSeams = append(mcpSeams, s)
+		}
+	}
+	require.Len(t, mcpSeams, 2)
+	assert.Equal(t, "term", mcpSeams[0].MCPServer.ID)
+	assert.Equal(t, []string{"asimi-term-mcp", "--headless"}, mcpSeams[0].MCPServer.Command)
+	assert.Equal(t, []string{"TERM=xterm"}, mcpSeams[0].MCPServer.Env)
+	assert.Contains(t, mcpSeams[0].Label, "term")
+	assert.Contains(t, mcpSeams[0].Label, "asimi-term-mcp --headless")
+	assert.Contains(t, mcpSeams[0].Label, "TERM=xterm")
+
+	// RestrictiveMandate (headless / no-dialog) fails closed: zero servers spawned.
+	restrictive := RestrictiveMandate(42, requested)
+	assert.Empty(t, restrictive.Config.MCP.Servers)
+	gTerm, ok := restrictive.GrantFor(SeamMCPServer, "term")
+	require.True(t, ok)
+	assert.False(t, gTerm.Granted)
+
+	// AllowAllMandate grants env vars but MUST NOT grant MCP servers.
+	allowAll := AllowAllMandate(42, requested)
+	assert.Equal(t, []string{"SAFE_ENV"}, allowAll.Config.Sandbox.PassthroughEnv)
+	assert.Empty(t, allowAll.Config.MCP.Servers, "AllowAll must never grant SeamMCPServer")
+
+	// Explicit grant for "term" keeps only "term" and strips "lsp".
+	partial := BuildMandate(42, requested, Selections{
+		MCPServers: map[string]bool{"term": true},
+	})
+	require.Len(t, partial.Config.MCP.Servers, 1)
+	assert.Equal(t, "term", partial.Config.MCP.Servers[0].ID)
+	gTerm, ok = partial.GrantFor(SeamMCPServer, "term")
+	require.True(t, ok)
+	assert.True(t, gTerm.Granted)
+	gLsp, ok := partial.GrantFor(SeamMCPServer, "lsp")
+	require.True(t, ok)
+	assert.False(t, gLsp.Granted)
+}
+
+func TestValidateMCPConfig(t *testing.T) {
+	t.Run("valid minimal stdio server without default_permissions", func(t *testing.T) {
+		cfg := MCPConfig{
+			Servers: []MCPServerConfig{
+				{ID: "term", Command: []string{"term-mcp"}},
+			},
+		}
+		assert.NoError(t, ValidateMCPConfig(cfg))
+	})
+
+	t.Run("valid explicit stdio transport case-insensitive", func(t *testing.T) {
+		cfg := MCPConfig{
+			Servers: []MCPServerConfig{
+				{ID: "term", Transport: "STDIO", Command: []string{"term-mcp"}, DefaultPermissions: "rwxr--r--"},
+			},
+		}
+		assert.NoError(t, ValidateMCPConfig(cfg))
+	})
+
+	t.Run("negative numeric limits rejected", func(t *testing.T) {
+		assert.Error(t, ValidateMCPConfig(MCPConfig{Timeout: -1}))
+		assert.Error(t, ValidateMCPConfig(MCPConfig{ToolTimeout: -1}))
+		assert.Error(t, ValidateMCPConfig(MCPConfig{MaxOutputTokens: -1}))
+	})
+
+	t.Run("missing or blank server id rejected", func(t *testing.T) {
+		for _, id := range []string{"", "   "} {
+			err := ValidateMCPConfig(MCPConfig{
+				Servers: []MCPServerConfig{{ID: id, Command: []string{"mcp-bin"}}},
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "id")
+		}
+	})
+
+	t.Run("duplicate server ids rejected", func(t *testing.T) {
+		err := ValidateMCPConfig(MCPConfig{
+			Servers: []MCPServerConfig{
+				{ID: "dup", Command: []string{"mcp-a"}},
+				{ID: "dup", Command: []string{"mcp-b"}},
+			},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate")
+	})
+
+	t.Run("missing or empty stdio command rejected", func(t *testing.T) {
+		for _, cmd := range [][]string{nil, {}, {""}, {"   "}} {
+			err := ValidateMCPConfig(MCPConfig{
+				Servers: []MCPServerConfig{{ID: "nocmd", Command: cmd}},
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "command")
+		}
+	})
+
+	t.Run("invalid 9-char default_permissions rejected", func(t *testing.T) {
+		badPerms := []string{
+			"rwx",         // too short
+			"rwxrwxrwxr",  // too long
+			"r-- r-- r--", // spaces between realms
+			" r--------",  // leading space
+			"r-------- ",  // trailing space
+			"         ",   // 9 spaces
+			"rwxrwxrwz",   // invalid character
+			"wrr------",   // wrong position
+		}
+		for _, perm := range badPerms {
+			err := ValidateMCPConfig(MCPConfig{
+				Servers: []MCPServerConfig{
+					{ID: "srv", Command: []string{"mcp-bin"}, DefaultPermissions: perm},
+				},
+			})
+			require.Error(t, err, "expected invalid default_permissions %q to fail", perm)
+			assert.Contains(t, err.Error(), "default_permissions")
+		}
+	})
+
+	t.Run("invalid tool overrides rejected", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			tools []MCPToolOverride
+		}{
+			{
+				name:  "empty tool name",
+				tools: []MCPToolOverride{{Name: "", Permissions: "r--------"}},
+			},
+			{
+				name: "duplicate tool override",
+				tools: []MCPToolOverride{
+					{Name: "read", Permissions: "r--------"},
+					{Name: "read", Permissions: "rw-------"},
+				},
+			},
+			{
+				name:  "empty tool permissions",
+				tools: []MCPToolOverride{{Name: "read", Permissions: ""}},
+			},
+			{
+				name:  "spaced tool permissions",
+				tools: []MCPToolOverride{{Name: "read", Permissions: "r-- r-- r--"}},
+			},
+			{
+				name:  "invalid char in tool permissions",
+				tools: []MCPToolOverride{{Name: "read", Permissions: "r--r--r-?"}},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := ValidateMCPConfig(MCPConfig{
+					Servers: []MCPServerConfig{
+						{ID: "srv", Command: []string{"mcp-bin"}, Tools: tc.tools},
+					},
+				})
+				require.Error(t, err)
+			})
+		}
+	})
+
+	t.Run("url and non-stdio transports rejected citing GO-2026-6911", func(t *testing.T) {
+		cases := []struct {
+			name string
+			srv  MCPServerConfig
+		}{
+			{
+				name: "url without command",
+				srv:  MCPServerConfig{ID: "remote", URL: "https://example.com/mcp"},
+			},
+			{
+				name: "url with command",
+				srv:  MCPServerConfig{ID: "hybrid", Command: []string{"mcp-bin"}, URL: "http://localhost:8080/mcp"},
+			},
+			{
+				name: "http transport",
+				srv:  MCPServerConfig{ID: "http-srv", Transport: "http", Command: []string{"mcp-bin"}},
+			},
+			{
+				name: "sse transport",
+				srv:  MCPServerConfig{ID: "sse-srv", Transport: "sse", Command: []string{"mcp-bin"}},
+			},
+			{
+				name: "streamable-http transport",
+				srv:  MCPServerConfig{ID: "shttp-srv", Transport: "streamable-http"},
+			},
+			{
+				name: "streamable_http transport",
+				srv:  MCPServerConfig{ID: "shttp2-srv", Transport: "streamable_http"},
+			},
+			{
+				name: "https transport",
+				srv:  MCPServerConfig{ID: "https-srv", Transport: "https"},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := ValidateMCPConfig(MCPConfig{Servers: []MCPServerConfig{tc.srv}})
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "GO-2026-6911")
+			})
+		}
+	})
+}
+
+func TestLoadProjectConfig_MCPRejectsInvalidAndForbiddenConfigs(t *testing.T) {
+	tests := []struct {
+		name        string
+		toml        string
+		wantContain string
+	}{
+		{
+			name: "url field rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+url = "https://mcp.example.com"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "endpoint raw key rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+command = ["mcp-bin"]
+endpoint = "https://mcp.example.com/v1"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "connection_string raw key rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+command = ["mcp-bin"]
+connection_string = "https://mcp.example.com/sse"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "connection_type raw key rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+command = ["mcp-bin"]
+connection_type = "http"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "http transport rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+transport = "http"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "sse transport rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+transport = "sse"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "streamable-http transport rejected citing GO-2026-6911",
+			toml: `[[mcp.servers]]
+id = "remote"
+transport = "streamable-http"
+`,
+			wantContain: "GO-2026-6911",
+		},
+		{
+			name: "missing command rejected",
+			toml: `[[mcp.servers]]
+id = "nocmd"
+`,
+			wantContain: "command",
+		},
+		{
+			name: "duplicate server ids rejected",
+			toml: `[[mcp.servers]]
+id = "same"
+command = ["mcp-a"]
+
+[[mcp.servers]]
+id = "same"
+command = ["mcp-b"]
+`,
+			wantContain: "duplicate",
+		},
+		{
+			name: "invalid 9-char default_permissions rejected",
+			toml: `[[mcp.servers]]
+id = "badperm"
+command = ["mcp-a"]
+default_permissions = "r-- r-- r--"
+`,
+			wantContain: "default_permissions",
+		},
+		{
+			name: "invalid 9-char tool override permissions rejected",
+			toml: `[[mcp.servers]]
+id = "badtool"
+command = ["mcp-a"]
+
+[[mcp.servers.tools]]
+name = "exec"
+permissions = "rwx"
+`,
+			wantContain: "permissions",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			projectDir := t.TempDir()
+			agentsDir := filepath.Join(projectDir, ".agents")
+			require.NoError(t, os.MkdirAll(agentsDir, 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(agentsDir, "asimi.conf"), []byte(tt.toml), 0o644))
+
+			_, err := LoadProjectConfig(projectDir, false)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantContain)
+		})
+	}
+}

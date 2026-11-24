@@ -72,3 +72,34 @@ func TestDefaultTabIDs(t *testing.T) {
 func TestSealChainIDs(t *testing.T) {
 	assert.Equal(t, []string{Judge, Chancellor, Ruler}, SealChainIDs)
 }
+
+func TestLoadMinisters_Rites(t *testing.T) {
+	defs, err := LoadMinisters()
+	require.NoError(t, err)
+
+	byID := LookupMap(defs)
+	rites, ok := byID[Rites]
+	require.True(t, ok, "rites must be present in builtin ministers")
+
+	assert.Equal(t, "Ministry of Rites", rites.Title)
+	assert.Equal(t, "rw-r--rw-", rites.Permissions)
+	assert.Empty(t, rites.ExtraTools, "rites relies on commonTools for ask_ruler")
+
+	// Documentation mandate
+	assert.Contains(t, rites.Role, "documentation")
+
+	// Foreign-envoy / MCP classification mandate and rules
+	assert.Contains(t, rites.Role, "MCP")
+	assert.Contains(t, rites.Role, "foreign envoy")
+	assert.Contains(t, rites.Role, "effect")
+	assert.Contains(t, rites.Role, "propose")
+	assert.Contains(t, rites.Role, "mcp_classification")
+	assert.Contains(t, rites.Role, "---------")
+	assert.Contains(t, rites.Role, "ask_ruler")
+	assert.Contains(t, rites.Role, "ToolRegistry")
+	assert.Contains(t, rites.Role, "unsealed")
+
+	// Tabless and outside the seal chain
+	assert.NotContains(t, DefaultTabIDs, Rites)
+	assert.NotContains(t, SealChainIDs, Rites)
+}

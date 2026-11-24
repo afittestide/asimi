@@ -201,6 +201,7 @@ type TaskFallback func(ctx context.Context, task *Task) (bool, error)
 type MinisterBase struct {
 	db           *gorm.DB
 	ministerID   string
+	configMu     sync.RWMutex
 	client       LLMProvider // LLM client for chat completions
 	config       *SessionConfig
 	repoInfo     repo.RepoInfo
@@ -350,7 +351,11 @@ func (m *MinisterBase) RunLoop(
 // If a promptPreprocessor hook is set, it transforms the prompt message
 // before streaming (e.g., adding edict context prefix).
 func (m *MinisterBase) ProcessPrompt(ctx context.Context, minister Minister, prompt *Prompt) {
-	if m.client == nil {
+	m.configMu.RLock()
+	client := m.client
+	cfg := m.config
+	m.configMu.RUnlock()
+	if client == nil {
 		m.notify(StreamErrorMsg{ChannelID: m.ministerID, Err: fmt.Errorf("LLM not configured for %s", m.ministerID)})
 		return
 	}
@@ -367,7 +372,7 @@ func (m *MinisterBase) ProcessPrompt(ctx context.Context, minister Minister, pro
 	sess := m.sessions[channelID]
 	if sess == nil {
 		var err error
-		sess, err = CreateSession(minister, m.client, m.config, m.notify, channelID, prompt.EdictKey)
+		sess, err = CreateSession(minister, client, cfg, m.notify, channelID, prompt.EdictKey)
 		if err != nil {
 			m.sessionMu.Unlock()
 			m.notify(StreamErrorMsg{ChannelID: channelID, Err: fmt.Errorf("failed to create session: %w", err)})
@@ -473,6 +478,8 @@ func (m *MinisterBase) SetRunner(r runners.Runner) {
 
 // RepoInfo returns the repository information
 func (m *MinisterBase) RepoInfo() repo.RepoInfo {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
 	return m.repoInfo
 }
 
@@ -520,6 +527,9 @@ func CreateSession(minister Minister, client LLMProvider, config *SessionConfig,
 	if err != nil {
 		return nil, err
 	}
+	if perm, ok := ministerPermissions(minister); ok {
+		sess.SetPermissions(perm)
+	}
 	attachAtifRecorder(sess, config)
 	return sess, nil
 }
@@ -527,26 +537,54 @@ func CreateSession(minister Minister, client LLMProvider, config *SessionConfig,
 // CreateSessionWithOpts creates a session with extended options including given context.
 func CreateSessionWithOpts(minister Minister, client LLMProvider, config *SessionConfig, notify internal.NotifyFunc, opts CreateSessionOpts) (*Session, error) {
 	systemPrompt := buildSystemPrompt(minister, config, opts.EdictKey, opts.Scratchpad)
-	tools := minister.Tools()
+	ministerTools := minister.Tools()
 	if len(opts.ExcludeTools) > 0 {
 		excludeSet := make(map[string]bool, len(opts.ExcludeTools))
 		for _, name := range opts.ExcludeTools {
 			excludeSet[name] = true
 		}
-		filtered := make([]Tool, 0, len(tools))
-		for _, t := range tools {
+		filtered := make([]Tool, 0, len(ministerTools))
+		for _, t := range ministerTools {
 			if !excludeSet[t.Name()] {
 				filtered = append(filtered, t)
 			}
 		}
-		tools = filtered
+		ministerTools = filtered
 	}
-	sess, err := NewSession(client, config, tools, nil, notify, systemPrompt, opts.ChannelID)
+	sess, err := NewSession(client, config, ministerTools, nil, notify, systemPrompt, opts.ChannelID)
 	if err != nil {
 		return nil, err
 	}
+	if len(opts.ExcludeTools) > 0 {
+		sess.setExcludedTools(opts.ExcludeTools)
+	}
+	if perm, ok := ministerPermissions(minister); ok {
+		sess.SetPermissions(perm)
+	}
 	attachAtifRecorder(sess, config)
 	return sess, nil
+}
+
+// ministerPermissions extracts the parsed Three Realms permissions for a
+// minister so sessions can propagate them onto tool execution contexts via
+// tools.PermissionsKey.
+func ministerPermissions(minister Minister) (tools.Permissions, bool) {
+	if minister == nil {
+		return tools.Permissions{}, false
+	}
+	if provider, ok := minister.(interface {
+		Permissions() (tools.Permissions, bool)
+	}); ok {
+		return provider.Permissions()
+	}
+	if impl, ok := minister.(*ministerImpl); ok {
+		perm, err := tools.ParsePermissions(impl.def.Permissions)
+		if err != nil {
+			return tools.Permissions{}, false
+		}
+		return perm, true
+	}
+	return tools.Permissions{}, false
 }
 
 // attachAtifRecorder creates and attaches an ATIF trajectory recorder to the
@@ -645,14 +683,18 @@ func readProjectContext(agentsFile, projectRoot string) string {
 // SetMinisterConfig updates the MinisterBase configuration for session creation.
 // This allows ministers to be configured with an LLM client after initialization.
 func (m *MinisterBase) SetMinisterConfig(client LLMProvider, config *SessionConfig, repoInfo repo.RepoInfo) {
+	m.configMu.Lock()
 	m.client = client
 	m.config = config
 	m.repoInfo = repoInfo
+	m.configMu.Unlock()
 }
 
 // SetRepoInfo updates the repo info without changing the LLM client or config.
 func (m *MinisterBase) SetRepoInfo(repoInfo repo.RepoInfo) {
+	m.configMu.Lock()
 	m.repoInfo = repoInfo
+	m.configMu.Unlock()
 }
 
 // SetNotify sets the notification callback.
@@ -763,7 +805,11 @@ func (m *MinisterBase) streamTask(ctx context.Context, work string, key storage.
 		if channelID == "" {
 			channelID = m.ministerID
 		}
-		session, err = CreateSessionWithOpts(m.self, m.client, m.config, notify, CreateSessionOpts{
+		m.configMu.RLock()
+		client := m.client
+		cfg := m.config
+		m.configMu.RUnlock()
+		session, err = CreateSessionWithOpts(m.self, client, cfg, notify, CreateSessionOpts{
 			EdictKey:     key,
 			ChannelID:    channelID,
 			Scratchpad:   scratchpad,
@@ -792,9 +838,11 @@ func (m *MinisterBase) processTask(ctx context.Context, task *Task) {
 		ctx = m.ctxMiddleware(ctx)
 	}
 
-	notify := m.notify
+	var notify internal.NotifyFunc
 	if task.Notify != nil {
 		notify = task.Notify
+	} else {
+		notify = m.notify
 	}
 
 	// Resolve channel ID for stream routing
@@ -820,7 +868,7 @@ func (m *MinisterBase) processTask(ctx context.Context, task *Task) {
 	var session *Session
 	sealed := true
 
-	if m.client != nil {
+	if m.Model() != nil {
 		notify(StreamStartMsg{ChannelID: channelID, EdictID: task.EdictKey.ID})
 		session, output, taskErr = m.streamTask(ctx, task.Work, task.EdictKey, task.Scratchpad, notify, task.Session, task.ChannelID, task.ExcludeTools)
 		notify(StreamDoneMsg{ChannelID: channelID})
@@ -849,11 +897,15 @@ func (m *MinisterBase) processTask(ctx context.Context, task *Task) {
 
 // Model returns the minister's LLM client.
 func (m *MinisterBase) Model() LLMProvider {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
 	return m.client
 }
 
 // GetConfig returns the minister's LLM configuration.
 func (m *MinisterBase) GetConfig() internalconfig.LLMConfig {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
 	if m.config != nil {
 		return m.config.LLM
 	}
@@ -917,7 +969,11 @@ func (m *MinisterBase) RestoreSession(minister Minister, msgs []schemas.ChatMess
 	if len(channelID) > 0 && channelID[0] != "" {
 		key = channelID[0]
 	}
-	sess, err := CreateSession(minister, m.client, m.config, m.notify, key)
+	m.configMu.RLock()
+	client := m.client
+	cfg := m.config
+	m.configMu.RUnlock()
+	sess, err := CreateSession(minister, client, cfg, m.notify, key)
 	if err != nil {
 		return err
 	}

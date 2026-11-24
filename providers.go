@@ -371,6 +371,7 @@ func ProvideGormDB(params GormDBParams) (*gorm.DB, error) {
 		&storage.Incident{},
 		&storage.RulerCouncil{},
 		&storage.RitualGuardCheckpoint{},
+		&storage.MCPToolClassification{},
 		&court.RitualExecution{},
 		&court.RitualStepState{},
 	); err != nil {
@@ -426,6 +427,7 @@ func ProvideCourt(params CourtParams) (*court.Court, error) {
 	if params.SessionStore != nil {
 		s.SetSessionPersister(params.SessionStore)
 	}
+	s.SetMCPConfig(params.Config.MCP)
 
 	// Register lifecycle hooks
 	params.Lifecycle.Append(fx.Hook{

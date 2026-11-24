@@ -4,101 +4,32 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/afittestide/asimi/internal/types"
 )
 
 // Access represents read/write/execute permissions within a single realm.
-type Access struct {
-	Read    bool
-	Write   bool
-	Execute bool
-}
+type Access = types.Access
 
 // Permissions holds per-realm access for a minister or a tool classification.
-type Permissions struct {
-	Earth  Access
-	Heaven Access
-	Intent Access
-}
+type Permissions = types.Permissions
 
 // ToolPermission pairs a tool with its permission classification.
 type ToolPermission struct {
 	Tool        Tool
 	Permissions Permissions
+	// SubsetMatch requires a minister's permissions to strictly cover every bit
+	// in Permissions (perm.Allows) rather than matching any single bit
+	// (perm.Match). Set for MCP tools to enforce least privilege while
+	// preserving dual-realm OR matching for built-ins like create_manifest.
+	SubsetMatch bool
 }
 
 // ParsePermissions parses a 9-character permission string of the form
 // "rwxrwxrwx" where positions [0-2] = earth, [3-5] = heaven, [6-8] = intent.
 // Each triple is (Read, Write, Execute); '-' means denied.
 func ParsePermissions(s string) (Permissions, error) {
-	if len(s) != 9 {
-		return Permissions{}, fmt.Errorf("invalid permission string %q: must be 9 characters", s)
-	}
-
-	parse := func(rwx string) (Access, error) {
-		if len(rwx) != 3 {
-			return Access{}, fmt.Errorf("invalid rwx triple %q", rwx)
-		}
-		read := rwx[0] == 'r'
-		write := rwx[1] == 'w'
-		exec := rwx[2] == 'x'
-		// Validate: each position is either the expected letter or '-'
-		for i, ch := range rwx {
-			expected := []byte{'r', 'w', 'x'}[i]
-			if ch != '-' && ch != rune(expected) {
-				return Access{}, fmt.Errorf("invalid character %q in position %d of %q", ch, i, rwx)
-			}
-		}
-		return Access{Read: read, Write: write, Execute: exec}, nil
-	}
-
-	earth, err := parse(s[0:3])
-	if err != nil {
-		return Permissions{}, err
-	}
-	heaven, err := parse(s[3:6])
-	if err != nil {
-		return Permissions{}, err
-	}
-	intent, err := parse(s[6:9])
-	if err != nil {
-		return Permissions{}, err
-	}
-
-	return Permissions{Earth: earth, Heaven: heaven, Intent: intent}, nil
-}
-
-// accessMatch returns true when both accesses share at least one true flag.
-func accessMatch(minister, tool Access) bool {
-	return (minister.Read && tool.Read) ||
-		(minister.Write && tool.Write) ||
-		(minister.Execute && tool.Execute)
-}
-
-// Match returns true when the minister's permissions match the tool's
-// permissions in at least one realm. A realm matches when both the
-// minister and the tool have true for at least one shared access flag.
-func (p Permissions) Match(tool Permissions) bool {
-	return accessMatch(p.Earth, tool.Earth) ||
-		accessMatch(p.Heaven, tool.Heaven) ||
-		accessMatch(p.Intent, tool.Intent)
-}
-
-// String returns the 9-character permission string representation.
-func (p Permissions) String() string {
-	formatAccess := func(a Access) string {
-		r, w, x := '-', '-', '-'
-		if a.Read {
-			r = 'r'
-		}
-		if a.Write {
-			w = 'w'
-		}
-		if a.Execute {
-			x = 'x'
-		}
-		return string([]byte{byte(r), byte(w), byte(x)})
-	}
-	return formatAccess(p.Earth) + formatAccess(p.Heaven) + formatAccess(p.Intent)
+	return types.ParsePermissions(s)
 }
 
 // ToolRegistry holds tool registrations with permission classifications
@@ -163,8 +94,89 @@ func (r *ToolRegistry) Update(tool Tool) {
 
 	name := tool.Name()
 	if existing, ok := r.entries[name]; ok {
-		r.entries[name] = ToolPermission{Tool: tool, Permissions: existing.Permissions}
+		r.entries[name] = ToolPermission{Tool: tool, Permissions: existing.Permissions, SubsetMatch: existing.SubsetMatch}
 	}
+}
+
+// Set registers a tool with the given permissions, replacing any existing
+// tool instance and permissions for the same name rather than unioning them.
+func (r *ToolRegistry) Set(tool Tool, perm Permissions) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.entries[tool.Name()] = ToolPermission{Tool: tool, Permissions: perm}
+}
+
+// SetMCP registers or replaces a dynamic MCP tool using strict subset
+// permission matching. It rejects nil tools, empty names, sealed-deny
+// ("---------") permissions, and any name that collides with a built-in or
+// extra tool.
+func (r *ToolRegistry) SetMCP(tool Tool, perm Permissions) error {
+	if tool == nil || tool.Name() == "" {
+		return fmt.Errorf("cannot register MCP tool: tool name is required")
+	}
+	if perm.IsEmpty() {
+		return fmt.Errorf("cannot register MCP tool %q: permissions %s represent sealed deny", tool.Name(), perm.String())
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	name := tool.Name()
+	if _, isExtra := r.extras[name]; isExtra {
+		return fmt.Errorf("cannot register MCP tool %q: collides with extra tool", name)
+	}
+	if _, isFactory := r.factories[name]; isFactory {
+		return fmt.Errorf("cannot register MCP tool %q: collides with extra tool factory", name)
+	}
+	if existing, exists := r.entries[name]; exists && !existing.SubsetMatch {
+		return fmt.Errorf("cannot register MCP tool %q: collides with built-in tool", name)
+	}
+
+	r.entries[name] = ToolPermission{
+		Tool:        tool,
+		Permissions: perm,
+		SubsetMatch: true,
+	}
+	return nil
+}
+
+// HasNonMCPTool reports whether name is already occupied by a built-in public
+// tool or an extra tool / factory (i.e., anything other than a dynamic MCP
+// registration).
+func (r *ToolRegistry) HasNonMCPTool(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if _, isExtra := r.extras[name]; isExtra {
+		return true
+	}
+	if _, isFactory := r.factories[name]; isFactory {
+		return true
+	}
+	if existing, exists := r.entries[name]; exists && !existing.SubsetMatch {
+		return true
+	}
+	return false
+}
+
+// Unregister removes a tool from the registry by name.
+// If the tool is not registered, this is a no-op.
+func (r *ToolRegistry) Unregister(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.entries, name)
+}
+
+// Get returns the ToolPermission entry for the given tool name and true,
+// or the zero value and false if not registered.
+func (r *ToolRegistry) Get(name string) (ToolPermission, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	tp, ok := r.entries[name]
+	return tp, ok
 }
 
 // RegisterExtra registers a static extra tool by name. Extra tools are
@@ -220,7 +232,13 @@ func (r *ToolRegistry) ForPermissions(perm Permissions) []Tool {
 		if seen[name] {
 			continue
 		}
-		if perm.Match(tp.Permissions) {
+		allowed := false
+		if tp.SubsetMatch {
+			allowed = perm.Allows(tp.Permissions)
+		} else {
+			allowed = perm.Match(tp.Permissions)
+		}
+		if allowed {
 			seen[name] = true
 			result = append(result, tp.Tool)
 		}

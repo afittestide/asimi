@@ -139,7 +139,7 @@ func (d *TrustDialog) ToggleAllowAll() {
 	}
 	d.allowAll = !d.allowAll
 	for i, seam := range d.seams {
-		if seam.Kind == config.SeamHostExec {
+		if seam.Kind == config.SeamHostExec || seam.Kind == config.SeamMCPServer {
 			continue
 		}
 		d.granted[i] = d.allowAll
@@ -167,8 +167,9 @@ func (d *TrustDialog) ToggleWritable() {
 // dialog yields the most restrictive answer: no grants at all.
 func (d *TrustDialog) Selections() config.Selections {
 	sel := config.Selections{
-		Mounts: map[string]bool{},
-		Env:    map[string]bool{},
+		Mounts:     map[string]bool{},
+		Env:        map[string]bool{},
+		MCPServers: map[string]bool{},
 	}
 	// An unreadable request grants nothing. This is the last veto: every
 	// mutator already refuses when loadErr is set, but the whole point of that
@@ -191,6 +192,10 @@ func (d *TrustDialog) Selections() config.Selections {
 			// from Allow all (see ToggleAllowAll) because it is strictly more
 			// authority than the sandbox: no blanket choice may reach it.
 			sel.HostExec = true
+		case config.SeamMCPServer:
+			// MCP servers spawn unsandboxed stdio processes on the host and
+			// are excluded from Allow all: only an explicit row grant enables them.
+			sel.MCPServers[s.MCPServer.ID] = true
 		}
 	}
 	return sel
@@ -222,7 +227,7 @@ func (d *TrustDialog) Covers(seam string) bool {
 		return false
 	}
 	for _, s := range d.seams {
-		if s.Label == seam || s.EnvName == seam || s.Mount.Source == seam {
+		if s.Label == seam || s.EnvName == seam || s.Mount.Source == seam || s.MCPServer.ID == seam {
 			return true
 		}
 	}
@@ -285,6 +290,9 @@ func (d *TrustDialog) Render(width int) string {
 			b.WriteString(fmt.Sprintf("%s%s %s - env var\n", cursor, box, s.Label))
 		case config.SeamHostExec:
 			b.WriteString(fmt.Sprintf("%s%s host %s (commands run OFF the sandbox, on this machine)\n",
+				cursor, box, s.Label))
+		case config.SeamMCPServer:
+			b.WriteString(fmt.Sprintf("%s%s mcp %s (runs OFF the sandbox, on this machine)\n",
 				cursor, box, s.Label))
 		}
 	}

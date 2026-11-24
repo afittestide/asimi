@@ -467,9 +467,15 @@ type Session struct {
 	// "use the tool's registered (Court-wide) runner".
 	runner runners.Runner `json:"-"`
 
-	// bindMu guards RepoInfo and runner once the session is live: the Court
-	// re-binds unbound sessions when it is re-rooted (a `:switch`), which can
-	// race a tool dispatch on the streaming goroutine.
+	// permissions holds the calling minister's parsed Three Realms permissions,
+	// propagated into each tool call's context via tools.PermissionsKey so
+	// tools (such as MCPToolAdapter) can enforce execution-time permission gating.
+	permissions    tools.Permissions `json:"-"`
+	hasPermissions bool              `json:"-"`
+
+	// bindMu guards RepoInfo, runner, and permissions once the session is live:
+	// the Court re-binds unbound sessions when it is re-rooted (a `:switch`),
+	// which can race a tool dispatch on the streaming goroutine.
 	bindMu sync.RWMutex
 
 	// ReasoningEffort, when non-empty, sets the reasoning.effort parameter on
@@ -537,16 +543,16 @@ type Session struct {
 
 	// Tool execution.
 	//
-	// toolMu guards toolCatalog and toolDefs. In production the catalog is
-	// built once in NewSession, so the lock is defensive: RegisterCourtTools is
-	// the only writer and exposes an in-place refresh, and the streaming paths
-	// below read the same state. Holding the lock keeps that contract honest for
-	// any caller that re-registers a tool set after construction instead of
-	// relying on construction order.
-	toolMu      sync.RWMutex
-	toolCatalog map[string]Tool
-	toolDefs    []schemas.ChatTool
-	scheduler   *runners.CoreToolScheduler
+	// toolMu guards toolCatalog, toolDefs, tools, and excludedTools.
+	// RegisterCourtTools and ReplaceCourtTools are the writers (the latter
+	// refreshes live sessions when MCP tools are registered or revoked), and
+	// the streaming paths below read the same state. Holding the lock keeps
+	// that contract race-free for live refreshes.
+	toolMu        sync.RWMutex
+	toolCatalog   map[string]Tool
+	toolDefs      []schemas.ChatTool
+	excludedTools map[string]bool
+	scheduler     *runners.CoreToolScheduler
 
 	// Streaming
 	accumulatedContent strings.Builder
@@ -737,6 +743,30 @@ func (s *Session) binding() (repo.RepoInfo, runners.Runner) {
 	return s.RepoInfo, s.runner
 }
 
+// SetPermissions attaches the calling minister's parsed Three Realms
+// permissions to the session so every tool call receives them via
+// tools.PermissionsKey.
+func (s *Session) SetPermissions(perm tools.Permissions) {
+	if s == nil {
+		return
+	}
+	s.bindMu.Lock()
+	s.permissions = perm
+	s.hasPermissions = true
+	s.bindMu.Unlock()
+}
+
+// Permissions returns the minister permissions attached to this session and
+// true, or the zero value and false if none were attached.
+func (s *Session) Permissions() (tools.Permissions, bool) {
+	if s == nil {
+		return tools.Permissions{}, false
+	}
+	s.bindMu.RLock()
+	defer s.bindMu.RUnlock()
+	return s.permissions, s.hasPermissions
+}
+
 // bindToTree points the session at the Court's current tree. It is called when
 // the Court is re-rooted (a `:switch`) on interactive minister sessions only:
 // those hold no tree of their own, and a session cached before the switch
@@ -829,6 +859,9 @@ func (s *Session) RegisterCourtTools(tools []Tool) {
 	s.toolMu.Lock()
 	defer s.toolMu.Unlock()
 	for _, tool := range tools {
+		if tool == nil {
+			continue
+		}
 		s.toolCatalog[tool.Name()] = tool
 		def := toolDef(tool)
 		replaced := false
@@ -843,6 +876,55 @@ func (s *Session) RegisterCourtTools(tools []Tool) {
 			s.toolDefs = append(s.toolDefs, def)
 		}
 	}
+}
+
+// setExcludedTools records tool names excluded from this session (from
+// CreateSessionOpts.ExcludeTools) so live ReplaceCourtTools refreshes never
+// reintroduce excluded tools.
+func (s *Session) setExcludedTools(names []string) {
+	if s == nil || len(names) == 0 {
+		return
+	}
+	excluded := make(map[string]bool, len(names))
+	for _, name := range names {
+		excluded[name] = true
+	}
+	s.toolMu.Lock()
+	s.excludedTools = excluded
+	s.toolMu.Unlock()
+}
+
+// ReplaceCourtTools atomically replaces the session's toolDefs and toolCatalog
+// under toolMu. Unlike RegisterCourtTools, removed tools are dropped so MCP
+// revocations, permission narrowings, and disconnects take effect immediately
+// on live sessions.
+//
+// Safe for concurrent use with the streaming goroutine.
+func (s *Session) ReplaceCourtTools(newTools []Tool) {
+	if s == nil {
+		return
+	}
+	s.toolMu.RLock()
+	excluded := s.excludedTools
+	s.toolMu.RUnlock()
+
+	filtered := make([]Tool, 0, len(newTools))
+	for _, tool := range newTools {
+		if tool == nil {
+			continue
+		}
+		if len(excluded) > 0 && excluded[tool.Name()] {
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	defs, catalog := buildLLMTools(filtered)
+
+	s.toolMu.Lock()
+	s.tools = filtered
+	s.toolDefs = defs
+	s.toolCatalog = catalog
+	s.toolMu.Unlock()
 }
 
 // toolDefsSnapshot returns a copy of the tool definitions slice. The copy
@@ -2563,6 +2645,9 @@ func (s *Session) executeToolCall(ctx context.Context, tool Tool, toolCallID, to
 	}
 	if runner != nil {
 		ctx = context.WithValue(ctx, tools.RunnerKey{}, runner)
+	}
+	if perm, ok := s.Permissions(); ok {
+		ctx = context.WithValue(ctx, tools.PermissionsKey{}, perm)
 	}
 	var out string
 	var callErr error

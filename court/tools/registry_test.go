@@ -8,10 +8,11 @@ import (
 // mockTool is a minimal Tool implementation for testing.
 type mockTool struct {
 	name string
+	desc string
 }
 
 func (m mockTool) Name() string                                     { return m.name }
-func (m mockTool) Description() string                              { return "" }
+func (m mockTool) Description() string                              { return m.desc }
 func (m mockTool) Call(_ context.Context, _ string) (string, error) { return "", nil }
 func (m mockTool) Format(_, _ string, _ error) string               { return "" }
 func (m mockTool) ParameterSchema() map[string]any                  { return nil }
@@ -29,51 +30,51 @@ func TestParsePermissionsValid(t *testing.T) {
 	}{
 		{
 			input:  "rwxrwxrwx",
-			earth:  Access{true, true, true},
-			heaven: Access{true, true, true},
-			intent: Access{true, true, true},
+			earth:  Access{Read: true, Write: true, Execute: true},
+			heaven: Access{Read: true, Write: true, Execute: true},
+			intent: Access{Read: true, Write: true, Execute: true},
 		},
 		{
 			input:  "r-----rw-",
-			earth:  Access{true, false, false},
-			heaven: Access{false, false, false},
-			intent: Access{true, true, false},
+			earth:  Access{Read: true},
+			heaven: Access{},
+			intent: Access{Read: true, Write: true},
 		},
 		{
 			input:  "r-----rwx",
-			earth:  Access{true, false, false},
-			heaven: Access{false, false, false},
-			intent: Access{true, true, true},
+			earth:  Access{Read: true},
+			heaven: Access{},
+			intent: Access{Read: true, Write: true, Execute: true},
 		},
 		{
 			input:  "r--r--rwx",
-			earth:  Access{true, false, false},
-			heaven: Access{true, false, false},
-			intent: Access{true, true, true},
+			earth:  Access{Read: true},
+			heaven: Access{Read: true},
+			intent: Access{Read: true, Write: true, Execute: true},
 		},
 		{
 			input:  "r-xr--rw-",
-			earth:  Access{true, false, true},
-			heaven: Access{true, false, false},
-			intent: Access{true, true, false},
+			earth:  Access{Read: true, Execute: true},
+			heaven: Access{Read: true},
+			intent: Access{Read: true, Write: true},
 		},
 		{
 			input:  "rwxr---w-",
-			earth:  Access{true, true, true},
-			heaven: Access{true, false, false},
-			intent: Access{false, true, false},
+			earth:  Access{Read: true, Write: true, Execute: true},
+			heaven: Access{Read: true},
+			intent: Access{Write: true},
 		},
 		{
 			input:  "rwxrwxr--",
-			earth:  Access{true, true, true},
-			heaven: Access{true, true, true},
-			intent: Access{true, false, false},
+			earth:  Access{Read: true, Write: true, Execute: true},
+			heaven: Access{Read: true, Write: true, Execute: true},
+			intent: Access{Read: true},
 		},
 		{
 			input:  "rwxr--rwx",
-			earth:  Access{true, true, true},
-			heaven: Access{true, false, false},
-			intent: Access{true, true, true},
+			earth:  Access{Read: true, Write: true, Execute: true},
+			heaven: Access{Read: true},
+			intent: Access{Read: true, Write: true, Execute: true},
 		},
 		{
 			input:  "---------",
@@ -382,6 +383,152 @@ func TestUpdateNonExistentNoOp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ToolRegistry — Get, Unregister, Set vs Register
+// ---------------------------------------------------------------------------
+
+func TestGet(t *testing.T) {
+	r := NewToolRegistry()
+
+	if _, ok := r.Get("missing"); ok {
+		t.Fatal("expected Get on empty registry to return false")
+	}
+
+	perm, err := ParsePermissions("r-----rw-")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	r.Register(mockTool{name: "read_file", desc: "v1"}, perm)
+	r.RegisterExtra("extra_only", mockTool{name: "extra_only"})
+
+	tp, ok := r.Get("read_file")
+	if !ok {
+		t.Fatal("expected Get to find registered tool")
+	}
+	if tp.Tool.Name() != "read_file" || tp.Tool.Description() != "v1" {
+		t.Errorf("unexpected tool returned: %+v", tp.Tool)
+	}
+	if tp.Permissions != perm {
+		t.Errorf("permissions = %s, want %s", tp.Permissions, perm)
+	}
+
+	if _, ok := r.Get("extra_only"); ok {
+		t.Error("expected Get to ignore extra tools")
+	}
+}
+
+func TestUnregister(t *testing.T) {
+	r := NewToolRegistry()
+	perm, _ := ParsePermissions("r--------")
+	r.Register(mockTool{name: "mcp_a"}, perm)
+	r.Register(mockTool{name: "mcp_b"}, perm)
+
+	// Unregistering a non-existent tool is a safe no-op.
+	r.Unregister("nonexistent")
+	if len(r.Tools()) != 2 {
+		t.Fatalf("expected 2 tools after no-op unregister, got %d", len(r.Tools()))
+	}
+
+	r.Unregister("mcp_a")
+
+	if _, ok := r.Get("mcp_a"); ok {
+		t.Error("expected mcp_a to be absent after Unregister")
+	}
+	if _, ok := r.Get("mcp_b"); !ok {
+		t.Error("expected mcp_b to remain registered")
+	}
+	names := toolNames(r.ForPermissions(perm))
+	assertNotHas(t, names, "mcp_a")
+	assertHas(t, names, "mcp_b")
+}
+
+func TestSetReplacesAndNarrowsVsRegisterUnions(t *testing.T) {
+	r := NewToolRegistry()
+	earthRead, _ := ParsePermissions("r--------")
+	earthWrite, _ := ParsePermissions("-w-------")
+	earthRW, _ := ParsePermissions("rw-------")
+	earthExec, _ := ParsePermissions("--x------")
+
+	// Register unions permissions and keeps the original tool instance.
+	r.Register(mockTool{name: "union_tool", desc: "v1"}, earthRead)
+	r.Register(mockTool{name: "union_tool", desc: "v2"}, earthWrite)
+
+	tp, ok := r.Get("union_tool")
+	if !ok {
+		t.Fatal("expected union_tool to be registered")
+	}
+	if tp.Permissions != earthRW {
+		t.Errorf("Register should union permissions: got %s, want %s", tp.Permissions, earthRW)
+	}
+	if tp.Tool.Description() != "v1" {
+		t.Errorf("Register should keep existing tool instance: got desc %q, want %q", tp.Tool.Description(), "v1")
+	}
+	assertHas(t, toolNames(r.ForPermissions(earthRead)), "union_tool")
+	assertHas(t, toolNames(r.ForPermissions(earthWrite)), "union_tool")
+
+	// Set replaces both permissions (narrowing) and tool instance.
+	r.Set(mockTool{name: "union_tool", desc: "v3"}, earthRead)
+
+	tp, ok = r.Get("union_tool")
+	if !ok {
+		t.Fatal("expected union_tool to remain registered after Set")
+	}
+	if tp.Permissions != earthRead {
+		t.Errorf("Set should replace/narrow permissions: got %s, want %s", tp.Permissions, earthRead)
+	}
+	if tp.Tool.Description() != "v3" {
+		t.Errorf("Set should replace tool instance: got desc %q, want %q", tp.Tool.Description(), "v3")
+	}
+	assertHas(t, toolNames(r.ForPermissions(earthRead)), "union_tool")
+	assertNotHas(t, toolNames(r.ForPermissions(earthWrite)), "union_tool")
+
+	// Set on a brand-new tool registers it directly.
+	r.Set(mockTool{name: "fresh_mcp", desc: "initial"}, earthExec)
+	tp, ok = r.Get("fresh_mcp")
+	if !ok {
+		t.Fatal("expected Set to insert new tool")
+	}
+	if tp.Permissions != earthExec {
+		t.Errorf("fresh_mcp permissions = %s, want %s", tp.Permissions, earthExec)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PermissionsFromContext
+// ---------------------------------------------------------------------------
+
+func TestPermissionsFromContext(t *testing.T) {
+	if p, ok := PermissionsFromContext(context.TODO()); ok || p != (Permissions{}) {
+		t.Errorf("unset context: got (%+v, %v), want (zero, false)", p, ok)
+	}
+	if p, ok := PermissionsFromContext(nil); ok || p != (Permissions{}) { //nolint:staticcheck // intentionally testing nil ctx safety
+		t.Errorf("nil context: got (%+v, %v), want (zero, false)", p, ok)
+	}
+
+	want, err := ParsePermissions("rwxr---w-")
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ctx := context.WithValue(context.Background(), PermissionsKey{}, want)
+	got, ok := PermissionsFromContext(ctx)
+	if !ok || got != want {
+		t.Errorf("set context: got (%s, %v), want (%s, true)", got, ok, want)
+	}
+
+	// Explicitly setting zero permissions ("---------") must be distinguishable from unset.
+	zeroCtx := context.WithValue(context.Background(), PermissionsKey{}, Permissions{})
+	gotZero, ok := PermissionsFromContext(zeroCtx)
+	if !ok || gotZero != (Permissions{}) {
+		t.Errorf("zero permissions context: got (%s, %v), want (---------, true)", gotZero, ok)
+	}
+
+	// Wrong value type under PermissionsKey must return false.
+	wrongCtx := context.WithValue(context.Background(), PermissionsKey{}, "rwxrwxrwx")
+	if p, ok := PermissionsFromContext(wrongCtx); ok || p != (Permissions{}) {
+		t.Errorf("wrong type context: got (%+v, %v), want (zero, false)", p, ok)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ToolRegistry — RegisterExtra / RegisterExtraFactory / ExtraTools
 // ---------------------------------------------------------------------------
 
@@ -437,6 +584,71 @@ func TestRegisterExtraFactory(t *testing.T) {
 	warExtras := r.ExtraTools("war", []string{"ask_ruler"})
 	if len(warExtras) != 1 || warExtras[0].Name() != "ask_ruler_war" {
 		t.Errorf("factory should produce per-minister tool for war, got %v", warExtras)
+	}
+}
+
+func TestSetMCP_SubsetMatchingAndCollisionRejection(t *testing.T) {
+	r := NewToolRegistry()
+
+	// Built-in dual-realm create_manifest preserves OR semantics.
+	heavenWrite, _ := ParsePermissions("----w----")
+	intentWrite, _ := ParsePermissions("-------w-")
+	r.Register(mockTool{name: "create_manifest"}, heavenWrite)
+	r.Register(mockTool{name: "create_manifest"}, intentWrite)
+	r.Register(mockTool{name: "read_file"}, Permissions{Earth: Access{Read: true}})
+	r.RegisterExtra("tian_ledger", mockTool{name: "tian_ledger"})
+	r.RegisterExtraFactory("ask_ruler", func(mid string) Tool { return mockTool{name: "ask_ruler"} })
+
+	// MCP tool requiring Earth read+write ("rw-------").
+	earthRW, _ := ParsePermissions("rw-------")
+	if err := r.SetMCP(mockTool{name: "envoy-edit"}, earthRW); err != nil {
+		t.Fatalf("SetMCP valid tool: %v", err)
+	}
+
+	// Read-only Earth ministers (Chancellor, War, Secretary) must NOT see rw------- MCP tool.
+	chancellor, _ := ParsePermissions("r--r--rwx")
+	war, _ := ParsePermissions("r-----rw-")
+	secretary, _ := ParsePermissions("r-xrwxrwx")
+	forge, _ := ParsePermissions("rwx----w-")
+	rites, _ := ParsePermissions("rw-r--rw-")
+
+	assertNotHas(t, toolNames(r.ForPermissions(chancellor)), "envoy-edit")
+	assertNotHas(t, toolNames(r.ForPermissions(war)), "envoy-edit")
+	assertNotHas(t, toolNames(r.ForPermissions(secretary)), "envoy-edit")
+
+	// Ministers with Earth rw/rwx MUST see envoy-edit, and forge still sees create_manifest via OR.
+	assertHas(t, toolNames(r.ForPermissions(forge)), "envoy-edit")
+	assertHas(t, toolNames(r.ForPermissions(forge)), "create_manifest")
+	assertHas(t, toolNames(r.ForPermissions(rites)), "envoy-edit")
+
+	// Narrowing permissions via SetMCP replaces rather than unions.
+	earthR, _ := ParsePermissions("r--------")
+	if err := r.SetMCP(mockTool{name: "envoy-edit"}, earthR); err != nil {
+		t.Fatalf("SetMCP reclassify: %v", err)
+	}
+	assertHas(t, toolNames(r.ForPermissions(chancellor)), "envoy-edit")
+
+	// Sealed deny ("---------") must be refused by SetMCP.
+	deny, _ := ParsePermissions("---------")
+	if err := r.SetMCP(mockTool{name: "envoy-danger"}, deny); err == nil {
+		t.Fatal("expected SetMCP to reject sealed deny ---------")
+	}
+
+	// Collisions with built-in, static extra, and factory extra tools must be rejected.
+	if err := r.SetMCP(mockTool{name: "read_file"}, earthR); err == nil {
+		t.Fatal("expected collision error for built-in tool name read_file")
+	}
+	if err := r.SetMCP(mockTool{name: "tian_ledger"}, earthR); err == nil {
+		t.Fatal("expected collision error for extra tool name tian_ledger")
+	}
+	if err := r.SetMCP(mockTool{name: "ask_ruler"}, earthR); err == nil {
+		t.Fatal("expected collision error for extra factory name ask_ruler")
+	}
+	if !r.HasNonMCPTool("read_file") || !r.HasNonMCPTool("tian_ledger") || !r.HasNonMCPTool("ask_ruler") {
+		t.Error("HasNonMCPTool should return true for built-ins and extras")
+	}
+	if r.HasNonMCPTool("envoy-edit") {
+		t.Error("HasNonMCPTool should return false for dynamic MCP tool")
 	}
 }
 

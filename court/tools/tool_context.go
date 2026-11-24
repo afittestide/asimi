@@ -68,6 +68,22 @@ func RunnerFromContext(ctx context.Context) (runners.Runner, bool) {
 	return nil, false
 }
 
+// PermissionsKey carries the executing minister's permissions via context.Context
+// so tools can enforce execution-time permission gating.
+type PermissionsKey struct{}
+
+// PermissionsFromContext returns the per-call minister permissions, or the zero
+// value and false when unset.
+func PermissionsFromContext(ctx context.Context) (Permissions, bool) {
+	if ctx == nil {
+		return Permissions{}, false
+	}
+	if v, ok := ctx.Value(PermissionsKey{}).(Permissions); ok {
+		return v, true
+	}
+	return Permissions{}, false
+}
+
 // ToolContext carries shared identity and daemon-level resources to all tools.
 // RepoInfo is a pointer so all contexts see live state (ProjectRoot, Branch, etc.)
 // MinisterID is the one field that varies per minister tool set.

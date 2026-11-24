@@ -120,6 +120,11 @@ type Client interface {
 	// Snapshots for the court debug view.
 	TakeSnapshot() court.Snapshot
 
+	// MCPStatus returns a wire-safe snapshot of configured MCP servers and
+	// their discovered tools (connection status, classification state,
+	// permissions, and registration state).
+	MCPStatus() ([]court.MCPServerStatus, error)
+
 	// CancelTab cancels any in-flight work registered under the given
 	// channel (tab). Wire-safe; the server-side Court maintains a
 	// per-channel cancel registry populated by CancellableStreamCtx.

@@ -36,7 +36,7 @@ type PingResult struct {
 // differs — adopting it would turn every new method call into a
 // permanent CodeUnknownMethod failure (edict 1056). A pure build
 // difference (same protocol, different version) is fine.
-const CurrentProtocol = 1
+const CurrentProtocol = 2
 
 // ProtocolCompatible reports whether a PingResult describes a daemon
 // this build can talk to: same protocol, and one was declared at all.
@@ -293,4 +293,8 @@ type SessionSeamsResult struct {
 
 type ApplyMandateParams struct {
 	Selections config.Selections `msgpack:"selections"`
+}
+
+type MCPStatusResult struct {
+	Servers []court.MCPServerStatus `msgpack:"servers"`
 }

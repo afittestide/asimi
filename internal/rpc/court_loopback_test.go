@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	courtmcp "github.com/afittestide/asimi/court/mcp"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/courtapi"
 	"github.com/afittestide/asimi/internal/runners"
@@ -56,6 +58,10 @@ type fakeCourt struct {
 	seams    []config.Seam
 	seamsErr error
 	mandates []config.Selections
+
+	// MCP status snapshot returned by fakeCourt.MCPStatus.
+	mcpStatus    []court.MCPServerStatus
+	mcpStatusErr error
 }
 
 func newFakeCourt() *fakeCourt {
@@ -345,6 +351,12 @@ func (f *fakeCourt) ApplyMandate(sel config.Selections) error {
 	defer f.mu.Unlock()
 	f.mandates = append(f.mandates, sel)
 	return nil
+}
+
+func (f *fakeCourt) MCPStatus() ([]court.MCPServerStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mcpStatus, f.mcpStatusErr
 }
 
 func intString(n int) string {
@@ -1141,5 +1153,241 @@ func TestCourtClient_ApplyMandate_ReachesTheCourt(t *testing.T) {
 	}
 	if got.AllowAll {
 		t.Error("an explicit per-seam selection must not arrive as Allow all")
+	}
+}
+
+// TestCourtClient_MCPStatus_RoundTrip verifies that MCP server connection
+// status and per-tool classification status (state, permissions, schema hash,
+// registered flag, command, and error) round-trip cleanly over msgpack RPC.
+func TestCourtClient_MCPStatus_RoundTrip(t *testing.T) {
+	want := []court.MCPServerStatus{
+		{
+			ID:      "term",
+			Name:    "Headless Terminal",
+			State:   "connected",
+			Command: []string{"/usr/local/bin/term-mcp", "--headless"},
+			Tools: []court.MCPToolStatus{
+				{
+					Name:           "read_screen",
+					RegisteredName: "term-read_screen",
+					Description:    "Read current terminal buffer",
+					State:          courtmcp.ToolStatePreclassified,
+					Permissions:    "r--------",
+					SchemaHash:     "sha256-read",
+					Registered:     true,
+				},
+				{
+					Name:           "run_cmd",
+					RegisteredName: "term-run_cmd",
+					Description:    "Execute shell command in terminal",
+					State:          courtmcp.ToolStateSealed,
+					Permissions:    "r-x------",
+					SchemaHash:     "sha256-run",
+					Registered:     true,
+				},
+				{
+					Name:           "wipe_disk",
+					RegisteredName: "term-wipe_disk",
+					Description:    "Destructive operation",
+					State:          courtmcp.ToolStateSealed,
+					Permissions:    "---------",
+					SchemaHash:     "sha256-wipe",
+					Registered:     false,
+				},
+				{
+					Name:        "send_keys",
+					Description: "Send keystrokes to PTY",
+					State:       courtmcp.ToolStateProposed,
+					Permissions: "rw-------",
+					SchemaHash:  "sha256-keys",
+					Registered:  false,
+				},
+				{
+					Name:        "resize",
+					Description: "Resize terminal dimensions",
+					State:       courtmcp.ToolStateUnclassified,
+					SchemaHash:  "sha256-resize",
+					Registered:  false,
+				},
+			},
+		},
+		{
+			ID:      "broken",
+			Name:    "Broken Envoy",
+			State:   "error",
+			Command: []string{"/nonexistent/mcp"},
+			Error:   "exec: /nonexistent/mcp: no such file or directory",
+		},
+	}
+
+	impl := newFakeCourt()
+	impl.mcpStatus = want
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	got, err := client.MCPStatus()
+	if err != nil {
+		t.Fatalf("MCPStatus: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MCPStatus round-trip mismatch:\ngot:  %+v\nwant: %+v", got, want)
+	}
+}
+
+// TestCourtClient_MCPStatus_Empty verifies an empty MCP server list round-trips
+// without error.
+func TestCourtClient_MCPStatus_Empty(t *testing.T) {
+	impl := newFakeCourt()
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	got, err := client.MCPStatus()
+	if err != nil {
+		t.Fatalf("MCPStatus: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("MCPStatus = %+v, want empty", got)
+	}
+}
+
+// TestCourtClient_MCPStatus_ErrorPropagates verifies a server-side MCPStatus
+// error propagates over the wire intact.
+func TestCourtClient_MCPStatus_ErrorPropagates(t *testing.T) {
+	impl := newFakeCourt()
+	impl.mcpStatusErr = errors.New("mcp bridge failed to start")
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	got, err := client.MCPStatus()
+	if err == nil {
+		t.Fatal("MCPStatus: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mcp bridge failed to start") {
+		t.Errorf("err = %v, want server error message", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got = %+v, want empty on error", got)
+	}
+}
+
+// TestMethodMCPStatusRegistered guards against a refactor dropping MethodMCPStatus
+// from the Court RPC handler table.
+func TestMethodMCPStatusRegistered(t *testing.T) {
+	impl := newFakeCourt()
+	impl.mcpStatus = []court.MCPServerStatus{
+		{ID: "lsp", State: "connected"},
+	}
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	raw, err := clientConn.Call(ctx, MethodMCPStatus, nil)
+	if err != nil {
+		t.Fatalf("MethodMCPStatus not served: %v", err)
+	}
+	var r MCPStatusResult
+	if err := wire.Decode(raw, &r); err != nil {
+		t.Fatalf("decode MCPStatusResult: %v", err)
+	}
+	if len(r.Servers) != 1 || r.Servers[0].ID != "lsp" || r.Servers[0].State != "connected" {
+		t.Errorf("result = %+v", r)
+	}
+}
+
+// TestLoopbackCourt_MCPStatus_ReachesWire verifies LoopbackCourt inherits
+// MCPStatus via CourtClient and serves it over the wire rather than Local.
+func TestLoopbackCourt_MCPStatus_ReachesWire(t *testing.T) {
+	impl := newFakeCourt()
+	impl.mcpStatus = []court.MCPServerStatus{
+		{
+			ID:    "wire-srv",
+			State: "connected",
+			Tools: []court.MCPToolStatus{
+				{Name: "inspect", State: courtmcp.ToolStateSealed, Permissions: "r--------", Registered: true},
+			},
+		},
+	}
+
+	pa, pb := net.Pipe()
+	server := New(pa, Options{})
+	clientConn := New(pb, Options{})
+	RegisterCourtHandlers(server, impl)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Serve() }()
+	go func() { defer wg.Done(); _ = clientConn.Serve() }()
+	defer func() {
+		_ = clientConn.Close()
+		_ = server.Close()
+		wg.Wait()
+	}()
+
+	local := newFakeCourt()
+	local.mcpStatus = []court.MCPServerStatus{{ID: "local-srv", State: "disconnected"}}
+	lb := NewLoopbackCourt(clientConn, local)
+
+	got, err := lb.MCPStatus()
+	if err != nil {
+		t.Fatalf("LoopbackCourt.MCPStatus: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "wire-srv" {
+		t.Fatalf("got = %+v, want wire-srv over RPC", got)
+	}
+}
+
+// TestReconnectingClient_MCPStatus verifies ReconnectingClient delegates
+// MCPStatus over the wire and returns ErrClosed when disconnected.
+func TestReconnectingClient_MCPStatus(t *testing.T) {
+	empty := &ReconnectingClient{}
+	if _, err := empty.MCPStatus(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("nil client err = %v, want ErrClosed", err)
+	}
+
+	impl := newFakeCourt()
+	impl.mcpStatus = []court.MCPServerStatus{
+		{
+			ID:    "term",
+			State: "connected",
+			Tools: []court.MCPToolStatus{
+				{
+					Name:           "exec",
+					RegisteredName: "term-exec",
+					State:          courtmcp.ToolStateSealed,
+					Permissions:    "r-x------",
+					Registered:     true,
+				},
+			},
+		},
+	}
+	client, stop := startSeamPair(t, impl)
+	defer stop()
+
+	rc := NewReconnectingClient(nil, nil)
+	rc.mu.Lock()
+	rc.conn = client.conn
+	rc.client = client
+	rc.mu.Unlock()
+
+	got, err := rc.MCPStatus()
+	if err != nil {
+		t.Fatalf("ReconnectingClient.MCPStatus: %v", err)
+	}
+	if !reflect.DeepEqual(got, impl.mcpStatus) {
+		t.Fatalf("ReconnectingClient.MCPStatus = %+v, want %+v", got, impl.mcpStatus)
 	}
 }

@@ -264,6 +264,11 @@ func serveOne(ctx context.Context, conn net.Conn, shared *Shared, connID uint64)
 	go rpc.PumpCourtEvents(connCtx, rpcConn, ct.Subscribe(connCtx))
 
 	defer func() {
+		if ct != nil {
+			if err := ct.Stop(); err != nil {
+				shared.Logger.Warn("daemon: court stop failed", "conn_id", connID, "err", err)
+			}
+		}
 		if runner != nil {
 			closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer closeCancel()

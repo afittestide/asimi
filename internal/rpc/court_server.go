@@ -417,6 +417,14 @@ func RegisterCourtHandlers(c *Conn, impl courtapi.Client) {
 		}
 		return nil, nil
 	})
+
+	c.Handle(MethodMCPStatus, func(ctx context.Context, _ []byte) ([]byte, error) {
+		servers, err := impl.MCPStatus()
+		if err != nil {
+			return nil, err
+		}
+		return wire.Encode(MCPStatusResult{Servers: servers})
+	})
 }
 
 // ServeCourtNotifications drives the server-side notification pump:

@@ -4,8 +4,11 @@
 # matches a finding, since a stale entry needs re-review.
 #
 # GO-2026-6911: mark3labs/mcp-go has no fixed release (Fixed in: N/A). The
-# vulnerable StreamableHTTP transport symbols are pulled in transitively by
-# bifrost's schemas package, but Asimi never configures an MCPConfig, so
-# bifrost never constructs its MCPManager and that transport path is never
-# exercised. Re-review when bifrost bumps mcp-go.
+# vulnerable transport.StreamableHTTP symbols are pulled in transitively by
+# bifrost, but InitBifrost leaves schemas.BifrostConfig.MCPConfig nil and
+# court/mcp constructs Bifrost's MCPManager strictly for stdio transport
+# (MCPConnectionTypeSTDIO). HTTP, SSE, Streamable-HTTP, and URL-based MCP
+# configs are rejected fail-closed at config load and bridge initialization, so
+# the vulnerable StreamableHTTP code path is never exercised. Re-review when
+# bifrost bumps mcp-go or before enabling any remote MCP transport.
 GO-2026-6911

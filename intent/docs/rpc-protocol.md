@@ -105,8 +105,10 @@ project metadata, API keys, and OAuth tokens to the daemon. The daemon
 uses this to initialise (or re-initialise) its Bifrost LLM client.
 `SetContext` is **idempotent** — it can be called at any time to push
 runtime configuration updates (model switch, OAuth token refresh, etc.)
-without reconnecting. Protocol versioning is a planned addition;
-currently both peers assume "same build" compatibility.
+without reconnecting. Protocol versioning is declared in `PingResult.Protocol`
+against `rpc.CurrentProtocol` (currently `2`, bumped when `MCPStatus` was
+added in edict 661); clients refuse to adopt a daemon speaking a different
+protocol.
 
 ## 4. Method catalog — TUI → daemon
 
@@ -144,11 +146,29 @@ Every method name is a Go constant in
 | `GetSessionExport`         | `{tab_target}`                                      | `{export *SessionExport}`       |
 | `TakeSnapshot`             | —                                                   | `{snapshot Snapshot}`           |
 | `CancelTab`                | `{channel_id}`                                      | —                               |
+| `SessionSeams`             | —                                                   | `{seams []config.Seam}`         |
+| `ApplyMandate`             | `{selections config.Selections}`                    | —                               |
+| `MCPStatus`                | —                                                   | `{servers []court.MCPServerStatus}` |
 | `SetContext`               | `{project, username, project_root, worktree_path, branch, api_keys?, auth_token?, refresh_token?}` | — |
 
 The `court.Prompt` type has a `context.Context` field that doesn't
 cross the wire. `SubmitPromptParams` carries the same fields minus
 `Ctx`; the server rebuilds `ctx` from the handler's own ctx.
+
+**`MCPStatus` result & `TakeSnapshot` in detail** — `MCPStatus` returns
+`{servers []court.MCPServerStatus}` where each `MCPServerStatus` carries
+`{id, name?, state, command?, tools?, error?}` and each `MCPToolStatus`
+carries `{name, registered_name?, description?, state, permissions?,
+schema_hash?, registered}`. Tool `state` is one of `"unclassified"`,
+`"proposed"`, `"sealed"`, `"denied"` (`---------`), or `"preclassified"`.
+`TakeSnapshot` also includes the same slice under `snapshot.mcp_servers`
+(`omitempty`).
+
+**`SessionSeams` / `ApplyMandate` and MCP servers** — `SessionSeams`
+includes a `SeamMCPServer` (`kind: "mcp_server"`) row for each configured
+`[[mcp.servers]]` entry. MCP servers are off by default, excluded from
+`AllowAll`, and only booted after `ApplyMandate` grants their server ID in
+`selections.MCPServers`.
 
 **`SetContext` params in detail** — the `api_keys` field is a
 `map[string]string` keyed by provider name (e.g. `"anthropic"`,
@@ -180,7 +200,7 @@ in `internal/rpc/notifications.go`.
 | `minister.invoking`         | `{channel_id, minister_id, edict_key, task}`                                     |
 | `minister.completed`        | `{channel_id, minister_id, edict_key, output, sealed, err string}`               |
 | `event`                     | `{channel_id, event_type, edict_key, message, payload}`                          |
-| `zhengming.pending`         | `{request_id, edict_key, minister_id, questions, priority}`                      |
+| `zhengming.pending`         | `{request_id, edict_key, minister_id, questions, priority}` (used for clarifications, edict suggestions, and general `propose` gates including `mcp_classification` with `edict_key.id = 0` and `minister_id = "rites"`) |
 | `zhengming.answered`        | `{request_id, answer}`                                                           |
 | `ritual.step`               | `{channel_id, ritual_name, execution_id, edict_id, step_name, step_index, total_steps, status, message}` |
 | `runner.container_launched` | `{message, container_id}`                                                        |

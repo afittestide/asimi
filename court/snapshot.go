@@ -41,10 +41,11 @@ type ZhengmingEntry struct {
 
 // Snapshot captures the current state of the court for dashboard display.
 type Snapshot struct {
-	Rituals   []RitualEntry    `msgpack:"rituals,omitempty"`
-	Events    []EventEntry     `msgpack:"events,omitempty"`
-	Zhengming []ZhengmingEntry `msgpack:"zhengming,omitempty"`
-	TakenAt   time.Time        `msgpack:"taken_at"`
+	Rituals    []RitualEntry     `msgpack:"rituals,omitempty"`
+	Events     []EventEntry      `msgpack:"events,omitempty"`
+	Zhengming  []ZhengmingEntry  `msgpack:"zhengming,omitempty"`
+	MCPServers []MCPServerStatus `msgpack:"mcp_servers,omitempty"`
+	TakenAt    time.Time         `msgpack:"taken_at"`
 }
 
 // TakeSnapshot returns a point-in-time snapshot of live rituals and recent events.
@@ -141,6 +142,10 @@ func (s *Court) TakeSnapshot() Snapshot {
 				TimeoutAt:  z.TimeoutAt,
 			})
 		}
+	}
+
+	if servers, err := s.MCPStatus(); err == nil && len(servers) > 0 {
+		snap.MCPServers = servers
 	}
 
 	return snap

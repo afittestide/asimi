@@ -23,6 +23,7 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
+	courtmcp "github.com/afittestide/asimi/court/mcp"
 	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/mocks"
@@ -103,6 +104,7 @@ func setupCourtTestDB(t *testing.T) *gorm.DB {
 		&storage.Incident{},
 		&storage.RulerCouncil{},
 		&storage.RitualGuardCheckpoint{},
+		&storage.MCPToolClassification{},
 		&RitualExecution{},
 		&RitualStepState{},
 	)
@@ -7566,4 +7568,657 @@ func TestCourt_AppendToIntent_PreservesRulerIntentSeal(t *testing.T) {
 	status, err := sealer.GetEdictStatus(key)
 	require.NoError(t, err)
 	assert.Equal(t, storage.EdictIntentApproved, status)
+}
+
+// --- Phase 3: Court & Session MCP Wiring Tests ---
+
+type fakeCourtMCPManager struct {
+	mu            sync.Mutex
+	clients       []schemas.MCPClientState
+	toolsByClient map[string][]schemas.ChatTool
+	cleanupCalls  int
+	execCalls     []string
+	execResult    string
+}
+
+func (f *fakeCourtMCPManager) GetClients() []schemas.MCPClientState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]schemas.MCPClientState, len(f.clients))
+	copy(out, f.clients)
+	return out
+}
+
+func (f *fakeCourtMCPManager) GetToolPerClient(ctx context.Context) map[string][]schemas.ChatTool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string][]schemas.ChatTool, len(f.toolsByClient))
+	for k, v := range f.toolsByClient {
+		cp := make([]schemas.ChatTool, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+func (f *fakeCourtMCPManager) ExecuteChatTool(ctx *schemas.BifrostContext, toolCall *schemas.ChatAssistantMessageToolCall) (*schemas.ChatMessage, *schemas.BifrostError) {
+	f.mu.Lock()
+	name := ""
+	if toolCall != nil && toolCall.Function.Name != nil {
+		name = *toolCall.Function.Name
+	}
+	f.execCalls = append(f.execCalls, name)
+	res := f.execResult
+	if res == "" {
+		res = "ok:" + name
+	}
+	f.mu.Unlock()
+	return &schemas.ChatMessage{
+		Role:    schemas.ChatMessageRoleTool,
+		Content: &schemas.ChatMessageContent{ContentStr: &res},
+	}, nil
+}
+
+func (f *fakeCourtMCPManager) Cleanup() error {
+	f.mu.Lock()
+	f.cleanupCalls++
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeCourtMCPManager) CleanupCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleanupCalls
+}
+
+func (f *fakeCourtMCPManager) SetTools(clientName string, list []schemas.ChatTool) {
+	f.mu.Lock()
+	if f.toolsByClient == nil {
+		f.toolsByClient = make(map[string][]schemas.ChatTool)
+	}
+	f.toolsByClient[clientName] = list
+	f.mu.Unlock()
+}
+
+func makeCourtMCPChatTool(name, description string) schemas.ChatTool {
+	desc := description
+	return schemas.ChatTool{
+		Type: schemas.ChatToolTypeFunction,
+		Function: &schemas.ChatToolFunction{
+			Name:        name,
+			Description: &desc,
+			Parameters: &schemas.ToolFunctionParameters{
+				Type: "object",
+			},
+		},
+	}
+}
+
+type capturingRitesLLM struct {
+	mu              sync.Mutex
+	seenToolNames   [][]string
+	responseContent string
+}
+
+func (c *capturingRitesLLM) ChatCompletionRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	c.recordTools(req)
+	content := c.responseContent
+	finish := "stop"
+	return &schemas.BifrostChatResponse{
+		ID: "rites-classify-1",
+		Choices: []schemas.BifrostResponseChoice{
+			{
+				Index: 0,
+				ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+					Delta: &schemas.ChatStreamResponseChoiceDelta{
+						Content: &content,
+					},
+				},
+				FinishReason: &finish,
+			},
+		},
+	}, nil
+}
+
+func (c *capturingRitesLLM) ChatCompletionStreamRequest(ctx *schemas.BifrostContext, req *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	c.recordTools(req)
+	ch := make(chan *schemas.BifrostStreamChunk, 1)
+	content := c.responseContent
+	finish := "stop"
+	ch <- &schemas.BifrostStreamChunk{
+		BifrostChatResponse: &schemas.BifrostChatResponse{
+			ID: "rites-stream-1",
+			Choices: []schemas.BifrostResponseChoice{
+				{
+					Index: 0,
+					ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+						Delta: &schemas.ChatStreamResponseChoiceDelta{
+							Content: &content,
+						},
+					},
+					FinishReason: &finish,
+				},
+			},
+		},
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (c *capturingRitesLLM) ListModelsRequest(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (c *capturingRitesLLM) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{}, nil
+}
+
+func (c *capturingRitesLLM) recordTools(req *schemas.BifrostChatRequest) {
+	var names []string
+	if req != nil && req.Params != nil {
+		for _, t := range req.Params.Tools {
+			if t.Function != nil {
+				names = append(names, t.Function.Name)
+			}
+		}
+	}
+	c.mu.Lock()
+	c.seenToolNames = append(c.seenToolNames, names)
+	c.mu.Unlock()
+}
+
+func (c *capturingRitesLLM) ToolBatches() [][]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([][]string, len(c.seenToolNames))
+	copy(out, c.seenToolNames)
+	return out
+}
+
+func sessionHasTool(sess *Session, name string) bool {
+	if _, ok := sess.lookupTool(name); !ok {
+		return false
+	}
+	for _, def := range sess.toolDefsSnapshot() {
+		if def.Function != nil && def.Function.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCourt_SetMCPConfigAndMCPStatus(t *testing.T) {
+	var nilCourt *Court
+	status, err := nilCourt.MCPStatus()
+	require.NoError(t, err)
+	assert.Nil(t, status)
+
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, &config.CourtConfig{Project: "test/mcp"}, nil, slog.Default())
+
+	// Unconfigured court returns empty status without error.
+	status, err = s.MCPStatus()
+	require.NoError(t, err)
+	assert.Nil(t, status)
+
+	mgr1 := &fakeCourtMCPManager{
+		clients: []schemas.MCPClientState{
+			{
+				Name:            "envoy_one",
+				ExecutionConfig: &schemas.MCPClientConfig{ID: "envoy-one", Name: "envoy_one"},
+				State:           schemas.MCPConnectionStateConnected,
+			},
+		},
+		toolsByClient: map[string][]schemas.ChatTool{
+			"envoy_one": {makeCourtMCPChatTool("envoy_one-ping", "Check envoy health")},
+		},
+	}
+	mgr2 := &fakeCourtMCPManager{
+		clients: []schemas.MCPClientState{
+			{
+				Name:            "envoy_two",
+				ExecutionConfig: &schemas.MCPClientConfig{ID: "envoy-two", Name: "envoy_two"},
+				State:           schemas.MCPConnectionStateConnected,
+			},
+		},
+		toolsByClient: map[string][]schemas.ChatTool{
+			"envoy_two": {makeCourtMCPChatTool("envoy_two-status", "Inspect envoy two")},
+		},
+	}
+
+	s.mcpManagerFactory = func(ctx context.Context, cfg schemas.MCPConfig) (courtmcp.MCPClientManager, error) {
+		if len(cfg.ClientConfigs) > 0 && cfg.ClientConfigs[0].ID == "envoy-two" {
+			return mgr2, nil
+		}
+		return mgr1, nil
+	}
+
+	// SetMCPConfig records requested config for SessionSeams; ungranted servers
+	// must NOT boot until ApplyMandate grants them (RestrictiveMandate spawns 0).
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:                 "envoy-one",
+				Command:            []string{"/usr/bin/envoy-one"},
+				DefaultPermissions: "r--------",
+			},
+		},
+	})
+	seams, err := s.SessionSeams()
+	require.NoError(t, err)
+	require.Len(t, seams, 1)
+	assert.Equal(t, config.SeamMCPServer, seams[0].Kind)
+	assert.Equal(t, "envoy-one", seams[0].MCPServer.ID)
+
+	require.NoError(t, s.Start(context.Background()))
+	defer func() { require.NoError(t, s.Stop()) }()
+
+	// Fail-closed under RestrictiveMandate: zero servers spawned.
+	s.ApplyRestrictiveMandate()
+	status, err = s.MCPStatus()
+	require.NoError(t, err)
+	assert.Nil(t, status, "RestrictiveMandate must spawn zero MCP servers")
+
+	// Grant envoy-one via ApplyMandate -> boots asynchronously.
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"envoy-one": true, "envoy-two": true, "bad-envoy": true},
+	}))
+
+	require.Eventually(t, func() bool {
+		st, stErr := s.MCPStatus()
+		return stErr == nil && len(st) == 1 && st[0].ID == "envoy-one" &&
+			st[0].State == string(schemas.MCPConnectionStateConnected) && len(st[0].Tools) == 1 && st[0].Tools[0].Registered
+	}, 2*time.Second, 10*time.Millisecond)
+
+	status, err = s.MCPStatus()
+	require.NoError(t, err)
+	require.Len(t, status, 1)
+	assert.Equal(t, "envoy-one", status[0].ID)
+	require.Len(t, status[0].Tools, 1)
+	assert.Equal(t, "ping", status[0].Tools[0].Name)
+	assert.Equal(t, "envoy-one-ping", status[0].Tools[0].RegisteredName)
+	assert.Equal(t, courtmcp.ToolStatePreclassified, status[0].Tools[0].State)
+	assert.Equal(t, "r--------", status[0].Tools[0].Permissions)
+	assert.True(t, status[0].Tools[0].Registered)
+
+	// Updating SetMCPConfig while running requires mandate grant for the new server.
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:                 "envoy-two",
+				Command:            []string{"/usr/bin/envoy-two"},
+				DefaultPermissions: "r--------",
+			},
+		},
+	})
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"envoy-two": true},
+	}))
+	assert.Equal(t, 1, mgr1.CleanupCount(), "replacing MCP config must clean up previous manager")
+
+	require.Eventually(t, func() bool {
+		st, stErr := s.MCPStatus()
+		return stErr == nil && len(st) == 1 && st[0].ID == "envoy-two" &&
+			len(st[0].Tools) == 1 && st[0].Tools[0].Registered
+	}, 2*time.Second, 10*time.Millisecond)
+	_, oldPresent := s.GetToolRegistry().Get("envoy-one-ping")
+	assert.False(t, oldPresent, "previous server's tools must be unregistered")
+	_, newPresent := s.GetToolRegistry().Get("envoy-two-status")
+	assert.True(t, newPresent, "new server's tools must be registered")
+
+	// Invalid MCP config (missing command / invalid permission) fails closed and surfaces via MCPStatus.
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:                 "bad-envoy",
+				Command:            []string{"/usr/bin/bad"},
+				DefaultPermissions: "invalid",
+			},
+		},
+	})
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"bad-envoy": true},
+	}))
+	status, err = s.MCPStatus()
+	assert.Nil(t, status)
+	assert.Error(t, err)
+}
+
+func TestCourt_TakeSnapshot_MCPStatus(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, &config.CourtConfig{Project: "test/mcp-snap"}, nil, slog.Default())
+
+	// Snapshot without MCP servers leaves MCPServers empty.
+	emptySnap := s.TakeSnapshot()
+	assert.Empty(t, emptySnap.MCPServers)
+
+	mgr := &fakeCourtMCPManager{
+		clients: []schemas.MCPClientState{
+			{
+				Name:            "term_envoy",
+				ExecutionConfig: &schemas.MCPClientConfig{ID: "term-envoy", Name: "term_envoy"},
+				State:           schemas.MCPConnectionStateConnected,
+			},
+		},
+		toolsByClient: map[string][]schemas.ChatTool{
+			"term_envoy": {makeCourtMCPChatTool("term_envoy-read_screen", "Read terminal buffer")},
+		},
+	}
+	s.mcpManagerFactory = func(ctx context.Context, cfg schemas.MCPConfig) (courtmcp.MCPClientManager, error) {
+		return mgr, nil
+	}
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:                 "term-envoy",
+				Command:            []string{"/usr/bin/term-envoy"},
+				DefaultPermissions: "r--------",
+			},
+		},
+	})
+	require.NoError(t, s.Start(context.Background()))
+	defer func() { require.NoError(t, s.Stop()) }()
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"term-envoy": true},
+	}))
+
+	require.Eventually(t, func() bool {
+		st, err := s.MCPStatus()
+		return err == nil && len(st) == 1 && len(st[0].Tools) == 1 && st[0].Tools[0].Registered
+	}, 2*time.Second, 10*time.Millisecond)
+
+	snap := s.TakeSnapshot()
+	require.Len(t, snap.MCPServers, 1)
+	assert.Equal(t, "term-envoy", snap.MCPServers[0].ID)
+	require.Len(t, snap.MCPServers[0].Tools, 1)
+	assert.Equal(t, "read_screen", snap.MCPServers[0].Tools[0].Name)
+	assert.Equal(t, "r--------", snap.MCPServers[0].Tools[0].Permissions)
+	assert.True(t, snap.MCPServers[0].Tools[0].Registered)
+
+	// Verify msgpack wire round-trip preserves mcp_servers.
+	encoded, err := msgpack.Marshal(snap)
+	require.NoError(t, err)
+	var decoded Snapshot
+	require.NoError(t, msgpack.Unmarshal(encoded, &decoded))
+	assert.Equal(t, snap.MCPServers, decoded.MCPServers)
+}
+
+func TestCourt_Stop_MCPTeardown(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, &config.CourtConfig{Project: "test/mcp-stop"}, nil, slog.Default())
+
+	mgr := &fakeCourtMCPManager{
+		clients: []schemas.MCPClientState{
+			{
+				Name:            "stop_envoy",
+				ExecutionConfig: &schemas.MCPClientConfig{ID: "stop-envoy", Name: "stop_envoy"},
+				State:           schemas.MCPConnectionStateConnected,
+			},
+		},
+		toolsByClient: map[string][]schemas.ChatTool{
+			"stop_envoy": {makeCourtMCPChatTool("stop_envoy-inspect", "Inspect state")},
+		},
+	}
+	s.mcpManagerFactory = func(ctx context.Context, cfg schemas.MCPConfig) (courtmcp.MCPClientManager, error) {
+		return mgr, nil
+	}
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:                 "stop-envoy",
+				Command:            []string{"/usr/bin/stop-envoy"},
+				DefaultPermissions: "r--------",
+			},
+		},
+	})
+
+	forge := s.GetMinister("forge")
+	require.NotNil(t, forge)
+	forgeSess, err := CreateSession(forge, mocks.NewLLMProvider(), &SessionConfig{}, func(any) {}, "forge")
+	require.NoError(t, err)
+	forge.(interface{ SetSession(*Session, ...string) }).SetSession(forgeSess, "forge")
+
+	require.NoError(t, s.Start(context.Background()))
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"stop-envoy": true},
+	}))
+
+	require.Eventually(t, func() bool {
+		return sessionHasTool(forgeSess, "stop-envoy-inspect")
+	}, 2*time.Second, 10*time.Millisecond)
+	_, registered := s.GetToolRegistry().Get("stop-envoy-inspect")
+	require.True(t, registered)
+
+	// Stop tears down bridge cleanly: Cleanup called, ToolRegistry cleared, live session refreshed, MCPStatus empty.
+	require.NoError(t, s.Stop())
+	assert.Equal(t, 1, mgr.CleanupCount())
+	_, registered = s.GetToolRegistry().Get("stop-envoy-inspect")
+	assert.False(t, registered, "Stop must unregister MCP tools from ToolRegistry")
+	assert.False(t, sessionHasTool(forgeSess, "stop-envoy-inspect"), "Stop must refresh live sessions to drop MCP tools")
+
+	status, err := s.MCPStatus()
+	require.NoError(t, err)
+	assert.Nil(t, status)
+
+	// Stop is idempotent.
+	require.NoError(t, s.Stop())
+	assert.Equal(t, 1, mgr.CleanupCount())
+}
+
+func TestCourt_LiveSessionToolRefreshAndPermissions(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, &config.CourtConfig{Project: "test/mcp-live"}, nil, slog.Default())
+
+	forge := s.GetMinister("forge") // rwxr---w-
+	war := s.GetMinister("war")     // r-----rw-
+	require.NotNil(t, forge)
+	require.NotNil(t, war)
+
+	// Open live interactive sessions BEFORE MCP starts.
+	forgeSess, err := CreateSession(forge, mocks.NewLLMProvider(), &SessionConfig{}, func(any) {}, "forge")
+	require.NoError(t, err)
+	forge.(interface{ SetSession(*Session, ...string) }).SetSession(forgeSess, "forge")
+
+	warSess, err := CreateSession(war, mocks.NewLLMProvider(), &SessionConfig{}, func(any) {}, "war")
+	require.NoError(t, err)
+	war.(interface{ SetSession(*Session, ...string) }).SetSession(warSess, "war")
+
+	// Verify CreateSession attached parsed minister permissions onto each session.
+	forgePerm, ok := forgeSess.Permissions()
+	require.True(t, ok)
+	assert.Equal(t, "rwxr---w-", forgePerm.String())
+
+	warPerm, ok := warSess.Permissions()
+	require.True(t, ok)
+	assert.Equal(t, "r-----rw-", warPerm.String())
+
+	mgr := &fakeCourtMCPManager{
+		clients: []schemas.MCPClientState{
+			{
+				Name:            "live_srv",
+				ExecutionConfig: &schemas.MCPClientConfig{ID: "live-srv", Name: "live_srv"},
+				State:           schemas.MCPConnectionStateConnected,
+			},
+		},
+		toolsByClient: map[string][]schemas.ChatTool{
+			"live_srv": {
+				makeCourtMCPChatTool("live_srv-read_info", "Read-only earth tool"),
+				makeCourtMCPChatTool("live_srv-exec_term", "Execute command on earth"),
+			},
+		},
+		execResult: "terminal-output",
+	}
+	s.mcpManagerFactory = func(ctx context.Context, cfg schemas.MCPConfig) (courtmcp.MCPClientManager, error) {
+		return mgr, nil
+	}
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:      "live-srv",
+				Command: []string{"/usr/bin/live-srv"},
+				Tools: []config.MCPToolOverride{
+					{Name: "read_info", Permissions: "r--------"},
+					{Name: "exec_term", Permissions: "--x------"},
+				},
+			},
+		},
+	})
+	require.NoError(t, s.Start(context.Background()))
+	defer func() { require.NoError(t, s.Stop()) }()
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"live-srv": true},
+	}))
+
+	// Live sessions refresh automatically via OnRegistryChanged -> refreshMinisterSessionTools -> ReplaceCourtTools.
+	require.Eventually(t, func() bool {
+		return sessionHasTool(forgeSess, "live-srv-read_info") &&
+			sessionHasTool(forgeSess, "live-srv-exec_term") &&
+			sessionHasTool(warSess, "live-srv-read_info")
+	}, 2*time.Second, 10*time.Millisecond)
+	assert.False(t, sessionHasTool(warSess, "live-srv-exec_term"),
+		"war (r-----rw-) must not receive earth-execute tool (--x------)")
+
+	// Execute live-srv-exec_term via forge's session: PermissionsKey propagates and succeeds.
+	execTool, ok := forgeSess.lookupTool("live-srv-exec_term")
+	require.True(t, ok)
+	resMsg := forgeSess.executeToolCall(context.Background(), execTool, "call-1", "live-srv-exec_term", `{}`)
+	require.NotNil(t, resMsg.Content)
+	require.NotNil(t, resMsg.Content.ContentStr)
+	assert.Equal(t, "terminal-output", *resMsg.Content.ContentStr)
+
+	// Attempting to execute the same adapter through war's session must fail closed at Call().
+	deniedMsg := warSess.executeToolCall(context.Background(), execTool, "call-2", "live-srv-exec_term", `{}`)
+	require.NotNil(t, deniedMsg.Content)
+	require.NotNil(t, deniedMsg.Content.ContentStr)
+	assert.Contains(t, *deniedMsg.Content.ContentStr, "permission denied")
+
+	// Removing exec_term from the MCP server reconciles and atomically drops it from forge's live session.
+	mgr.SetTools("live_srv", []schemas.ChatTool{
+		makeCourtMCPChatTool("live_srv-read_info", "Read-only earth tool"),
+	})
+	s.mcpMu.RLock()
+	bridge := s.mcpBridge
+	s.mcpMu.RUnlock()
+	require.NotNil(t, bridge)
+	bridge.Reconcile(context.Background())
+
+	assert.False(t, sessionHasTool(forgeSess, "live-srv-exec_term"),
+		"ReplaceCourtTools must drop removed MCP tools from live sessions")
+	assert.True(t, sessionHasTool(forgeSess, "live-srv-read_info"),
+		"still-registered MCP tools must remain in live sessions")
+}
+
+func TestCourt_MCPClassification_RetryOnConfigureModel(t *testing.T) {
+	db := setupCourtTestDB(t)
+	s := NewCourt(db, &config.CourtConfig{Project: "test/mcp-classify"}, nil, slog.Default())
+
+	mgr := &fakeCourtMCPManager{
+		clients: []schemas.MCPClientState{
+			{
+				Name:            "classify_srv",
+				ExecutionConfig: &schemas.MCPClientConfig{ID: "classify-srv", Name: "classify_srv"},
+				State:           schemas.MCPConnectionStateConnected,
+			},
+		},
+		toolsByClient: map[string][]schemas.ChatTool{
+			"classify_srv": {makeCourtMCPChatTool("classify_srv-inspect", "Read repository status")},
+		},
+	}
+	s.mcpManagerFactory = func(ctx context.Context, cfg schemas.MCPConfig) (courtmcp.MCPClientManager, error) {
+		return mgr, nil
+	}
+	// No default_permissions / overrides: must flow through RitesProposer + ZhengmingGate.
+	s.SetMCPConfig(config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{
+				ID:      "classify-srv",
+				Command: []string{"/usr/bin/classify-srv"},
+			},
+		},
+	})
+
+	forge := s.GetMinister("forge")
+	require.NotNil(t, forge)
+	forgeSess, err := CreateSession(forge, mocks.NewLLMProvider(), &SessionConfig{}, func(any) {}, "forge")
+	require.NoError(t, err)
+	forge.(interface{ SetSession(*Session, ...string) }).SetSession(forgeSess, "forge")
+
+	// Start BEFORE ConfigureModel: must not block, and tool remains unclassified/withheld.
+	require.NoError(t, s.Start(context.Background()))
+	defer func() { require.NoError(t, s.Stop()) }()
+	require.NoError(t, s.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"classify-srv": true},
+	}))
+
+	require.Eventually(t, func() bool {
+		st, err := s.MCPStatus()
+		return err == nil && len(st) == 1 && len(st[0].Tools) == 1 &&
+			st[0].Tools[0].State == courtmcp.ToolStateUnclassified && !st[0].Tools[0].Registered
+	}, 2*time.Second, 10*time.Millisecond)
+	assert.False(t, sessionHasTool(forgeSess, "classify-srv-inspect"))
+
+	// Capture ZhengmingPendingMsg raised by the general propose tool.
+	var (
+		zmMu      sync.Mutex
+		pendingID string
+		pendingZM *ZhengmingPendingMsg
+	)
+	s.SetNotify(func(msg any) {
+		if zm, ok := msg.(ZhengmingPendingMsg); ok && zm.MinisterID == "rites" {
+			zmMu.Lock()
+			pendingID = zm.RequestID
+			cp := zm
+			pendingZM = &cp
+			zmMu.Unlock()
+		}
+	})
+
+	// ConfigureModel makes the LLM ready and triggers RetryPendingClassifications.
+	llm := &capturingRitesLLM{
+		responseContent: "```json\n[{\"tool_name\":\"inspect\",\"permissions\":\"r--------\",\"rationale\":\"reads repository status\"}]\n```",
+	}
+	s.ConfigureModel(llm, &SessionConfig{
+		LLM: config.LLMConfig{Provider: "mock", Model: "mock-model"},
+	}, repo.RepoInfo{ProjectRoot: t.TempDir()})
+
+	// Wait for Rites to propose and raise a proposal Zhengming under CourtEdictKey() as "rites".
+	require.Eventually(t, func() bool {
+		zmMu.Lock()
+		defer zmMu.Unlock()
+		return pendingID != ""
+	}, 5*time.Second, 20*time.Millisecond)
+
+	zmMu.Lock()
+	reqID := pendingID
+	zm := pendingZM
+	zmMu.Unlock()
+	require.NotNil(t, zm)
+	assert.Equal(t, uint(0), zm.EdictKey.ID, "MCP classification Zhengming must use CourtEdictKey (edict_id 0)")
+	assert.Equal(t, "rites", zm.MinisterID)
+
+	// Verify Rites' classification session excluded write/mutation tools and included propose + ask_ruler.
+	batches := llm.ToolBatches()
+	require.NotEmpty(t, batches)
+	assert.Contains(t, batches[0], "propose", "rites MCP classification session must include propose")
+	assert.Contains(t, batches[0], "ask_ruler", "rites MCP classification session must include ask_ruler")
+	for _, excluded := range []string{"write_file", "replace_text", "insert_ling", "transition_edict", "dismiss_zhengming"} {
+		assert.NotContains(t, batches[0], excluded, "rites MCP classification session must exclude %s", excluded)
+	}
+
+	// Ruler approves the proposed classification via HandleZhengmingResponse (general propose contract).
+	require.NoError(t, s.HandleZhengmingResponse(context.Background(), reqID, tools.AnswerApproveProposal))
+
+	// Tool becomes sealed, registered, persisted, and live-refreshed into forge's session.
+	require.Eventually(t, func() bool {
+		st, err := s.MCPStatus()
+		return err == nil && len(st) == 1 && len(st[0].Tools) == 1 &&
+			st[0].Tools[0].State == courtmcp.ToolStateSealed &&
+			st[0].Tools[0].Registered &&
+			sessionHasTool(forgeSess, "classify-srv-inspect")
+	}, 3*time.Second, 20*time.Millisecond)
+
+	status, err := s.MCPStatus()
+	require.NoError(t, err)
+	assert.Equal(t, "r--------", status[0].Tools[0].Permissions)
 }

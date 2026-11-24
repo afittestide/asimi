@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,10 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	courtmcp "github.com/afittestide/asimi/court/mcp"
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/rpc"
@@ -83,6 +87,7 @@ func initTestDB(t *testing.T) (*gorm.DB, *storage.DB, func()) {
 		&storage.Incident{},
 		&storage.RulerCouncil{},
 		&storage.RitualGuardCheckpoint{},
+		&storage.MCPToolClassification{},
 		&court.RitualExecution{},
 		&court.RitualStepState{},
 	); err != nil {
@@ -1267,4 +1272,236 @@ func TestCreateCourtRefusesOriginlessAmbiguity(t *testing.T) {
 	if !strings.Contains(err.Error(), "add an origin remote") {
 		t.Errorf("error = %v, want it to instruct adding an origin remote", err)
 	}
+}
+
+const (
+	mcpTestServerEnv  = "ASIMI_TEST_MCP_SERVER"
+	mcpTestPIDFileEnv = "ASIMI_TEST_MCP_PID_FILE"
+)
+
+// runTestMCPStdioServer runs a minimal JSON-RPC 2.0 MCP server over stdin/stdout
+// for daemon RPC integration testing. It exits cleanly when stdin closes.
+func runTestMCPStdioServer() {
+	if pidFile := os.Getenv(mcpTestPIDFileEnv); pidFile != "" {
+		_ = os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	enc := json.NewEncoder(os.Stdout)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var req struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id,omitempty"`
+			Method  string          `json:"method"`
+			Params  struct {
+				ProtocolVersion string `json:"protocolVersion,omitempty"`
+			} `json:"params,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			continue
+		}
+		// Notifications have no id and expect no reply.
+		if len(req.ID) == 0 || string(req.ID) == "null" {
+			continue
+		}
+
+		var result any
+		switch req.Method {
+		case "initialize":
+			proto := req.Params.ProtocolVersion
+			if proto == "" {
+				proto = "2025-03-26"
+			}
+			result = map[string]any{
+				"protocolVersion": proto,
+				"capabilities": map[string]any{
+					"tools": map[string]any{},
+				},
+				"serverInfo": map[string]any{
+					"name":    "test-mcp-envoy",
+					"version": "1.0.0",
+				},
+			}
+		case "tools/list":
+			result = map[string]any{
+				"tools": []map[string]any{
+					{
+						"name":        "echo",
+						"description": "Echo input text",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"text": map[string]any{"type": "string"},
+							},
+						},
+					},
+				},
+			}
+		default:
+			result = map[string]any{}
+		}
+
+		_ = enc.Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  result,
+		})
+	}
+}
+
+// TestDaemonMCPStatusOverRPC verifies end-to-end daemon MCP wiring over the
+// Unix-socket RPC surface:
+//   - initTestDB migrates storage.MCPToolClassification
+//   - createCourt wires projectCfg.MCP via SetMCPConfig before Court.Start
+//   - client.MCPStatus returns the configured/connected stdio server and its
+//     discovered tool status over msgpack RPC
+//   - disconnecting the client tears down the per-connection Court and its
+//     MCP stdio subprocess cleanly via serveOne's ct.Stop() defer
+func TestDaemonMCPStatusOverRPC(t *testing.T) {
+	if os.Getenv(mcpTestServerEnv) == "1" {
+		runTestMCPStdioServer()
+		os.Exit(0)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	pidFile := filepath.Join(t.TempDir(), "mcp.pid")
+	userConfDir := filepath.Join(home, ".config", "asimi")
+	if err := os.MkdirAll(userConfDir, 0o755); err != nil {
+		t.Fatalf("mkdir user config dir: %v", err)
+	}
+	conf := fmt.Sprintf(`[mcp]
+timeout = 5000
+tool_timeout = 5000
+
+[[mcp.servers]]
+id = "test-envoy"
+command = [%s, "-test.run", "^TestDaemonMCPStatusOverRPC$"]
+env = ["%s=1", "%s=%s"]
+default_permissions = "r--------"
+`, strconv.Quote(exe), mcpTestServerEnv, mcpTestPIDFileEnv, pidFile)
+	if err := os.WriteFile(filepath.Join(userConfDir, "asimi.conf"), []byte(conf), 0o600); err != nil {
+		t.Fatalf("write user asimi.conf: %v", err)
+	}
+
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	if !shared.DB.Migrator().HasTable(&storage.MCPToolClassification{}) {
+		t.Fatal("mcp_tool_classifications table was not migrated by initTestDB")
+	}
+
+	projectRoot := t.TempDir()
+	clientConn, client, stop := dialServeOne(t, shared, projectRoot)
+	defer stop()
+
+	// Under RestrictiveMandate (before trust dialog), zero MCP servers spawn.
+	initialServers, err := client.MCPStatus()
+	if err != nil {
+		t.Fatalf("initial MCPStatus: %v", err)
+	}
+	if len(initialServers) != 0 {
+		t.Fatalf("MCPStatus before ApplyMandate returned %d servers, want 0 (fail-closed): %+v", len(initialServers), initialServers)
+	}
+
+	// SessionSeams exposes the requested MCP server as SeamMCPServer.
+	seams, err := client.SessionSeams()
+	if err != nil {
+		t.Fatalf("SessionSeams: %v", err)
+	}
+	foundMCPSeam := false
+	for _, s := range seams {
+		if s.Kind == config.SeamMCPServer && s.MCPServer.ID == "test-envoy" {
+			foundMCPSeam = true
+			break
+		}
+	}
+	if !foundMCPSeam {
+		t.Fatalf("SessionSeams missing SeamMCPServer for test-envoy: %+v", seams)
+	}
+
+	// Grant test-envoy via ApplyMandate -> daemon boots the stdio MCP bridge.
+	if err := client.ApplyMandate(config.Selections{
+		MCPServers: map[string]bool{"test-envoy": true},
+	}); err != nil {
+		t.Fatalf("ApplyMandate: %v", err)
+	}
+
+	var servers []court.MCPServerStatus
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := client.MCPStatus()
+		if err != nil {
+			t.Fatalf("MCPStatus: %v", err)
+		}
+		servers = got
+		if len(servers) == 1 && servers[0].State == "connected" && len(servers[0].Tools) == 1 && servers[0].Tools[0].Registered {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if len(servers) != 1 {
+		t.Fatalf("MCPStatus returned %d servers, want 1: %+v", len(servers), servers)
+	}
+	srv := servers[0]
+	if srv.ID != "test-envoy" {
+		t.Errorf("server.ID = %q, want %q", srv.ID, "test-envoy")
+	}
+	if srv.State != "connected" {
+		t.Errorf("server.State = %q, want %q (err=%q)", srv.State, "connected", srv.Error)
+	}
+	if len(srv.Tools) != 1 {
+		t.Fatalf("server.Tools len = %d, want 1: %+v", len(srv.Tools), srv.Tools)
+	}
+	tool := srv.Tools[0]
+	if tool.Name != "echo" {
+		t.Errorf("tool.Name = %q, want %q", tool.Name, "echo")
+	}
+	if tool.RegisteredName != "test-envoy-echo" {
+		t.Errorf("tool.RegisteredName = %q, want %q", tool.RegisteredName, "test-envoy-echo")
+	}
+	if tool.State != courtmcp.ToolStatePreclassified {
+		t.Errorf("tool.State = %q, want %q", tool.State, courtmcp.ToolStatePreclassified)
+	}
+	if tool.Permissions != "r--------" {
+		t.Errorf("tool.Permissions = %q, want %q", tool.Permissions, "r--------")
+	}
+	if !tool.Registered {
+		t.Error("tool.Registered = false, want true")
+	}
+
+	// Verify serveOne tears down the MCP subprocess on client disconnect
+	// before the daemon itself shuts down.
+	pidRaw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read MCP subprocess pid file: %v", err)
+	}
+	mcpPID, err := strconv.Atoi(strings.TrimSpace(string(pidRaw)))
+	if err != nil || mcpPID <= 0 {
+		t.Fatalf("invalid MCP subprocess pid %q: %v", string(pidRaw), err)
+	}
+
+	clientConn.Close()
+
+	teardownDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(teardownDeadline) {
+		if err := syscall.Kill(mcpPID, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("MCP subprocess pid %d still alive after client disconnect (ct.Stop did not tear down bridge)", mcpPID)
 }

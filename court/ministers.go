@@ -29,7 +29,7 @@ func LoadAllMinisters(projectDir string) ([]MinisterDef, error) {
 // that cannot record an incident loses the observation.
 // consult_minister is NOT included here — only the secretary needs it,
 // and it is provided via the secretary's extra_tools list.
-var commonTools = []string{"ask_ruler", "tian_ledger", "create_incident"}
+var commonTools = []string{"ask_ruler", "tian_ledger", "create_incident", "propose"}
 
 // ministerImpl is the generic, YAML-driven minister type. It replaces the
 // five hand-coded minister structs (Secretary, Forge, Judge, Chancellor,

@@ -25,7 +25,7 @@ const (
 	MethodSubmitPrompt           = "SubmitPrompt"
 	MethodRestoreMinisterSess    = "RestoreMinisterSession"
 	MethodHandleZhengming        = "HandleZhengmingResponse"
-	MethodDismissZhengming      = "DismissZhengming"
+	MethodDismissZhengming       = "DismissZhengming"
 	MethodGetZhengming           = "GetZhengming"
 	MethodCancelZhengming        = "CancelZhengming"
 	MethodAllowRunnerFallback    = "AllowRunnerFallback"
@@ -45,4 +45,5 @@ const (
 	MethodEnsureEdictWorktree    = "EnsureEdictWorktree"
 	MethodSessionSeams           = "SessionSeams"
 	MethodApplyMandate           = "ApplyMandate"
+	MethodMCPStatus              = "MCPStatus"
 )

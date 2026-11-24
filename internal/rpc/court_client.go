@@ -386,6 +386,18 @@ func (c *CourtClient) ApplyMandate(sel config.Selections) error {
 	return c.callVoid(context.Background(), MethodApplyMandate, ApplyMandateParams{Selections: sel})
 }
 
+func (c *CourtClient) MCPStatus() ([]court.MCPServerStatus, error) {
+	raw, err := c.conn.Call(context.Background(), MethodMCPStatus, nil)
+	if err != nil {
+		return nil, err
+	}
+	var r MCPStatusResult
+	if err := wire.Decode(raw, &r); err != nil {
+		return nil, fmt.Errorf("rpc: decode MCPStatus result: %w", err)
+	}
+	return r.Servers, nil
+}
+
 func (c *CourtClient) GetSessionExport(tabTarget string) (*court.SessionExport, error) {
 	raw, err := c.conn.Call(context.Background(), MethodGetSessionExport, GetSessionExportParams{TabTarget: tabTarget})
 	if err != nil {

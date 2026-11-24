@@ -2,6 +2,7 @@ package court
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	courtmcp "github.com/afittestide/asimi/court/mcp"
 	"github.com/afittestide/asimi/court/skills"
 	"github.com/afittestide/asimi/court/tools"
 	"github.com/afittestide/asimi/internal"
@@ -23,6 +25,14 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"gorm.io/gorm"
 )
+
+// MCPServerStatus is a wire-safe snapshot of a configured MCP server and its
+// discovered tools.
+type MCPServerStatus = courtmcp.ServerStatus
+
+// MCPToolStatus is a wire-safe snapshot of a single discovered MCP tool's
+// classification and registration state.
+type MCPToolStatus = courtmcp.ToolStatus
 
 // Event is a dispatched event carrying type, edict key, and payload.
 type Event struct {
@@ -203,6 +213,27 @@ type Court struct {
 	// Set by the transport (the daemon's socket peer); 0 falls back to
 	// os.Getpid() for in-process courts (edict 1036).
 	clientPID int
+
+	// proposalRegistry holds registered ProposalHandlers for the general propose
+	// tool (edict 661). Proposals are validated before Zhengming and applied
+	// ONLY by HandleZhengmingResponse on Ruler approval.
+	proposalRegistry *tools.ProposalRegistry
+
+	// MCP bridge lifecycle state. mcpLifecycleMu serializes start/stop/reconfig
+	// transitions; mcpMu guards mcpConfig, mcpActiveConfig, mcpBridge, mcpErr,
+	// mcpParentCtx, mcpBootCtx, and mcpBootCancel without blocking status
+	// readers on I/O.
+	mcpLifecycleMu    sync.Mutex
+	mcpMu             sync.RWMutex
+	mcpConfig         config.MCPConfig // requested config (for SessionSeams)
+	mcpActiveConfig   config.MCPConfig // currently booted mandate-granted config
+	mcpBridge         *courtmcp.Bridge
+	mcpErr            error
+	mcpParentCtx      context.Context
+	mcpBootCtx        context.Context
+	mcpBootCancel     context.CancelFunc
+	mcpBootWg         sync.WaitGroup
+	mcpManagerFactory func(ctx context.Context, cfg schemas.MCPConfig) (courtmcp.MCPClientManager, error)
 }
 
 // SetClientPID records the PID of the client process that established the
@@ -439,8 +470,8 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 			if known {
 				sessionID = req.SessionID
 			}
-			if known && isEdictSuggestionRequest(&req) {
-				s.logger.Info("ignoring non-approval answer to edict suggestion", "request_id", requestID, "answer", answer)
+			if known && (isEdictSuggestionRequest(&req) || isProposalRequest(&req)) {
+				s.logger.Info("ignoring non-approval answer to edict suggestion or proposal", "request_id", requestID, "answer", answer)
 				return
 			}
 			if edict, err := s.CreateEdict("", answer, sessionID); err != nil {
@@ -511,6 +542,15 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		ministerIDs = append(ministerIDs, id)
 	}
 
+	// Initialize the Court's general proposal registry and register the
+	// built-in MCP tool classification handler (edict 661).
+	if s.proposalRegistry == nil {
+		s.proposalRegistry = tools.NewProposalRegistry()
+	}
+	_ = s.proposalRegistry.Register(&courtmcp.ClassificationProposalHandler{
+		BridgeGetter: s.currentMCPBridge,
+	})
+
 	opts := tools.ToolRegistrationOpts{
 		Ctx:                ctx,
 		DBPath:             dbPath,
@@ -532,6 +572,7 @@ func (s *Court) buildToolRegistry() *tools.ToolRegistry {
 		// The Court implements tools.ZhengmingDisposer so a minister can close
 		// a superseded prompt without direct SQL (e1010).
 		ZhengmingDisposer: s,
+		ProposalRegistry:  s.proposalRegistry,
 	}
 
 	tools.RegisterBuiltinTools(registry, opts)
@@ -698,6 +739,10 @@ func (s *Court) Start(ctx context.Context) error {
 		go s.ritualGuard.Run(s.ctx)
 	}
 
+	// Boot external MCP servers asynchronously so startup never blocks on
+	// stdio server initialization or pending Zhengming responses.
+	s.startMCPBridgeAsync(s.ctx)
+
 	s.logger.Info("court started",
 		"ministers", s.ministerIDs(),
 		"rituals", s.ritualGuard.RitualRegistry().List())
@@ -812,6 +857,9 @@ func (s *Court) Stop() error {
 	}
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if err := s.stopMCPBridge(true); err != nil {
+		s.logger.Warn("MCP bridge stop failed", "error", err)
 	}
 	// Close the runner — stops and removes any sandbox containers
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -971,6 +1019,12 @@ func (s *Court) ConfigureModel(client LLMProvider, config *SessionConfig, repoIn
 
 	// Inject skills when project root becomes available the first time
 	s.injectSkills()
+
+	// Once the LLM client is ready, retry any MCP tool classifications that
+	// were discovered before ConfigureModel ran.
+	if client != nil {
+		s.retryPendingMCPClassifications()
+	}
 
 	s.logger.Info("court model configured", "ministers", s.ministerIDs())
 }
@@ -2155,6 +2209,17 @@ func isEdictSuggestionRequest(req *storage.Zhengming) bool {
 	return req.Questions[0].Options[0] == tools.AnswerApproveEdict
 }
 
+// isProposalRequest reports whether a zhengming request was submitted through
+// the general propose tool: a single question whose first option approves the
+// proposal. Proposal answers are resolved strictly by HandleZhengmingResponse
+// via ProposalRegistry.ApplyResponse and must never create a spurious edict.
+func isProposalRequest(req *storage.Zhengming) bool {
+	if req == nil || len(req.Questions) == 0 || len(req.Questions[0].Options) == 0 {
+		return false
+	}
+	return req.Questions[0].Options[0] == tools.AnswerApproveProposal
+}
+
 // isEdictReplacementRequest reports whether a zhengming request was raised by
 // the replace_edict tool: an edict suggestion targeting an existing edict
 // (EdictID > 0). Since suggest_edict is gone, replace_edict is the only tool
@@ -2332,23 +2397,47 @@ func (s *Court) HandleZhengmingResponse(ctx context.Context, requestID, answer s
 	}
 
 	// Route to the raising minister when the request is on record.
-	var req storage.Zhengming
+	var (
+		req     storage.Zhengming
+		handled bool
+		respErr error
+	)
 	if err := s.db.First(&req, "request_id = ?", requestID).Error; err == nil && req.MinisterID != "" {
 		if m := s.GetMinister(req.MinisterID); m != nil {
 			if h, ok := m.(zhengmingHandler); ok {
-				return h.HandleZhengmingResponse(ctx, requestID, answer)
+				respErr = h.HandleZhengmingResponse(ctx, requestID, answer)
+				handled = true
 			}
 		}
 	}
 
 	// Unknown request (or raising minister gone) — fall back to the first
 	// minister that knows how to handle a zhengming response.
-	for _, m := range s.Ministers() {
-		if h, ok := m.(zhengmingHandler); ok {
-			return h.HandleZhengmingResponse(ctx, requestID, answer)
+	if !handled {
+		for _, m := range s.Ministers() {
+			if h, ok := m.(zhengmingHandler); ok {
+				respErr = h.HandleZhengmingResponse(ctx, requestID, answer)
+				handled = true
+				break
+			}
 		}
 	}
-	return fmt.Errorf("no minister accepted zhengming response")
+	if !handled {
+		return fmt.Errorf("no minister accepted zhengming response")
+	}
+	if respErr != nil {
+		return respErr
+	}
+
+	// Apply (or reject) any pending general proposal submitted via `propose`.
+	// ProposalHandler.Apply is invoked ONLY here upon Ruler approval.
+	if s.proposalRegistry != nil {
+		if _, err := s.proposalRegistry.ApplyResponse(ctx, requestID, answer); err != nil {
+			s.logger.Warn("failed to apply approved proposal", "request_id", requestID, "error", err)
+			return err
+		}
+	}
+	return nil
 }
 
 // CancelZhengming retires a pending zhengming request the Ruler abandoned.
@@ -2636,3 +2725,609 @@ var connDoneNever = make(chan struct{})
 // ConnDone returns a channel that is never closed for the in-process
 // Court — there is no transport that can drop.
 func (s *Court) ConnDone() <-chan struct{} { return connDoneNever }
+
+// ritesClassificationExcludedTools lists mutation/write/delegation tools
+// stripped from the Minister of Rites' session when inspecting untrusted MCP
+// tool metadata so prompt-injection cannot mutate Earth, Heaven, or Intent.
+var ritesClassificationExcludedTools = []string{
+	"write_file",
+	"replace_text",
+	"run_shell_command",
+	"create_manifest",
+	"record_verdict",
+	"update_manifest_status",
+	"insert_ling",
+	"update_ling_status",
+	"transition_edict",
+	"dismiss_zhengming",
+	"resolve_incident",
+	"create_incident",
+	"new_edict",
+	"replace_edict",
+	"record_precedent",
+	"consult_minister",
+	"enact_ritual",
+}
+
+// ProposalRegistry returns the Court's general ProposalRegistry.
+func (s *Court) ProposalRegistry() *tools.ProposalRegistry {
+	if s == nil {
+		return nil
+	}
+	return s.proposalRegistry
+}
+
+// RegisterProposalHandler registers a ProposalHandler for the general propose
+// tool on this Court.
+func (s *Court) RegisterProposalHandler(h tools.ProposalHandler) error {
+	if s == nil || s.proposalRegistry == nil {
+		return fmt.Errorf("court proposal registry not initialized")
+	}
+	return s.proposalRegistry.Register(h)
+}
+
+func (s *Court) currentMCPBridge() *courtmcp.Bridge {
+	if s == nil {
+		return nil
+	}
+	s.mcpMu.RLock()
+	defer s.mcpMu.RUnlock()
+	return s.mcpBridge
+}
+
+// SetMCPConfig records the Court's requested MCP configuration so SessionSeams
+// enumerates each [[mcp.servers]] entry as SeamMCPServer. Ungranted servers
+// are never spawned: if a mandate is already bound and the Court is running,
+// only servers granted by the mandate are booted; otherwise servers wait for
+// ApplyMandate (and spawn zero under RestrictiveMandate).
+func (s *Court) SetMCPConfig(cfg config.MCPConfig) {
+	if s == nil {
+		return
+	}
+	cloned := cloneMCPConfig(cfg)
+
+	// Record requested MCP config for SessionSeams / trust dialog.
+	s.mandateMu.Lock()
+	if s.requestedConfig == nil {
+		s.requestedConfig = &config.Config{}
+	}
+	s.requestedConfig.MCP = cloneMCPConfig(cloned)
+	m := s.mandate
+	s.mandateMu.Unlock()
+
+	s.mcpLifecycleMu.Lock()
+	defer s.mcpLifecycleMu.Unlock()
+
+	s.mcpMu.Lock()
+	s.mcpConfig = cloned
+	s.mcpErr = nil
+	parentCtx := s.mcpParentCtx
+	s.mcpMu.Unlock()
+
+	if parentCtx != nil && parentCtx.Err() == nil && m != nil {
+		granted := filterMCPConfigByMandate(cloned, m)
+		if err := s.stopMCPBridgeLocked(false); err != nil && s.logger != nil {
+			s.logger.Warn("failed to stop previous MCP bridge on config update", "error", err)
+		}
+		s.startMCPBridgeAsyncLocked(parentCtx, granted)
+	}
+}
+
+// applyMCPMandate aligns the active stdio MCP bridge strictly with the servers
+// granted by m. RestrictiveMandate grants zero servers (tearing down or
+// spawning nothing); ApplyMandate boots only explicitly granted servers.
+func (s *Court) applyMCPMandate(m *config.Mandate) {
+	if s == nil {
+		return
+	}
+	var granted config.MCPConfig
+	if m != nil && m.Config != nil {
+		granted = cloneMCPConfig(m.Config.MCP)
+	}
+
+	s.mcpLifecycleMu.Lock()
+	defer s.mcpLifecycleMu.Unlock()
+
+	s.mcpMu.RLock()
+	parentCtx := s.mcpParentCtx
+	activeCfg := s.mcpActiveConfig
+	hasBridge := s.mcpBridge != nil
+	hasErr := s.mcpErr != nil
+	s.mcpMu.RUnlock()
+
+	if parentCtx == nil || parentCtx.Err() != nil {
+		return
+	}
+	if mcpConfigsEqual(activeCfg, granted) && (len(granted.Servers) == 0 || hasBridge || hasErr) {
+		return
+	}
+	if err := s.stopMCPBridgeLocked(false); err != nil && s.logger != nil {
+		s.logger.Warn("failed to stop previous MCP bridge on mandate change", "error", err)
+	}
+	s.startMCPBridgeAsyncLocked(parentCtx, granted)
+}
+
+func filterMCPConfigByMandate(cfg config.MCPConfig, m *config.Mandate) config.MCPConfig {
+	out := cloneMCPConfig(cfg)
+	if m == nil {
+		out.Servers = nil
+		return out
+	}
+	granted := make([]config.MCPServerConfig, 0, len(out.Servers))
+	for _, srv := range out.Servers {
+		if g, ok := m.GrantFor(config.SeamMCPServer, strings.TrimSpace(srv.ID)); ok && g.Granted {
+			granted = append(granted, srv)
+		}
+	}
+	out.Servers = granted
+	return out
+}
+
+func mcpConfigsEqual(a, b config.MCPConfig) bool {
+	if a.Timeout != b.Timeout || a.ToolTimeout != b.ToolTimeout || a.MaxOutputTokens != b.MaxOutputTokens {
+		return false
+	}
+	if len(a.Servers) != len(b.Servers) {
+		return false
+	}
+	for i := range a.Servers {
+		sa, sb := a.Servers[i], b.Servers[i]
+		if sa.ID != sb.ID || sa.Transport != sb.Transport || sa.URL != sb.URL || sa.DefaultPermissions != sb.DefaultPermissions {
+			return false
+		}
+		if len(sa.Command) != len(sb.Command) || len(sa.Env) != len(sb.Env) || len(sa.Tools) != len(sb.Tools) {
+			return false
+		}
+		for j := range sa.Command {
+			if sa.Command[j] != sb.Command[j] {
+				return false
+			}
+		}
+		for j := range sa.Env {
+			if sa.Env[j] != sb.Env[j] {
+				return false
+			}
+		}
+		for j := range sa.Tools {
+			if sa.Tools[j] != sb.Tools[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// MCPStatus returns a wire-safe snapshot of all configured MCP servers and
+// their discovered tools. Returns nil, nil when no MCP bridge is active.
+func (s *Court) MCPStatus() ([]MCPServerStatus, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mcpMu.RLock()
+	bridge := s.mcpBridge
+	bootErr := s.mcpErr
+	s.mcpMu.RUnlock()
+
+	if bridge == nil {
+		if bootErr != nil {
+			return nil, bootErr
+		}
+		return nil, nil
+	}
+	return bridge.Status(), nil
+}
+
+// refreshMinisterSessionTools atomically refreshes tool definitions and
+// catalogs across all live minister sessions from the current ToolRegistry.
+// Wired as the MCP bridge's OnRegistryChanged callback.
+func (s *Court) refreshMinisterSessionTools() {
+	if s == nil {
+		return
+	}
+	for _, minister := range s.Ministers() {
+		gs, ok := minister.(interface{ GetSessions() map[string]*Session })
+		if !ok {
+			continue
+		}
+		sessions := gs.GetSessions()
+		if len(sessions) == 0 {
+			continue
+		}
+		refreshed := minister.Tools()
+		for _, sess := range sessions {
+			if sess == nil {
+				continue
+			}
+			sess.ReplaceCourtTools(refreshed)
+		}
+	}
+}
+
+func (s *Court) startMCPBridgeAsync(parentCtx context.Context) {
+	if s == nil {
+		return
+	}
+	s.mcpLifecycleMu.Lock()
+	defer s.mcpLifecycleMu.Unlock()
+
+	s.mcpMu.Lock()
+	s.mcpParentCtx = parentCtx
+	s.mcpMu.Unlock()
+
+	// Only boot servers already granted by a bound mandate. Before the trust
+	// dialog (or under RestrictiveMandate), zero MCP servers are spawned.
+	if m := s.Mandate(); m != nil && m.Config != nil && len(m.Config.MCP.Servers) > 0 {
+		s.startMCPBridgeAsyncLocked(parentCtx, cloneMCPConfig(m.Config.MCP))
+	}
+}
+
+func (s *Court) startMCPBridgeAsyncLocked(parentCtx context.Context, cfg config.MCPConfig) {
+	if parentCtx == nil || parentCtx.Err() != nil {
+		return
+	}
+
+	s.mcpMu.RLock()
+	factory := s.mcpManagerFactory
+	s.mcpMu.RUnlock()
+
+	if len(cfg.Servers) == 0 {
+		s.mcpMu.Lock()
+		s.mcpActiveConfig = config.MCPConfig{}
+		s.mcpMu.Unlock()
+		return
+	}
+
+	courtKey := s.CourtEdictKey()
+	bridge, err := courtmcp.NewBridge(courtmcp.BridgeOpts{
+		Config:            cfg,
+		Registry:          s.toolRegistry,
+		DB:                s.db,
+		Username:          courtKey.Username,
+		Project:           courtKey.Project,
+		Logger:            s.logger,
+		Proposer:          s.proposeMCPToolsWithRites,
+		OnRegistryChanged: s.refreshMinisterSessionTools,
+		ManagerFactory:    factory,
+	})
+	if err != nil {
+		s.mcpMu.Lock()
+		s.mcpBridge = nil
+		s.mcpActiveConfig = cloneMCPConfig(cfg)
+		s.mcpErr = err
+		s.mcpMu.Unlock()
+		if s.logger != nil {
+			s.logger.Warn("failed to initialize MCP bridge", "error", err)
+		}
+		return
+	}
+
+	bootCtx, bootCancel := context.WithCancel(parentCtx)
+	s.mcpMu.Lock()
+	if s.mcpParentCtx == nil || parentCtx.Err() != nil {
+		s.mcpMu.Unlock()
+		bootCancel()
+		return
+	}
+	s.mcpBridge = bridge
+	s.mcpActiveConfig = cloneMCPConfig(cfg)
+	s.mcpErr = nil
+	s.mcpBootCtx = bootCtx
+	s.mcpBootCancel = bootCancel
+	s.mcpBootWg.Add(1)
+	s.mcpMu.Unlock()
+
+	go func() {
+		defer s.mcpBootWg.Done()
+		if bootCtx.Err() != nil {
+			return
+		}
+		if err := bridge.Start(bootCtx); err != nil && bootCtx.Err() == nil {
+			s.mcpMu.Lock()
+			if s.mcpBridge == bridge {
+				s.mcpErr = err
+			}
+			s.mcpMu.Unlock()
+			if s.logger != nil {
+				s.logger.Warn("failed to start MCP bridge", "error", err)
+			}
+		}
+	}()
+}
+
+func (s *Court) stopMCPBridge(clearParent bool) error {
+	if s == nil {
+		return nil
+	}
+	s.mcpLifecycleMu.Lock()
+	defer s.mcpLifecycleMu.Unlock()
+	return s.stopMCPBridgeLocked(clearParent)
+}
+
+func (s *Court) stopMCPBridgeLocked(clearParent bool) error {
+	s.mcpMu.Lock()
+	if clearParent {
+		s.mcpParentCtx = nil
+	}
+	bootCancel := s.mcpBootCancel
+	s.mcpBootCancel = nil
+	s.mcpBootCtx = nil
+	bridge := s.mcpBridge
+	s.mcpMu.Unlock()
+
+	if bootCancel != nil {
+		bootCancel()
+	}
+	s.mcpBootWg.Wait()
+
+	s.mcpMu.Lock()
+	if s.mcpBridge != nil {
+		bridge = s.mcpBridge
+		s.mcpBridge = nil
+	}
+	s.mcpActiveConfig = config.MCPConfig{}
+	s.mcpErr = nil
+	s.mcpMu.Unlock()
+
+	if bridge != nil {
+		return bridge.Stop()
+	}
+	return nil
+}
+
+func (s *Court) retryPendingMCPClassifications() {
+	if s == nil {
+		return
+	}
+	s.mcpMu.Lock()
+	bridge := s.mcpBridge
+	bootCtx := s.mcpBootCtx
+	if bridge == nil || bootCtx == nil || bootCtx.Err() != nil {
+		s.mcpMu.Unlock()
+		return
+	}
+	s.mcpBootWg.Add(1)
+	s.mcpMu.Unlock()
+
+	go func() {
+		defer s.mcpBootWg.Done()
+		bridge.RetryPendingClassifications(bootCtx)
+	}()
+}
+
+// proposeMCPToolsWithRites invokes the Minister of Rites in an isolated
+// read-only task session (write/mutation tools stripped via ExcludeTools) to
+// classify newly discovered or schema-changed MCP tools and submit them via
+// the general `propose` tool (kind: "mcp_classification").
+func (s *Court) proposeMCPToolsWithRites(ctx context.Context, serverID string, discovered []courtmcp.ToolDescriptor) ([]courtmcp.ToolProposal, error) {
+	if s == nil {
+		return nil, fmt.Errorf("court not initialised")
+	}
+	if len(discovered) == 0 {
+		return nil, nil
+	}
+	rites := s.GetMinister("rites")
+	if rites == nil {
+		return nil, fmt.Errorf("rites minister not available")
+	}
+	if rites.Model() == nil {
+		return nil, fmt.Errorf("rites minister LLM not configured")
+	}
+
+	prompt, err := buildRitesClassificationPrompt(serverID, discovered)
+	if err != nil {
+		return nil, err
+	}
+
+	doneChan := make(chan Result, 1)
+	task := &Task{
+		Ctx:          ctx,
+		EdictKey:     s.CourtEdictKey(),
+		Work:         prompt,
+		Done:         doneChan,
+		Notify:       func(any) {},
+		ChannelID:    "rites",
+		ExcludeTools: append([]string(nil), ritesClassificationExcludedTools...),
+	}
+
+	select {
+	case rites.Tasks() <- task:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	var result Result
+	select {
+	case result = <-doneChan:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if result.Err != nil {
+		return nil, fmt.Errorf("rites classification failed: %w", result.Err)
+	}
+
+	// If Rites already submitted proposals via the `propose` tool during the
+	// session, those tools are already in ToolStateProposed awaiting Ruler
+	// approval in HandleZhengmingResponse.
+	if s.allDiscoveredProposed(serverID, discovered) {
+		return nil, nil
+	}
+
+	// Fallback for non-tool-calling / JSON-outputting Rites responses: parse
+	// the proposals and submit them through the general ProposeTool so EVERY
+	// MCP classification flows through validation -> Zhengming ->
+	// HandleZhengmingResponse -> ClassificationProposalHandler.Apply.
+	proposals, err := parseMCPToolProposals(result.Output)
+	if err != nil {
+		return nil, fmt.Errorf("parse rites classification proposals: %w", err)
+	}
+	hashByTool := make(map[string]string, len(discovered))
+	for _, d := range discovered {
+		hashByTool[d.Name] = d.SchemaHash
+	}
+	for i := range proposals {
+		if proposals[i].SchemaHash == "" {
+			if h, ok := hashByTool[proposals[i].ToolName]; ok {
+				proposals[i].SchemaHash = h
+			}
+		}
+	}
+
+	courtKey := s.CourtEdictKey()
+	proposeTool := tools.ProposeTool{
+		Ctx: tools.ToolContext{
+			MinisterID: "rites",
+			Username:   courtKey.Username,
+			Project:    courtKey.Project,
+		},
+		Registry:  s.proposalRegistry,
+		Requester: s,
+		NotifyFn:  func() func(any) { return s.notify },
+	}
+	inputBytes, err := json.Marshal(map[string]any{
+		"kind":    courtmcp.ProposalKindMCPClassification,
+		"summary": fmt.Sprintf("Classify MCP tools for server %s", serverID),
+		"payload": courtmcp.ClassificationProposalPayload{
+			ServerID:  serverID,
+			Proposals: proposals,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal propose input: %w", err)
+	}
+	if _, err := proposeTool.Call(ctx, string(inputBytes)); err != nil {
+		return nil, fmt.Errorf("submit mcp_classification proposal: %w", err)
+	}
+	return nil, nil
+}
+
+func (s *Court) allDiscoveredProposed(serverID string, discovered []courtmcp.ToolDescriptor) bool {
+	bridge := s.currentMCPBridge()
+	if bridge == nil || len(discovered) == 0 {
+		return false
+	}
+	statusByTool := make(map[string]courtmcp.ToolStatus)
+	for _, srv := range bridge.Status() {
+		if srv.ID != serverID {
+			continue
+		}
+		for _, ts := range srv.Tools {
+			statusByTool[ts.Name] = ts
+		}
+	}
+	for _, d := range discovered {
+		ts, ok := statusByTool[d.Name]
+		if !ok || (ts.State != courtmcp.ToolStateProposed && ts.State != courtmcp.ToolStateSealed && ts.State != courtmcp.ToolStateDenied) {
+			return false
+		}
+	}
+	return true
+}
+
+type ritesToolPromptEntry struct {
+	Name        string                          `json:"name"`
+	Description string                          `json:"description,omitempty"`
+	Parameters  *schemas.ToolFunctionParameters `json:"parameters,omitempty"`
+	SchemaHash  string                          `json:"schema_hash"`
+}
+
+func buildRitesClassificationPrompt(serverID string, discovered []courtmcp.ToolDescriptor) (string, error) {
+	entries := make([]ritesToolPromptEntry, 0, len(discovered))
+	for _, d := range discovered {
+		entries = append(entries, ritesToolPromptEntry{
+			Name:        d.Name,
+			Description: d.Description,
+			Parameters:  d.Parameters,
+			SchemaHash:  d.SchemaHash,
+		})
+	}
+	raw, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal MCP tool descriptors: %w", err)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Classify the following MCP tools from server %q into the Three Realms permission model.\n\n", serverID)
+	b.WriteString("Permission format: strict 9-character Unix-style rwx string for Earth/Heaven/Intent (positions 0-2 Earth, 3-5 Heaven, 6-8 Intent).\n")
+	b.WriteString("Map non-filesystem tools by actual effect: terminal/command execution -> Earth execute (`x`), test/observability/CI -> Heaven, docs/court records -> Intent, dangerous/opaque side effects -> \"---------\" (sealed deny).\n")
+	b.WriteString("If a tool's effect is ambiguous, invoke `ask_ruler` first.\n")
+	b.WriteString("Submit the classification table using the `propose` tool with `kind: \"mcp_classification\"`, a short `summary`, and `payload: {\"server_id\": \"...\", \"proposals\": [{\"tool_name\": \"...\", \"permissions\": \"r--------\", \"rationale\": \"...\", \"schema_hash\": \"...\"}]}`.\n\n")
+	b.WriteString("Discovered tools:\n```json\n")
+	b.Write(raw)
+	b.WriteString("\n```\n")
+	return b.String(), nil
+}
+
+func parseMCPToolProposals(output string) ([]courtmcp.ToolProposal, error) {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty classification output")
+	}
+
+	candidates := []string{trimmed}
+
+	remaining := trimmed
+	for {
+		start := strings.Index(remaining, "```")
+		if start == -1 {
+			break
+		}
+		after := remaining[start+3:]
+		nl := strings.IndexByte(after, '\n')
+		if nl == -1 {
+			break
+		}
+		body := after[nl+1:]
+		end := strings.Index(body, "```")
+		if end == -1 {
+			break
+		}
+		candidates = append(candidates, strings.TrimSpace(body[:end]))
+		remaining = body[end+3:]
+	}
+
+	if first := strings.IndexByte(trimmed, '['); first != -1 {
+		if last := strings.LastIndexByte(trimmed, ']'); last > first {
+			candidates = append(candidates, strings.TrimSpace(trimmed[first:last+1]))
+		}
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		var proposals []courtmcp.ToolProposal
+		if err := json.Unmarshal([]byte(candidate), &proposals); err == nil {
+			return proposals, nil
+		}
+		var wrapped struct {
+			Proposals []courtmcp.ToolProposal `json:"proposals"`
+		}
+		if err := json.Unmarshal([]byte(candidate), &wrapped); err == nil && wrapped.Proposals != nil {
+			return wrapped.Proposals, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no valid JSON proposal array found in rites output")
+}
+
+func cloneMCPConfig(cfg config.MCPConfig) config.MCPConfig {
+	out := cfg
+	if len(cfg.Servers) > 0 {
+		out.Servers = make([]config.MCPServerConfig, len(cfg.Servers))
+		for i, srv := range cfg.Servers {
+			cp := srv
+			if len(srv.Command) > 0 {
+				cp.Command = append([]string(nil), srv.Command...)
+			}
+			if len(srv.Env) > 0 {
+				cp.Env = append([]string(nil), srv.Env...)
+			}
+			if len(srv.Tools) > 0 {
+				cp.Tools = append([]config.MCPToolOverride(nil), srv.Tools...)
+			}
+			out.Servers[i] = cp
+		}
+	}
+	return out
+}

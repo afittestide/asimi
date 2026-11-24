@@ -580,6 +580,7 @@ func MigrateProjectSlugs(db *gorm.DB, user string) error {
 		"censor_precedents",
 		"incidents",
 		"ruler_councils",
+		"mcp_tool_classifications",
 	}
 	for _, table := range tables {
 		// Older databases (or partial test schemas) may lack a table; skipping

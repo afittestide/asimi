@@ -154,6 +154,11 @@ func (s *Court) propagateMandate(m *config.Mandate) {
 		s.logger.Debug("propagated mandate to per-edict runner", "edict", edictID)
 	}
 	s.edictRunnersMu.Unlock()
+
+	// Align the stdio MCP bridge strictly with mandate-granted servers:
+	// RestrictiveMandate grants zero servers (fail closed), and ApplyMandate
+	// boots only servers explicitly granted via SeamMCPServer (edict 661).
+	s.applyMCPMandate(m)
 }
 
 // projectSlug returns the Court's configured project slug, or "".
@@ -165,17 +170,25 @@ func (s *Court) projectSlug() string {
 }
 
 // recordRequestedConfigFromSession captures the sandbox section of the session
-// config as the requested set of grantable seams. SessionConfig does not carry
-// the whole config.Config, so the request is rebuilt from its Sandbox section;
-// that is sufficient because every grantable seam (additional_mounts,
-// passthrough_env) lives there.
+// config as the requested set of grantable seams, preserving any requested MCP
+// server config recorded via SetMCPConfig so SessionSeams enumerates both
+// sandbox seams and SeamMCPServer entries.
 func (s *Court) recordRequestedConfigFromSession(sc *SessionConfig) {
 	if s == nil || sc == nil {
 		return
 	}
+	s.mcpMu.RLock()
+	mcpReq := cloneMCPConfig(s.mcpConfig)
+	s.mcpMu.RUnlock()
+
+	s.mandateMu.Lock()
 	req := &config.Config{}
 	req.Sandbox = sc.Sandbox
-	s.mandateMu.Lock()
+	if len(mcpReq.Servers) > 0 {
+		req.MCP = mcpReq
+	} else if s.requestedConfig != nil {
+		req.MCP = cloneMCPConfig(s.requestedConfig.MCP)
+	}
 	s.requestedConfig = req
 	s.mandateMu.Unlock()
 }

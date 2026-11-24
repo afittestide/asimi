@@ -1,8 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"os/user"
+	"strings"
 	"time"
+
+	"github.com/afittestide/asimi/internal/types"
 )
 
 // Config represents the application configuration structure
@@ -16,6 +20,7 @@ type Config struct {
 	Sandbox         SandboxConfig         `koanf:"sandbox"`
 	RunShellCommand RunShellCommandConfig `koanf:"run_shell_command"`
 	Court           CourtConfig           `koanf:"court"`
+	MCP             MCPConfig             `koanf:"mcp"`
 }
 
 // RunShellCommandConfig holds settings for the run_shell_command tool's
@@ -255,4 +260,123 @@ func DefaultSessionConfig() *SessionConfig {
 		MaxSessions: 50,
 		MaxAgeDays:  30,
 	}
+}
+
+const (
+	// DefaultMCPTimeoutMS is the default MCP server connection/startup timeout in milliseconds.
+	DefaultMCPTimeoutMS = 10000
+	// DefaultMCPToolTimeoutMS is the default per-tool MCP execution timeout in milliseconds.
+	DefaultMCPToolTimeoutMS = 30000
+	// DefaultMCPMaxOutputTokens is the default cap on MCP tool output tokens.
+	DefaultMCPMaxOutputTokens = 10000
+)
+
+// MCPConfig holds configuration for external MCP servers (foreign envoys).
+// Until upstream fixes GO-2026-6911 in github.com/mark3labs/mcp-go, only stdio
+// transport is permitted; URL, HTTP, SSE, and Streamable-HTTP configs are
+// rejected fail-closed.
+type MCPConfig struct {
+	Timeout         int               `koanf:"timeout"`
+	ToolTimeout     int               `koanf:"tool_timeout"`
+	MaxOutputTokens int               `koanf:"max_output_tokens"`
+	Servers         []MCPServerConfig `koanf:"servers"`
+}
+
+// MCPServerConfig configures a single stdio MCP server.
+// URL and Transport are present for fail-closed validation so non-stdio
+// configurations are caught and rejected citing GO-2026-6911.
+type MCPServerConfig struct {
+	ID                 string            `koanf:"id"`
+	Command            []string          `koanf:"command"`
+	Env                []string          `koanf:"env"`
+	DefaultPermissions string            `koanf:"default_permissions"`
+	Tools              []MCPToolOverride `koanf:"tools"`
+	URL                string            `koanf:"url"`
+	Transport          string            `koanf:"transport"`
+}
+
+// MCPToolOverride sets Three Realms permissions for a specific tool on an MCP server.
+type MCPToolOverride struct {
+	Name        string `koanf:"name"`
+	Permissions string `koanf:"permissions"`
+}
+
+// DefaultMCPConfig returns the default MCP configuration.
+func DefaultMCPConfig() MCPConfig {
+	return MCPConfig{
+		Timeout:         DefaultMCPTimeoutMS,
+		ToolTimeout:     DefaultMCPToolTimeoutMS,
+		MaxOutputTokens: DefaultMCPMaxOutputTokens,
+	}
+}
+
+// ValidateMCPConfig validates MCP configuration fail-closed:
+//   - rejects negative timeouts or token limits
+//   - rejects any URL or non-stdio Transport citing GO-2026-6911
+//   - requires non-empty unique server IDs and non-empty stdio Command
+//   - validates DefaultPermissions (when set) and every tool override's
+//     Permissions via types.ParsePermissions (strict 9-char rwx, no spaces)
+func ValidateMCPConfig(cfg MCPConfig) error {
+	if cfg.Timeout < 0 {
+		return fmt.Errorf("mcp.timeout must be non-negative, got %d", cfg.Timeout)
+	}
+	if cfg.ToolTimeout < 0 {
+		return fmt.Errorf("mcp.tool_timeout must be non-negative, got %d", cfg.ToolTimeout)
+	}
+	if cfg.MaxOutputTokens < 0 {
+		return fmt.Errorf("mcp.max_output_tokens must be non-negative, got %d", cfg.MaxOutputTokens)
+	}
+
+	seenIDs := make(map[string]bool, len(cfg.Servers))
+	for i, srv := range cfg.Servers {
+		label := strings.TrimSpace(srv.ID)
+		if label == "" {
+			label = fmt.Sprintf("#%d", i)
+		}
+
+		// Fail closed on any URL or non-stdio transport before checking Command,
+		// so URL/HTTP/SSE/Streamable-HTTP configs always report GO-2026-6911.
+		if srv.URL != "" {
+			return fmt.Errorf("mcp.servers[%s]: url is not supported (only stdio transport is allowed due to GO-2026-6911)", label)
+		}
+		if srv.Transport != "" && !strings.EqualFold(strings.TrimSpace(srv.Transport), "stdio") {
+			return fmt.Errorf("mcp.servers[%s]: transport %q is not supported (only \"stdio\" transport is allowed due to GO-2026-6911)", label, srv.Transport)
+		}
+
+		id := strings.TrimSpace(srv.ID)
+		if id == "" {
+			return fmt.Errorf("mcp.servers[%d]: id is required", i)
+		}
+		if seenIDs[id] {
+			return fmt.Errorf("mcp.servers[%s]: duplicate server id %q", id, id)
+		}
+		seenIDs[id] = true
+
+		if len(srv.Command) == 0 || strings.TrimSpace(srv.Command[0]) == "" {
+			return fmt.Errorf("mcp.servers[%s]: stdio command is required", id)
+		}
+
+		if srv.DefaultPermissions != "" {
+			if _, err := types.ParsePermissions(srv.DefaultPermissions); err != nil {
+				return fmt.Errorf("mcp.servers[%s]: invalid default_permissions: %w", id, err)
+			}
+		}
+
+		seenTools := make(map[string]bool, len(srv.Tools))
+		for j, tool := range srv.Tools {
+			toolName := strings.TrimSpace(tool.Name)
+			if toolName == "" {
+				return fmt.Errorf("mcp.servers[%s].tools[%d]: tool name is required", id, j)
+			}
+			if seenTools[toolName] {
+				return fmt.Errorf("mcp.servers[%s].tools[%s]: duplicate tool override %q", id, toolName, toolName)
+			}
+			seenTools[toolName] = true
+			if _, err := types.ParsePermissions(tool.Permissions); err != nil {
+				return fmt.Errorf("mcp.servers[%s].tools[%s]: invalid permissions: %w", id, toolName, err)
+			}
+		}
+	}
+
+	return nil
 }

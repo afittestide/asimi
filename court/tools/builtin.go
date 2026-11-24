@@ -52,6 +52,10 @@ type ToolRegistrationOpts struct {
 	// ZhengmingDisposer, when set, lets a minister close a pending
 	// zhengming prompt on the Court's authority (e1010) instead of direct SQL.
 	ZhengmingDisposer ZhengmingDisposer
+
+	// ProposalRegistry, when set alongside ZhengmingRequester, registers the
+	// general propose tool backed by registered ProposalHandlers.
+	ProposalRegistry *ProposalRegistry
 }
 
 // RegisterBuiltinTools populates the registry with all builtin tools,
@@ -183,5 +187,17 @@ func registerExtraTools(r *ToolRegistry, opts ToolRegistrationOpts) {
 				Project:       opts.Ctx.Project,
 			}
 		})
+		if opts.ProposalRegistry != nil {
+			r.RegisterExtraFactory("propose", func(mid string) Tool {
+				ctx := opts.Ctx
+				ctx.MinisterID = mid
+				return ProposeTool{
+					Ctx:       ctx,
+					Registry:  opts.ProposalRegistry,
+					Requester: opts.ZhengmingRequester,
+					NotifyFn:  opts.NotifyFn,
+				}
+			})
+		}
 	}
 }
