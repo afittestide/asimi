@@ -333,7 +333,7 @@ func TestGrantChancellorSeal_StaleSealAllowsReseal(t *testing.T) {
 
 	// Grant a chancellor seal, then invalidate it
 	sealSvc := storage.NewSealService(db)
-	if err := sealSvc.GrantSeal(key, "chancellor", storage.JSON{}); err != nil {
+	if err := sealSvc.GrantSeal(key, "chancellor", "earth", storage.JSON{}); err != nil {
 		t.Fatalf("failed to grant chancellor seal: %v", err)
 	}
 	if err := sealSvc.InvalidateSeals(key); err != nil {
@@ -371,7 +371,7 @@ func TestGrantChancellorSeal_ResurrectsInvalidatedTombstone(t *testing.T) {
 	key := storage.EdictKey{ID: 77, Username: "testuser", Project: "testproject"}
 	sealSvc := storage.NewSealService(db)
 
-	detID := storage.DeterministicSealID(77, "testuser", "testproject", "chancellor")
+	detID := storage.DeterministicSealID(77, "testuser", "testproject", "chancellor", "earth")
 
 	// First grant at the deterministic ID, as the historical tool path minted.
 	first := storage.Seal{

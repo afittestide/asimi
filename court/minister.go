@@ -1022,9 +1022,18 @@ func (m *MinisterBase) AppendToIntent(key storage.EdictKey, clarification string
 		return fmt.Errorf("failed to append to intent: %w", result.Error)
 	}
 
-	// Invalidate existing seals — they were earned against the old intent
-	if err := storage.NewSealService(m.db).InvalidateSeals(key); err != nil {
+	// Invalidate existing seals — they were earned against the old intent.
+	// Preserve the Ruler's intent approval if it was already granted so a
+	// clarification does not demote an active edict back to draft.
+	sealer := storage.NewSealService(m.db)
+	hadRulerIntent, _ := sealer.HasSeal(key, "ruler", "intent")
+	if err := sealer.InvalidateSeals(key); err != nil {
 		return fmt.Errorf("failed to invalidate seals: %w", err)
+	}
+	if hadRulerIntent {
+		if err := sealer.GrantSeal(key, "ruler", "intent", nil); err != nil {
+			return fmt.Errorf("failed to re-grant ruler intent seal: %w", err)
+		}
 	}
 	return nil
 }

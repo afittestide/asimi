@@ -106,7 +106,8 @@ type TUIModel struct {
 	// Ritual enactment confirmation state
 	pendingRitualEnact *pendingRitualEnact
 	// Seal override confirmation state
-	pendingSealOverride *pendingSealOverride
+	pendingSealOverride   *pendingSealOverride
+	pendingIntentApproval *pendingIntentApproval
 	pendingEdictCancel  *pendingEdictCancel
 	// Onboarding model selection confirmation state
 	pendingOnboarding bool
@@ -305,6 +306,11 @@ type pendingRitualEnact struct {
 type pendingSealOverride struct {
 	edictID uint
 	notes   string
+}
+
+// pendingIntentApproval tracks state when waiting for Ruler confirmation to approve an edict's intent
+type pendingIntentApproval struct {
+	edictID uint
 }
 
 // pendingEdictCancel tracks state when waiting for Ruler confirmation to cancel an edict
@@ -3107,8 +3113,49 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if minister == "" {
 				minister = "Unknown"
 			}
+			realm, _ := msg.Payload["realm"].(string)
+			if realm == "intent" {
+				if minister == "ruler" {
+					m.commandLine.AddToast(
+						fmt.Sprintf("%s Edict %d intent approved", sealPrefix, msg.EdictKey.ID),
+						"success", 4*time.Second,
+					)
+					return m, nil
+				}
+				if minister == "chancellor" && m.court != nil {
+					if seals, err := m.court.GetEdictSeals(msg.EdictKey); err == nil {
+						var hasChancellorIntent, hasRulerIntent bool
+						for _, s := range seals {
+							if s.StaleAt != nil || s.Realm != "intent" {
+								continue
+							}
+							if s.MinisterID == "chancellor" {
+								hasChancellorIntent = true
+							}
+							if s.MinisterID == "ruler" {
+								hasRulerIntent = true
+							}
+						}
+						if hasChancellorIntent && !hasRulerIntent {
+							var intentText string
+							if edict, err := m.court.GetEdict(msg.EdictKey.ID); err == nil && edict != nil {
+								intentText = edict.Intent
+							}
+							prompt := fmt.Sprintf("📜 Edict %d intent ready for Ruler approval", msg.EdictKey.ID)
+							if intentText != "" {
+								prompt += "\n\n" + intentText
+							}
+							chat.AddToRawHistory("CONTEXT", prompt)
+							chat.AddMessage(prompt)
+							m.pendingIntentApproval = &pendingIntentApproval{edictID: msg.EdictKey.ID}
+							return m, m.enterYesNoOrAuto(fmt.Sprintf("Approve intent for edict %d?", msg.EdictKey.ID), false)
+						}
+					}
+				}
+				return m, nil
+			}
 			if minister == "ruler" {
-				// Ruler's seal is final — show an ephemeral toast instead of
+				// Ruler's earth seal is final — show an ephemeral toast instead of
 				// a lingering chat message.
 				m.commandLine.AddToast(
 					fmt.Sprintf("%s Edict %d sealed", sealPrefix, msg.EdictKey.ID),
@@ -3535,6 +3582,16 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, enactRitualForEdict(&m, edictID, "swift-strike")
 			}
 			// No explicit "declined" message needed; the 📜 notification already shows
+			return m, nil
+		}
+
+		// Check if this is a response to an intent approval prompt
+		if m.pendingIntentApproval != nil {
+			edictID := m.pendingIntentApproval.edictID
+			m.pendingIntentApproval = nil
+			if msg.answer {
+				return m, grantIntentSealCmd(&m, edictID)
+			}
 			return m, nil
 		}
 

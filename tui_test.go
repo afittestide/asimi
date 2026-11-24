@@ -3932,20 +3932,21 @@ func TestSetContextParams_UsernameFallbackToOSUser(t *testing.T) {
 // --- mockCourtClient records PublishEvent calls for test assertions ---
 
 type mockCourtClient struct {
-	courtapi.Client     // embed to satisfy interface; nil receivers panic on unused methods
-	publishedEvents     []publishedEvent
-	edictKeyFn          func(uint) storage.EdictKey
-	zhengmingResponses  []zhengmingResponse
-	sealsFn             func() ([]storage.Seal, error)
-	getEdictFn          func(uint) (*storage.Edict, error)
-	cancelEdictFn       func(uint) error
-	cancelledEdicts     map[uint]bool
-	grantRulerSealCalls map[uint]bool
-	pauseRitualFn       func(string) bool
-	resumeRitualFn      func(string) bool
-	pausedChannels      []string
-	resumedChannels     []string
-	cancelledChannels   []string
+	courtapi.Client      // embed to satisfy interface; nil receivers panic on unused methods
+	publishedEvents      []publishedEvent
+	edictKeyFn           func(uint) storage.EdictKey
+	zhengmingResponses   []zhengmingResponse
+	sealsFn              func() ([]storage.Seal, error)
+	getEdictFn           func(uint) (*storage.Edict, error)
+	cancelEdictFn        func(uint) error
+	cancelledEdicts      map[uint]bool
+	grantRulerSealCalls  map[uint]bool
+	grantIntentSealCalls map[uint]string
+	pauseRitualFn        func(string) bool
+	resumeRitualFn       func(string) bool
+	pausedChannels       []string
+	resumedChannels      []string
+	cancelledChannels    []string
 
 	setContextFn       func(types.SetContextParams) error
 	setContextCalls    []types.SetContextParams
@@ -4069,6 +4070,14 @@ func (m *mockCourtClient) GrantRulerSeal(edictID uint, notes string) error {
 		m.grantRulerSealCalls = make(map[uint]bool)
 	}
 	m.grantRulerSealCalls[edictID] = true
+	return nil
+}
+
+func (m *mockCourtClient) GrantIntentSeal(edictID uint, ministerID string, metadata storage.JSON) error {
+	if m.grantIntentSealCalls == nil {
+		m.grantIntentSealCalls = make(map[uint]string)
+	}
+	m.grantIntentSealCalls[edictID] = ministerID
 	return nil
 }
 
@@ -5868,6 +5877,127 @@ func TestEventSealGranted_NonRulerAddsChatMessage(t *testing.T) {
 	assert.Contains(t, updated.commandLine.toasts[0].Message, "Minister judge sealed edict 7")
 }
 
+func TestEventSealGranted_IntentRealm(t *testing.T) {
+	t.Run("ruler intent seal shows concise intent-approved toast distinct from earth ascension", func(t *testing.T) {
+		mock := &mockCourtClient{}
+		model := newTestModel(t)
+		model.court = mock
+
+		eventMsg := court.EventNotificationMsg{
+			ChannelID: "secretary",
+			EventType: storage.EventSealGranted,
+			EdictKey:  storage.EdictKey{ID: 7, Username: "test", Project: "test"},
+			Payload: map[string]interface{}{
+				"minister_id": "ruler",
+				"realm":       "intent",
+			},
+		}
+
+		newModel, _ := model.handleCustomMessages(eventMsg)
+		updated, ok := newModel.(TUIModel)
+		require.True(t, ok)
+
+		require.Len(t, updated.commandLine.toasts, 1)
+		assert.Contains(t, updated.commandLine.toasts[0].Message, "intent approved")
+		assert.NotContains(t, updated.commandLine.toasts[0].Message, "Edict 7 sealed")
+	})
+
+	t.Run("does not prompt before chancellor signs intent", func(t *testing.T) {
+		mock := &mockCourtClient{
+			sealsFn: func() ([]storage.Seal, error) {
+				return nil, nil // no chancellor intent seal yet
+			},
+			getEdictFn: func(id uint) (*storage.Edict, error) {
+				return &storage.Edict{ID: id, Intent: "Draft intent body"}, nil
+			},
+		}
+		model := newTestModel(t)
+		model.court = mock
+
+		eventMsg := court.EventNotificationMsg{
+			ChannelID: "secretary",
+			EventType: storage.EventSealGranted,
+			EdictKey:  storage.EdictKey{ID: 8, Username: "test", Project: "test"},
+			Payload: map[string]interface{}{
+				"minister_id": "chancellor",
+				"realm":       "intent",
+			},
+		}
+
+		newModel, _ := model.handleCustomMessages(eventMsg)
+		updated, ok := newModel.(TUIModel)
+		require.True(t, ok)
+		assert.False(t, updated.commandLine.IsInYesNoMode(), "must not prompt when chancellor intent seal is absent")
+	})
+
+	t.Run("chancellor intent seal prompts ruler for interactive approval with intent doc", func(t *testing.T) {
+		mock := &mockCourtClient{
+			sealsFn: func() ([]storage.Seal, error) {
+				return []storage.Seal{
+					{MinisterID: "chancellor", Realm: "intent", SealID: "ci-9"},
+				}, nil
+			},
+			getEdictFn: func(id uint) (*storage.Edict, error) {
+				return &storage.Edict{ID: id, Intent: "Build per-realm seal chain"}, nil
+			},
+		}
+		model := newTestModel(t)
+		model.court = mock
+
+		eventMsg := court.EventNotificationMsg{
+			ChannelID: "secretary",
+			EventType: storage.EventSealGranted,
+			EdictKey:  storage.EdictKey{ID: 9, Username: "test", Project: "test"},
+			Payload: map[string]interface{}{
+				"minister_id": "chancellor",
+				"realm":       "intent",
+			},
+		}
+
+		newModel, _ := model.handleCustomMessages(eventMsg)
+		updated, ok := newModel.(TUIModel)
+		require.True(t, ok)
+
+		// Intent document should be displayed to the Ruler.
+		chat := updated.tabs.ChatByTab("secretary")
+		foundIntent := false
+		for _, m := range chat.Messages {
+			if strings.Contains(m.Content, "Build per-realm seal chain") {
+				foundIntent = true
+				break
+			}
+		}
+		assert.True(t, foundIntent, "TUI must present the edict's intent document to the Ruler")
+
+		// TUI must enter an interactive yes/no approval prompt so the Ruler can
+		// approve and grant the (ruler, intent) seal (not merely print a passive notice).
+		assert.True(t, updated.commandLine.IsInYesNoMode(),
+			"chancellor intent seal must prompt the Ruler for interactive approval to grant (ruler, intent) seal")
+		require.NotNil(t, updated.pendingIntentApproval)
+		assert.Equal(t, uint(9), updated.pendingIntentApproval.edictID)
+
+		// Answering yes grants the (ruler, intent) seal and clears pendingIntentApproval.
+		afterYes, cmd := updated.handleCustomMessages(yesNoResponseMsg{answer: true})
+		finalModel, ok := afterYes.(TUIModel)
+		require.True(t, ok)
+		assert.Nil(t, finalModel.pendingIntentApproval)
+		require.NotNil(t, cmd)
+		cmd()
+		assert.Equal(t, "ruler", mock.grantIntentSealCalls[9])
+
+		// Declining clears pendingIntentApproval without calling GrantIntentSeal.
+		mockNo := &mockCourtClient{}
+		updated.court = mockNo
+		updated.pendingIntentApproval = &pendingIntentApproval{edictID: 10}
+		afterNo, noCmd := updated.handleCustomMessages(yesNoResponseMsg{answer: false})
+		declinedModel, ok := afterNo.(TUIModel)
+		require.True(t, ok)
+		assert.Nil(t, declinedModel.pendingIntentApproval)
+		assert.Nil(t, noCmd)
+		assert.Empty(t, mockNo.grantIntentSealCalls)
+	})
+}
+
 func TestEventRitualCompleted_ShowsToast(t *testing.T) {
 	mock := &mockCourtClient{}
 	model := newTestModel(t)
@@ -6434,8 +6564,8 @@ func TestDispatchEdictAction_SealAllSealsPresent_ReturnsToEdictsList(t *testing.
 	mock := &mockCourtClient{
 		sealsFn: func() ([]storage.Seal, error) {
 			return []storage.Seal{
-				{MinisterID: "judge"},
-				{MinisterID: "chancellor"},
+				{MinisterID: "judge", Realm: "earth"},
+				{MinisterID: "chancellor", Realm: "earth"},
 			}, nil
 		},
 	}
@@ -6461,9 +6591,9 @@ func TestDispatchEdictAction_SealAlreadySealed_ReturnsToEdictsList(t *testing.T)
 	mock := &mockCourtClient{
 		sealsFn: func() ([]storage.Seal, error) {
 			return []storage.Seal{
-				{MinisterID: "judge"},
-				{MinisterID: "chancellor"},
-				{MinisterID: "ruler"},
+				{MinisterID: "judge", Realm: "earth"},
+				{MinisterID: "chancellor", Realm: "earth"},
+				{MinisterID: "ruler", Realm: "earth"},
 			}, nil
 		},
 	}
@@ -6518,17 +6648,31 @@ func TestRenderEdictDashboard_BasicFields(t *testing.T) {
 		SessionID: "sess-1",
 	}
 	seals := []storage.Seal{
-		{MinisterID: "judge", SealID: "j1"},
-		{MinisterID: "ruler", SealID: "r1"},
+		{MinisterID: "judge", Realm: "earth", SealID: "j1"},
+		{MinisterID: "ruler", Realm: "earth", SealID: "r1"},
 	}
 
 	output := renderEdictDashboard(edict, seals, 80)
 	assert.Contains(t, output, "Edict 42")
-	assert.Contains(t, output, "sealed") // ruler seal present → status "sealed"
+	assert.Contains(t, output, "sealed") // ruler earth seal present → status "sealed"
 	assert.Contains(t, output, "Fix the login bug")
 	assert.Contains(t, output, "Login fix")
 	assert.Contains(t, output, "sess-1")
 	assert.Contains(t, output, "Seal Chain")
+}
+
+func TestRenderEdictDashboard_IntentSealNotSealed(t *testing.T) {
+	edict := &storage.Edict{
+		ID:     43,
+		Intent: "Drafting intent",
+	}
+	seals := []storage.Seal{
+		{MinisterID: "ruler", Realm: "intent", SealID: "ri1"},
+	}
+
+	output := renderEdictDashboard(edict, seals, 80)
+	assert.Contains(t, output, "Edict 43")
+	assert.NotContains(t, output, "Status: sealed")
 }
 
 func TestRenderEdictDashboard_Cancelled(t *testing.T) {
@@ -6937,7 +7081,7 @@ func TestHandleContinueCommand_SealedEdict(t *testing.T) {
 		},
 		sealsFn: func() ([]storage.Seal, error) {
 			return []storage.Seal{
-				{MinisterID: ministers.Ruler, SealedAt: time.Now()},
+				{MinisterID: ministers.Ruler, Realm: "earth", SealedAt: time.Now()},
 			}, nil
 		},
 	}
@@ -10900,4 +11044,46 @@ func TestGateSelectionNoLongerPendingRefreshesList(t *testing.T) {
 	assert.Nil(t, updated.prompt().answering, "a dead gate must not open a dialog")
 	assert.Len(t, updated.commandLine.toasts, 1, "the dead gate must be reported")
 	assert.Contains(t, updated.commandLine.toasts[0].Message, "no longer pending")
+}
+
+func TestHandleEdictSeal_IgnoresIntentSeals(t *testing.T) {
+	mock := &mockCourtClient{
+		sealsFn: func() ([]storage.Seal, error) {
+			return []storage.Seal{
+				{MinisterID: "chancellor", Realm: "intent"},
+				{MinisterID: "ruler", Realm: "intent"},
+			}, nil
+		},
+	}
+	model := newTestModel(t)
+	model.court = mock
+
+	_ = handleEdictSeal(model, 42, "")
+	assert.True(t, model.commandLine.IsInYesNoMode(), "intent seals must not be treated as earth seals; should prompt for missing Judge and Chancellor")
+	require.NotNil(t, model.pendingSealOverride)
+	assert.Equal(t, uint(42), model.pendingSealOverride.edictID)
+}
+
+func TestHandleContinueCommand_IntentSealDoesNotBlock(t *testing.T) {
+	mock := &mockCourtClient{
+		getEdictFn: func(edictID uint) (*storage.Edict, error) {
+			return &storage.Edict{ID: edictID, Intent: "Test"}, nil
+		},
+		sealsFn: func() ([]storage.Seal, error) {
+			return []storage.Seal{
+				{MinisterID: ministers.Ruler, Realm: "intent", SealedAt: time.Now()},
+			}, nil
+		},
+	}
+	model := newTestModel(t)
+	model.court = mock
+	model.tabs.DismissWelcome()
+
+	model.tabs.Add("Ritual:e648", "ritual", "e648")
+	tab := model.tabs.TabByTarget("e648")
+	tab.EdictID = 648
+	model.tabs.SwitchTo(len(model.tabs.tabs) - 1)
+
+	cmd := handleContinueCommand(model, []string{})
+	require.NotNil(t, cmd, "a (ruler, intent) seal must not block :continue")
 }

@@ -118,10 +118,18 @@ type EdictKey struct {
 type EdictStatus string
 
 const (
-	EdictActive    EdictStatus = "active"
-	EdictBlocked   EdictStatus = "blocked"
-	EdictSealed    EdictStatus = "sealed"
-	EdictCancelled EdictStatus = "cancelled"
+	// EdictDraft is an edict whose intent has not yet been approved by the Ruler
+	// (missing a live (ruler, intent) seal). Derived, never stored.
+	//
+	// Invariant: draft ⇒ not blocked. The draft check must precede the
+	// pending-zhengming derivation in GetEdictStatus so a draft with a pending
+	// zhengming derives as EdictDraft, not EdictBlocked.
+	EdictDraft          EdictStatus = "draft"
+	EdictIntentApproved EdictStatus = "intent-approved"
+	EdictActive         EdictStatus = "active"
+	EdictBlocked        EdictStatus = "blocked"
+	EdictSealed         EdictStatus = "sealed"
+	EdictCancelled      EdictStatus = "cancelled"
 )
 
 // Edict represents a high-level task/issue being processed by the Court
@@ -157,6 +165,7 @@ type Seal struct {
 	Username   string     `gorm:"column:username"`
 	Project    string     `gorm:"column:project"`
 	MinisterID string     `gorm:"column:minister_id"` // "judge", "chancellor", "ruler"
+	Realm      string     `gorm:"column:realm"`       // "intent" or "earth"
 	SealedAt   time.Time  `gorm:"column:sealed_at;autoCreateTime"`
 	Metadata   JSON       `gorm:"column:metadata;type:json"` // Optional: verdict_id, precedent_id, etc.
 	StaleAt    *time.Time `gorm:"column:stale_at"`           // Non-null when invalidated by intent change

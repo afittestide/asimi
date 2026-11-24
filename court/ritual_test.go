@@ -438,7 +438,7 @@ func TestMergeWorktreeRitual_LoadsWithTriggerAndOneStep(t *testing.T) {
 
 	require.Len(t, def.Triggers, 1)
 	assert.Equal(t, "seal_granted", def.Triggers[0].Event)
-	assert.Equal(t, map[string]string{"minister_id": "ruler"}, def.Triggers[0].Filter)
+	assert.Equal(t, map[string]string{"minister_id": "ruler", "realm": "earth"}, def.Triggers[0].Filter)
 }
 
 func TestRitualRegistry_Summaries(t *testing.T) {
@@ -1237,7 +1237,7 @@ func TestRitualRun_MergeWorktreeExemptFromSealedEdictGate(t *testing.T) {
 	require.NoError(t, db.Create(&storage.Edict{
 		ID: key.ID, Username: key.Username, Project: key.Project, Intent: "sealed already",
 	}).Error)
-	require.NoError(t, storage.NewSealService(db).GrantSeal(key, "ruler", storage.JSON{}))
+	require.NoError(t, storage.NewSealService(db).GrantSeal(key, "ruler", "earth", storage.JSON{}))
 
 	registry := NewRitualRegistry()
 	require.NoError(t, registry.Register(&RitualDef{
@@ -1432,7 +1432,7 @@ func TestBackgroundGiven_EdictDetailsRendersMarkdown(t *testing.T) {
 	data, ok := exec.Data["edict"].(map[string]interface{})
 	require.True(t, ok, "exec.Data[\"edict\"] must stay a plain map for templates")
 	assert.Equal(t, intent, data["intent"])
-	assert.Equal(t, "active", data["status"])
+	assert.Equal(t, "draft", data["status"])
 }
 
 // TestStepLevelGiven_EdictDetailsRendersMarkdown pins the step-level given
@@ -5266,10 +5266,12 @@ func TestBuildStepScratchpad_SealsAndLings(t *testing.T) {
 	// Seed a JudgeVerdict and ForgeManifest so the existing sections also show up
 	sealSvc := storage.NewSealService(db)
 
+	// Grant ruler intent seal — must NOT appear in the Earth Seal Chain section.
+	require.NoError(t, sealSvc.GrantSeal(key, "ruler", "intent", nil))
 	// Grant judge seal
-	require.NoError(t, sealSvc.GrantSeal(key, "judge", nil))
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", "earth", nil))
 	// Grant chancellor seal
-	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", nil))
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", "earth", nil))
 
 	// Add a couple of lings
 	ling1 := uuid.New().String()

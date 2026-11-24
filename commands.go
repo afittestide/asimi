@@ -1031,7 +1031,7 @@ func handleContinueCommand(model *TUIModel, args []string) tea.Cmd {
 		slog.Warn("failed to check edict seals", "edict_id", edictID, "error", err)
 	}
 	for _, s := range seals {
-		if s.MinisterID == ministers.Ruler {
+		if s.MinisterID == ministers.Ruler && s.Realm == "earth" && s.StaleAt == nil {
 			model.commandLine.AddToast(fmt.Sprintf("Edict %d is already sealed", edictID), "warning", 3*time.Second)
 			return nil
 		}
@@ -1409,6 +1409,9 @@ func handleEdictSeal(model *TUIModel, edictID uint, notes string) tea.Cmd {
 	hasChancellor := false
 	hasRuler := false
 	for _, seal := range seals {
+		if seal.StaleAt != nil || seal.Realm != "earth" {
+			continue
+		}
 		switch seal.MinisterID {
 		case ministers.Judge:
 			hasJudge = true
@@ -1516,7 +1519,7 @@ func renderEdictDashboard(edict *storage.Edict, seals []storage.Seal, width int)
 		status = "cancelled"
 	} else {
 		for _, s := range seals {
-			if s.MinisterID == ministers.Ruler {
+			if s.MinisterID == ministers.Ruler && s.Realm == "earth" && s.StaleAt == nil {
 				status = "sealed"
 				break
 			}
@@ -1563,4 +1566,14 @@ func grantRulerSealCmd(model *TUIModel, edictID uint, notes string) tea.Cmd {
 		},
 		reloadEdictsListCmd(model),
 	)
+}
+
+// grantIntentSealCmd grants the Ruler's intent seal to an edict.
+func grantIntentSealCmd(model *TUIModel, edictID uint) tea.Cmd {
+	return func() tea.Msg {
+		if err := model.court.GrantIntentSeal(edictID, "ruler", nil); err != nil {
+			return showSystemMsg(fmt.Sprintf("Failed to approve intent for edict %d: %v", edictID, err))
+		}
+		return nil
+	}
 }

@@ -290,5 +290,5 @@ func (t QueryPrecedentsTool) Format(input, result string, err error) string {
 // Converges on SealService.GrantSeal, which resurrects tombstones left
 // by InvalidateSeals instead of colliding with their IDs (e882).
 func grantChancellorSeal(db *gorm.DB, key storage.EdictKey, ministerID string, metadata storage.JSON) error {
-	return storage.NewSealService(db).GrantSeal(key, ministerID, metadata)
+	return storage.NewSealService(db).GrantSeal(key, ministerID, "earth", metadata)
 }

@@ -255,7 +255,7 @@ func (t ListEdictsTool) ParameterSchema() map[string]any {
 		"properties": map[string]any{
 			"status": map[string]any{
 				"type":        "string",
-				"enum":        []string{"active", "blocked", "sealed", "cancelled"},
+				"enum":        []string{"draft", "intent-approved", "active", "blocked", "sealed", "cancelled"},
 				"description": "Filter by status (optional)",
 			},
 			"limit": map[string]any{
@@ -363,7 +363,7 @@ func (t TransitionEdictTool) Call(ctx context.Context, input string) (string, er
 			resultJSON, _ := json.Marshal(result)
 			return string(resultJSON), nil
 		}
-		if err := sealService.GrantSeal(key, "ruler", storage.JSON{"transitioned_by": "transition_edict"}); err != nil {
+		if err := sealService.GrantSeal(key, "ruler", "earth", storage.JSON{"transitioned_by": "transition_edict"}); err != nil {
 			return "", fmt.Errorf("seal edict: %w", err)
 		}
 	case "active", "blocked":

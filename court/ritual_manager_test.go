@@ -591,6 +591,24 @@ func TestRitualGuard_EventNotification(t *testing.T) {
 	}
 	mu.Unlock()
 
+	// Test EventSealGranted intent-realm notification wording
+	intentRuler := rg.buildEventNotification(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 2},
+		Payload:  map[string]interface{}{"minister_id": "ruler", "realm": "intent"},
+	})
+	if intentRuler.Message != "Ruler approved intent for edict 2" {
+		t.Errorf("unexpected ruler intent notification: %q", intentRuler.Message)
+	}
+	intentCh := rg.buildEventNotification(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 2},
+		Payload:  map[string]interface{}{"minister_id": "chancellor", "realm": "intent"},
+	})
+	if intentCh.Message != "Minister chancellor sealed intent for edict 2" {
+		t.Errorf("unexpected chancellor intent notification: %q", intentCh.Message)
+	}
+
 	// Test EventEdictSealed notification
 	notifications = nil
 	rg.DispatchEvent(Event{
@@ -1323,7 +1341,7 @@ func TestScanForStaleRituals_OtherProjectExcluded(t *testing.T) {
 	if err := db.Create(&localEdict).Error; err != nil {
 		t.Fatalf("failed to create local edict: %v", err)
 	}
-	db.Create(&storage.Seal{EdictID: localEdict.ID, Username: "test", Project: "test/project", MinisterID: "ruler"})
+	db.Create(&storage.Seal{EdictID: localEdict.ID, Username: "test", Project: "test/project", MinisterID: "ruler", Realm: "earth"})
 
 	// Create a running ritual for the local user/project
 	localExec := &RitualExecution{
@@ -1419,7 +1437,7 @@ func TestScanForStaleRituals_MergeWorktreeExempt(t *testing.T) {
 	sealed := storage.Edict{Intent: "sealed edict", Username: "test", Project: "test/project"}
 	require.NoError(t, db.Create(&sealed).Error)
 	require.NoError(t, db.Create(&storage.Seal{
-		EdictID: sealed.ID, Username: "test", Project: "test/project", MinisterID: "ruler",
+		EdictID: sealed.ID, Username: "test", Project: "test/project", MinisterID: "ruler", Realm: "earth",
 	}).Error)
 
 	require.NoError(t, db.Save(&RitualExecution{
@@ -2859,4 +2877,67 @@ func TestStartRitualNonRulerCancelReportsFailure(t *testing.T) {
 			t.Errorf("persisted failure reason must not be 'cancelled by ruler': %v", ev.Payload["error"])
 		}
 	}
+}
+
+// TestDispatchEvent_MergeWorktreeRequiresEarthRealm verifies that the builtin
+// merge-worktree trigger fires on seal_granted{minister_id: ruler, realm: earth}
+// and does NOT fire on seal_granted{minister_id: ruler, realm: intent}.
+func TestDispatchEvent_MergeWorktreeRequiresEarthRealm(t *testing.T) {
+	db := setupEventTestDB(t)
+
+	rituals, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+	var def *RitualDef
+	for _, r := range rituals {
+		if r.Name == mergeWorktreeRitual {
+			def = r
+			break
+		}
+	}
+	require.NotNil(t, def, "builtin merge-worktree ritual must be loaded")
+
+	// Replace steps with a no-op step so we isolate trigger matching cleanly
+	// while preserving the real builtin trigger filters.
+	testRegistry := NewRitualRegistry()
+	require.NoError(t, testRegistry.Register(&RitualDef{
+		Name:     def.Name,
+		Triggers: def.Triggers,
+		Steps:    []RitualStep{{Name: "landing"}},
+	}))
+
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+	rg := NewRitualGuard(RitualGuardOpts{Base: base})
+	rg.ritualRegistry = testRegistry
+	rg.ritualRunner = NewRitualRunner(testRegistry, func(string) Minister { return nil }, nil,
+		db, &worktreeTestRunner{}, slog.Default(), repo.RepoInfo{})
+	rg.ritualRunner.blessedBranchLock = rg.blessedBranchLock
+	rg.ritualRunner.blessedWaiters = &rg.blessedWaiters
+	rg.streamingCtx = func(string) context.Context { return context.Background() }
+	rg.recoveryMu.Lock()
+	rg.recoveryComplete = true
+	rg.recoveryMu.Unlock()
+	rg.SetNotify(func(any) {})
+
+	// Ruler intent seal must NOT trigger merge-worktree.
+	rg.DispatchEvent(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 77, Username: "testuser", Project: "testproject"},
+		Payload:  map[string]interface{}{"minister_id": "ruler", "realm": "intent"},
+	})
+	time.Sleep(200 * time.Millisecond)
+	var n int64
+	db.Model(&RitualExecution{}).Where("ritual_name = ?", mergeWorktreeRitual).Count(&n)
+	assert.Zero(t, n, "ruler intent seal must NOT start merge-worktree")
+
+	// Ruler earth seal MUST trigger merge-worktree.
+	rg.DispatchEvent(Event{
+		Type:     storage.EventSealGranted,
+		EdictKey: storage.EdictKey{ID: 77, Username: "testuser", Project: "testproject"},
+		Payload:  map[string]interface{}{"minister_id": "ruler", "realm": "earth"},
+	})
+	require.Eventually(t, func() bool {
+		var count int64
+		db.Model(&RitualExecution{}).Where("ritual_name = ? AND state = ?", mergeWorktreeRitual, RitualStateCompleted).Count(&count)
+		return count > 0 && !rg.ritualRunningFor(77)
+	}, 3*time.Second, 10*time.Millisecond, "ruler earth seal must start and complete merge-worktree")
 }

@@ -83,7 +83,7 @@ func registerContinueStepDefs(ctx *godog.ScenarioContext, t *testing.T) {
 		}
 		s.mock.sealsFn = func() ([]storage.Seal, error) {
 			return []storage.Seal{
-				{MinisterID: ministers.Ruler, SealedAt: time.Now()},
+				{MinisterID: ministers.Ruler, Realm: "earth", SealedAt: time.Now()},
 			}, nil
 		}
 		return nil

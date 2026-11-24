@@ -2495,28 +2495,37 @@ func (r *RitualRunner) buildStepScratchpad(exec *RitualExecution, step RitualSte
 		parts = append(parts, buf.String())
 	}
 
-	// Seals — show all non-stale seals with minister and timestamp
+	// Seals — show live earth-realm seals (the ascension chain) with minister and timestamp.
+	// Intent seals are excluded so ministers never mistake (ruler, intent) for Earth ascension.
 	seals, _ := r.arrangeGetSeals(key)
 	if sealist, ok := seals.([]map[string]interface{}); ok && len(sealist) > 0 {
-		var buf strings.Builder
-		buf.WriteString("## Seals (Seal Chain)\n")
+		var earthSeals []map[string]interface{}
 		for _, s := range sealist {
-			ministerID, _ := s["minister_id"].(string)
-			sealedAt, _ := s["sealed_at"].(time.Time)
-			var icon string
-			switch ministerID {
-			case "judge":
-				icon = "🪶"
-			case "chancellor":
-				icon = "📜"
-			case "ruler":
-				icon = "👑"
-			default:
-				icon = "🔏"
+			if realm, _ := s["realm"].(string); realm == "earth" {
+				earthSeals = append(earthSeals, s)
 			}
-			buf.WriteString(fmt.Sprintf("- %s **%s** — sealed %s\n", icon, ministerID, sealedAt.Format(time.RFC3339)))
 		}
-		parts = append(parts, buf.String())
+		if len(earthSeals) > 0 {
+			var buf strings.Builder
+			buf.WriteString("## Seals (Seal Chain)\n")
+			for _, s := range earthSeals {
+				ministerID, _ := s["minister_id"].(string)
+				sealedAt, _ := s["sealed_at"].(time.Time)
+				var icon string
+				switch ministerID {
+				case "judge":
+					icon = "🪶"
+				case "chancellor":
+					icon = "📜"
+				case "ruler":
+					icon = "👑"
+				default:
+					icon = "🔏"
+				}
+				buf.WriteString(fmt.Sprintf("- %s **%s** — sealed %s\n", icon, ministerID, sealedAt.Format(time.RFC3339)))
+			}
+			parts = append(parts, buf.String())
+		}
 	}
 
 	// Lings — show all sub-tasks with their status

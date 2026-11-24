@@ -4,17 +4,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
-// DeterministicSealID mirrors the historical tool-side ID scheme
-// (GenerateID("seal", edict, user, project, minister)) so that seals
-// invalidated by InvalidateSeals can be resurrected in place: the
-// tombstone already owns the ID the deterministic grant would mint.
-func DeterministicSealID(edictID uint, username, project, ministerID string) string {
+// DeterministicSealID derives a deterministic seal ID for (edict, user,
+// project, minister, realm) so that (minister, intent) and (minister, earth)
+// never collide and invalidated tombstones can be resurrected in place.
+func DeterministicSealID(edictID uint, username, project, ministerID, realm string) string {
 	h := sha256.New()
 	for _, p := range []string{
 		"seal",
@@ -22,6 +21,7 @@ func DeterministicSealID(edictID uint, username, project, ministerID string) str
 		username,
 		project,
 		ministerID,
+		realm,
 	} {
 		h.Write([]byte(p))
 	}
@@ -38,19 +38,23 @@ func NewSealService(db *gorm.DB) *SealService {
 	return &SealService{db: db}
 }
 
-// GrantSeal records (or resurrects) a minister's seal on an edict.
-// Idempotent per (edict, user, project, minister): a live seal is left
-// untouched, an invalidated tombstone at the deterministic ID is
-// resurrected, and only if neither exists is a fresh row inserted.
-func (s *SealService) GrantSeal(key EdictKey, ministerID string, metadata JSON) error {
+// GrantSeal records (or resurrects) a minister's seal on an edict in the given
+// realm ("intent" or "earth"). Idempotent per (edict, user, project, minister,
+// realm): a live seal is left untouched, an invalidated tombstone at the
+// deterministic ID is resurrected, and only if neither exists is a fresh row
+// inserted.
+func (s *SealService) GrantSeal(key EdictKey, ministerID, realm string, metadata JSON) error {
 	if key.ID == 0 {
 		return fmt.Errorf("id is required")
 	}
 	if ministerID == "" {
 		return fmt.Errorf("minister_id is required")
 	}
+	if realm != "intent" && realm != "earth" {
+		return fmt.Errorf("invalid realm %q: must be \"intent\" or \"earth\"", realm)
+	}
 
-	has, err := s.HasSeal(key, ministerID)
+	has, err := s.HasSeal(key, ministerID, realm)
 	if err != nil {
 		return err
 	}
@@ -59,12 +63,13 @@ func (s *SealService) GrantSeal(key EdictKey, ministerID string, metadata JSON) 
 	}
 
 	// UPDATE first: an invalidated tombstone owns the deterministic ID.
-	detID := DeterministicSealID(key.ID, key.Username, key.Project, ministerID)
+	detID := DeterministicSealID(key.ID, key.Username, key.Project, ministerID, realm)
 	res := s.db.Model(&Seal{}).
 		Where("seal_id = ?", detID).
 		Updates(map[string]any{
 			"stale_at":  nil,
 			"sealed_at": time.Now(),
+			"realm":     realm,
 			"metadata":  metadata,
 		})
 	if res.Error != nil {
@@ -75,11 +80,12 @@ func (s *SealService) GrantSeal(key EdictKey, ministerID string, metadata JSON) 
 	}
 
 	seal := Seal{
-		SealID:     uuid.New().String(),
+		SealID:     detID,
 		EdictID:    key.ID,
 		Username:   key.Username,
 		Project:    key.Project,
 		MinisterID: ministerID,
+		Realm:      realm,
 		SealedAt:   time.Now(),
 		Metadata:   metadata,
 	}
@@ -135,11 +141,12 @@ func (s *SealService) GetActiveSeals(key EdictKey) ([]Seal, error) {
 	return seals, nil
 }
 
-// HasSeal checks if a specific minister has sealed an edict
-func (s *SealService) HasSeal(key EdictKey, ministerID string) (bool, error) {
+// HasSeal checks if a specific minister holds a live seal in the given realm.
+func (s *SealService) HasSeal(key EdictKey, ministerID, realm string) (bool, error) {
 	var count int64
 	err := s.db.Model(&Seal{}).
-		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND stale_at IS NULL", key.ID, key.Username, key.Project, ministerID).
+		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND realm = ? AND stale_at IS NULL",
+			key.ID, key.Username, key.Project, ministerID, realm).
 		Count(&count).Error
 	if err != nil {
 		return false, fmt.Errorf("failed to check seal: %w", err)
@@ -147,13 +154,13 @@ func (s *SealService) HasSeal(key EdictKey, ministerID string) (bool, error) {
 	return count > 0, nil
 }
 
-// GetMissingSeals returns the list of required seals that are missing
+// GetMissingSeals returns the list of required earth-realm seals that are missing.
 func (s *SealService) GetMissingSeals(key EdictKey) ([]string, error) {
 	requiredMinisters := []string{"judge", "chancellor", "ruler"}
 	var missing []string
 
 	for _, ministerID := range requiredMinisters {
-		hasSeal, err := s.HasSeal(key, ministerID)
+		hasSeal, err := s.HasSeal(key, ministerID, "earth")
 		if err != nil {
 			return nil, err
 		}
@@ -165,19 +172,20 @@ func (s *SealService) GetMissingSeals(key EdictKey) ([]string, error) {
 	return missing, nil
 }
 
-// IsPendingAscension checks if an edict has judge and chancellor seals but is awaiting ruler seal
+// IsPendingAscension checks if an edict has judge and chancellor earth seals
+// but is awaiting the ruler earth seal.
 func (s *SealService) IsPendingAscension(key EdictKey) (bool, error) {
-	hasJudge, err := s.HasSeal(key, "judge")
+	hasJudge, err := s.HasSeal(key, "judge", "earth")
 	if err != nil {
 		return false, err
 	}
 
-	hasChancellor, err := s.HasSeal(key, "chancellor")
+	hasChancellor, err := s.HasSeal(key, "chancellor", "earth")
 	if err != nil {
 		return false, err
 	}
 
-	hasRuler, err := s.HasSeal(key, "ruler")
+	hasRuler, err := s.HasSeal(key, "ruler", "earth")
 	if err != nil {
 		return false, err
 	}
@@ -185,13 +193,27 @@ func (s *SealService) IsPendingAscension(key EdictKey) (bool, error) {
 	return hasJudge && hasChancellor && !hasRuler, nil
 }
 
-// GetSealStatus returns a map of minister IDs to their seal status
+// IsPendingIntentApproval checks if an edict has a chancellor intent seal
+// and is awaiting the ruler intent seal.
+func (s *SealService) IsPendingIntentApproval(key EdictKey) (bool, error) {
+	hasChancellor, err := s.HasSeal(key, "chancellor", "intent")
+	if err != nil {
+		return false, err
+	}
+	hasRuler, err := s.HasSeal(key, "ruler", "intent")
+	if err != nil {
+		return false, err
+	}
+	return hasChancellor && !hasRuler, nil
+}
+
+// GetSealStatus returns a map of minister IDs to their earth-realm seal status.
 func (s *SealService) GetSealStatus(key EdictKey) (map[string]bool, error) {
 	status := make(map[string]bool)
 	requiredMinisters := []string{"judge", "chancellor", "ruler"}
 
 	for _, ministerID := range requiredMinisters {
-		hasSeal, err := s.HasSeal(key, ministerID)
+		hasSeal, err := s.HasSeal(key, ministerID, "earth")
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +259,8 @@ func (s *SealService) DisposeZhengming(requestID string, status ZhengmingStatus,
 	return res.RowsAffected > 0, nil
 }
 
-// GetEdictStatus derives the status of an edict from seals and zhengming tables
+// GetEdictStatus derives the status of an edict from seals, zhengming, and
+// ritual_executions tables.
 func (s *SealService) GetEdictStatus(key EdictKey) (EdictStatus, error) {
 	var edict Edict
 	if err := s.db.First(&edict, "id = ? AND username = ? AND project = ?", key.ID, key.Username, key.Project).Error; err != nil {
@@ -247,12 +270,22 @@ func (s *SealService) GetEdictStatus(key EdictKey) (EdictStatus, error) {
 		return EdictCancelled, nil
 	}
 
-	hasRuler, err := s.HasSeal(key, "ruler")
+	hasRulerEarth, err := s.HasSeal(key, "ruler", "earth")
 	if err != nil {
 		return "", err
 	}
-	if hasRuler {
+	if hasRulerEarth {
 		return EdictSealed, nil
+	}
+
+	// Draft check MUST precede pending-zhengming so a draft with a pending
+	// zhengming derives as draft, not blocked.
+	hasRulerIntent, err := s.HasSeal(key, "ruler", "intent")
+	if err != nil {
+		return "", err
+	}
+	if !hasRulerIntent {
+		return EdictDraft, nil
 	}
 
 	var zhengmingCount int64
@@ -266,7 +299,23 @@ func (s *SealService) GetEdictStatus(key EdictKey) (EdictStatus, error) {
 		return EdictBlocked, nil
 	}
 
-	return EdictActive, nil
+	var runningCount int64
+	err = s.db.Raw(
+		`SELECT COUNT(*) FROM ritual_executions WHERE edict_id = ? AND username = ? AND project = ? AND state = 'running'`,
+		key.ID, key.Username, key.Project,
+	).Scan(&runningCount).Error
+	if err != nil {
+		// Isolated storage tests may not create the ritual_executions table.
+		if !strings.Contains(err.Error(), "no such table") {
+			return "", fmt.Errorf("check running rituals: %w", err)
+		}
+		runningCount = 0
+	}
+	if runningCount > 0 {
+		return EdictActive, nil
+	}
+
+	return EdictIntentApproved, nil
 }
 
 // IsEdictSealed checks if an edict has all three seals (judge, chancellor, ruler)
@@ -311,20 +360,20 @@ func (s *SealService) ListActiveEdicts(username, project string) ([]ActiveEdict,
 		WHERE e.username = ? AND e.project = ?
 		AND e.project != ''
 		AND e.cancelled_at IS NULL
-		AND NOT EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.stale_at IS NULL)
+		AND NOT EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.realm = 'earth' AND s.stale_at IS NULL)
 		ORDER BY e.id DESC`, username, project).Scan(&edicts).Error
 	if err != nil {
 		return nil, fmt.Errorf("list pending seals: %w", err)
 	}
 
-	// Fetch all non-ruler seals for these edicts in one query
+	// Fetch all non-ruler earth seals for these edicts in one query
 	var seals []Seal
 	edictIDs := make([]uint, len(edicts))
 	for i, e := range edicts {
 		edictIDs[i] = e.ID
 	}
 	if len(edictIDs) > 0 {
-		s.db.Where("edict_id IN ? AND username = ? AND project = ? AND minister_id IN ('judge','chancellor') AND stale_at IS NULL",
+		s.db.Where("edict_id IN ? AND username = ? AND project = ? AND minister_id IN ('judge','chancellor') AND realm = 'earth' AND stale_at IS NULL",
 			edictIDs, username, project).Find(&seals)
 	}
 

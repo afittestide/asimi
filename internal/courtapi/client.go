@@ -47,6 +47,7 @@ type Client interface {
 
 	// Seals.
 	GrantRulerSeal(edictID uint, notes string) error
+	GrantIntentSeal(edictID uint, ministerID string, metadata storage.JSON) error
 	GetEdictSeals(key storage.EdictKey) ([]storage.Seal, error)
 	ListActiveEdicts() ([]storage.ActiveEdict, error)
 

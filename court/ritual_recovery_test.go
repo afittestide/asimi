@@ -1053,7 +1053,7 @@ func TestPromptForAbortedRituals_AutoCompleteSealedEdict(t *testing.T) {
 
 	seal := storage.Seal{
 		SealID: "seal-1", EdictID: edict.ID, Username: "testuser",
-		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+		Project: "testproject", MinisterID: "ruler", Realm: "earth", SealedAt: time.Now(),
 	}
 	if err := db.Create(&seal).Error; err != nil {
 		t.Fatalf("failed to create seal: %v", err)
@@ -2364,7 +2364,7 @@ func TestPromptForAbortedRituals_StaleSealsNotAutoCompleted(t *testing.T) {
 	sealSvc := storage.NewSealService(db)
 
 	// Grant a ruler seal, then invalidate it (simulating intent change)
-	if err := sealSvc.GrantSeal(key, "ruler", storage.JSON{}); err != nil {
+	if err := sealSvc.GrantSeal(key, "ruler", "earth", storage.JSON{}); err != nil {
 		t.Fatalf("failed to grant ruler seal: %v", err)
 	}
 	if err := sealSvc.InvalidateSeals(key); err != nil {
@@ -2747,7 +2747,7 @@ func TestRetireSupersededAbortPrompts_SealedEdict(t *testing.T) {
 
 	seal := storage.Seal{
 		SealID: "seal-ruler", EdictID: edict.ID, Username: "testuser",
-		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+		Project: "testproject", MinisterID: "ruler", Realm: "earth", SealedAt: time.Now(),
 	}
 	if err := db.Create(&seal).Error; err != nil {
 		t.Fatalf("failed to create seal: %v", err)
@@ -2843,7 +2843,7 @@ func TestRetireSupersededAbortPrompts_Idempotent(t *testing.T) {
 
 	seal := storage.Seal{
 		SealID: "seal-ruler", EdictID: edict.ID, Username: "testuser",
-		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+		Project: "testproject", MinisterID: "ruler", Realm: "earth", SealedAt: time.Now(),
 	}
 	if err := db.Create(&seal).Error; err != nil {
 		t.Fatalf("failed to create seal: %v", err)
@@ -2923,7 +2923,7 @@ func TestPromptForAbortedRituals_RetiresSupersededPromptWithNoAbortedRows(t *tes
 	// failed execution rows exist at all.
 	seal := storage.Seal{
 		SealID: "seal-ruler", EdictID: edict.ID, Username: "testuser",
-		Project: "testproject", MinisterID: "ruler", SealedAt: time.Now(),
+		Project: "testproject", MinisterID: "ruler", Realm: "earth", SealedAt: time.Now(),
 	}
 	if err := db.Create(&seal).Error; err != nil {
 		t.Fatalf("failed to create seal: %v", err)
@@ -2941,5 +2941,50 @@ func TestPromptForAbortedRituals_RetiresSupersededPromptWithNoAbortedRows(t *tes
 	}
 	if !strings.Contains(reason, "edict sealed") {
 		t.Errorf("disposition_reason = %q, want it to name the seal", reason)
+	}
+}
+
+// TestPromptForAbortedRituals_IntentSealDoesNotAutoCompleteOrRetire verifies
+// e713: a live (ruler, intent) seal on an open edict must NOT auto-complete an
+// aborted ritual and must NOT retire its pending abort-recovery zhengming.
+func TestPromptForAbortedRituals_IntentSealDoesNotAutoCompleteOrRetire(t *testing.T) {
+	db := setupRecoveryTestDB(t)
+	edict := createSupersedeEdict(t, db, "open edict with intent seal")
+
+	sealSvc := storage.NewSealService(db)
+	if err := sealSvc.GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("grant ruler intent seal: %v", err)
+	}
+
+	exec := &RitualExecution{
+		ID:         "exec-intent-only",
+		RitualName: "swift-strike",
+		EdictID:    edict.ID,
+		Username:   "testuser",
+		Project:    "testproject",
+		State:      RitualStateAborted,
+		CreatedAt:  time.Now().Add(-time.Minute),
+	}
+	if err := db.Create(exec).Error; err != nil {
+		t.Fatalf("create aborted execution: %v", err)
+	}
+	reqID := createAbortPrompt(t, db, edict.ID, exec.ID)
+
+	rg := newTestRitualGuard(t, db, func(id string) Minister { return nil }, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rg.promptForAbortedRituals(ctx)
+
+	var updated RitualExecution
+	if err := db.First(&updated, "id = ?", exec.ID).Error; err != nil {
+		t.Fatalf("reload execution: %v", err)
+	}
+	if updated.State == RitualStateCompleted {
+		t.Errorf("aborted ritual on edict with only (ruler, intent) seal must NOT be auto-completed")
+	}
+
+	status, _, reason := statusOfZhengming(t, db, reqID)
+	if status != storage.ZhengmingPending {
+		t.Errorf("abort prompt status = %q (reason %q), want pending: (ruler, intent) seal is not ascension", status, reason)
 	}
 }

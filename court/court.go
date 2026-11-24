@@ -395,7 +395,7 @@ func NewCourt(db *gorm.DB, cfg *config.CourtConfig, runner runners.Runner, logge
 							// a prompt can slip past the call-time guard (an older pending
 							// prompt, a direct DB row) and must not write to a dead target.
 							s.reportRefusedApproval(&req, key, "unknown", statusErr)
-						} else if status != storage.EdictActive && status != storage.EdictBlocked {
+						} else if status == storage.EdictCancelled || status == storage.EdictSealed {
 							s.reportRefusedApproval(&req, key, string(status), nil)
 						} else if err := s.setIntentFor(key, suggestion, issueRef); err != nil {
 							// A failed write is also visible, never silent.
@@ -1228,6 +1228,11 @@ func (s *Court) createEdict(issueRef, intent, sessionID string) (*storage.Edict,
 	if err := s.db.Create(&edict).Error; err != nil {
 		return nil, fmt.Errorf("failed to create edict: %w", err)
 	}
+	if sealer := s.GetSealService(); sealer != nil {
+		if err := sealer.GrantSeal(edict.Key(), "ruler", "intent", nil); err != nil {
+			s.logger.Warn("failed to grant ruler intent seal on new edict", "edict_id", edict.ID, "error", err)
+		}
+	}
 	return &edict, nil
 }
 
@@ -1242,6 +1247,7 @@ func CreateEdictForTest(db *gorm.DB, intent string) (*storage.Edict, error) {
 	if err := db.Create(&edict).Error; err != nil {
 		return nil, fmt.Errorf("failed to create edict: %w", err)
 	}
+	_ = storage.NewSealService(db).GrantSeal(edict.Key(), "ruler", "intent", nil)
 	return &edict, nil
 }
 
@@ -1257,6 +1263,7 @@ func CreateEdictForTestWithSession(db *gorm.DB, intent, sessionID string) (*stor
 	if err := db.Create(&edict).Error; err != nil {
 		return nil, fmt.Errorf("failed to create edict: %w", err)
 	}
+	_ = storage.NewSealService(db).GrantSeal(edict.Key(), "ruler", "intent", nil)
 	return &edict, nil
 }
 
@@ -1344,9 +1351,18 @@ func (s *Court) setIntentFor(key storage.EdictKey, intent, issueRef string) erro
 	}
 
 	// Invalidate existing seals — they were earned against the old intent
-	// (see appendToIntent for the precedent).
-	if err := s.GetSealService().InvalidateSeals(key); err != nil {
+	// (see appendToIntent for the precedent). Preserve the Ruler's intent
+	// approval if it was already granted so a replacement does not demote an
+	// approved edict back to draft.
+	sealer := s.GetSealService()
+	hadRulerIntent, _ := sealer.HasSeal(key, "ruler", "intent")
+	if err := sealer.InvalidateSeals(key); err != nil {
 		return fmt.Errorf("invalidate seals: %w", err)
+	}
+	if hadRulerIntent {
+		if err := sealer.GrantSeal(key, "ruler", "intent", nil); err != nil {
+			return fmt.Errorf("re-grant ruler intent seal: %w", err)
+		}
 	}
 	return nil
 }
@@ -1363,9 +1379,18 @@ func (s *Court) appendToIntent(key storage.EdictKey, clarification string) error
 		return fmt.Errorf("update edict intent: %w", err)
 	}
 
-	// Invalidate existing seals — they were earned against the old intent
-	if err := s.GetSealService().InvalidateSeals(key); err != nil {
+	// Invalidate existing seals — they were earned against the old intent.
+	// Preserve the Ruler's intent approval if it was already granted so a
+	// clarification or refinement does not demote an active edict back to draft.
+	sealer := s.GetSealService()
+	hadRulerIntent, _ := sealer.HasSeal(key, "ruler", "intent")
+	if err := sealer.InvalidateSeals(key); err != nil {
 		return fmt.Errorf("invalidate seals: %w", err)
+	}
+	if hadRulerIntent {
+		if err := sealer.GrantSeal(key, "ruler", "intent", nil); err != nil {
+			return fmt.Errorf("re-grant ruler intent seal: %w", err)
+		}
 	}
 	return nil
 }
@@ -1419,6 +1444,11 @@ func (s *Court) ensureCourtInfrastructureEdict() {
 	if err := s.db.Create(&courtEdict).Error; err != nil {
 		s.logger.Warn("failed to create court infrastructure edict", "error", err)
 		return
+	}
+	if sealer := s.GetSealService(); sealer != nil {
+		if err := sealer.GrantSeal(courtEdict.Key(), "ruler", "intent", nil); err != nil {
+			s.logger.Warn("failed to grant ruler intent seal on court infrastructure edict", "error", err)
+		}
 	}
 
 	s.logger.Info("court infrastructure edict created", "edict_id", 1)
@@ -2007,7 +2037,7 @@ func (s *Court) GrantRulerSeal(edictID uint, notes string) error {
 	}
 	key := s.EdictKey(edictID)
 	timestamp := time.Now().Format(time.RFC3339)
-	if err := sealer.GrantSeal(key, "ruler", storage.JSON{
+	if err := sealer.GrantSeal(key, "ruler", "earth", storage.JSON{
 		"notes":     notes,
 		"timestamp": timestamp,
 	}); err != nil {
@@ -2015,13 +2045,35 @@ func (s *Court) GrantRulerSeal(edictID uint, notes string) error {
 	}
 	s.PublishEvent(key, storage.EventSealGranted, storage.JSON{
 		"minister_id": "ruler",
+		"realm":       "earth",
 		"notes":       notes,
 		"timestamp":   timestamp,
 	})
 	return nil
 }
 
-// SealEdict stamps the ruler's seal and publishes EventSealGranted, which the
+// GrantIntentSeal stamps a minister's intent seal on an edict and publishes EventSealGranted.
+func (s *Court) GrantIntentSeal(edictID uint, ministerID string, metadata storage.JSON) error {
+	if s == nil {
+		return fmt.Errorf("court not initialized")
+	}
+	sealer := s.GetSealService()
+	if sealer == nil {
+		return fmt.Errorf("seal service not available")
+	}
+	key := s.EdictKey(edictID)
+	if err := sealer.GrantSeal(key, ministerID, "intent", metadata); err != nil {
+		return err
+	}
+	s.PublishEvent(key, storage.EventSealGranted, storage.JSON{
+		"minister_id": ministerID,
+		"realm":       "intent",
+		"timestamp":   time.Now().Format(time.RFC3339),
+	})
+	return nil
+}
+
+// SealEdict stamps the ruler's earth seal and publishes EventSealGranted, which the
 // merge-worktree ritual picks up to land the edict's worktree. Landing is no
 // longer inline: the ritual is the single path, and it retries through the
 // forge when a rebase conflicts. A terminal landing failure surfaces durably
@@ -2037,7 +2089,7 @@ func (s *Court) SealEdict(edictID uint, notes string) error {
 	}
 	key := s.EdictKey(edictID)
 	timestamp := time.Now().Format(time.RFC3339)
-	if err := sealer.GrantSeal(key, "ruler", storage.JSON{
+	if err := sealer.GrantSeal(key, "ruler", "earth", storage.JSON{
 		"notes":     notes,
 		"timestamp": timestamp,
 	}); err != nil {
@@ -2045,6 +2097,7 @@ func (s *Court) SealEdict(edictID uint, notes string) error {
 	}
 	s.PublishEvent(key, storage.EventSealGranted, storage.JSON{
 		"minister_id": "ruler",
+		"realm":       "earth",
 		"notes":       notes,
 		"timestamp":   timestamp,
 	})
@@ -2211,7 +2264,7 @@ func (s *Court) refuseIneligibleApprovalTarget(requestID, answer string) bool {
 		return true
 	}
 	switch status {
-	case storage.EdictActive, storage.EdictBlocked:
+	case storage.EdictDraft, storage.EdictIntentApproved, storage.EdictActive, storage.EdictBlocked:
 		return false
 	case storage.EdictCancelled:
 		when := "unknown time"

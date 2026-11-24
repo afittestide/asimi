@@ -2623,22 +2623,50 @@ func TestMinisterBase_AppendToIntent_InvalidatesSeals(t *testing.T) {
 
 	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
 	sealSvc := storage.NewSealService(db)
-	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
-	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", "earth", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", "earth", storage.JSON{}))
 
 	// Confirm seals are valid before append
-	hasJudge, err := sealSvc.HasSeal(key, "judge")
+	hasJudge, err := sealSvc.HasSeal(key, "judge", "earth")
 	require.NoError(t, err)
 	require.True(t, hasJudge)
 
 	// Append — should invalidate seals
 	require.NoError(t, base.AppendToIntent(key, "clarification from minister"))
 
-	hasJudge, err = sealSvc.HasSeal(key, "judge")
+	hasJudge, err = sealSvc.HasSeal(key, "judge", "earth")
 	require.NoError(t, err)
 	require.False(t, hasJudge, "judge seal should be stale after minister AppendToIntent")
 
-	hasChancellor, err := sealSvc.HasSeal(key, "chancellor")
+	hasChancellor, err := sealSvc.HasSeal(key, "chancellor", "earth")
 	require.NoError(t, err)
 	require.False(t, hasChancellor, "chancellor seal should be stale after minister AppendToIntent")
+}
+
+func TestMinisterBase_AppendToIntent_PreservesRulerIntentSeal(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+
+	edict := storage.Edict{Intent: "original intent", Username: "testuser", Project: "testproject"}
+	require.NoError(t, db.Create(&edict).Error)
+
+	key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
+	sealSvc := storage.NewSealService(db)
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", "intent", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "ruler", "intent", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", "earth", storage.JSON{}))
+
+	require.NoError(t, base.AppendToIntent(key, "clarification during ritual"))
+
+	hasJudgeEarth, err := sealSvc.HasSeal(key, "judge", "earth")
+	require.NoError(t, err)
+	assert.False(t, hasJudgeEarth, "earth seal should be invalidated")
+
+	hasChIntent, err := sealSvc.HasSeal(key, "chancellor", "intent")
+	require.NoError(t, err)
+	assert.False(t, hasChIntent, "prior chancellor intent seal should be invalidated")
+
+	hasRulerIntent, err := sealSvc.HasSeal(key, "ruler", "intent")
+	require.NoError(t, err)
+	assert.True(t, hasRulerIntent, "ruler intent seal must be preserved on clarification")
 }

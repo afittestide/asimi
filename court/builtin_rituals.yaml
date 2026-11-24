@@ -61,6 +61,7 @@
     - event: seal_granted
       match:
         minister_id: ruler
+        realm: earth
   inputs:
     edict_id:
       type: string

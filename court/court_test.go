@@ -1750,11 +1750,11 @@ func TestCourt_AppendToIntent_InvalidatesSeals(t *testing.T) {
 
 	key := storage.EdictKey{ID: edict.ID, Username: config.OSUsername(), Project: "testproject"}
 	sealSvc := s.GetSealService()
-	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
-	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", "earth", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", "earth", storage.JSON{}))
 
 	// Confirm seals exist
-	hasJudge, err := sealSvc.HasSeal(key, "judge")
+	hasJudge, err := sealSvc.HasSeal(key, "judge", "earth")
 	require.NoError(t, err)
 	require.True(t, hasJudge, "judge seal should exist before appendToIntent")
 
@@ -1762,18 +1762,18 @@ func TestCourt_AppendToIntent_InvalidatesSeals(t *testing.T) {
 	require.NoError(t, s.AppendToIntent(edict.ID, "additional clarification"))
 
 	// Seals should now be stale
-	hasJudge, err = sealSvc.HasSeal(key, "judge")
+	hasJudge, err = sealSvc.HasSeal(key, "judge", "earth")
 	require.NoError(t, err)
 	require.False(t, hasJudge, "judge seal should be stale after appendToIntent")
 
-	hasChancellor, err := sealSvc.HasSeal(key, "chancellor")
+	hasChancellor, err := sealSvc.HasSeal(key, "chancellor", "earth")
 	require.NoError(t, err)
 	require.False(t, hasChancellor, "chancellor seal should be stale after appendToIntent")
 
-	// Edict status should be active again (no valid seals)
+	// Edict status should be draft again (no valid seals)
 	status, err := sealSvc.GetEdictStatus(key)
 	require.NoError(t, err)
-	assert.Equal(t, storage.EdictActive, status, "edict should be active after seal invalidation")
+	assert.Equal(t, storage.EdictDraft, status, "edict should be draft after seal invalidation")
 }
 
 // TestCourt_GetEdictSealsExcludesStaleSeals verifies the Court's seal-chain
@@ -1791,9 +1791,9 @@ func TestCourt_GetEdictSealsExcludesStaleSeals(t *testing.T) {
 
 	key := storage.EdictKey{ID: edict.ID, Username: config.OSUsername(), Project: "testproject"}
 	sealSvc := s.GetSealService()
-	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
-	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
-	require.NoError(t, sealSvc.GrantSeal(key, "ruler", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", "earth", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", "earth", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "ruler", "earth", storage.JSON{}))
 
 	// Sanity: the live chain reaches the Court before the intent changes.
 	seals, err := s.GetEdictSeals(key)
@@ -1811,10 +1811,10 @@ func TestCourt_GetEdictSealsExcludesStaleSeals(t *testing.T) {
 	}
 	assert.Empty(t, seals, "all seals should be stale and excluded after appendToIntent")
 
-	// The Court and the derived status agree: the edict is active, not sealed.
+	// The Court and the derived status agree: the edict is draft, not sealed.
 	status, err := sealSvc.GetEdictStatus(key)
 	require.NoError(t, err)
-	assert.Equal(t, storage.EdictActive, status, "edict should be active after seal invalidation")
+	assert.Equal(t, storage.EdictDraft, status, "edict should be draft after seal invalidation")
 }
 
 // TestCourt_DeliverZhengmingAnswer verifies the Court-owned zhengming dispatch:
@@ -5674,6 +5674,7 @@ func insertPendingAbortPrompt(t *testing.T, db *gorm.DB, execID string) (storage
 func TestCourt_DismissZhengming_RecordsDisposition(t *testing.T) {
 	s, db := newDisposalTestCourt(t)
 	edict, reqID := insertPendingAbortPrompt(t, db, "exec-aborted")
+	require.NoError(t, s.GetSealService().GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}))
 
 	// The pending row blocks the edict's derived status.
 	status, err := s.GetSealService().GetEdictStatus(edict.Key())
@@ -5722,6 +5723,7 @@ func TestCourt_DismissZhengming_DefaultReasonAndErrors(t *testing.T) {
 func TestCourt_CancelZhengming_WritesDisposition(t *testing.T) {
 	s, db := newDisposalTestCourt(t)
 	edict, reqID := insertPendingAbortPrompt(t, db, "exec-aborted")
+	require.NoError(t, s.GetSealService().GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}))
 
 	s.CancelZhengming(reqID)
 
@@ -6727,7 +6729,7 @@ func TestCourt_SetIntent_ReplacesWithoutClarificationMarker(t *testing.T) {
 
 	key := storage.EdictKey{ID: 77, Username: config.OSUsername(), Project: "testproject"}
 	sealSvc := s.GetSealService()
-	require.NoError(t, sealSvc.GrantSeal(key, "judge", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "judge", "earth", storage.JSON{}))
 
 	require.NoError(t, s.SetIntentWithIssueRef(77, "the entire new intent", "afittestide/asimi-cli#168"))
 
@@ -6738,7 +6740,7 @@ func TestCourt_SetIntent_ReplacesWithoutClarificationMarker(t *testing.T) {
 	assert.Equal(t, "afittestide/asimi-cli#168", fresh.IssueRef, "a non-empty issue_ref must set the link")
 
 	// Seals were earned against the old intent: stale now.
-	hasJudge, err := sealSvc.HasSeal(key, "judge")
+	hasJudge, err := sealSvc.HasSeal(key, "judge", "earth")
 	require.NoError(t, err)
 	assert.False(t, hasJudge, "the judge seal must be invalidated by a replacement")
 }
@@ -6786,7 +6788,7 @@ func TestZhengmingAnswered_ApprovedReplacementReplacesIntent(t *testing.T) {
 	require.NoError(t, db.Create(&edict).Error)
 
 	key := storage.EdictKey{ID: 52, Username: config.OSUsername(), Project: cfg.Project}
-	require.NoError(t, s.GetSealService().GrantSeal(key, "chancellor", storage.JSON{}))
+	require.NoError(t, s.GetSealService().GrantSeal(key, "chancellor", "earth", storage.JSON{}))
 	var sealedChancellor storage.Seal
 	require.NoError(t, db.Where("edict_id = ? AND minister_id = ?", 52, "chancellor").First(&sealedChancellor).Error)
 	require.Nil(t, sealedChancellor.StaleAt)
@@ -6861,7 +6863,7 @@ func TestZhengmingAnswered_ApprovalAgainstCancelledTargetWritesNothing(t *testin
 	// A live chancellor seal granted before the cancellation (the observed
 	// failure shape: the approval voided it 1ms after answering).
 	key := storage.EdictKey{ID: 180, Username: config.OSUsername(), Project: cfg.Project}
-	require.NoError(t, s.GetSealService().GrantSeal(key, "chancellor", storage.JSON{}))
+	require.NoError(t, s.GetSealService().GrantSeal(key, "chancellor", "earth", storage.JSON{}))
 	var seal storage.Seal
 	require.NoError(t, db.Where("edict_id = ? AND minister_id = ?", 180, "chancellor").First(&seal).Error)
 	require.Nil(t, seal.StaleAt)
@@ -6929,7 +6931,7 @@ func TestZhengmingAnswered_ApprovalAgainstSealedTargetWritesNothing(t *testing.T
 	require.NoError(t, db.Create(&edict).Error)
 
 	key := storage.EdictKey{ID: 55, Username: config.OSUsername(), Project: cfg.Project}
-	require.NoError(t, s.GetSealService().GrantSeal(key, "ruler", storage.JSON{}))
+	require.NoError(t, s.GetSealService().GrantSeal(key, "ruler", "earth", storage.JSON{}))
 
 	req := storage.Zhengming{
 		RequestID:  "test-sealed-approval",
@@ -7437,4 +7439,131 @@ func TestZhengmingTriageMsg_WireRoundTrip(t *testing.T) {
 	var out ZhengmingTriageMsg
 	require.NoError(t, msgpack.Unmarshal(b, &out))
 	assert.Equal(t, in, out)
+}
+
+// TestCourt_PerRealmSealsAndInfraEdict verifies e713's Court seal contracts:
+//   - ensureCourtInfrastructureEdict stamps (ruler, intent) so edict 1 derives intent-approved
+//   - CreateEdict stamps (ruler, intent) so enrolled edicts derive intent-approved
+//   - GrantIntentSeal stamps (minister, intent) and publishes EventSealGranted with realm="intent"
+//   - GrantRulerSeal and SealEdict stamp (ruler, earth) and publish EventSealGranted with realm="earth"
+func TestCourt_PerRealmSealsAndInfraEdict(t *testing.T) {
+	s, _ := newDisposalTestCourt(t)
+
+	// 1. ensureCourtInfrastructureEdict must stamp (ruler, intent) on edict 1.
+	s.ensureCourtInfrastructureEdict()
+	infraKey := s.EdictKey(1)
+	hasInfraIntent, err := s.GetSealService().HasSeal(infraKey, "ruler", "intent")
+	require.NoError(t, err)
+	assert.True(t, hasInfraIntent, "edict 1 created by ensureCourtInfrastructureEdict must hold (ruler, intent) seal")
+	infraStatus, err := s.GetSealService().GetEdictStatus(infraKey)
+	require.NoError(t, err)
+	assert.Equal(t, storage.EdictIntentApproved, infraStatus, "edict 1 must derive intent-approved, not draft")
+
+	// 2. CreateEdict stamps (ruler, intent) and derives intent-approved.
+	edict, err := s.CreateEdict("", "Implement per-realm seals", "")
+	require.NoError(t, err)
+	status, err := s.GetSealService().GetEdictStatus(edict.Key())
+	require.NoError(t, err)
+	assert.Equal(t, storage.EdictIntentApproved, status)
+
+	// Drain eventCh before checking seal_granted payloads.
+	for len(s.ritualGuard.eventCh) > 0 {
+		<-s.ritualGuard.eventCh
+	}
+
+	// 3. GrantIntentSeal records (chancellor, intent) and publishes realm="intent".
+	require.NoError(t, s.GrantIntentSeal(edict.ID, "chancellor", storage.JSON{"note": "reviewed"}))
+	hasChIntent, err := s.GetSealService().HasSeal(edict.Key(), "chancellor", "intent")
+	require.NoError(t, err)
+	assert.True(t, hasChIntent)
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		assert.Equal(t, storage.EventSealGranted, ev.Type)
+		assert.Equal(t, "chancellor", ev.Payload["minister_id"])
+		assert.Equal(t, "intent", ev.Payload["realm"])
+	case <-time.After(time.Second):
+		t.Fatal("expected EventSealGranted for GrantIntentSeal")
+	}
+
+	// 4. GrantRulerSeal records (ruler, earth) and publishes realm="earth".
+	require.NoError(t, s.GrantRulerSeal(edict.ID, "looks good"))
+	hasRulerEarth, err := s.GetSealService().HasSeal(edict.Key(), "ruler", "earth")
+	require.NoError(t, err)
+	assert.True(t, hasRulerEarth)
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		assert.Equal(t, storage.EventSealGranted, ev.Type)
+		assert.Equal(t, "ruler", ev.Payload["minister_id"])
+		assert.Equal(t, "earth", ev.Payload["realm"])
+	case <-time.After(time.Second):
+		t.Fatal("expected EventSealGranted for GrantRulerSeal")
+	}
+
+	// 5. SealEdict publishes realm="earth".
+	edict2, err := s.CreateEdict("", "Second edict for SealEdict", "")
+	require.NoError(t, err)
+	for len(s.ritualGuard.eventCh) > 0 {
+		<-s.ritualGuard.eventCh
+	}
+	require.NoError(t, s.SealEdict(edict2.ID, "ascend"))
+	select {
+	case ev := <-s.ritualGuard.eventCh:
+		assert.Equal(t, storage.EventSealGranted, ev.Type)
+		assert.Equal(t, "ruler", ev.Payload["minister_id"])
+		assert.Equal(t, "earth", ev.Payload["realm"])
+	case <-time.After(time.Second):
+		t.Fatal("expected EventSealGranted for SealEdict")
+	}
+}
+
+func TestCourt_GrantIntentSealApprovesDraft(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Project = "testproject"
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	draft := storage.Edict{ID: 99, Username: config.OSUsername(), Project: "testproject", Intent: "Draft intent"}
+	require.NoError(t, db.Create(&draft).Error)
+	key := draft.Key()
+
+	status, err := s.GetSealService().GetEdictStatus(key)
+	require.NoError(t, err)
+	assert.Equal(t, storage.EdictDraft, status)
+
+	require.NoError(t, s.GrantIntentSeal(draft.ID, "ruler", nil))
+
+	status, err = s.GetSealService().GetEdictStatus(key)
+	require.NoError(t, err)
+	assert.Equal(t, storage.EdictIntentApproved, status)
+
+	require.NoError(t, s.GetSealService().GrantSeal(key, "judge", "earth", storage.JSON{}))
+}
+
+func TestCourt_AppendToIntent_PreservesRulerIntentSeal(t *testing.T) {
+	db := setupMinisterTestDB(t)
+	cfg := config.DefaultCourtConfig()
+	cfg.Project = "testproject"
+	s := NewCourt(db, cfg, nil, slog.Default())
+	require.NotNil(t, s)
+
+	edict, err := s.CreateEdictSilent("", "Original intent", "")
+	require.NoError(t, err)
+	key := edict.Key()
+	sealer := s.GetSealService()
+	require.NoError(t, sealer.GrantSeal(key, "judge", "earth", storage.JSON{}))
+
+	require.NoError(t, s.AppendToIntent(edict.ID, "Clarified detail"))
+
+	hasJudgeEarth, err := sealer.HasSeal(key, "judge", "earth")
+	require.NoError(t, err)
+	assert.False(t, hasJudgeEarth, "earth seals must be invalidated on intent change")
+
+	hasRulerIntent, err := sealer.HasSeal(key, "ruler", "intent")
+	require.NoError(t, err)
+	assert.True(t, hasRulerIntent, "ruler intent seal must be preserved on clarification")
+
+	status, err := sealer.GetEdictStatus(key)
+	require.NoError(t, err)
+	assert.Equal(t, storage.EdictIntentApproved, status)
 }

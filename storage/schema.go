@@ -8,7 +8,8 @@ import (
 )
 
 // Schema version
-const SchemaVersion = 8
+// SchemaVersion is the current schema version.
+const SchemaVersion = 9
 
 // Type aliases - use types from internal/config as the single source of truth
 type (

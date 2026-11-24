@@ -1048,3 +1048,114 @@ func TestPostGormMigrate_BackfillsCensorPrecedentEdictID(t *testing.T) {
 	require.Equal(t, uint(2), precB.EdictID, "per-manifest precedent should inherit edict_id 2")
 	require.Equal(t, uint(0), precEdict.EdictID, "edict-level precedent should stay 0 (unknown owner)")
 }
+
+// TestMigrateV8toV9_BackfillsRealmAndLegacyIntentSeals verifies the e713
+// migration contract: pre-existing seals are backfilled to realm='earth',
+// historical sealed edicts remain sealed, pre-existing uncancelled edicts
+// (including edict 1) receive a live (ruler, intent) seal so they never
+// regress to draft, while cancelled edicts do not.
+func TestMigrateV8toV9_BackfillsRealmAndLegacyIntentSeals(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_v8v9_test.db")
+
+	conn, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO schema_version (version, applied_at) VALUES (8, unixepoch())`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE edicts (
+		id INTEGER NOT NULL,
+		username TEXT NOT NULL DEFAULT '',
+		project TEXT NOT NULL DEFAULT '',
+		session_id TEXT,
+		issue_ref TEXT,
+		summary TEXT,
+		intent TEXT,
+		cancelled_at DATETIME,
+		created_at DATETIME,
+		updated_at DATETIME,
+		PRIMARY KEY (id, username, project)
+	)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE seals (
+		seal_id TEXT PRIMARY KEY,
+		edict_id INTEGER,
+		username TEXT,
+		project TEXT,
+		minister_id TEXT,
+		sealed_at DATETIME,
+		metadata TEXT,
+		stale_at DATETIME
+	)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE zhengming_requests (
+		request_id TEXT PRIMARY KEY,
+		edict_id INTEGER,
+		username TEXT,
+		project TEXT,
+		minister_id TEXT,
+		status TEXT
+	)`)
+	require.NoError(t, err)
+
+	// Edict 1 (infra), 10 (open), 11 (historical sealed), 12 (cancelled).
+	_, err = conn.Exec(`INSERT INTO edicts (id, username, project, intent, cancelled_at, created_at, updated_at) VALUES
+		(1,  'u', 'p', 'infra',     NULL,                  '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
+		(10, 'u', 'p', 'open',      NULL,                  '2026-02-01 00:00:00', '2026-02-01 00:00:00'),
+		(11, 'u', 'p', 'sealed',    NULL,                  '2026-02-02 00:00:00', '2026-02-02 00:00:00'),
+		(12, 'u', 'p', 'cancelled', '2026-02-04 00:00:00', '2026-02-03 00:00:00', '2026-02-04 00:00:00')`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO seals (seal_id, edict_id, username, project, minister_id, sealed_at) VALUES
+		('legacy-j', 11, 'u', 'p', 'judge',      '2026-02-02 01:00:00'),
+		('legacy-c', 11, 'u', 'p', 'chancellor', '2026-02-02 02:00:00'),
+		('legacy-r', 11, 'u', 'p', 'ruler',      '2026-02-02 03:00:00')`)
+	require.NoError(t, err)
+	conn.Close()
+
+	db, err := InitDB(dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Legacy seals must be backfilled to 'earth'.
+	var nonEarthLegacy int
+	require.NoError(t, db.Conn().QueryRow(
+		"SELECT COUNT(*) FROM seals WHERE seal_id IN ('legacy-j','legacy-c','legacy-r') AND realm != 'earth'",
+	).Scan(&nonEarthLegacy))
+	require.Equal(t, 0, nonEarthLegacy, "legacy seals must be backfilled to earth realm")
+
+	// Derive statuses via SealService against the migrated DB.
+	gormDB, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	require.NoError(t, err)
+	svc := NewSealService(gormDB)
+
+	st1, err := svc.GetEdictStatus(EdictKey{ID: 1, Username: "u", Project: "p"})
+	require.NoError(t, err)
+	require.Equal(t, EdictIntentApproved, st1, "edict 1 must derive intent-approved, not draft")
+
+	st10, err := svc.GetEdictStatus(EdictKey{ID: 10, Username: "u", Project: "p"})
+	require.NoError(t, err)
+	require.Equal(t, EdictIntentApproved, st10, "pre-existing open edict must derive intent-approved, not draft")
+
+	st11, err := svc.GetEdictStatus(EdictKey{ID: 11, Username: "u", Project: "p"})
+	require.NoError(t, err)
+	require.Equal(t, EdictSealed, st11, "historical sealed edict must stay sealed")
+
+	st12, err := svc.GetEdictStatus(EdictKey{ID: 12, Username: "u", Project: "p"})
+	require.NoError(t, err)
+	require.Equal(t, EdictCancelled, st12, "cancelled edict must stay cancelled")
+	hasCancelledIntent, err := svc.HasSeal(EdictKey{ID: 12, Username: "u", Project: "p"}, "ruler", "intent")
+	require.NoError(t, err)
+	require.False(t, hasCancelledIntent, "cancelled edict must not receive backfilled intent seal")
+
+	// Idempotency: re-running migration v8->v9 must succeed without duplicating rows.
+	var beforeCount int
+	require.NoError(t, db.Conn().QueryRow("SELECT COUNT(*) FROM seals").Scan(&beforeCount))
+	_, err = db.Conn().Exec("DELETE FROM schema_version WHERE version = 9")
+	require.NoError(t, err)
+	require.NoError(t, db.runMigrations(8))
+	var afterCount int
+	require.NoError(t, db.Conn().QueryRow("SELECT COUNT(*) FROM seals").Scan(&afterCount))
+	require.Equal(t, beforeCount, afterCount, "re-running migrateV8toV9 must be idempotent")
+}

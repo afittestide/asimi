@@ -65,6 +65,9 @@ func TestTransitionEdictTool_Cancel(t *testing.T) {
 
 	// Verify derived status is cancelled
 	sealService := storage.NewSealService(db)
+	if err := sealService.GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("failed to grant ruler intent seal: %v", err)
+	}
 	status, err := sealService.GetEdictStatus(edict.Key())
 	if err != nil {
 		t.Fatalf("Failed to get edict status: %v", err)
@@ -124,6 +127,9 @@ func TestTransitionEdictTool_BlockedToSealed(t *testing.T) {
 
 	// Verify edict is now sealed
 	sealService := storage.NewSealService(db)
+	if err := sealService.GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("failed to grant ruler intent seal: %v", err)
+	}
 	status, err := sealService.GetEdictStatus(edict.Key())
 	if err != nil {
 		t.Fatalf("Failed to get edict status: %v", err)
@@ -193,15 +199,20 @@ func TestListEdictsTool_FilterByStatus(t *testing.T) {
 		t.Fatalf("failed to create zhengming: %v", err)
 	}
 
-	// Seal the fourth edict
+	// Seal the fourth edict (and grant intent seals on enrolled edicts)
 	sealService := storage.NewSealService(db)
-	if err := sealService.GrantSeal(edicts[3].Key(), "judge", storage.JSON{}); err != nil {
+	for _, e := range edicts {
+		if err := sealService.GrantSeal(e.Key(), "ruler", "intent", storage.JSON{}); err != nil {
+			t.Fatalf("failed to grant ruler intent seal: %v", err)
+		}
+	}
+	if err := sealService.GrantSeal(edicts[3].Key(), "judge", "earth", storage.JSON{}); err != nil {
 		t.Fatalf("failed to grant judge seal: %v", err)
 	}
-	if err := sealService.GrantSeal(edicts[3].Key(), "chancellor", storage.JSON{}); err != nil {
+	if err := sealService.GrantSeal(edicts[3].Key(), "chancellor", "earth", storage.JSON{}); err != nil {
 		t.Fatalf("failed to grant chancellor seal: %v", err)
 	}
-	if err := sealService.GrantSeal(edicts[3].Key(), "ruler", storage.JSON{}); err != nil {
+	if err := sealService.GrantSeal(edicts[3].Key(), "ruler", "earth", storage.JSON{}); err != nil {
 		t.Fatalf("failed to grant ruler seal: %v", err)
 	}
 
@@ -252,6 +263,9 @@ func TestGetEdictStatusTool_ReturnsStatus(t *testing.T) {
 	if err := db.Create(&edict).Error; err != nil {
 		t.Fatalf("failed to create edict: %v", err)
 	}
+	if err := storage.NewSealService(db).GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("failed to grant ruler intent seal: %v", err)
+	}
 
 	tool := GetEdictStatusTool{DB: db, Username: "testuser", Project: "testproject"}
 
@@ -259,8 +273,8 @@ func TestGetEdictStatusTool_ReturnsStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
-	if !containsSubstring(result, "active") {
-		t.Errorf("Expected result to contain 'active', got: %s", result)
+	if !containsSubstring(result, "intent-approved") {
+		t.Errorf("Expected result to contain 'intent-approved', got: %s", result)
 	}
 	if !containsSubstring(result, "Test edict") {
 		t.Errorf("Expected result to contain intent, got: %s", result)
@@ -388,8 +402,8 @@ func TestListEdictsTool_PopulatedReturnsTableEnvelope(t *testing.T) {
 	if len(env.Rows) != 1 {
 		t.Fatalf("Rows = %d, want 1", len(env.Rows))
 	}
-	if env.Rows[0][0] != "1" || env.Rows[0][1] != "active" || env.Rows[0][2] != "Active edict" {
-		t.Errorf("row = %v, want [1 active Active edict]", env.Rows[0])
+	if env.Rows[0][0] != "1" || env.Rows[0][1] != "draft" || env.Rows[0][2] != "Active edict" {
+		t.Errorf("row = %v, want [1 draft Active edict]", env.Rows[0])
 	}
 
 	raw, err := json.Marshal(env.Raw)
@@ -677,6 +691,9 @@ func TestTransitionEdictTool_SealedAfterSupersededPromptRetired(t *testing.T) {
 	}
 
 	sealService := storage.NewSealService(db)
+	if err := sealService.GrantSeal(edict.Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("failed to grant ruler intent seal: %v", err)
+	}
 	status, err := sealService.GetEdictStatus(edict.Key())
 	if err != nil {
 		t.Fatalf("get edict status: %v", err)
@@ -792,5 +809,79 @@ func TestDismissZhengmingTool_CallErrors(t *testing.T) {
 	unwired := DismissZhengmingTool{Ctx: ToolContext{Username: "testuser", Project: "testproject"}}
 	if _, err := unwired.Call(context.Background(), `{"request_id": "req-1"}`); err == nil {
 		t.Error("an unwired disposer must error, not silently succeed")
+	}
+}
+
+func TestListEdictsTool_FiltersDraftIntentApprovedAndActive(t *testing.T) {
+	db := setupEdictTestDB(t)
+	if err := db.Exec(`CREATE TABLE ritual_executions (
+		id TEXT PRIMARY KEY,
+		edict_id INTEGER,
+		username TEXT,
+		project TEXT,
+		state TEXT
+	)`).Error; err != nil {
+		t.Fatalf("create ritual_executions: %v", err)
+	}
+
+	edicts := []storage.Edict{
+		{ID: 1, Username: "testuser", Project: "testproject", Intent: "Draft edict"},
+		{ID: 2, Username: "testuser", Project: "testproject", Intent: "Backlog edict"},
+		{ID: 3, Username: "testuser", Project: "testproject", Intent: "Running edict"},
+	}
+	for i := range edicts {
+		if err := db.Create(&edicts[i]).Error; err != nil {
+			t.Fatalf("create edict %d: %v", edicts[i].ID, err)
+		}
+	}
+
+	sealSvc := storage.NewSealService(db)
+	if err := sealSvc.GrantSeal(edicts[1].Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("grant ruler intent on edict 2: %v", err)
+	}
+	if err := sealSvc.GrantSeal(edicts[2].Key(), "ruler", "intent", storage.JSON{}); err != nil {
+		t.Fatalf("grant ruler intent on edict 3: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO ritual_executions (id, edict_id, username, project, state) VALUES ('exec-3', 3, 'testuser', 'testproject', 'running')`).Error; err != nil {
+		t.Fatalf("insert running ritual: %v", err)
+	}
+
+	tool := ListEdictsTool{DB: db, Username: "testuser", Project: "testproject"}
+
+	// Schema enum must include draft and intent-approved.
+	props := tool.ParameterSchema()["properties"].(map[string]any)
+	statusEnum := props["status"].(map[string]any)["enum"].([]string)
+	hasDraft, hasIntentApproved := false, false
+	for _, s := range statusEnum {
+		if s == "draft" {
+			hasDraft = true
+		}
+		if s == "intent-approved" {
+			hasIntentApproved = true
+		}
+	}
+	if !hasDraft || !hasIntentApproved {
+		t.Fatalf("ListEdictsTool status enum %v must contain draft and intent-approved", statusEnum)
+	}
+
+	for _, tc := range []struct {
+		status string
+		want   string
+		absent string
+	}{
+		{"draft", "Draft edict", "Backlog edict"},
+		{"intent-approved", "Backlog edict", "Running edict"},
+		{"active", "Running edict", "Backlog edict"},
+	} {
+		res, err := tool.Call(context.Background(), fmt.Sprintf(`{"status": %q}`, tc.status))
+		if err != nil {
+			t.Fatalf("list_edicts status=%s: %v", tc.status, err)
+		}
+		if !containsSubstring(res, tc.want) {
+			t.Errorf("status=%s: expected %q in %s", tc.status, tc.want, res)
+		}
+		if containsSubstring(res, tc.absent) {
+			t.Errorf("status=%s: did not expect %q in %s", tc.status, tc.absent, res)
+		}
 	}
 }

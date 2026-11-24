@@ -126,6 +126,7 @@ Every method name is a Go constant in
 | `GetEdict`                 | `{edict_id uint}`                                   | `{edict *Edict}`                |
 | `ListActiveEdicts`         | —                                                   | `{edicts []ActiveEdict}`        |
 | `GrantRulerSeal`           | `{edict_id uint, notes}`                            | —                               |
+| `GrantIntentSeal`          | `{edict_id uint, minister_id, metadata?}`           | —                               |
 | `GetEdictSeals`            | `{key EdictKey}`                                    | `{seals []Seal}`                |
 | `PublishEvent`             | `{key EdictKey, event_type, payload JSON}`          | `{event_id uint}`               |
 | `SubmitPrompt`             | `{target_id, message, edict_key, channel_id, context_files}` | —                      |

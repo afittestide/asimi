@@ -43,7 +43,7 @@ func TestSealIfComplete_ResurrectsInvalidatedJudgeTombstone(t *testing.T) {
 	}
 
 	// Seed + invalidate a judge tombstone at the deterministic ID.
-	detID := storage.DeterministicSealID(key.ID, key.Username, key.Project, "judge")
+	detID := storage.DeterministicSealID(key.ID, key.Username, key.Project, "judge", "earth")
 	if err := db.Create(&storage.Seal{
 		SealID: detID, EdictID: key.ID, Username: key.Username, Project: key.Project,
 		MinisterID: "judge",

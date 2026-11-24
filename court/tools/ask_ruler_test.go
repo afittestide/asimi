@@ -347,7 +347,7 @@ func TestReplaceEdictTool_RefusesSealedTargetWithoutRaisingZhengming(t *testing.
 	if err := db.Create(&edict).Error; err != nil {
 		t.Fatalf("failed to create edict: %v", err)
 	}
-	if err := storage.NewSealService(db).GrantSeal(storage.EdictKey{ID: 7, Username: "sageuser", Project: "myproject"}, "ruler", nil); err != nil {
+	if err := storage.NewSealService(db).GrantSeal(storage.EdictKey{ID: 7, Username: "sageuser", Project: "myproject"}, "ruler", "earth", nil); err != nil {
 		t.Fatalf("failed to grant ruler seal: %v", err)
 	}
 

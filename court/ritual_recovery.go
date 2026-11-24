@@ -166,8 +166,8 @@ func (rg *RitualGuard) supersedingCause(key storage.EdictKey, exec *RitualExecut
 
 	var sealCount int64
 	if err := rg.db.Model(&storage.Seal{}).
-		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND stale_at IS NULL",
-			key.ID, key.Username, key.Project, "ruler").
+		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND realm = ? AND stale_at IS NULL",
+			key.ID, key.Username, key.Project, "ruler", "earth").
 		Count(&sealCount).Error; err == nil && sealCount > 0 {
 		return "court: edict sealed", true
 	}
@@ -351,7 +351,7 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 			continue
 		}
 		var sealCount int64
-		rg.db.Model(&storage.Seal{}).Where("edict_id = ? AND username = ? AND project = ? AND stale_at IS NULL", exec.EdictID, exec.Username, exec.Project).Count(&sealCount)
+		rg.db.Model(&storage.Seal{}).Where("edict_id = ? AND username = ? AND project = ? AND minister_id = 'ruler' AND realm = 'earth' AND stale_at IS NULL", exec.EdictID, exec.Username, exec.Project).Count(&sealCount)
 		if sealCount > 0 || edict.CancelledAt != nil {
 			exec.State = RitualStateCompleted
 			rg.db.Save(exec)

@@ -28,9 +28,10 @@ type fakeCourt struct {
 	hasIDs    map[string]bool
 	resetLog  []string
 	edicts    map[uint]*storage.Edict
-	seals     map[uint][]storage.Seal
-	sealNotes map[uint]string
-	fallback  bool
+	seals       map[uint][]storage.Seal
+	sealNotes   map[uint]string
+	intentSeals map[uint]string
+	fallback    bool
 	cancels   []string
 	clears    []string
 	pauses    []string
@@ -59,11 +60,12 @@ type fakeCourt struct {
 
 func newFakeCourt() *fakeCourt {
 	return &fakeCourt{
-		hasIDs:    map[string]bool{},
-		edicts:    map[uint]*storage.Edict{},
-		seals:     map[uint][]storage.Seal{},
-		sealNotes: map[uint]string{},
-		sessions:  map[string]court.SessionState{},
+		hasIDs:      map[string]bool{},
+		edicts:      map[uint]*storage.Edict{},
+		seals:       map[uint][]storage.Seal{},
+		sealNotes:   map[uint]string{},
+		intentSeals: map[uint]string{},
+		sessions:    map[string]court.SessionState{},
 	}
 }
 
@@ -143,6 +145,16 @@ func (f *fakeCourt) GrantRulerSeal(edictID uint, notes string) error {
 		return errors.New("edict not found")
 	}
 	f.sealNotes[edictID] = notes
+	return nil
+}
+
+func (f *fakeCourt) GrantIntentSeal(edictID uint, ministerID string, metadata storage.JSON) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.edicts[edictID]; !ok {
+		return errors.New("edict not found")
+	}
+	f.intentSeals[edictID] = ministerID
 	return nil
 }
 

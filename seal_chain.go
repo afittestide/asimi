@@ -21,10 +21,11 @@ func renderSealChain(seals []storage.Seal, w int) string {
 	defs, _ := ministers.LoadMinisters()
 	defsByID := ministers.LookupMap(defs)
 
-	// Build set of granted seals, skipping invalidated tombstones.
+	// Build set of granted earth seals, skipping invalidated tombstones and
+	// intent-realm seals.
 	granted := make(map[string]bool)
 	for _, seal := range seals {
-		if seal.StaleAt != nil {
+		if seal.StaleAt != nil || seal.Realm != "earth" {
 			continue
 		}
 		granted[seal.MinisterID] = true

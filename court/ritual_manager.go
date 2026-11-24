@@ -784,7 +784,14 @@ func (rg *RitualGuard) buildEventNotification(event Event) EventNotificationMsg 
 		if minister == "" {
 			minister = "Unknown"
 		}
-		if minister == "ruler" {
+		realm, _ := event.Payload["realm"].(string)
+		if realm == "intent" {
+			if minister == "ruler" {
+				msg.Message = fmt.Sprintf("Ruler approved intent for edict %d", edictID)
+			} else {
+				msg.Message = fmt.Sprintf("Minister %s sealed intent for edict %d", minister, edictID)
+			}
+		} else if minister == "ruler" {
 			msg.Message = fmt.Sprintf("Ruler sealed edict %d", edictID)
 		} else {
 			msg.Message = fmt.Sprintf("Minister %s sealed edict %d", minister, edictID)

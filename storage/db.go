@@ -204,6 +204,10 @@ func (db *DB) runMigrations(currentVersion int) error {
 			if err := db.migrateV7toV8(); err != nil {
 				return fmt.Errorf("migration v7→v8 failed: %w", err)
 			}
+		case 9:
+			if err := db.migrateV8toV9(); err != nil {
+				return fmt.Errorf("migration v8→v9 failed: %w", err)
+			}
 		default:
 			return fmt.Errorf("unknown migration version: %d", v)
 		}
@@ -439,6 +443,95 @@ func (db *DB) migrateV7toV8() error {
 	return nil
 }
 
+// migrateV8toV9 adds the realm column to seals, backfills pre-existing seals
+// to 'earth', and grants legacy (ruler, intent) seals to pre-existing
+// uncancelled edicts so they do not regress to draft on upgrade.
+func (db *DB) migrateV8toV9() error {
+	var sealsTable, edictsTable bool
+	if err := db.conn.QueryRow(
+		"SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='seals'",
+	).Scan(&sealsTable); err != nil {
+		return fmt.Errorf("check seals table existence: %w", err)
+	}
+	if err := db.conn.QueryRow(
+		"SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='edicts'",
+	).Scan(&edictsTable); err != nil {
+		return fmt.Errorf("check edicts table existence: %w", err)
+	}
+
+	if sealsTable {
+		var colExists bool
+		if err := db.conn.QueryRow(
+			"SELECT COUNT(*) > 0 FROM pragma_table_info('seals') WHERE name = 'realm'",
+		).Scan(&colExists); err != nil {
+			return fmt.Errorf("check seals.realm column existence: %w", err)
+		}
+		if !colExists {
+			if _, err := db.conn.Exec(`ALTER TABLE seals ADD COLUMN realm TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("add seals.realm column: %w", err)
+			}
+		}
+
+		if _, err := db.conn.Exec(`UPDATE seals SET realm = 'earth' WHERE COALESCE(realm, '') = ''`); err != nil {
+			return fmt.Errorf("backfill seals.realm: %w", err)
+		}
+	}
+
+	if sealsTable && edictsTable {
+		type legacyEdict struct {
+			id        uint
+			username  string
+			project   string
+			createdAt any
+		}
+		rows, err := db.conn.Query(`
+			SELECT e.id, e.username, e.project, e.created_at
+			FROM edicts e
+			WHERE e.cancelled_at IS NULL
+			AND NOT EXISTS (
+				SELECT 1 FROM seals s
+				WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project
+				AND s.minister_id = 'ruler' AND s.realm = 'intent' AND s.stale_at IS NULL
+			)
+		`)
+		if err != nil {
+			return fmt.Errorf("query legacy edicts for intent seal backfill: %w", err)
+		}
+		var legacy []legacyEdict
+		for rows.Next() {
+			var e legacyEdict
+			if err := rows.Scan(&e.id, &e.username, &e.project, &e.createdAt); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan legacy edict: %w", err)
+			}
+			legacy = append(legacy, e)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate legacy edicts: %w", err)
+		}
+
+		for _, e := range legacy {
+			sealID := DeterministicSealID(e.id, e.username, e.project, "ruler", "intent")
+			if _, err := db.conn.Exec(
+				`INSERT OR IGNORE INTO seals (seal_id, edict_id, username, project, minister_id, realm, sealed_at)
+				 VALUES (?, ?, ?, ?, 'ruler', 'intent', COALESCE(?, CURRENT_TIMESTAMP))`,
+				sealID, e.id, e.username, e.project, e.createdAt,
+			); err != nil {
+				return fmt.Errorf("backfill intent seal for edict %d: %w", e.id, err)
+			}
+		}
+	}
+
+	if _, err := db.conn.Exec(
+		"INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, unixepoch())",
+		9,
+	); err != nil {
+		return fmt.Errorf("record version 9: %w", err)
+	}
+	slog.Debug("migrated schema v8→v9: added realm column to seals and backfilled intent/earth realms")
+	return nil
+}
 // registerRegexpFunction adds REGEXP support to SQLite
 func (db *DB) registerRegexpFunction() error {
 	// Note: The sqlite driver from modernc.org/sqlite doesn't support

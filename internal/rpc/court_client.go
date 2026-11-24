@@ -123,6 +123,14 @@ func (c *CourtClient) GrantRulerSeal(edictID uint, notes string) error {
 	return c.callVoid(context.Background(), MethodGrantRulerSeal, GrantRulerSealParams{EdictID: edictID, Notes: notes})
 }
 
+func (c *CourtClient) GrantIntentSeal(edictID uint, ministerID string, metadata storage.JSON) error {
+	return c.callVoid(context.Background(), MethodGrantIntentSeal, GrantIntentSealParams{
+		EdictID:    edictID,
+		MinisterID: ministerID,
+		Metadata:   metadata,
+	})
+}
+
 func (c *CourtClient) CancelEdict(edictID uint) error {
 	return c.callVoid(context.Background(), MethodCancelEdict, CancelEdictParams{EdictID: edictID})
 }

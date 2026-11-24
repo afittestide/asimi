@@ -45,14 +45,14 @@ func TestListActiveEdicts_ORSemantics(t *testing.T) {
 
 	// Seal edict 3 with all three seals (judge, chancellor, ruler)
 	for _, ministerID := range []string{"judge", "chancellor", "ruler"} {
-		if err := svc.GrantSeal(edicts[2].Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edicts[2].Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant seal: %v", err)
 		}
 	}
 
 	// Seal edict 4 with all three seals
 	for _, ministerID := range []string{"judge", "chancellor", "ruler"} {
-		if err := svc.GrantSeal(edicts[3].Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edicts[3].Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant seal: %v", err)
 		}
 	}
@@ -121,7 +121,7 @@ func TestListActiveEdicts_SealStatusPopulated(t *testing.T) {
 	}
 
 	// Grant only judge seal
-	if err := svc.GrantSeal(edict.Key(), "judge", JSON{}); err != nil {
+	if err := svc.GrantSeal(edict.Key(), "judge", "earth", JSON{}); err != nil {
 		t.Fatalf("failed to grant seal: %v", err)
 	}
 
@@ -153,7 +153,7 @@ func TestListActiveEdicts_ChancellorSealPopulated(t *testing.T) {
 	}
 
 	// Grant chancellor seal
-	if err := svc.GrantSeal(edict.Key(), "chancellor", JSON{}); err != nil {
+	if err := svc.GrantSeal(edict.Key(), "chancellor", "earth", JSON{}); err != nil {
 		t.Fatalf("failed to grant chancellor seal: %v", err)
 	}
 
@@ -222,13 +222,13 @@ func TestInvalidateSealsMarksExistingSealsStale(t *testing.T) {
 
 	// Grant judge and chancellor seals
 	for _, ministerID := range []string{"judge", "chancellor"} {
-		if err := svc.GrantSeal(edict.Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edict.Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant %s seal: %v", ministerID, err)
 		}
 	}
 
 	// Verify seals exist and are not stale
-	hasJudge, err := svc.HasSeal(edict.Key(), "judge")
+	hasJudge, err := svc.HasSeal(edict.Key(), "judge", "earth")
 	if err != nil {
 		t.Fatalf("HasSeal judge: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestInvalidateSealsMarksExistingSealsStale(t *testing.T) {
 	}
 
 	// HasSeal should now return false for both
-	hasJudge, err = svc.HasSeal(edict.Key(), "judge")
+	hasJudge, err = svc.HasSeal(edict.Key(), "judge", "earth")
 	if err != nil {
 		t.Fatalf("HasSeal judge after invalidation: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestInvalidateSealsMarksExistingSealsStale(t *testing.T) {
 		t.Error("Expected HasSeal(judge) to return false after invalidation")
 	}
 
-	hasChancellor, err := svc.HasSeal(edict.Key(), "chancellor")
+	hasChancellor, err := svc.HasSeal(edict.Key(), "chancellor", "earth")
 	if err != nil {
 		t.Fatalf("HasSeal chancellor after invalidation: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestGetActiveSealsExcludesStaleTombstones(t *testing.T) {
 	}
 
 	for _, ministerID := range []string{"judge", "chancellor", "ruler"} {
-		if err := svc.GrantSeal(edict.Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edict.Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant %s seal: %v", ministerID, err)
 		}
 	}
@@ -310,7 +310,7 @@ func TestGetActiveSealsExcludesStaleTombstones(t *testing.T) {
 	}
 
 	// Re-sealing only the ruler leaves judge/chancellor stale.
-	if err := svc.GrantSeal(edict.Key(), "ruler", JSON{}); err != nil {
+	if err := svc.GrantSeal(edict.Key(), "ruler", "earth", JSON{}); err != nil {
 		t.Fatalf("failed to re-grant ruler seal: %v", err)
 	}
 	active, err = svc.GetActiveSeals(edict.Key())
@@ -333,7 +333,7 @@ func TestResealAfterStalenessRestoresStatus(t *testing.T) {
 
 	// Grant judge and chancellor seals
 	for _, ministerID := range []string{"judge", "chancellor"} {
-		if err := svc.GrantSeal(edict.Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edict.Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant %s seal: %v", ministerID, err)
 		}
 	}
@@ -343,18 +343,18 @@ func TestResealAfterStalenessRestoresStatus(t *testing.T) {
 		t.Fatalf("InvalidateSeals: %v", err)
 	}
 
-	// Status should be "active" (no valid seals)
+	// Status should be "draft" (all seals including intent seal invalidated)
 	status, err := svc.GetEdictStatus(edict.Key())
 	if err != nil {
 		t.Fatalf("GetEdictStatus after invalidation: %v", err)
 	}
-	if status != EdictActive {
-		t.Errorf("Expected status active after invalidation, got %s", status)
+	if status != EdictDraft {
+		t.Errorf("Expected status draft after invalidation, got %s", status)
 	}
 
-	// Re-seal with all three
+	// Re-seal with all three earth seals
 	for _, ministerID := range []string{"judge", "chancellor", "ruler"} {
-		if err := svc.GrantSeal(edict.Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edict.Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to re-grant %s seal: %v", ministerID, err)
 		}
 	}
@@ -368,13 +368,13 @@ func TestResealAfterStalenessRestoresStatus(t *testing.T) {
 		t.Errorf("Expected status sealed after re-seal, got %s", status)
 	}
 
-	// GetSeals should return 5 seals total (2 stale + 3 fresh)
+	// GetSeals should return 3 seals total (2 tombstones resurrected in place + 1 ruler seal)
 	seals, err := svc.GetSeals(edict.Key())
 	if err != nil {
 		t.Fatalf("GetSeals: %v", err)
 	}
-	if len(seals) != 5 {
-		t.Errorf("Expected 5 seals (2 stale + 3 fresh), got %d", len(seals))
+	if len(seals) != 3 {
+		t.Errorf("Expected 3 seals (2 resurrected + 1 fresh), got %d", len(seals))
 	}
 
 	// Verify the fresh seals are not stale
@@ -400,7 +400,7 @@ func TestListActiveEdicts_SealedEdictReappearsAfterStaleness(t *testing.T) {
 
 	// Seal with all three ministers
 	for _, ministerID := range []string{"judge", "chancellor", "ruler"} {
-		if err := svc.GrantSeal(edict.Key(), ministerID, JSON{}); err != nil {
+		if err := svc.GrantSeal(edict.Key(), ministerID, "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant %s seal: %v", ministerID, err)
 		}
 	}
@@ -446,7 +446,7 @@ func TestInvalidateSealsOnlyAffectsTargetEdict(t *testing.T) {
 
 	// Grant judge seal on both edicts
 	for _, e := range []Edict{edict1, edict2} {
-		if err := svc.GrantSeal(e.Key(), "judge", JSON{}); err != nil {
+		if err := svc.GrantSeal(e.Key(), "judge", "earth", JSON{}); err != nil {
 			t.Fatalf("failed to grant judge seal: %v", err)
 		}
 	}
@@ -457,7 +457,7 @@ func TestInvalidateSealsOnlyAffectsTargetEdict(t *testing.T) {
 	}
 
 	// Edict1's seal should be stale
-	hasJudge1, err := svc.HasSeal(edict1.Key(), "judge")
+	hasJudge1, err := svc.HasSeal(edict1.Key(), "judge", "earth")
 	if err != nil {
 		t.Fatalf("HasSeal edict1: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestInvalidateSealsOnlyAffectsTargetEdict(t *testing.T) {
 	}
 
 	// Edict2's seal should still be valid
-	hasJudge2, err := svc.HasSeal(edict2.Key(), "judge")
+	hasJudge2, err := svc.HasSeal(edict2.Key(), "judge", "earth")
 	if err != nil {
 		t.Fatalf("HasSeal edict2: %v", err)
 	}
@@ -485,6 +485,9 @@ func TestDisposeZhengming_IdempotentAndUnblocks(t *testing.T) {
 	edict := Edict{ID: 10, Username: "testuser", Project: "testproject", Intent: "dispose"}
 	if err := db.Create(&edict).Error; err != nil {
 		t.Fatalf("create edict: %v", err)
+	}
+	if err := svc.GrantSeal(edict.Key(), "ruler", "intent", JSON{}); err != nil {
+		t.Fatalf("grant ruler intent seal: %v", err)
 	}
 	req := Zhengming{
 		RequestID: "req-1", EdictID: edict.ID, Username: "testuser", Project: "testproject",
@@ -639,5 +642,275 @@ func TestDisposeZhengming_SupersededByEdict(t *testing.T) {
 	}
 	if status == EdictBlocked {
 		t.Error("status = blocked after dispose, want unblocked")
+	}
+}
+
+func TestPerRealmSeals_DeterministicIDsCoexistAndValidateRealm(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	edict := Edict{ID: 101, Username: "testuser", Project: "testproject", Intent: "Per-realm seals"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("create edict: %v", err)
+	}
+	key := edict.Key()
+
+	// Distinct deterministic IDs across realms for chancellor and ruler.
+	chIntent := DeterministicSealID(key.ID, key.Username, key.Project, "chancellor", "intent")
+	chEarth := DeterministicSealID(key.ID, key.Username, key.Project, "chancellor", "earth")
+	if chIntent == chEarth {
+		t.Fatalf("chancellor intent and earth seal IDs must differ, both %q", chIntent)
+	}
+	ruIntent := DeterministicSealID(key.ID, key.Username, key.Project, "ruler", "intent")
+	ruEarth := DeterministicSealID(key.ID, key.Username, key.Project, "ruler", "earth")
+	if ruIntent == ruEarth {
+		t.Fatalf("ruler intent and earth seal IDs must differ, both %q", ruIntent)
+	}
+
+	// Reject empty and invalid realms.
+	for _, bad := range []string{"", "heaven", "bogus"} {
+		if err := svc.GrantSeal(key, "ruler", bad, JSON{}); err == nil {
+			t.Errorf("GrantSeal should reject invalid realm %q", bad)
+		}
+	}
+
+	// Both realms coexist for chancellor and ruler.
+	for _, pair := range [][2]string{
+		{"chancellor", "intent"},
+		{"ruler", "intent"},
+		{"chancellor", "earth"},
+		{"ruler", "earth"},
+	} {
+		if err := svc.GrantSeal(key, pair[0], pair[1], JSON{}); err != nil {
+			t.Fatalf("GrantSeal(%s, %s): %v", pair[0], pair[1], err)
+		}
+		has, err := svc.HasSeal(key, pair[0], pair[1])
+		if err != nil || !has {
+			t.Fatalf("HasSeal(%s, %s) = (%v, %v), want (true, nil)", pair[0], pair[1], has, err)
+		}
+	}
+
+	active, err := svc.GetActiveSeals(key)
+	if err != nil {
+		t.Fatalf("GetActiveSeals: %v", err)
+	}
+	if len(active) != 4 {
+		t.Fatalf("expected 4 coexisting active seals, got %d", len(active))
+	}
+
+	// Invalidate all, then resurrect only ("chancellor", "intent") — earth tombstone stays stale.
+	if err := svc.InvalidateSeals(key); err != nil {
+		t.Fatalf("InvalidateSeals: %v", err)
+	}
+	if err := svc.GrantSeal(key, "chancellor", "intent", JSON{"resurrected": true}); err != nil {
+		t.Fatalf("resurrect (chancellor, intent): %v", err)
+	}
+	hasCI, _ := svc.HasSeal(key, "chancellor", "intent")
+	hasCE, _ := svc.HasSeal(key, "chancellor", "earth")
+	if !hasCI || hasCE {
+		t.Errorf("expected independent resurrection: intent=%v earth=%v, want true/false", hasCI, hasCE)
+	}
+	if err := svc.GrantSeal(key, "chancellor", "earth", JSON{"resurrected": true}); err != nil {
+		t.Fatalf("resurrect (chancellor, earth): %v", err)
+	}
+	hasCE, _ = svc.HasSeal(key, "chancellor", "earth")
+	if !hasCE {
+		t.Error("expected (chancellor, earth) to be resurrected independently")
+	}
+}
+
+func TestPerRealmSeals_EarthHelpersIgnoreIntentAndIsPendingIntentApproval(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	edict := Edict{ID: 102, Username: "testuser", Project: "testproject", Intent: "Realm isolation"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("create edict: %v", err)
+	}
+	key := edict.Key()
+
+	// Initially not pending intent approval.
+	pending, err := svc.IsPendingIntentApproval(key)
+	if err != nil || pending {
+		t.Fatalf("IsPendingIntentApproval initially = (%v, %v), want (false, nil)", pending, err)
+	}
+
+	// Chancellor earth seal does not trigger IsPendingIntentApproval.
+	if err := svc.GrantSeal(key, "chancellor", "earth", JSON{}); err != nil {
+		t.Fatalf("grant chancellor earth: %v", err)
+	}
+	pending, err = svc.IsPendingIntentApproval(key)
+	if err != nil || pending {
+		t.Fatalf("IsPendingIntentApproval with only earth seal = (%v, %v), want (false, nil)", pending, err)
+	}
+
+	// Chancellor intent seal makes it pending intent approval.
+	if err := svc.GrantSeal(key, "chancellor", "intent", JSON{}); err != nil {
+		t.Fatalf("grant chancellor intent: %v", err)
+	}
+	pending, err = svc.IsPendingIntentApproval(key)
+	if err != nil || !pending {
+		t.Fatalf("IsPendingIntentApproval after chancellor intent = (%v, %v), want (true, nil)", pending, err)
+	}
+
+	// Ruler intent seal clears pending intent approval, but does NOT hide edict from ListActiveEdicts or count as earth seal.
+	if err := svc.GrantSeal(key, "ruler", "intent", JSON{}); err != nil {
+		t.Fatalf("grant ruler intent: %v", err)
+	}
+	pending, err = svc.IsPendingIntentApproval(key)
+	if err != nil || pending {
+		t.Fatalf("IsPendingIntentApproval after ruler intent = (%v, %v), want (false, nil)", pending, err)
+	}
+
+	// Ruler intent seal must NOT satisfy earth chain.
+	missing, err := svc.GetMissingSeals(key)
+	if err != nil {
+		t.Fatalf("GetMissingSeals: %v", err)
+	}
+	if len(missing) != 2 || missing[0] != "judge" || missing[1] != "ruler" {
+		t.Errorf("GetMissingSeals = %v, want [judge ruler]", missing)
+	}
+	sealStatus, err := svc.GetSealStatus(key)
+	if err != nil {
+		t.Fatalf("GetSealStatus: %v", err)
+	}
+	if sealStatus["ruler"] || sealStatus["judge"] || !sealStatus["chancellor"] {
+		t.Errorf("GetSealStatus = %+v, want ruler=false judge=false chancellor=true", sealStatus)
+	}
+	activeEdicts, err := svc.ListActiveEdicts("testuser", "testproject")
+	if err != nil {
+		t.Fatalf("ListActiveEdicts: %v", err)
+	}
+	if len(activeEdicts) != 1 || activeEdicts[0].ID != edict.ID {
+		t.Errorf("ListActiveEdicts should include edict with ruler intent seal, got %+v", activeEdicts)
+	}
+
+	// Grant judge earth -> now pending ascension despite ruler intent seal.
+	if err := svc.GrantSeal(key, "judge", "earth", JSON{}); err != nil {
+		t.Fatalf("grant judge earth: %v", err)
+	}
+	asc, err := svc.IsPendingAscension(key)
+	if err != nil || !asc {
+		t.Fatalf("IsPendingAscension = (%v, %v), want (true, nil)", asc, err)
+	}
+}
+
+func TestGetEdictStatus_FullPerRealmDerivationOrder(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	if err := db.Exec(`CREATE TABLE ritual_executions (
+		id TEXT PRIMARY KEY,
+		edict_id INTEGER,
+		username TEXT,
+		project TEXT,
+		state TEXT
+	)`).Error; err != nil {
+		t.Fatalf("create ritual_executions: %v", err)
+	}
+	svc := NewSealService(db)
+
+	edict := Edict{ID: 103, Username: "testuser", Project: "testproject", Intent: "Derivation order"}
+	if err := db.Create(&edict).Error; err != nil {
+		t.Fatalf("create edict: %v", err)
+	}
+	key := edict.Key()
+
+	// Enrolled edict without (ruler, intent) + pending zhengming -> MUST derive draft, not blocked.
+	zm := Zhengming{
+		RequestID: "zm-draft-check", EdictID: key.ID, Username: key.Username, Project: key.Project,
+		MinisterID: "chancellor", Status: ZhengmingPending, TimeoutAt: time.Now().Add(time.Hour),
+	}
+	if err := db.Create(&zm).Error; err != nil {
+		t.Fatalf("create zhengming: %v", err)
+	}
+	status, err := svc.GetEdictStatus(key)
+	if err != nil || status != EdictDraft {
+		t.Fatalf("without (ruler, intent) and with pending zhengming: got (%q, %v), want draft", status, err)
+	}
+
+	// Grant (ruler, intent) -> pending zhengming now derives blocked.
+	if err := svc.GrantSeal(key, "ruler", "intent", JSON{}); err != nil {
+		t.Fatalf("grant ruler intent: %v", err)
+	}
+	status, err = svc.GetEdictStatus(key)
+	if err != nil || status != EdictBlocked {
+		t.Fatalf("with (ruler, intent) and pending zhengming: got (%q, %v), want blocked", status, err)
+	}
+
+	// Running ritual while zhengming is still pending -> blocked still precedes active.
+	if err := db.Exec(`INSERT INTO ritual_executions (id, edict_id, username, project, state) VALUES ('exec-1', ?, ?, ?, 'running')`,
+		key.ID, key.Username, key.Project).Error; err != nil {
+		t.Fatalf("insert ritual_execution: %v", err)
+	}
+	status, err = svc.GetEdictStatus(key)
+	if err != nil || status != EdictBlocked {
+		t.Fatalf("pending zhengming with running ritual: got (%q, %v), want blocked", status, err)
+	}
+
+	// Clear zhengming while ritual is running -> derives active.
+	if err := db.Model(&Zhengming{}).Where("request_id = ?", zm.RequestID).Update("status", ZhengmingAnswered).Error; err != nil {
+		t.Fatalf("answer zhengming: %v", err)
+	}
+	status, err = svc.GetEdictStatus(key)
+	if err != nil || status != EdictActive {
+		t.Fatalf("with (ruler, intent) and running ritual: got (%q, %v), want active", status, err)
+	}
+
+	// Complete ritual -> drops back to intent-approved (backlog).
+	if err := db.Exec(`UPDATE ritual_executions SET state = 'completed' WHERE id = 'exec-1'`).Error; err != nil {
+		t.Fatalf("complete ritual_execution: %v", err)
+	}
+	status, err = svc.GetEdictStatus(key)
+	if err != nil || status != EdictIntentApproved {
+		t.Fatalf("with (ruler, intent) and no running ritual: got (%q, %v), want intent-approved", status, err)
+	}
+
+	// Grant (ruler, earth) -> sealed.
+	if err := svc.GrantSeal(key, "ruler", "earth", JSON{}); err != nil {
+		t.Fatalf("grant ruler earth: %v", err)
+	}
+	status, err = svc.GetEdictStatus(key)
+	if err != nil || status != EdictSealed {
+		t.Fatalf("with (ruler, earth): got (%q, %v), want sealed", status, err)
+	}
+}
+
+func TestGrantSeal_RulerIntentApprovesDraft(t *testing.T) {
+	db := setupSealServiceTestDB(t)
+	svc := NewSealService(db)
+
+	draft := Edict{ID: 77, Username: "testuser", Project: "testproject", Intent: "Draft edict"}
+	if err := db.Create(&draft).Error; err != nil {
+		t.Fatalf("create draft: %v", err)
+	}
+	status, err := svc.GetEdictStatus(draft.Key())
+	if err != nil {
+		t.Fatalf("GetEdictStatus: %v", err)
+	}
+	if status != EdictDraft {
+		t.Fatalf("precondition: status = %q, want draft", status)
+	}
+
+	if err := svc.GrantSeal(draft.Key(), "ruler", "intent", JSON{}); err != nil {
+		t.Fatalf("GrantSeal(ruler, intent): %v", err)
+	}
+
+	status, err = svc.GetEdictStatus(draft.Key())
+	if err != nil {
+		t.Fatalf("GetEdictStatus after intent seal: %v", err)
+	}
+	if status != EdictIntentApproved {
+		t.Fatalf("status = %q, want intent-approved", status)
+	}
+
+	active, err := svc.ListActiveEdicts("testuser", "testproject")
+	if err != nil {
+		t.Fatalf("ListActiveEdicts: %v", err)
+	}
+	if len(active) != 1 || active[0].ID != 77 {
+		t.Fatalf("expected edict 77 in ListActiveEdicts, got %+v", active)
+	}
+
+	if err := svc.GrantSeal(draft.Key(), "judge", "earth", JSON{}); err != nil {
+		t.Fatalf("expected earth seal to succeed after (ruler, intent) approval, got: %v", err)
 	}
 }

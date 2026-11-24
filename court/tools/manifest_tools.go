@@ -249,7 +249,7 @@ func (t RecordVerdictTool) sealIfComplete(key storage.EdictKey) bool {
 	if ministerID == "" {
 		ministerID = "judge"
 	}
-	if err := storage.NewSealService(t.Ctx.DB).GrantSeal(key, ministerID, storage.JSON{"type": "judgment_complete"}); err != nil {
+	if err := storage.NewSealService(t.Ctx.DB).GrantSeal(key, ministerID, "earth", storage.JSON{"type": "judgment_complete"}); err != nil {
 		// Surface the failure instead of silently returning false, which
 		// previously masked both the e882 collision and empty-minister bugs.
 		log.Printf("ERROR sealIfComplete: failed to grant %s seal for edict %d: %v",

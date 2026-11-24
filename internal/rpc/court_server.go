@@ -124,6 +124,17 @@ func RegisterCourtHandlers(c *Conn, impl courtapi.Client) {
 		return nil, nil
 	})
 
+	c.Handle(MethodGrantIntentSeal, func(ctx context.Context, params []byte) ([]byte, error) {
+		var p GrantIntentSealParams
+		if err := wire.Decode(params, &p); err != nil {
+			return nil, wire.NewError(wire.CodeDecodeFailed, err.Error())
+		}
+		if err := impl.GrantIntentSeal(p.EdictID, p.MinisterID, p.Metadata); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+
 	c.Handle(MethodListActiveEdicts, func(ctx context.Context, _ []byte) ([]byte, error) {
 		edicts, err := impl.ListActiveEdicts()
 		if err != nil {

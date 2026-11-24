@@ -86,7 +86,7 @@ func TestGetEdict_ReturnsDisplayEnvelope(t *testing.T) {
 	data, ok := de.Data.(map[string]interface{})
 	require.True(t, ok, "Data must be the template-facing map")
 	assert.Equal(t, intent, data["intent"])
-	assert.Equal(t, "active", data["status"])
+	assert.Equal(t, "draft", data["status"])
 	assert.EqualValues(t, 975, data["edict_id"])
 }
 
@@ -2997,29 +2997,30 @@ func TestGetCourtStatus_ChancellorSealChecksChancellorMinisterID(t *testing.T) {
 	runner := NewRitualRunner(registry, nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
 
 	key := storage.EdictKey{ID: 1, Username: "testuser", Project: "testproject"}
+	sealSvc := storage.NewSealService(db)
+	require.NoError(t, sealSvc.GrantSeal(key, "ruler", "intent", storage.JSON{}))
 
-	// Before any seal: status should be 'active'.
+	// Before any earth seal: status should be 'intent-approved'.
 	result, err := runner.getCourtStatus(key)
 	require.NoError(t, err)
 	rows, ok := result.([]map[string]interface{})
 	require.True(t, ok)
 	require.Len(t, rows, 1)
-	assert.Equal(t, "active", rows[0]["status"])
+	assert.Equal(t, "intent-approved", rows[0]["status"])
 
-	// Grant a chancellor seal — the SQL must match minister_id = 'chancellor'.
-	sealSvc := storage.NewSealService(db)
-	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", storage.JSON{}))
+	// Grant a chancellor earth seal — the SQL must match minister_id = 'chancellor'.
+	require.NoError(t, sealSvc.GrantSeal(key, "chancellor", "earth", storage.JSON{}))
 
 	result, err = runner.getCourtStatus(key)
 	require.NoError(t, err)
 	rows, ok = result.([]map[string]interface{})
 	require.True(t, ok)
 	require.Len(t, rows, 1)
-	// With a chancellor seal (but no ruler seal), the edict is still 'active'.
-	assert.Equal(t, "active", rows[0]["status"])
+	// With a chancellor seal (but no ruler earth seal), the edict is still 'intent-approved'.
+	assert.Equal(t, "intent-approved", rows[0]["status"])
 
 	// Grant a ruler seal — the edict should disappear from the active list.
-	require.NoError(t, sealSvc.GrantSeal(key, "ruler", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(key, "ruler", "earth", storage.JSON{}))
 	result, err = runner.getCourtStatus(key)
 	require.NoError(t, err)
 	rows, ok = result.([]map[string]interface{})
@@ -3164,21 +3165,21 @@ func TestGetCourtStatus_StaleRulerSealShowsActive(t *testing.T) {
 
 	// Seal with all three — edict is sealed
 	for _, m := range []string{"judge", "chancellor", "ruler"} {
-		require.NoError(t, sealSvc.GrantSeal(key, m, storage.JSON{}))
+		require.NoError(t, sealSvc.GrantSeal(key, m, "earth", storage.JSON{}))
 	}
 	result, err := runner.getCourtStatus(key)
 	require.NoError(t, err)
 	rows, _ := result.([]map[string]interface{})
 	assert.Empty(t, rows, "sealed edict should not appear in court status")
 
-	// Invalidate seals (intent changed) — edict should reappear as 'active'
+	// Invalidate seals (intent changed) — edict should reappear as 'draft'
 	require.NoError(t, sealSvc.InvalidateSeals(key))
 	result, err = runner.getCourtStatus(key)
 	require.NoError(t, err)
 	rows, ok := result.([]map[string]interface{})
 	require.True(t, ok)
-	require.Len(t, rows, 1, "edict with stale ruler seal should reappear as active")
-	assert.Equal(t, "active", rows[0]["status"])
+	require.Len(t, rows, 1, "edict with stale ruler seal should reappear")
+	assert.Equal(t, "draft", rows[0]["status"])
 }
 
 // ---------------------------------------------------------------------------
@@ -4015,3 +4016,74 @@ func (m *taggedMergeRunner) RunnerType() string                   { return "tagg
 func (m *taggedMergeRunner) GetOS() string                        { return runtime.GOOS }
 func (m *taggedMergeRunner) SetMessageChannel(chan<- runners.Msg) {}
 func (m *taggedMergeRunner) HealthCheck(context.Context) error    { return nil }
+
+// TestGetCourtStatus_PerRealmAndDerivedStatuses verifies e713's SQL parity
+// between getCourtStatus and SealService.GetEdictStatus:
+//   - an edict without (ruler, intent) derives 'draft' even with a pending zhengming
+//   - an edict with (ruler, intent) is NOT excluded as 'sealed' and derives 'intent-approved'
+//   - a running ritual_executions row promotes it to 'active'
+//   - a pending zhengming on an intent-approved edict derives 'blocked'
+//   - only (ruler, earth) marks an edict 'sealed' and excludes it from open status
+func TestGetCourtStatus_PerRealmAndDerivedStatuses(t *testing.T) {
+	db := setupRitualTestDB(t)
+	require.NoError(t, db.AutoMigrate(&storage.Edict{}, &storage.Seal{}, &storage.Zhengming{}))
+
+	const username, project = "testuser", "testproject"
+	sealSvc := storage.NewSealService(db)
+
+	// Edict 10: NO (ruler, intent), pending zhengming -> MUST derive 'draft'.
+	eDraft := storage.Edict{ID: 10, Username: username, Project: project, Intent: "draft without intent seal"}
+	require.NoError(t, db.Create(&eDraft).Error)
+	require.NoError(t, db.Create(&storage.Zhengming{
+		RequestID: "zm-draft-10", EdictID: 10, Username: username, Project: project,
+		Status: storage.ZhengmingPending,
+	}).Error)
+
+	// Edict 11: (ruler, intent), no running ritual -> MUST appear as 'intent-approved'.
+	eBacklog := storage.Edict{ID: 11, Username: username, Project: project, Intent: "backlog intent-approved"}
+	require.NoError(t, db.Create(&eBacklog).Error)
+	require.NoError(t, sealSvc.GrantSeal(eBacklog.Key(), "ruler", "intent", storage.JSON{}))
+
+	// Edict 12: (ruler, intent) + running ritual -> MUST derive 'active'.
+	eActive := storage.Edict{ID: 12, Username: username, Project: project, Intent: "running ritual"}
+	require.NoError(t, db.Create(&eActive).Error)
+	require.NoError(t, sealSvc.GrantSeal(eActive.Key(), "ruler", "intent", storage.JSON{}))
+	require.NoError(t, db.Create(&RitualExecution{
+		ID: "exec-12", RitualName: "swift-strike", EdictID: 12,
+		Username: username, Project: project, State: RitualStateRunning,
+	}).Error)
+
+	// Edict 13: (ruler, intent) + pending zhengming -> MUST derive 'blocked'.
+	eBlocked := storage.Edict{ID: 13, Username: username, Project: project, Intent: "blocked edict"}
+	require.NoError(t, db.Create(&eBlocked).Error)
+	require.NoError(t, sealSvc.GrantSeal(eBlocked.Key(), "ruler", "intent", storage.JSON{}))
+	require.NoError(t, db.Create(&storage.Zhengming{
+		RequestID: "zm-blocked-13", EdictID: 13, Username: username, Project: project,
+		Status: storage.ZhengmingPending,
+	}).Error)
+
+	// Edict 14: (ruler, intent) + (ruler, earth) -> MUST be excluded (sealed).
+	eSealed := storage.Edict{ID: 14, Username: username, Project: project, Intent: "sealed on earth"}
+	require.NoError(t, db.Create(&eSealed).Error)
+	require.NoError(t, sealSvc.GrantSeal(eSealed.Key(), "ruler", "intent", storage.JSON{}))
+	require.NoError(t, sealSvc.GrantSeal(eSealed.Key(), "ruler", "earth", storage.JSON{}))
+
+	runner := NewRitualRunner(NewRitualRegistry(), nil, nil, db, nil, slog.Default(), repo.RepoInfo{HasVCS: true})
+	result, err := runner.getCourtStatus(storage.EdictKey{ID: 11, Username: username, Project: project})
+	require.NoError(t, err)
+	rows, ok := result.([]map[string]interface{})
+	require.True(t, ok)
+
+	got := map[uint]string{}
+	for _, row := range rows {
+		id := uint(row["id"].(int64))
+		got[id] = row["status"].(string)
+	}
+
+	assert.Equal(t, "draft", got[10], "edict without (ruler, intent) + pending zhengming must derive draft")
+	assert.Equal(t, "intent-approved", got[11], "edict with (ruler, intent) and no running ritual must appear as intent-approved")
+	assert.Equal(t, "active", got[12], "edict with (ruler, intent) and running ritual must derive active")
+	assert.Equal(t, "blocked", got[13], "edict with (ruler, intent) and pending zhengming must derive blocked")
+	_, hasSealed := got[14]
+	assert.False(t, hasSealed, "edict with (ruler, earth) must be excluded from open court status")
+}

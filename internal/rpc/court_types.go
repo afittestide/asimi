@@ -123,6 +123,12 @@ type GrantRulerSealParams struct {
 	Notes   string `msgpack:"notes,omitempty"`
 }
 
+type GrantIntentSealParams struct {
+	EdictID    uint         `msgpack:"edict_id"`
+	MinisterID string       `msgpack:"minister_id"`
+	Metadata   storage.JSON `msgpack:"metadata,omitempty"`
+}
+
 type ListActiveEdictsResult struct {
 	Edicts []storage.ActiveEdict `msgpack:"edicts"`
 }

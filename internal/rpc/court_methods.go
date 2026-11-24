@@ -17,6 +17,7 @@ const (
 	MethodSetIntent              = "SetIntent"
 	MethodPublishEvent           = "PublishEvent"
 	MethodGrantRulerSeal         = "GrantRulerSeal"
+	MethodGrantIntentSeal        = "GrantIntentSeal"
 	MethodGetEdictSeals          = "GetEdictSeals"
 	MethodListActiveEdicts       = "ListActiveEdicts"
 	MethodListModels             = "ListModels"

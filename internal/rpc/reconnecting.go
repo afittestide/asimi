@@ -430,6 +430,20 @@ func (rc *ReconnectingClient) GrantRulerSeal(edictID uint, notes string) error {
 	return err
 }
 
+func (rc *ReconnectingClient) GrantIntentSeal(edictID uint, ministerID string, metadata storage.JSON) error {
+	client := rc.getClient()
+	if client == nil {
+		return ErrClosed
+	}
+	err := client.GrantIntentSeal(edictID, ministerID, metadata)
+	if rc.reconnectIfError(err, rc.shouldRetry) {
+		if client = rc.getClient(); client != nil {
+			return client.GrantIntentSeal(edictID, ministerID, metadata)
+		}
+	}
+	return err
+}
+
 func (rc *ReconnectingClient) CancelEdict(edictID uint) error {
 	client := rc.getClient()
 	if client == nil {

@@ -658,15 +658,16 @@ func (r *RitualRunner) getCourtStatus(key storage.EdictKey) (interface{}, error)
 SELECT
     e.id, e.session_id, e.issue_ref, e.intent, e.created_at, e.updated_at,
     CASE
-        WHEN EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.stale_at IS NULL) THEN 'sealed'
+        WHEN e.cancelled_at IS NOT NULL THEN 'cancelled'
+        WHEN EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.realm = 'earth' AND s.stale_at IS NULL) THEN 'sealed'
+        WHEN NOT EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.realm = 'intent' AND s.stale_at IS NULL) THEN 'draft'
         WHEN EXISTS (SELECT 1 FROM zhengming_requests z WHERE z.edict_id = e.id AND z.username = e.username AND z.project = e.project AND z.status = 'pending') THEN 'blocked'
-        WHEN EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'chancellor' AND s.stale_at IS NULL) THEN 'active'
-        WHEN EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'judge' AND s.stale_at IS NULL) THEN 'active'
-        ELSE 'active'
+        WHEN EXISTS (SELECT 1 FROM ritual_executions re WHERE re.edict_id = e.id AND re.username = e.username AND re.project = e.project AND re.state = 'running') THEN 'active'
+        ELSE 'intent-approved'
     END as status
 FROM edicts e
 WHERE e.username = ? AND e.project = ?
-  AND NOT EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.stale_at IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM seals s WHERE s.edict_id = e.id AND s.username = e.username AND s.project = e.project AND s.minister_id = 'ruler' AND s.realm = 'earth' AND s.stale_at IS NULL)
 ORDER BY e.updated_at DESC
 `
 	if err := r.db.Raw(query, key.Username, key.Project).Scan(&result).Error; err != nil {
@@ -754,6 +755,7 @@ func (r *RitualRunner) arrangeGetSeals(key storage.EdictKey) (interface{}, error
 		result[i] = map[string]interface{}{
 			"seal_id":     s.SealID,
 			"minister_id": s.MinisterID,
+			"realm":       s.Realm,
 			"sealed_at":   s.SealedAt,
 		}
 	}
@@ -1415,12 +1417,13 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 		// the event would seal the edict but silently leave its work unmerged
 		// on the edict branch.
 		sealService := storage.NewSealService(r.db)
-		if err := sealService.GrantSeal(thenKey, "ruler", storage.JSON{"ritual": exec.RitualName}); err != nil {
+		if err := sealService.GrantSeal(thenKey, "ruler", "earth", storage.JSON{"ritual": exec.RitualName}); err != nil {
 			return err
 		}
 		if r.publishEvent != nil {
 			r.publishEvent(thenKey, storage.EventSealGranted, storage.JSON{
 				"minister_id": "ruler",
+				"realm":       "earth",
 				"ritual":      exec.RitualName,
 			})
 		}
@@ -1553,14 +1556,14 @@ func (r *RitualRunner) runThen(ctx context.Context, exec *RitualExecution, fn st
 	case "record_judge_seal":
 		// Record the judge's seal on the edict
 		sealService := storage.NewSealService(r.db)
-		if err := sealService.GrantSeal(thenKey, "judge", storage.JSON{"ritual": exec.RitualName}); err != nil {
+		if err := sealService.GrantSeal(thenKey, "judge", "earth", storage.JSON{"ritual": exec.RitualName}); err != nil {
 			return fmt.Errorf("failed to record judge's seal: %w", err)
 		}
 		return nil
 	case "record_chancellor_seal":
 		// Record the chancellor's seal on the edict
 		sealService := storage.NewSealService(r.db)
-		if err := sealService.GrantSeal(thenKey, "chancellor", storage.JSON{"ritual": exec.RitualName}); err != nil {
+		if err := sealService.GrantSeal(thenKey, "chancellor", "earth", storage.JSON{"ritual": exec.RitualName}); err != nil {
 			return fmt.Errorf("failed to record chancellor's seal: %w", err)
 		}
 		return nil

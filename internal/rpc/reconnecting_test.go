@@ -411,6 +411,9 @@ func TestReconnectingClient_NilClientReturnsErrClosed(t *testing.T) {
 	if err := rc.GrantRulerSeal(1, ""); !errors.Is(err, ErrClosed) {
 		t.Errorf("GrantRulerSeal with nil client should return ErrClosed, got %v", err)
 	}
+	if err := rc.GrantIntentSeal(1, "ruler", nil); !errors.Is(err, ErrClosed) {
+		t.Errorf("GrantIntentSeal with nil client should return ErrClosed, got %v", err)
+	}
 	if _, err := rc.GetEdict(1); !errors.Is(err, ErrClosed) {
 		t.Errorf("GetEdict with nil client should return ErrClosed, got %v", err)
 	}
