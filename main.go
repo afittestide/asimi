@@ -154,6 +154,15 @@ func runHeadless(stdout io.Writer, startTime time.Time) int {
 	return runHeadlessMode()
 }
 
+func runHeadlessEvent(stdout, stderr io.Writer, rawEvent string, startTime time.Time) int {
+	initLogger()
+	if cli.Debug {
+		printDebugAnnouncement(stdout)
+		slog.Debug("[TIMING] initLogger() completed", "duration", time.Since(startTime))
+	}
+	return runHeadlessEventMode(stdout, stderr, rawEvent)
+}
+
 func initLogger() {
 	dir := logDir()
 	if dir == "" {
@@ -478,33 +487,18 @@ func main() {
 		slog.Debug("[TIMING] main() started", "time", startTime)
 	}
 
-	// Determine if we should run in non-interactive mode
-	// Non-interactive mode is triggered by:
+	// Determine if we should run in non-interactive mode:
 	// 1. Explicit -p flag: asimi -p "prompt here"
-	// 2. Non-interactive stdin (pipe/redirect): echo "prompt" | asimi
+	// 2. ASIMI_EVENT_JSON env var: event-driven headless mode
+	// 3. Non-interactive stdin (pipe/redirect): echo "prompt" | asimi
 	isStdinTerminal := isatty.IsTerminal(os.Stdin.Fd())
-	hasPromptArg := cli.Prompt != ""
-
-	// If no -p flag but stdin is not a terminal, read from stdin
-	if !hasPromptArg && !isStdinTerminal {
-		// Read prompt from stdin
-		var builder strings.Builder
-		buf := make([]byte, 4096)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if n > 0 {
-				builder.Write(buf[:n])
-			}
-			if err != nil {
-				break
-			}
-		}
-		cli.Prompt = strings.TrimSpace(builder.String())
-		hasPromptArg = cli.Prompt != ""
-	}
-
-	if hasPromptArg {
+	mode, arg := selectEntryMode(cli.Prompt, os.Getenv("ASIMI_EVENT_JSON"), isStdinTerminal, os.Stdin)
+	switch mode {
+	case entryHeadlessPrompt:
+		cli.Prompt = arg
 		os.Exit(runHeadless(os.Stdout, startTime))
+	case entryHeadlessEvent:
+		os.Exit(runHeadlessEvent(os.Stdout, os.Stderr, arg, startTime))
 	}
 
 	// Interactive mode
@@ -530,6 +524,44 @@ func main() {
 	}
 
 	slog.Debug("[TIMING] Total execution time", "duration", time.Since(startTime))
+}
+
+type entryMode int
+
+const (
+	entryInteractive entryMode = iota
+	entryHeadlessPrompt
+	entryHeadlessEvent
+)
+
+// selectEntryMode chooses between prompt headless mode, event headless mode,
+// piped-stdin headless mode, and interactive TUI. Explicit -p takes precedence
+// over ASIMI_EVENT_JSON, and ASIMI_EVENT_JSON is checked before reading
+// non-TTY stdin so an open stdin pipe (e.g. in containers) never blocks.
+func selectEntryMode(promptArg, eventJSON string, isStdinTerminal bool, stdin io.Reader) (entryMode, string) {
+	if promptArg != "" {
+		return entryHeadlessPrompt, promptArg
+	}
+	if eventJSON != "" {
+		return entryHeadlessEvent, eventJSON
+	}
+	if !isStdinTerminal {
+		var builder strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := stdin.Read(buf)
+			if n > 0 {
+				builder.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		if prompt := strings.TrimSpace(builder.String()); prompt != "" {
+			return entryHeadlessPrompt, prompt
+		}
+	}
+	return entryInteractive, ""
 }
 
 // atifAgentName returns the agent name for ATIF trajectory recording.

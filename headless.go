@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -108,6 +109,130 @@ func runHeadlessModeImpl() int {
 	return exitCode
 }
 
+type webhookEnvelope struct {
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
+}
+
+// parseWebhookEvent parses ASIMI_EVENT_JSON ({"headers": {...}, "body": "..."})
+// into a normalized storage.JSON payload for EventWebhookReceived.
+func parseWebhookEvent(raw string) (storage.JSON, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if obj == nil {
+		return nil, fmt.Errorf("expected a JSON object")
+	}
+
+	var env webhookEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		return nil, fmt.Errorf("invalid webhook envelope: %w", err)
+	}
+
+	var githubEvent, githubDelivery string
+	for k, v := range env.Headers {
+		switch strings.ToLower(k) {
+		case "x-github-event":
+			githubEvent = v
+		case "x-github-delivery":
+			githubDelivery = v
+		}
+	}
+
+	return storage.JSON{
+		"event_json":      raw,
+		"github_event":    githubEvent,
+		"github_delivery": githubDelivery,
+		"headers":         env.Headers,
+		"body":            env.Body,
+	}, nil
+}
+
+// runHeadlessEventMode handles event-driven headless execution when
+// ASIMI_EVENT_JSON is set. It boots the Court, waits for startup recovery,
+// publishes EventWebhookReceived, and waits for all triggered rituals to reach
+// a terminal state.
+func runHeadlessEventMode(stdout, stderr io.Writer, rawEvent string) int {
+	payload, err := parseWebhookEvent(rawEvent)
+	if err != nil {
+		fmt.Fprintf(stderr, "asimi: invalid ASIMI_EVENT_JSON: %v\n", err)
+		return 1
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var c *court.Court
+	var cfg *Config
+	var repoInfo repo.RepoInfo
+
+	app := fx.New(
+		fx.NopLogger,
+		fx.Provide(
+			ProvideLogger,
+			ProvideRepoInfo,
+			ProvideConfig,
+			ProvideStorage,
+			ProvideGormDB,
+			ProvideScheduler,
+			ProvideShellRunner,
+			ProvideCourt,
+		),
+		fx.Populate(&c, &cfg, &repoInfo),
+	)
+
+	if err := app.Start(ctx); err != nil {
+		fmt.Fprintf(stderr, "asimi: failed to start: %v\n", err)
+		return 1
+	}
+	defer app.Stop(context.Background())
+
+	if err := c.SetContext(ctx, headlessContextParams(&repoInfo)); err != nil {
+		fmt.Fprintf(stderr, "asimi: context init failed: %v\n", err)
+		return 1
+	}
+
+	sink := newHeadlessSink(c)
+	sink.handsoff = cli.Handsoff
+	sink.stdout = stdout
+	sink.eventMode = true
+
+	subCtx, cancelSub := context.WithCancel(ctx)
+	defer cancelSub()
+	events := c.Subscribe(subCtx)
+	go sink.drain(events)
+
+	watchdog := time.AfterFunc(headlessRunWatchdog, func() {
+		fmt.Fprintf(stderr, "asimi: headless watchdog fired after %s; aborting\n", headlessRunWatchdog)
+		sink.finish(1)
+	})
+	defer watchdog.Stop()
+
+	c.PublishEvent(c.CourtEdictKey(), storage.EventCourtStarted, storage.JSON{
+		"current_version": utils.AsimiVersion,
+	})
+
+	if err := c.WaitForRecovery(ctx); err != nil {
+		fmt.Fprintf(stderr, "asimi: failed waiting for recovery: %v\n", err)
+		return 1
+	}
+
+	matched := c.MatchingRituals(storage.EventWebhookReceived, payload)
+	if len(matched) == 0 {
+		githubEvent, _ := payload["github_event"].(string)
+		githubDelivery, _ := payload["github_delivery"].(string)
+		fmt.Fprintf(stdout, "asimi: no ritual matched webhook_received (github_event=%q, github_delivery=%q)\n", githubEvent, githubDelivery)
+		return 0
+	}
+
+	sink.armEventRituals(matched)
+
+	c.PublishEvent(c.CourtEdictKey(), storage.EventWebhookReceived, payload)
+
+	return sink.wait()
+}
+
 // buildSetContextParams extracts SetContextParams from repo info. Shared by
 // both the TUI (TUIModel.setContextParams) and headless mode
 // (headlessContextParams) to keep the two paths in sync. The config is not a
@@ -195,7 +320,8 @@ type headlessSink struct {
 	enactedSet         map[uint]bool // tracks edicts we've already auto-enacted
 	pendingSuggestions int           // number of edict suggestions awaiting edict creation
 	stdin              io.Reader     // for interactive zhengming prompts
-	stdout             io.Writer     // for interactive zhengming menus
+	stdout             io.Writer     // for interactive zhengming menus and ritual output
+	stderr             io.Writer     // for error output
 	streaming          bool          // true while the LLM is streaming (StreamStart→StreamComplete)
 	streamingEdictID   uint          // edict bound to the active stream, 0 when none (from StreamStartMsg)
 
@@ -210,13 +336,17 @@ type headlessSink struct {
 	// Seal-pass state (handsoff only), guarded by mu. The pass runs once when
 	// the initial ritual completes: it seals every pending-ascension edict and
 	// waits for their merge-worktree landings before the run exits.
-	mu              sync.Mutex
-	sealPassStarted bool          // the initial ritual completed and the pass was entered
-	sealPassPending bool          // the pass is still discovering/sealing and must not be exited
-	sealPassFailed  bool          // the pass could not enumerate pending edicts
-	handsoffSealed  map[uint]bool // edicts the pass sealed, awaiting a terminal landing event
-	handsoffLanded  map[uint]bool // sealed edicts whose landing reported edict_sealed
-	handsoffFailed  map[uint]bool // sealed edicts whose landing terminally failed or timed out
+	mu                  sync.Mutex
+	eventMode           bool           // true when driven by ASIMI_EVENT_JSON
+	eventRitualsArmed   bool           // true once pendingEventRituals is populated
+	pendingEventRituals map[string]int // matched ritual name -> remaining count awaiting terminal state
+	eventRitualError    bool           // true if any triggered ritual failed in eventMode
+	sealPassStarted  bool          // the initial ritual completed and the pass was entered
+	sealPassPending  bool          // the pass is still discovering/sealing and must not be exited
+	sealPassFailed   bool          // the pass could not enumerate pending edicts
+	handsoffSealed   map[uint]bool // edicts the pass sealed, awaiting a terminal landing event
+	handsoffLanded   map[uint]bool // sealed edicts whose landing reported edict_sealed
+	handsoffFailed   map[uint]bool // sealed edicts whose landing terminally failed or timed out
 }
 
 func newHeadlessSink(c *court.Court) *headlessSink {
@@ -269,13 +399,15 @@ func (s *headlessSink) handle(msg any) {
 		// edict creation hasn't landed yet, so wait rather than exit now.
 		// maybeFinish keeps this stream-phase exit mutually exclusive with
 		// the handsoff seal-pass exit.
-		if len(s.enactedSet) == 0 && s.pendingSuggestions == 0 {
+		if !s.eventMode && len(s.enactedSet) == 0 && s.pendingSuggestions == 0 {
 			s.maybeFinish()
 		}
 
 	case court.StreamErrorMsg:
-		fmt.Fprintf(os.Stderr, "\nError: %v\n", m.Err)
-		s.finish(1)
+		fmt.Fprintf(s.errOut(), "\nError: %v\n", m.Err)
+		if !s.eventMode {
+			s.finish(1)
+		}
 
 	case court.ZhengmingPendingMsg:
 		if s.handsoff {
@@ -408,13 +540,17 @@ func (s *headlessSink) handleEvent(msg court.EventNotificationMsg) {
 		}
 
 	case storage.EventRitualCompleted:
-		fmt.Printf("\n[ritual completed for edict %d]\n", msg.EdictKey.ID)
-		s.onRitualCompleted()
+		fmt.Fprintf(s.stdout, "\n[ritual completed for edict %d]\n", msg.EdictKey.ID)
+		if !s.eventMode {
+			s.onRitualCompleted()
+		}
 
 	case storage.EventRitualFailed:
 		errMsg, _ := msg.Payload["error"].(string)
 		fmt.Fprintf(os.Stderr, "\n[ritual failed for edict %d: %s]\n", msg.EdictKey.ID, errMsg)
-		s.finish(1)
+		if !s.eventMode {
+			s.finish(1)
+		}
 
 	case storage.EventEdictSealed:
 		fmt.Printf("\n[edict %d sealed — ascended to Heaven]\n", msg.EdictKey.ID)
@@ -425,29 +561,87 @@ func (s *headlessSink) handleEvent(msg court.EventNotificationMsg) {
 	}
 }
 
+func (s *headlessSink) out() io.Writer {
+	if s.stdout != nil {
+		return s.stdout
+	}
+	return os.Stdout
+}
+
+func (s *headlessSink) errOut() io.Writer {
+	if s.stderr != nil {
+		return s.stderr
+	}
+	return os.Stderr
+}
+
 // handleRitualStep processes RitualStepMsg, watching for completion/failure.
 func (s *headlessSink) handleRitualStep(msg court.RitualStepMsg) {
 	switch msg.Status {
 	case "started":
 		if msg.StepName == "" {
-			fmt.Printf("\n[ritual %s started for edict %d]\n", msg.RitualName, msg.EdictID)
+			fmt.Fprintf(s.out(), "\n[ritual %s started for edict %d]\n", msg.RitualName, msg.EdictID)
 		} else if msg.ForkItem != "" {
-			fmt.Printf("\n  %s [%s]: %s\n", msg.StepName, msg.ForkItem, msg.Message)
+			fmt.Fprintf(s.out(), "\n  %s [%s]: %s\n", msg.StepName, msg.ForkItem, msg.Message)
 		} else if msg.TotalSteps > 1 {
-			fmt.Printf("\n  step %d/%d: %s\n", msg.StepIndex+1, msg.TotalSteps, msg.StepName)
+			fmt.Fprintf(s.out(), "\n  step %d/%d: %s\n", msg.StepIndex+1, msg.TotalSteps, msg.StepName)
 		}
+	case "info":
+		fmt.Fprintln(s.out(), msg.Message)
 	case "completed":
 		if msg.Message != "" {
-			fmt.Printf("  ✓ %s\n", msg.Message)
+			fmt.Fprintf(s.out(), "  ✓ %s\n", msg.Message)
 		}
 	case "failed":
-		fmt.Printf("  ✗ Failed: %s\n", msg.StepName)
+		fmt.Fprintf(s.out(), "  ✗ Failed: %s\n", msg.StepName)
 	case "ritual_completed":
-		fmt.Printf("\n[ritual %s completed in %s]\n", msg.RitualName, msg.Message)
-		s.onRitualCompleted()
+		fmt.Fprintf(s.out(), "\n[ritual %s completed in %s]\n", msg.RitualName, msg.Message)
+		if s.eventMode {
+			s.onEventRitualDone(msg.RitualName, msg.EdictID, false)
+		} else {
+			s.onRitualCompleted()
+		}
 	case "ritual_failed":
-		fmt.Fprintf(os.Stderr, "\n[ritual %s failed: %s]\n", msg.RitualName, msg.Message)
-		s.finish(1)
+		fmt.Fprintf(s.errOut(), "\n[ritual %s failed: %s]\n", msg.RitualName, msg.Message)
+		if s.eventMode {
+			s.onEventRitualDone(msg.RitualName, msg.EdictID, true)
+		} else {
+			s.finish(1)
+		}
+	}
+}
+
+func (s *headlessSink) armEventRituals(names []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingEventRituals = make(map[string]int, len(names))
+	for _, name := range names {
+		s.pendingEventRituals[name]++
+	}
+	s.eventRitualsArmed = true
+}
+
+func (s *headlessSink) onEventRitualDone(ritualName string, edictID uint, failed bool) {
+	s.mu.Lock()
+	if !s.eventRitualsArmed || edictID != 0 || s.pendingEventRituals[ritualName] <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	if failed {
+		s.eventRitualError = true
+	}
+	s.pendingEventRituals[ritualName]--
+	if s.pendingEventRituals[ritualName] == 0 {
+		delete(s.pendingEventRituals, ritualName)
+	}
+	done := len(s.pendingEventRituals) == 0
+	exitCode := 0
+	if s.eventRitualError {
+		exitCode = 1
+	}
+	s.mu.Unlock()
+	if done {
+		s.finish(exitCode)
 	}
 }
 

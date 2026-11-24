@@ -82,6 +82,18 @@
   then:
     - the edict ascended to heaven
 
+- name: hello
+  description: "Smoke-test ritual that echoes an incoming webhook ping event"
+  triggers:
+    - event: webhook_received
+      match:
+        github_event: ping
+  steps:
+    - name: echo
+      out: |
+        hello: received webhook event={{ .github_event }} delivery={{ .github_delivery }}
+        {{ .event_json }}
+
 - name: castle-siege
   description: "A medium complexity 地 change with planning"
   inputs:

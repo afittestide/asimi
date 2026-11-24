@@ -125,6 +125,7 @@ type RitualGuard struct {
 	// recoveryMu blocks event-driven rituals during recovery prompts
 	recoveryMu       sync.RWMutex
 	recoveryComplete bool
+	recoveryDone     chan struct{}
 }
 
 // RitualGuardOpts configures a new RitualGuard.
@@ -167,6 +168,7 @@ func NewRitualGuard(opts RitualGuardOpts) *RitualGuard {
 		version:          opts.Version,
 		waitForZhengming: opts.WaitForZhengming,
 		requestZhengming: opts.RequestZhengming,
+		recoveryDone:     make(chan struct{}),
 		deliverZhengming: opts.DeliverZhengming,
 		flatlineRunners:  opts.FlatlineRunners,
 	}
@@ -214,6 +216,51 @@ func (rg *RitualGuard) Tasks() chan<- *Task {
 }
 
 // --- Event lifecycle ---
+
+func (rg *RitualGuard) markRecoveryComplete() {
+	rg.recoveryMu.Lock()
+	defer rg.recoveryMu.Unlock()
+	if !rg.recoveryComplete {
+		rg.recoveryComplete = true
+		if rg.recoveryDone != nil {
+			close(rg.recoveryDone)
+		}
+	}
+}
+
+// WaitForRecovery blocks until startup recovery completes (so event-driven
+// rituals will not be skipped by DispatchEvent) or ctx is cancelled.
+func (rg *RitualGuard) WaitForRecovery(ctx context.Context) error {
+	if rg == nil {
+		return nil
+	}
+	rg.recoveryMu.RLock()
+	if rg.recoveryComplete || rg.recoveryDone == nil {
+		rg.recoveryMu.RUnlock()
+		return nil
+	}
+	done := rg.recoveryDone
+	rg.recoveryMu.RUnlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// MatchingRituals returns the names of rituals whose triggers match eventType and payload.
+func (rg *RitualGuard) MatchingRituals(eventType storage.CourtEvent, payload storage.JSON) []string {
+	if rg == nil || rg.ritualRegistry == nil {
+		return nil
+	}
+	rituals := rg.ritualRegistry.GetByEventAndPayload(string(eventType), payload)
+	names := make([]string, 0, len(rituals))
+	for _, r := range rituals {
+		names = append(names, r.Name)
+	}
+	return names
+}
 
 // PublishEvent persists an event to the DB and sends it to the event channel.
 //
@@ -384,6 +431,14 @@ func (rg *RitualGuard) startRitual(ritualName string, key storage.EdictKey, inpu
 		exec, err := rg.ritualRunner.Start(ctx, ritualName, key, inputs, rg.notify)
 		if err != nil {
 			rg.logger.Warn("failed to start ritual", "ritual", ritualName, "error", err)
+			if rg.notify != nil {
+				rg.notify(RitualStepMsg{
+					EdictID:    key.ID,
+					RitualName: ritualName,
+					Status:     "ritual_failed",
+					Message:    err.Error(),
+				})
+			}
 			return
 		}
 		if err := rg.ritualRunner.Run(ctx, exec); err != nil {
@@ -676,7 +731,13 @@ func (rg *RitualGuard) DispatchEvent(event Event) {
 					"ritual", ritual.Name, "event", event.Type)
 				continue
 			}
-			inputs := map[string]string{"edict_id": fmt.Sprint(event.EdictKey.ID)}
+			inputs := make(map[string]string, len(event.Payload)+1)
+			for k, v := range event.Payload {
+				if s, ok := v.(string); ok {
+					inputs[k] = s
+				}
+			}
+			inputs["edict_id"] = fmt.Sprint(event.EdictKey.ID)
 			rg.startRitual(ritual.Name, event.EdictKey, inputs)
 		}
 	}

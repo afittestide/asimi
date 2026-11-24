@@ -296,11 +296,7 @@ func (rg *RitualGuard) hasPendingAbortPrompt(exec *RitualExecution) bool {
 // and prompts the user (via zhengming) to recover, mark as completed, or pass.
 // It runs at startup and sets recoveryComplete when done.
 func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
-	defer func() {
-		rg.recoveryMu.Lock()
-		rg.recoveryComplete = true
-		rg.recoveryMu.Unlock()
-	}()
+	defer rg.markRecoveryComplete()
 
 	if rg.db == nil {
 		rg.logger.Debug("no db available, skipping aborted ritual recovery")
@@ -315,9 +311,7 @@ func (rg *RitualGuard) promptForAbortedRituals(ctx context.Context) {
 	// Set recoveryComplete before the per-ritual loop so event-driven rituals
 	// are not blocked. The per-edict ritual locks serialize ritual execution, so
 	// a recovering ritual cannot conflict with itself.
-	rg.recoveryMu.Lock()
-	rg.recoveryComplete = true
-	rg.recoveryMu.Unlock()
+	rg.markRecoveryComplete()
 
 	// Retire pending abort prompts whose abort has been superseded. This runs
 	// BEFORE the aborted-execution scan below and must not be gated on it: a

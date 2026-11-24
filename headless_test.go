@@ -1158,6 +1158,303 @@ func TestLogLevelRegression_NoFlags(t *testing.T) {
 	require.Empty(t, buf.String(), "no announcement without --debug")
 }
 
+func TestHeadlessSink_HandleRitualStepInfo(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	var out bytes.Buffer
+	sink.stdout = &out
+
+	sink.handleRitualStep(court.RitualStepMsg{
+		StepName: "echo",
+		Status:   "info",
+		Message:  "hello from out step",
+	})
+
+	require.Equal(t, "hello from out step\n", out.String())
+}
+
+func TestHeadlessEventMode_MalformedJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "invalid json", raw: "{not-json"},
+		{name: "json array", raw: `["a","b"]`},
+		{name: "json null", raw: "null"},
+		{name: "non-object headers", raw: `{"headers":"bad","body":""}`},
+		{name: "non-string body", raw: `{"headers":{},"body":123}`},
+		{name: "non-string header value", raw: `{"headers":{"X-GitHub-Event":123},"body":""}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runHeadlessEventMode(&stdout, &stderr, tc.raw)
+			require.Equal(t, 1, code)
+			require.NotEmpty(t, stderr.String())
+			require.Empty(t, stdout.String())
+		})
+	}
+}
+
+func setupIsolatedEventEnv(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ASIMI_HOME", home)
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("GEMINI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+
+	origIsolated := cli.IsolatedHost
+	origHandsoff := cli.Handsoff
+	cli.IsolatedHost = true
+	cli.Handsoff = true
+	t.Cleanup(func() {
+		cli.IsolatedHost = origIsolated
+		cli.Handsoff = origHandsoff
+	})
+}
+
+func TestHeadlessEventMode_PingTriggersHello(t *testing.T) {
+	setupIsolatedEventEnv(t)
+
+	raw := `{"headers":{"X-GitHub-Event":"ping","X-GitHub-Delivery":"delivery-abc"},"body":"{\"zen\":\"keep it simple\"}"}`
+	var stdout, stderr bytes.Buffer
+	code := runHeadlessEventMode(&stdout, &stderr, raw)
+
+	require.Equal(t, 0, code, "stderr: %s", stderr.String())
+	require.Contains(t, stdout.String(), "event=ping")
+	require.Contains(t, stdout.String(), "delivery=delivery-abc")
+	require.Contains(t, stdout.String(), raw)
+}
+
+func TestHeadlessEventMode_CaseInsensitiveHeader(t *testing.T) {
+	setupIsolatedEventEnv(t)
+
+	raw := `{"headers":{"x-github-event":"ping","x-github-delivery":"delivery-lower"},"body":"{}"}`
+	var stdout, stderr bytes.Buffer
+	code := runHeadlessEventMode(&stdout, &stderr, raw)
+
+	require.Equal(t, 0, code, "stderr: %s", stderr.String())
+	require.Contains(t, stdout.String(), "event=ping")
+	require.Contains(t, stdout.String(), "delivery=delivery-lower")
+	require.Contains(t, stdout.String(), raw)
+}
+
+func TestHeadlessEventMode_UnmatchedEventExitsZero(t *testing.T) {
+	setupIsolatedEventEnv(t)
+
+	raw := `{"headers":{"X-GitHub-Event":"unknown_test_event","X-GitHub-Delivery":"delivery-999"},"body":"{}"}`
+	var stdout, stderr bytes.Buffer
+	code := runHeadlessEventMode(&stdout, &stderr, raw)
+
+	require.Equal(t, 0, code, "stderr: %s", stderr.String())
+	require.Contains(t, stdout.String(), "unknown_test_event")
+	require.Contains(t, stdout.String(), "delivery-999")
+}
+
+func TestHeadlessSink_EventModeIgnoresStreamDone(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	var out bytes.Buffer
+	sink.stdout = &out
+	sink.eventMode = true
+
+	sink.handle(court.StreamDoneMsg{ChannelID: "e0"})
+
+	select {
+	case code := <-sink.done:
+		t.Fatalf("eventMode sink exited prematurely with code %d on StreamDoneMsg", code)
+	default:
+	}
+}
+
+func TestHeadlessSink_EventModeIgnoresUnrelatedCompletionBeforeArm(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	var out bytes.Buffer
+	sink.stdout = &out
+	sink.eventMode = true
+
+	sink.handleRitualStep(court.RitualStepMsg{
+		RitualName: "dawn-audience",
+		EdictID:    0,
+		Status:     "ritual_completed",
+		Message:    "1ms",
+	})
+
+	select {
+	case code := <-sink.done:
+		t.Fatalf("eventMode sink exited prematurely with code %d on unrelated ritual_completed before matched rituals were armed", code)
+	default:
+	}
+}
+
+func TestHeadlessSink_EventModeRitualFailureExitsOne(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	var out, errBuf bytes.Buffer
+	sink.stdout = &out
+	sink.stderr = &errBuf
+	sink.eventMode = true
+	sink.armEventRituals([]string{"hello"})
+
+	sink.handleRitualStep(court.RitualStepMsg{
+		RitualName: "hello",
+		EdictID:    0,
+		Status:     "ritual_failed",
+		Message:    "boom",
+	})
+
+	select {
+	case code := <-sink.done:
+		require.Equal(t, 1, code)
+	default:
+		t.Fatal("expected eventMode sink to finish with exit code 1")
+	}
+	require.Contains(t, errBuf.String(), "boom")
+}
+
+func TestHeadlessSink_EventModeMultipleRituals(t *testing.T) {
+	t.Run("all succeed exits 0", func(t *testing.T) {
+		sink := newHeadlessSink(nil)
+		var out, errBuf bytes.Buffer
+		sink.stdout = &out
+		sink.stderr = &errBuf
+		sink.eventMode = true
+		sink.armEventRituals([]string{"hello", "audit"})
+
+		sink.handleRitualStep(court.RitualStepMsg{
+			RitualName: "hello",
+			EdictID:    0,
+			Status:     "ritual_completed",
+			Message:    "1ms",
+		})
+		select {
+		case code := <-sink.done:
+			t.Fatalf("exited early with code %d while second ritual still pending", code)
+		default:
+		}
+
+		sink.handleRitualStep(court.RitualStepMsg{
+			RitualName: "audit",
+			EdictID:    0,
+			Status:     "ritual_completed",
+			Message:    "2ms",
+		})
+		select {
+		case code := <-sink.done:
+			require.Equal(t, 0, code)
+		default:
+			t.Fatal("expected exit 0 after all matched rituals succeeded")
+		}
+	})
+
+	t.Run("one succeeds one fails exits 1", func(t *testing.T) {
+		sink := newHeadlessSink(nil)
+		var out, errBuf bytes.Buffer
+		sink.stdout = &out
+		sink.stderr = &errBuf
+		sink.eventMode = true
+		sink.armEventRituals([]string{"hello", "audit"})
+
+		sink.handleRitualStep(court.RitualStepMsg{
+			RitualName: "hello",
+			EdictID:    0,
+			Status:     "ritual_completed",
+			Message:    "1ms",
+		})
+		select {
+		case code := <-sink.done:
+			t.Fatalf("exited early with code %d while second ritual still pending", code)
+		default:
+		}
+
+		sink.handleRitualStep(court.RitualStepMsg{
+			RitualName: "audit",
+			EdictID:    0,
+			Status:     "ritual_failed",
+			Message:    "failed step",
+		})
+		select {
+		case code := <-sink.done:
+			require.Equal(t, 1, code)
+		default:
+			t.Fatal("expected exit 1 after one matched ritual failed")
+		}
+	})
+}
+
+func TestHeadlessSink_EventModeIgnoresUnrelatedWhilePending(t *testing.T) {
+	sink := newHeadlessSink(nil)
+	var out, errBuf bytes.Buffer
+	sink.stdout = &out
+	sink.stderr = &errBuf
+	sink.eventMode = true
+	sink.armEventRituals([]string{"hello"})
+
+	// Different ritual name on edict 0.
+	sink.handleRitualStep(court.RitualStepMsg{
+		RitualName: "dawn-audience",
+		EdictID:    0,
+		Status:     "ritual_completed",
+		Message:    "1ms",
+	})
+	// Same ritual name but non-zero EdictID.
+	sink.handleRitualStep(court.RitualStepMsg{
+		RitualName: "hello",
+		EdictID:    42,
+		Status:     "ritual_completed",
+		Message:    "1ms",
+	})
+	// StreamDoneMsg and StreamErrorMsg while ritual is still pending.
+	sink.handle(court.StreamDoneMsg{ChannelID: "e0"})
+	sink.handle(court.StreamErrorMsg{ChannelID: "e0", Err: io.EOF})
+
+	select {
+	case code := <-sink.done:
+		t.Fatalf("exited early with code %d on unrelated completions", code)
+	default:
+	}
+
+	sink.handleRitualStep(court.RitualStepMsg{
+		RitualName: "hello",
+		EdictID:    0,
+		Status:     "ritual_completed",
+		Message:    "3ms",
+	})
+	select {
+	case code := <-sink.done:
+		require.Equal(t, 0, code)
+	default:
+		t.Fatal("expected exit 0 once matched ritual completed")
+	}
+}
+
+func TestSelectEntryMode_EventJSONDoesNotBlockOnOpenStdin(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+
+	// ASIMI_EVENT_JSON with non-TTY open stdin pipe must not block on stdin.
+	mode, arg := selectEntryMode("", `{"headers":{},"body":""}`, false, pr)
+	require.Equal(t, entryHeadlessEvent, mode)
+	require.Equal(t, `{"headers":{},"body":""}`, arg)
+
+	// Explicit -p prompt still takes precedence over ASIMI_EVENT_JSON.
+	mode, arg = selectEntryMode("do something", `{"headers":{},"body":""}`, false, pr)
+	require.Equal(t, entryHeadlessPrompt, mode)
+	require.Equal(t, "do something", arg)
+
+	// Piped stdin without -p or ASIMI_EVENT_JSON reads prompt.
+	mode, arg = selectEntryMode("", "", false, strings.NewReader("  piped prompt \n"))
+	require.Equal(t, entryHeadlessPrompt, mode)
+	require.Equal(t, "piped prompt", arg)
+
+	// Empty closed stdin without -p or ASIMI_EVENT_JSON falls back to interactive.
+	mode, arg = selectEntryMode("", "", false, strings.NewReader(""))
+	require.Equal(t, entryInteractive, mode)
+	require.Equal(t, "", arg)
+}
+
 // TestDebugLogAnnouncement verifies the harness-visible line printed in
 // headless --debug runs, table-testing both path-resolution success and
 // failure cases.

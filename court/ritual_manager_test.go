@@ -2187,6 +2187,103 @@ func TestDispatchEvent_JudgeSealDoesNotStartMergeWorktree(t *testing.T) {
 	assert.Zero(t, n, "a judge's seal must not start merge-worktree")
 }
 
+func TestRitualGuard_WaitForRecovery(t *testing.T) {
+	rg := NewRitualGuard(RitualGuardOpts{
+		Base: &MinisterBase{logger: slog.Default()},
+	})
+
+	// Before promptForAbortedRituals runs, WaitForRecovery blocks until ctx expires.
+	shortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := rg.WaitForRecovery(shortCtx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Once promptForAbortedRituals runs, WaitForRecovery unblocks cleanly.
+	done := make(chan error, 1)
+	go func() {
+		done <- rg.WaitForRecovery(context.Background())
+	}()
+
+	rg.promptForAbortedRituals(context.Background())
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForRecovery did not unblock after promptForAbortedRituals")
+	}
+
+	// Subsequent calls return immediately.
+	assert.NoError(t, rg.WaitForRecovery(context.Background()))
+}
+
+func TestDispatchEvent_ForwardsWebhookPayloadToInputs(t *testing.T) {
+	db := setupEventTestDB(t)
+	rg := mergeWorktreeGuard(t, db)
+	builtins, err := LoadEmbeddedRituals()
+	require.NoError(t, err)
+	for _, r := range builtins {
+		if r.Name == "hello" {
+			require.NoError(t, rg.ritualRegistry.Register(r))
+		}
+	}
+	require.NoError(t, rg.ritualRegistry.Register(&RitualDef{
+		Name: "edict-id-check",
+		Triggers: []RitualTrigger{
+			{Event: string(storage.EventWebhookReceived), Filter: map[string]string{"github_event": "ping"}},
+		},
+		Steps: []RitualStep{
+			{Name: "check", Out: "edict_id={{ .edict_id }} body={{ .body }}"},
+		},
+	}))
+
+	var mu sync.Mutex
+	var infoMessages []string
+	var completedCount int
+	rg.SetNotify(func(msg any) {
+		if step, ok := msg.(RitualStepMsg); ok {
+			mu.Lock()
+			if step.Status == "info" {
+				infoMessages = append(infoMessages, step.Message)
+			} else if step.Status == "ritual_completed" {
+				completedCount++
+			}
+			mu.Unlock()
+		}
+	})
+
+	rawJSON := `{"headers":{"X-GitHub-Event":"ping","X-GitHub-Delivery":"deliv-123"},"body":"{\"zen\":\"keep it simple\"}"}`
+	rg.DispatchEvent(Event{
+		Type:     storage.EventWebhookReceived,
+		EdictKey: storage.EdictKey{ID: 0, Username: "testuser", Project: "testproject"},
+		Payload: map[string]interface{}{
+			"event_json":      rawJSON,
+			"github_event":    "ping",
+			"github_delivery": "deliv-123",
+			"headers":         map[string]string{"X-GitHub-Event": "ping"},
+			"body":            `{"zen":"keep it simple"}`,
+			"edict_id":        "999",
+		},
+	})
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(infoMessages) >= 2 && completedCount >= 2
+	}, 3*time.Second, 10*time.Millisecond, "both hello and edict-id-check rituals should emit info output and complete")
+
+	mu.Lock()
+	combined := strings.Join(infoMessages, "\n")
+	mu.Unlock()
+	assert.Contains(t, combined, "event=ping")
+	assert.Contains(t, combined, "delivery=deliv-123")
+	assert.Contains(t, combined, rawJSON)
+	assert.Contains(t, combined, "edict_id=0")
+	assert.NotContains(t, combined, "edict_id=999")
+	assert.Contains(t, combined, `body={"zen":"keep it simple"}`)
+}
+
+
 // TestMergeWorktreeTerminalFailurePublishesEvent: when the merge-worktree
 // ritual exhausts its retries, the terminal failure path publishes
 // EventWorktreeMergeFailed carrying the failure reason.

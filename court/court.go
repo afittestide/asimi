@@ -1268,6 +1268,22 @@ func (s *Court) PublishEvent(key storage.EdictKey, eventType storage.CourtEvent,
 	return s.ritualGuard.PublishEvent(key, eventType, payload)
 }
 
+// WaitForRecovery blocks until startup recovery completes or ctx is cancelled.
+func (s *Court) WaitForRecovery(ctx context.Context) error {
+	if s == nil || s.ritualGuard == nil {
+		return nil
+	}
+	return s.ritualGuard.WaitForRecovery(ctx)
+}
+
+// MatchingRituals returns the names of rituals triggered by eventType and payload.
+func (s *Court) MatchingRituals(eventType storage.CourtEvent, payload storage.JSON) []string {
+	if s == nil || s.ritualGuard == nil {
+		return nil
+	}
+	return s.ritualGuard.MatchingRituals(eventType, payload)
+}
+
 // CancelEdict marks an edict as cancelled and stops any running ritual.
 func (s *Court) CancelEdict(edictID uint) error {
 	now := time.Now()

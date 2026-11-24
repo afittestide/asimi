@@ -324,6 +324,7 @@ const (
 	// is already recorded, so without this event the seal looks like an
 	// unqualified success while the work never lands.
 	EventWorktreeMergeFailed CourtEvent = "worktree_merge_failed"
+	EventWebhookReceived     CourtEvent = "webhook_received"
 )
 
 // TianEvent represents an event in the Tian ledger
