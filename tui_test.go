@@ -10661,6 +10661,166 @@ func TestTrustSeamsLoadedMsg_UpdateForwardsTheError(t *testing.T) {
 	assert.Empty(t, mock.appliedMandates[0].Env, "an unreadable request grants no env")
 }
 
+// TestTrustDialog_ViewHidesPromptCentersAndFitsHeight verifies the e1102 layout:
+// while the trust dialog is open, the prompt is hidden, tab bar + status +
+// command line stay visible, completion overlay is suppressed, the dialog is
+// centered horizontally and vertically, and total rendered lines match m.height
+// across normal and small terminals.
+func TestTrustDialog_ViewHidesPromptCentersAndFitsHeight(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		width, height       int
+		expectVertCentered  bool
+		expectHorizCentered bool
+	}{
+		{name: "small 80x12", width: 80, height: 12},
+		{name: "narrow 50x24", width: 50, height: 24},
+		{name: "standard 80x24", width: 80, height: 24},
+		{name: "standard 80x30", width: 80, height: 30, expectVertCentered: true},
+		{name: "tall 100x40", width: 100, height: 40, expectVertCentered: true, expectHorizCentered: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, nil)
+			model.width = tc.width
+			model.height = tc.height
+			model.updateAvailable = true
+			model.configCreated = true
+			model.showCompletionDialog = true
+			model.completions.SetOptions([]string{"COMPLETION_SENTINEL_ITEM"})
+			model.commandLine.AddToast("trust-toast-check", "info", time.Minute)
+			model.trustDialog = NewTrustDialog(trustDialogSeams())
+
+			view := model.View()
+			lines := strings.Split(view, "\n")
+			assert.Equal(t, tc.height, len(lines),
+				"view height must equal terminal height %d", tc.height)
+
+			// Tab bar at top and status bar + command line at bottom must stay visible.
+			tabBar := model.tabs.RenderTabBar(tc.width)
+			require.NotEmpty(t, tabBar)
+			assert.Equal(t, strings.TrimRight(tabBar, " "), strings.TrimRight(lines[0], " "),
+				"tab bar must stay at the top")
+			assert.Equal(t, strings.TrimRight(model.status.View(), " "), strings.TrimRight(lines[len(lines)-2], " "),
+				"status bar must stay above command line")
+			assert.Contains(t, lines[len(lines)-1], "trust-toast-check",
+				"command line must stay at the bottom")
+
+			// Prompt box and completion overlay must be hidden while trust dialog is open.
+			require.NotEmpty(t, model.prompt().TextArea.Placeholder)
+			assert.NotContains(t, view, model.prompt().TextArea.Placeholder,
+				"prompt placeholder must not appear while trust dialog is open")
+			assert.NotContains(t, view, "COMPLETION_SENTINEL_ITEM",
+				"completion dialog must not overlay while trust dialog is open")
+
+			if tc.expectVertCentered {
+				// Shortened welcome + notices + seams + key hints must all appear.
+				assert.Contains(t, view, "Asimi - A sandboxed imperial court for project rulers")
+				assert.Contains(t, view, "Version:")
+				assert.Contains(t, view, ":help tutorial")
+				assert.Contains(t, view, "Update available")
+				assert.Contains(t, view, "config file created")
+				assert.Contains(t, view, "Allow this session access")
+				assert.Contains(t, view, "~/.config/gh")
+				assert.Contains(t, view, "~/.config/gcloud")
+				assert.Contains(t, view, "GOOGLE_APPLICATION_CREDENTIALS")
+				assert.Contains(t, view, "space toggle")
+
+				// Centered vertically: blank padding lines above and below the box
+				// inside the main viewport (between tab bar and status/command line).
+				firstBoxLine, lastBoxLine := -1, -1
+				for i, line := range lines {
+					if strings.Contains(line, "╭") && firstBoxLine == -1 {
+						firstBoxLine = i
+					}
+					if strings.Contains(line, "╰") {
+						lastBoxLine = i
+					}
+				}
+				require.Greater(t, firstBoxLine, 1, "dialog should have vertical padding above it")
+				require.Less(t, lastBoxLine, len(lines)-3, "dialog should have vertical padding below it")
+				assert.Empty(t, strings.TrimSpace(lines[firstBoxLine-1]),
+					"line immediately above dialog should be blank vertical padding")
+				assert.Empty(t, strings.TrimSpace(lines[lastBoxLine+1]),
+					"line immediately below dialog should be blank vertical padding")
+
+				if tc.expectHorizCentered {
+					// Centered horizontally: the top border line should have leading spaces.
+					assert.True(t, strings.HasPrefix(lines[firstBoxLine], " "),
+						"dialog border should be horizontally centered with leading spaces")
+				}
+			}
+		})
+	}
+}
+
+// TestTrustDialog_RenderKeyHints verifies the bottom keybinding hint line for
+// both readable and unreadable trust dialogs, and notice flag propagation (e1102).
+func TestTrustDialog_RenderKeyHints(t *testing.T) {
+	readable := NewTrustDialog(trustDialogSeams()).Render(80)
+	assert.Contains(t, readable, "↑/↓ move · space toggle · w rw/ro · a allow all · enter confirm · esc deny")
+	assert.Contains(t, readable, "Asimi - A sandboxed imperial court for project rulers")
+	assert.NotContains(t, readable, "Update available")
+	assert.NotContains(t, readable, "config file created")
+
+	unreadable := NewUnreadTrustDialog(errors.New("rpc: peer disconnected")).Render(80)
+	assert.Contains(t, unreadable, "enter/esc dismiss")
+	assert.NotContains(t, unreadable, "allow all")
+	assert.NotContains(t, unreadable, "Allow all")
+
+	// openTrustDialog must propagate update/config notice flags for both readable and unreadable dialogs.
+	m := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, nil)
+	m.court = &mockCourtClient{}
+	m.updateAvailable = true
+	m.configCreated = true
+	m.openTrustDialog(trustDialogSeams(), nil)
+	require.NotNil(t, m.trustDialog)
+	rendered := m.trustDialog.Render(80)
+	assert.Contains(t, rendered, "Update available")
+	assert.Contains(t, rendered, "config file created")
+
+	m.openTrustDialog(nil, errors.New("rpc: peer disconnected"))
+	require.NotNil(t, m.trustDialog)
+	unreadRendered := m.trustDialog.Render(80)
+	assert.Contains(t, unreadRendered, "Update available")
+	assert.Contains(t, unreadRendered, "config file created")
+	assert.Contains(t, unreadRendered, "enter/esc dismiss")
+}
+
+// TestTrustDialog_DismissingAlsoDismissesWelcome verifies that pressing enter
+// or esc on either a readable or unreadable trust dialog dismisses the welcome
+// state and restores the prompt box so the user lands directly in chat (e1102).
+func TestTrustDialog_DismissingAlsoDismissesWelcome(t *testing.T) {
+	for _, unread := range []bool{false, true} {
+		for _, key := range []string{"enter", "esc"} {
+			name := key
+			if unread {
+				name = "unread_" + key
+			}
+			t.Run(name, func(t *testing.T) {
+				model := NewTUIModel(mockConfig(), nil, nil, nil, nil, nil, nil, nil)
+				model.width = 100
+				model.height = 40
+				if unread {
+					model.trustDialog = NewUnreadTrustDialog(errors.New("rpc: peer disconnected"))
+				} else {
+					model.trustDialog = NewTrustDialog(trustDialogSeams())
+				}
+				require.True(t, model.tabs.IsWelcome())
+
+				updated, _, handled := model.handleTrustDialogKey(key)
+				require.True(t, handled)
+				u := updated.(TUIModel)
+				assert.Nil(t, u.trustDialog)
+				assert.False(t, u.tabs.IsWelcome(), "welcome should be dismissed when trust dialog closes")
+
+				postView := u.View()
+				assert.Contains(t, postView, u.prompt().TextArea.Placeholder,
+					"prompt box must reappear after trust dialog closes")
+			})
+		}
+	}
+}
+
 // TestTrustSeamsLoadedMsg_UpdateOpensTheChooser is the success half: a clean
 // read with seams opens the chooser and applies NOTHING until the Ruler
 // answers — a request is not a grant.

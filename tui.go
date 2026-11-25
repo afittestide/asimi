@@ -4517,20 +4517,26 @@ func (m TUIModel) View() string {
 		return "Initializing..."
 	}
 
-	// Update prompt dimensions based on content before rendering
-	// This ensures the prompt grows to 10 lines when multiline (#31)
-	// SetWidth ensures the active tab's prompt matches the terminal width
-	// (prompts are per-tab, but only the active one is sized on WindowSizeMsg)
-	m.prompt().SetScreenHeight(m.height)
-	m.prompt().SetWidth(m.width - 2)
-	promptHeight := m.prompt().CalculateDesiredHeight()
-	m.prompt().SetHeight(promptHeight)
-	promptWithBorder := promptHeight + 2
-
-	// Recalculate content height based on new prompt height
 	commandLineHeight := 1
 	statusHeight := 1
 	tabBarHeight := m.tabs.TabBarHeight()
+
+	var promptWithBorder int
+	var promptView string
+	if m.trustDialog == nil {
+		// Update prompt dimensions based on content before rendering
+		// This ensures the prompt grows to 10 lines when multiline (#31)
+		// SetWidth ensures the active tab's prompt matches the terminal width
+		// (prompts are per-tab, but only the active one is sized on WindowSizeMsg)
+		m.prompt().SetScreenHeight(m.height)
+		m.prompt().SetWidth(m.width - 2)
+		promptHeight := m.prompt().CalculateDesiredHeight()
+		m.prompt().SetHeight(promptHeight)
+		promptWithBorder = promptHeight + 2
+		promptView = m.prompt().View()
+	}
+
+	// Recalculate content height based on new prompt height
 	contentHeight := m.height - commandLineHeight - statusHeight - promptWithBorder - tabBarHeight
 	if contentHeight < 0 {
 		contentHeight = 0
@@ -4542,10 +4548,9 @@ func (m TUIModel) View() string {
 		modalHeight = lipgloss.Height(m.modal.Render())
 	}
 	mainContent := m.renderMainContent(modalHeight)
-	promptView := m.prompt().View()
 	commandLineView := m.commandLine.View()
 	view := m.composeBaseView(mainContent, promptView, commandLineView)
-	if m.showCompletionDialog {
+	if m.showCompletionDialog && m.trustDialog == nil {
 		view = m.overlayCompletionDialog(view, promptView, commandLineView)
 	}
 
@@ -4558,11 +4563,18 @@ func (m TUIModel) renderMainContent(modalHeight int) string {
 	// Account for prompt, status, vi mode/toast line, and command line dynamically
 	commandLineHeight := 1
 	statusHeight := 1
-	promptWithBorder := m.prompt().Height + 2
+	promptWithBorder := 0
+	if m.trustDialog == nil {
+		promptWithBorder = m.prompt().Height + 2
+	}
 	tabBarHeight := m.tabs.TabBarHeight()
 	contentHeight := m.height - commandLineHeight - statusHeight - promptWithBorder - tabBarHeight - modalHeight
 	if contentHeight < 0 {
 		contentHeight = 0
+	}
+
+	if m.trustDialog != nil {
+		return m.renderTrustDialog(m.width, contentHeight)
 	}
 
 	// First check if we're viewing help/models/resume - these take precedence
@@ -4597,10 +4609,6 @@ func (m TUIModel) composeBaseView(mainContent, promptView, commandLineView strin
 	if m.modal != nil {
 		modalRender := m.modal.Render()
 		layoutParts = append(layoutParts, modalRender, "")
-	}
-
-	if m.trustDialog != nil {
-		layoutParts = append(layoutParts, m.renderTrustDialog(), "")
 	}
 
 	if promptView != "" {

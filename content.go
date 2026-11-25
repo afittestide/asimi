@@ -133,88 +133,66 @@ func (tm *TabManager) DismissWelcome() {
 	tm.activeTab = 0
 }
 
-// renderWelcome renders the welcome screen shown before the user starts interacting.
-func (tm *TabManager) renderWelcome(width, height int) string {
-
+// renderWelcomeHeader renders the compact welcome block shared by the
+// standalone welcome screen and the launch-time trust dialog.
+func renderWelcomeHeader(width int, updateAvail, configCreated bool) string {
 	titleStyle := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(globalTheme.PromptBorder).
 		Align(lipgloss.Center).
 		Width(width)
 
-	title := titleStyle.Render("Asimi - A sandboxed imperial court for project rulers")
-
 	versionStyle := lipgloss.NewStyle().
 		Foreground(globalTheme.DimTextColor).
 		Align(lipgloss.Center).
 		Width(width)
 
-	versionDisplay := versionStyle.Render("Version: " + utils.AsimiVersion)
-
-	commands := []string{
-		"▶ vi-like UI",
-		"▶ Starts in INSERT mode (press ESC for NORMAL)",
-		"▶ Prompt using the royal 'We'",
-		"▶ `:qa` to quit all tabs and exit",
-		"▶ `CTRL-C` to stop the model, twice to exit",
-		"▶ `ESC` to switch modes",
-		"▶ `:help tutorial` for the tutorial",
-		"▶ `CTRL-B/F` to scroll the chat",
-		"▶ `:!uname` to run uname in the sandbox's shell",
-		"⇒ `TAB` to switch tabs",
-	}
-
-	commandStyle := lipgloss.NewStyle().
+	hintStyle := lipgloss.NewStyle().
 		Foreground(globalTheme.ChatBorder).
-		PaddingLeft(2)
-
-	subStyle := lipgloss.NewStyle().
-		Foreground(globalTheme.TextColor).
 		Align(lipgloss.Center).
 		Width(width)
 
-	var commandViews []string
-	for _, command := range commands {
-		commandViews = append(commandViews, commandStyle.Render(command))
+	parts := []string{
+		titleStyle.Render("Asimi - A sandboxed imperial court for project rulers"),
+		versionStyle.Render("Version: " + utils.AsimiVersion),
 	}
 
-	contentParts := []string{
-		subStyle.Render("🎂  Happy 50th Birthday to visual mode  🎂")}
-
-	contentParts = append(contentParts, lipgloss.JoinVertical(
-		lipgloss.Left, commandViews...))
-
-	if tm.getUpdateAvail != nil && tm.getUpdateAvail() {
+	if updateAvail {
 		updateStyle := lipgloss.NewStyle().
 			Bold(true).
 			Foreground(globalTheme.SuccessColor).
 			Align(lipgloss.Center).
 			Width(width)
-		contentParts = append(contentParts,
+		parts = append(parts,
 			updateStyle.Render("🚀 Update available! Run :update to install the latest version"))
 	}
-	if tm.getConfigCreated != nil && tm.getConfigCreated() {
+	if configCreated {
 		configStyle := lipgloss.NewStyle().
 			Bold(true).
 			Foreground(globalTheme.InfoColor).
 			Align(lipgloss.Center).
 			Width(width)
-		contentParts = append(contentParts,
+		parts = append(parts,
 			configStyle.Render("📝 User's config file created at ~/.config/asimi/asimi.conf"))
 	}
 
-	contentParts = append([]string{title, versionDisplay}, contentParts...)
+	parts = append(parts, hintStyle.Render("vi-like UI (INSERT/ESC) · :help tutorial · :qa to quit all tabs"))
 
-	content := lipgloss.JoinVertical(lipgloss.Center, contentParts...)
+	return lipgloss.JoinVertical(lipgloss.Center, parts...)
+}
 
-	container := lipgloss.NewStyle().
+// renderWelcome renders the welcome screen shown before the user starts interacting.
+func (tm *TabManager) renderWelcome(width, height int) string {
+	updateAvail := tm.getUpdateAvail != nil && tm.getUpdateAvail()
+	configCreated := tm.getConfigCreated != nil && tm.getConfigCreated()
+	content := renderWelcomeHeader(width, updateAvail, configCreated)
+
+	return lipgloss.NewStyle().
 		Width(width).
 		Height(height).
 		MaxHeight(height). // Truncate when content overflows allocated height
 		Align(lipgloss.Center, lipgloss.Center).
 		Render(content)
-
-	return container
 }
 
 // StreamingChat returns the ChatComponent receiving stream data.

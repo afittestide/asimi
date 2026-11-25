@@ -94,6 +94,8 @@ func (m *TUIModel) openTrustDialog(seams []config.Seam, loadErr error) tea.Cmd {
 		slog.Warn("failed to read the requested host assets", "error", loadErr)
 		m.commandLine.AddToast(fmt.Sprintf("Trust: could not read the requested host assets (%v); the restrictive mandate applies", loadErr), "error", 5*time.Second)
 		m.trustDialog = NewUnreadTrustDialog(loadErr)
+		m.trustDialog.updateAvail = m.updateAvailable
+		m.trustDialog.configCreated = m.configCreated
 		return m.applyMandate(restrictiveSelections())
 	}
 	// A genuinely empty request has nothing to choose. A chooser with no
@@ -106,6 +108,8 @@ func (m *TUIModel) openTrustDialog(seams []config.Seam, loadErr error) tea.Cmd {
 		return m.applyMandate(restrictiveSelections())
 	}
 	m.trustDialog = NewTrustDialog(seams)
+	m.trustDialog.updateAvail = m.updateAvailable
+	m.trustDialog.configCreated = m.configCreated
 	return nil
 }
 
@@ -159,6 +163,7 @@ func (m TUIModel) handleTrustDialogKey(keyStr string) (tea.Model, tea.Cmd, bool)
 		sel := d.Selections()
 		grants := d.GrantedCount()
 		m.trustDialog = nil
+		m.tabs.DismissWelcome()
 		if d.LoadErr() != nil {
 			// The restrictive mandate was already applied when the read failed;
 			// there is nothing to add and nothing to answer.
@@ -169,6 +174,7 @@ func (m TUIModel) handleTrustDialogKey(keyStr string) (tea.Model, tea.Cmd, bool)
 		return m, m.applyMandate(sel), true
 	case "esc":
 		m.trustDialog = nil
+		m.tabs.DismissWelcome()
 		if d.LoadErr() != nil {
 			return m, nil, true
 		}
@@ -179,19 +185,33 @@ func (m TUIModel) handleTrustDialogKey(keyStr string) (tea.Model, tea.Cmd, bool)
 	return m, nil, true
 }
 
-// renderTrustDialog renders the dialog as a modal above the prompt.
-func (m TUIModel) renderTrustDialog() string {
-	if m.trustDialog == nil {
+// renderTrustDialog renders the dialog centered inside the main viewport.
+func (m TUIModel) renderTrustDialog(width, height int) string {
+	if m.trustDialog == nil || width <= 0 || height <= 0 {
 		return ""
 	}
-	width := m.width - 8
-	if width < 40 {
-		width = 60
+	m.trustDialog.updateAvail = m.trustDialog.updateAvail || m.updateAvailable
+	m.trustDialog.configCreated = m.trustDialog.configCreated || m.configCreated
+
+	innerWidth := width - 8
+	if innerWidth > 76 {
+		innerWidth = 76
 	}
-	body := m.trustDialog.Render(width)
+	if innerWidth < 40 {
+		innerWidth = width - 6
+	}
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+
+	body := m.trustDialog.Render(innerWidth)
 	style := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(globalTheme.Warning).
-		Padding(1, 2)
-	return style.Render(body)
+		Padding(1, 2).
+		MaxWidth(width).
+		MaxHeight(height)
+	boxed := style.Render(body)
+	placed := lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, boxed)
+	return lipgloss.NewStyle().MaxHeight(height).Render(placed)
 }

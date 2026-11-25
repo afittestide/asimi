@@ -47,6 +47,10 @@ type TrustDialog struct {
 	// second is not a chooser at all — nothing may be granted and the dialog
 	// must say why (edict 1036).
 	loadErr error
+
+	// Optional welcome notice flags folded into the dialog header.
+	updateAvail   bool
+	configCreated bool
 }
 
 // NewTrustDialog builds a dialog over the requested seams. Every seam starts
@@ -243,9 +247,12 @@ func (d *TrustDialog) Render(width int) string {
 	}
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(globalTheme.Warning)
 	hintStyle := lipgloss.NewStyle().Foreground(globalTheme.TextColor)
+	dimStyle := lipgloss.NewStyle().Foreground(globalTheme.DimTextColor)
 	cursorStyle := lipgloss.NewStyle().Foreground(globalTheme.SuccessColor).Bold(true)
 
 	var b strings.Builder
+	b.WriteString(renderWelcomeHeader(width, d.updateAvail, d.configCreated))
+	b.WriteString("\n\n")
 	b.WriteString(titleStyle.Render("Allow this session access"))
 	b.WriteString("\n")
 	b.WriteString(hintStyle.Render("The following requested host assets are up for your answer:"))
@@ -310,6 +317,13 @@ func (d *TrustDialog) Render(width int) string {
 
 	cwd, _ := os.Getwd()
 	b.WriteString(hintStyle.Render("  [x] Read-write access to " + cwd))
+	b.WriteString("\n\n")
+
+	if d.loadErr != nil {
+		b.WriteString(dimStyle.Render("enter/esc dismiss"))
+	} else {
+		b.WriteString(dimStyle.Render("↑/↓ move · space toggle · w rw/ro · a allow all · enter confirm · esc deny"))
+	}
 
 	b.WriteString("\n")
 	return b.String()

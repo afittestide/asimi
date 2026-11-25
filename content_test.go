@@ -149,13 +149,17 @@ func TestTabManager_RenderWelcome(t *testing.T) {
 
 	view := tm.renderWelcome(80, 24)
 	assert.NotEmpty(t, view)
-	assert.Contains(t, view, "Asimi")
+	assert.Contains(t, view, "Asimi - A sandboxed imperial court for project rulers")
+	assert.Contains(t, view, "Version:")
 	assert.Contains(t, view, "INSERT")
 	// The welcome screen advertises :qa to quit all tabs (e744).
 	assert.Contains(t, view, ":qa")
 	assert.Contains(t, view, "quit all tabs")
 	// The tutorial hint must be advertised now that :help tutorial works.
 	assert.Contains(t, view, ":help tutorial")
+	// Shortened welcome drops the birthday banner and verbose bullet list (e1102).
+	assert.NotContains(t, view, "Happy 50th Birthday")
+	assert.NotContains(t, view, "Prompt using the royal")
 }
 
 func TestTabManager_RenderWelcome_UpdateAvailable(t *testing.T) {
