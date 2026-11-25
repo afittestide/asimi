@@ -45,10 +45,9 @@ const (
 	// explicit Selections.HostExec can grant it (edict 1036, seam 7).
 	SeamHostExec SeamKind = "host_exec"
 	// SeamMCPServer is an unsandboxed stdio MCP server subprocess spawned on
-	// the host (edict 661, seam 9). Like SeamHostExec, it executes outside the
-	// podman sandbox and can read host environment variables, so it is off by
-	// default, excluded from "Allow all", and only granted by an explicit
-	// Selections.MCPServers[id] entry.
+	// the host (edict 661, seam 9). It starts off by default and is stripped
+	// under RestrictiveMandate; it is granted either by an explicit
+	// Selections.MCPServers[id] entry or via Selections.AllowAll.
 	SeamMCPServer SeamKind = "mcp_server"
 )
 
@@ -129,8 +128,8 @@ type Selections struct {
 	// command is refused (edict 1036, seam 7).
 	HostExec bool
 	// MCPServers grants unsandboxed stdio MCP server subprocesses on the host
-	// (server ID -> granted, edict 661). Like HostExec, MCP servers are off by
-	// default and excluded from AllowAll.
+	// (server ID -> granted, edict 661). Off by default and stripped under
+	// RestrictiveMandate; also granted when AllowAll is true.
 	MCPServers map[string]bool
 }
 
@@ -260,15 +259,15 @@ func BuildMandate(ownerPID int, requested *Config, sel Selections) *Mandate {
 	grants = append(grants, Grant{Kind: SeamHostExec, Target: SeamHostRunner, Granted: sel.HostExec})
 
 	// MCP servers (edict 661) execute unsandboxed on the host via stdio and
-	// can read host env vars. Like SeamHostExec, they are off by default,
-	// excluded from AllowAll, and stripped unless explicitly granted by ID.
+	// can read host env vars. They are off by default and stripped unless
+	// granted by ID or via AllowAll; RestrictiveMandate grants zero servers.
 	mcpServers := make([]MCPServerConfig, 0, len(requested.MCP.Servers))
 	for _, srv := range requested.MCP.Servers {
 		id := strings.TrimSpace(srv.ID)
 		if id == "" {
 			continue
 		}
-		if !sel.MCPServers[id] {
+		if !sel.AllowAll && !sel.MCPServers[id] {
 			grants = append(grants, Grant{Kind: SeamMCPServer, Target: id, Granted: false})
 			continue
 		}
