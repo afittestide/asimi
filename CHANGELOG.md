@@ -11,15 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`review-contribution` built-in ritual** — reviews a foreign contributor's GitHub pull request (`pr` input) without checking out or executing untrusted code: the Judge reviews correctness, test coverage, and build/CI safety, the Chancellor checks adherence to the Imperial Code, and the Secretary synthesizes both reports to post an atomic GitHub review (`APPROVE` or `REQUEST_CHANGES`) with inline diff comments (0bb5c5fa4)
 - **The Ruler's Guide (mdBook)** — added a structured, multi-chapter user guide under `intent/guides/ruler/` covering the Court, getting started, edicts, lings, rituals, zhengming, the TUI, models, configuration, and troubleshooting, linked from `README.md` with a `just serve-book <name>` recipe for live preview (e252441e8)
+- **MCP support (`stdio`-only) and general `propose` tool** — Bifrost-native `stdio` MCP client integration with project `[[mcp.servers]]` gated in the launch-time trust dialog (`SeamMCPServer`), isolated Minister of Rites classification into Three Realms permissions, a general `propose` tool for Ruler sealing, persisted `mcp_tool_classifications` cache with cross-project reuse (`schema_hash` + `command_hash`, `---------` sealed deny), live-session permission gating, and daemon RPC status (e661)
+- **Event-driven headless mode via `ASIMI_EVENT_JSON` and builtin `hello` ritual** — running `asimi --isolated-host --handsoff` with `ASIMI_EVENT_JSON` set parses the webhook envelope, publishes `webhook_received` after recovery completes, forwards payload fields into triggered ritual inputs, prints `out:` step output to stdout, and ships a deterministic builtin `hello` ritual matching `X-GitHub-Event: ping` (e1093)
+- **Transient scratchpad buffer on `Session`** — ritual step context and retry/rejection notes are injected via a transient scratchpad buffer on sessions for court history visibility without polluting persisted chat history (e723)
 
 ### Changed
 
 - **`[court]` ling settings unified into `max_parallel_lings`** — replaced `ling_ignition_enabled` and `ling_parallelism` with a single `[court] max_parallel_lings` integer (`0` disables automatic ling ignition by default; `N > 0` runs up to `N` ready lings concurrently in the edict's worktree), and removed the unused legacy `ritual_timeout` config field (e1088)
+- **Per-realm seal chain (`intent` vs `earth`) and six derived edict statuses** — split seals by realm (`intent` for `chancellor -> ruler`, `earth` for `judge -> chancellor -> ruler`) with a v8-to-v9 migration; expanded derived edict statuses to `draft`, `intent-approved`, `active` (ritual running), `blocked`, `sealed`, and `cancelled`, and wired the TUI to prompt for Ruler intent approval when `(chancellor, intent)` is granted (e713)
 
 ### Fixed
 
 - **All `[court]` config fields wired into Court construction** — both standalone (`ProvideCourt`) and daemon (`createCourt`) Court constructors previously cherry-picked only a subset of `[court]` settings and silently dropped fields like `step_idle_timeout` and ling configuration; they now forward all `[court]` fields via `CourtConfig.Resolved`, while keeping `project` checkout-derived and `isolated_host` caller-verified (e1088)
 - **`list_edicts` filtered by derived status after `LIMIT`** — filtered queries (such as `status="cancelled"` or `status="sealed"`) previously truncated to the newest `limit` rows before checking derived status, falsely reporting "none match" when matches lay beyond the limit, and reported the limit as `in_scope`; `list_edicts` now resolves and filters across the full scope before applying `limit` and reports the true scope size in `in_scope` (e1080)
+- **`castle-siege` 0-ling retry deadlock** — routed Judge and Chancellor failures back to `strategizing` when no lings exist instead of deadlocking on an empty forging retry loop (e1099)
+
+### Removed
+
+- **Obsolete in-repo `nvim/` files** — removed the legacy `nvim/` plugin docs, loader, and test stubs ahead of the standalone `asimi.nvim` track (c9ededb74)
 
 ### Developer tooling
 
