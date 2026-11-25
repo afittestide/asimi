@@ -808,3 +808,209 @@ func TestGO20266911AcceptanceBasisStillHolds(t *testing.T) {
 	assert.Contains(t, defaultConf, "GO-2026-6911",
 		"default.conf must document the stdio-only MCP restriction citing GO-2026-6911")
 }
+
+// TestRootDockerfileCloudRunContract guards e1094: the root Dockerfile builds a
+// multi-arch, non-root Cloud Run runtime image whose Go builder stays in lockstep
+// with go.mod, whose .dockerignore keeps vendor/ available for -mod=vendor, and
+// whose entrypoint and env defaults do not interfere with Cloud Run ADC.
+func TestRootDockerfileCloudRunContract(t *testing.T) {
+	dockerfile := readRootFile(t, "Dockerfile")
+	var codeLines []string
+	for _, line := range strings.Split(dockerfile, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		codeLines = append(codeLines, line)
+	}
+	code := strings.Join(codeLines, "\n")
+
+	wantGo := goModToolchain(t, readRootFile(t, "go.mod"))
+	fromMatch := regexp.MustCompile(`(?m)^FROM\s+--platform=\$BUILDPLATFORM\s+golang:(\d+\.\d+(?:\.\d+)?)-bookworm\s+AS\s+builder`).FindStringSubmatch(code)
+	require.Len(t, fromMatch, 2, "Dockerfile builder must use `FROM --platform=$BUILDPLATFORM golang:<ver>-bookworm AS builder`")
+	gotGo, err := semver.ParseTolerant(fromMatch[1])
+	require.NoError(t, err, "parse builder Go version %q", fromMatch[1])
+	assert.True(t, gotGo.EQ(wantGo), "Dockerfile Go builder %s must match go.mod %s", gotGo, wantGo)
+
+	// BuildKit injects TARGETOS and TARGETARCH into the global scope; redeclaring
+	// them with a default value (e.g. `ARG TARGETARCH=amd64`) overrides the
+	// global automatic platform arg in BuildKit's dispatchArg and silently embeds
+	// an amd64 binary into the linux/arm64 image. They must be bare declarations,
+	// with fallback defaults applied in the shell expansion instead.
+	var bareTargetOS, bareTargetArch bool
+	for _, line := range codeLines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "ARG") {
+			continue
+		}
+		for _, tok := range fields[1:] {
+			switch tok {
+			case "TARGETOS":
+				bareTargetOS = true
+			case "TARGETARCH":
+				bareTargetArch = true
+			}
+			assert.False(t, strings.HasPrefix(tok, "TARGETOS="),
+				"Dockerfile must declare bare `ARG TARGETOS` without a default value (got %q), otherwise BuildKit overrides the automatic platform arg", tok)
+			assert.False(t, strings.HasPrefix(tok, "TARGETARCH="),
+				"Dockerfile must declare bare `ARG TARGETARCH` without a default value (got %q), otherwise BuildKit overrides the automatic platform arg and breaks linux/arm64 builds", tok)
+		}
+	}
+	assert.True(t, bareTargetOS, "builder must declare bare `ARG TARGETOS`")
+	assert.True(t, bareTargetArch, "builder must declare bare `ARG TARGETARCH`")
+
+	assert.Regexp(t, `CGO_ENABLED=0\s+GOOS=\$\{TARGETOS:-linux\}\s+GOARCH=\$\{TARGETARCH:-amd64\}`, code,
+		"builder must cross-compile statically with shell fallback defaults GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64}")
+	assert.Contains(t, code, "-mod=vendor", "builder must compile offline with -mod=vendor")
+	assert.Contains(t, code, "-tags containers_image_openpgp", "builder must pass -tags containers_image_openpgp")
+
+	assert.Regexp(t, `(?m)^FROM\s+debian:(?:bookworm|trixie)-slim\b`, code,
+		"runtime stage must use a minimal multi-arch Debian slim base image")
+	assert.Contains(t, code, "COPY --from=builder /out/asimi /usr/local/bin/asimi",
+		"runtime stage must copy only the compiled binary from builder")
+	for _, pkg := range []string{"ca-certificates", "git", "curl"} {
+		assert.Contains(t, code, pkg, "runtime stage must install %q", pkg)
+	}
+	assert.Contains(t, code, "/var/lib/apt/lists/*", "runtime stage must clean apt lists")
+	assert.Contains(t, code, `org.opencontainers.image.source="https://github.com/afittestide/asimi"`,
+		"runtime image must declare OCI source label so GHCR links the package")
+	assert.Contains(t, code, `org.opencontainers.image.licenses="MIT"`,
+		"runtime image must declare OCI license label")
+	assert.Regexp(t, `(?m)^WORKDIR\s+/workspace\b`, code,
+		"runtime image must set WORKDIR /workspace")
+	assert.Regexp(t, `(?m)^ENV\s+ASIMI_HOME=/tmp/asimi\b`, code,
+		"runtime image must default ASIMI_HOME=/tmp/asimi for ephemeral writable storage")
+	userMatch := regexp.MustCompile(`(?m)^USER\s+(\S+)`).FindStringSubmatch(code)
+	require.Len(t, userMatch, 2, "runtime image must declare a USER instruction")
+	assert.NotEqual(t, "root", userMatch[1], "runtime image must run as a non-root user")
+	assert.NotEqual(t, "0", userMatch[1], "runtime image must not run as UID 0")
+	assert.Contains(t, code, `ENTRYPOINT ["asimi", "--isolated-host", "--handsoff"]`,
+		"runtime image must keep the headless isolated-host entrypoint contract")
+	assert.NotRegexp(t, `(?m)^ENV\s+.*\b(GOOGLE_APPLICATION_CREDENTIALS|ASIMI_PROVIDER|ASIMI_MODEL|GOOGLE_CLOUD_PROJECT|GOOGLE_CLOUD_REGION)\b`, code,
+		"Dockerfile must not hardcode Cloud Run ADC or Vertex provider env vars")
+
+	ignoreSet := map[string]bool{}
+	for _, line := range strings.Split(readRootFile(t, ".dockerignore"), "\n") {
+		entry := strings.TrimSpace(line)
+		if entry == "" || strings.HasPrefix(entry, "#") {
+			continue
+		}
+		ignoreSet[entry] = true
+	}
+	assert.False(t, ignoreSet["vendor"] || ignoreSet["vendor/"],
+		".dockerignore must not exclude vendor/ because Dockerfile builds with -mod=vendor")
+	for _, excluded := range []string{".git", ".agents/worktrees", "heaven", "jobs", "dist", ".gocache", "asimi", "asimi_linux", "*.log", "*.sqlite*"} {
+		assert.True(t, ignoreSet[excluded], ".dockerignore must exclude %q from the build context", excluded)
+	}
+}
+
+// TestCIDockerPublishJob guards e1094: .github/workflows/ci.yml must remain
+// valid YAML, keep `test` and `goreleaser`, and delegate image publishing to
+// the reusable .github/workflows/publish-image.yml workflow after `test`
+// passes. The reusable workflow must support both `workflow_call` and
+// `workflow_dispatch`, and enforce a build-only guard (no GHCR login or push)
+// on pull requests and non-main branches.
+func TestCIDockerPublishJob(t *testing.T) {
+	type workflowJob struct {
+		Name        string            `yaml:"name"`
+		Needs       any               `yaml:"needs"`
+		If          string            `yaml:"if"`
+		RunsOn      string            `yaml:"runs-on"`
+		Uses        string            `yaml:"uses"`
+		Permissions map[string]string `yaml:"permissions"`
+		Steps       []struct {
+			Name string            `yaml:"name"`
+			If   string            `yaml:"if"`
+			Uses string            `yaml:"uses"`
+			With map[string]string `yaml:"with"`
+		} `yaml:"steps"`
+	}
+	type workflowFile struct {
+		Name string                 `yaml:"name"`
+		On   map[string]any         `yaml:"on"`
+		Jobs map[string]workflowJob `yaml:"jobs"`
+	}
+
+	var ci workflowFile
+	require.NoError(t,
+		yaml.Unmarshal([]byte(readRootFile(t, ".github/workflows/ci.yml")), &ci),
+		".github/workflows/ci.yml must be valid YAML")
+
+	_, hasTest := ci.Jobs["test"]
+	assert.True(t, hasTest, "ci.yml must keep the existing `test` job")
+	_, hasRelease := ci.Jobs["goreleaser"]
+	assert.True(t, hasRelease, "ci.yml must keep the existing `goreleaser` job")
+	_, hasLegacyDocker := ci.Jobs["docker"]
+	assert.False(t, hasLegacyDocker, "ci.yml must extract the legacy `docker` job into publish-image.yml")
+
+	ciJob, ok := ci.Jobs["publish-image"]
+	require.True(t, ok, "ci.yml must define a `publish-image` job")
+	assert.Equal(t, "Publish Image", ciJob.Name)
+	assert.Equal(t, "test", ciJob.Needs, "publish-image job must depend on `test` so broken commits never publish")
+	assert.Equal(t, "./.github/workflows/publish-image.yml", ciJob.Uses,
+		"publish-image job must call the reusable publish-image.yml workflow")
+	assert.Empty(t, ciJob.Steps, "reusable workflow caller job must not define inline steps")
+	assert.Contains(t, ciJob.If, "pull_request", "publish-image job must validate pull requests")
+	assert.Contains(t, ciJob.If, "refs/heads/main", "publish-image job must run on main pushes")
+	assert.Contains(t, ciJob.If, "refs/tags/v", "publish-image job must run on v* tag pushes")
+	assert.Equal(t, map[string]string{
+		"contents": "read",
+		"packages": "write",
+	}, ciJob.Permissions, "ci.yml publish-image caller must grant only least-privilege permissions")
+
+	var pub workflowFile
+	require.NoError(t,
+		yaml.Unmarshal([]byte(readRootFile(t, ".github/workflows/publish-image.yml")), &pub),
+		".github/workflows/publish-image.yml must be valid YAML")
+
+	assert.Equal(t, "Publish Image", pub.Name)
+	_, hasCall := pub.On["workflow_call"]
+	assert.True(t, hasCall, "publish-image.yml must declare `workflow_call` trigger")
+	_, hasDispatch := pub.On["workflow_dispatch"]
+	assert.True(t, hasDispatch, "publish-image.yml must declare `workflow_dispatch` trigger")
+
+	job, ok := pub.Jobs["publish-image"]
+	require.True(t, ok, "publish-image.yml must define a `publish-image` job")
+	assert.Equal(t, "Publish Image", job.Name)
+	assert.Equal(t, "ubuntu-latest", job.RunsOn)
+	assert.Equal(t, map[string]string{
+		"contents": "read",
+		"packages": "write",
+	}, job.Permissions, "publish-image job must grant only least-privilege permissions")
+
+	const wantPushGuard = "github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))"
+
+	var sawQEMU, sawBuildx, sawLogin, sawMeta, sawBuild bool
+	for _, step := range job.Steps {
+		switch {
+		case strings.HasPrefix(step.Uses, "docker/setup-qemu-action@"):
+			sawQEMU = true
+		case strings.HasPrefix(step.Uses, "docker/setup-buildx-action@"):
+			sawBuildx = true
+		case strings.HasPrefix(step.Uses, "docker/login-action@"):
+			sawLogin = true
+			assert.Equal(t, "ghcr.io", step.With["registry"])
+			assert.Equal(t, wantPushGuard, strings.TrimSpace(step.If),
+				"GHCR login must be skipped on pull_request and non-main branches")
+		case strings.HasPrefix(step.Uses, "docker/metadata-action@"):
+			sawMeta = true
+			assert.Equal(t, "ghcr.io/afittestide/asimi", step.With["images"])
+			tags := step.With["tags"]
+			assert.Contains(t, tags, "value=main,enable={{is_default_branch}}")
+			assert.Contains(t, tags, "prefix=sha-,format=short,enable={{is_default_branch}}")
+			assert.Contains(t, tags, "type=semver,pattern=v{{version}}")
+			assert.Contains(t, tags, "value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}")
+		case strings.HasPrefix(step.Uses, "docker/build-push-action@"):
+			sawBuild = true
+			assert.Equal(t, "linux/amd64,linux/arm64", step.With["platforms"])
+			assert.Equal(t, "${{ "+wantPushGuard+" }}", strings.TrimSpace(step.With["push"]),
+				"pull_request and non-main manual dispatch builds must be build-only (never push)")
+			assert.Contains(t, step.With["cache-from"], "type=gha")
+			assert.Contains(t, step.With["cache-to"], "type=gha")
+		}
+	}
+	assert.True(t, sawQEMU, "publish-image job must set up QEMU for multi-arch runtime stage builds")
+	assert.True(t, sawBuildx, "publish-image job must set up Docker Buildx")
+	assert.True(t, sawLogin, "publish-image job must log in to GHCR")
+	assert.True(t, sawMeta, "publish-image job must extract Docker metadata")
+	assert.True(t, sawBuild, "publish-image job must build and push the multi-arch image")
+}
