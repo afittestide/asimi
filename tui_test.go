@@ -10576,11 +10576,17 @@ func TestTrustDialog_MCPServerNeedsItsOwnRow(t *testing.T) {
 	assert.True(t, d.Covers("term"))
 
 	d.ToggleAllowAll()
-	assert.Empty(t, d.Selections().MCPServers, "Allow all must not grant unsandboxed MCP servers")
-	assert.False(t, d.granted[mcpRow], "the MCP server row must stay unticked under Allow all")
+	assert.True(t, d.Selections().MCPServers["term"],
+		"Allow all grants unsandboxed MCP servers as requested assets")
+	assert.True(t, d.granted[mcpRow], "the MCP server row is ticked under Allow all")
 	assert.True(t, d.granted[0], "ordinary sandbox seams are still granted by Allow all")
 
+	// Unticking the MCP row after Allow all revokes just that server.
 	d.cursor = mcpRow
+	d.Toggle()
+	assert.False(t, d.Selections().MCPServers["term"], "unticking the row revokes the grant")
+
+	// Ticking the MCP row by name grants it without Allow all.
 	d.Toggle()
 	assert.True(t, d.Selections().MCPServers["term"], "ticking the MCP server row explicitly grants it")
 
@@ -10716,7 +10722,7 @@ func TestTrustDialog_ViewHidesPromptCentersAndFitsHeight(t *testing.T) {
 				// Shortened welcome + notices + seams + key hints must all appear.
 				assert.Contains(t, view, "Asimi - A sandboxed imperial court for project rulers")
 				assert.Contains(t, view, "Version:")
-				assert.Contains(t, view, ":help tutorial")
+				assert.Contains(t, view, ":help")
 				assert.Contains(t, view, "Update available")
 				assert.Contains(t, view, "config file created")
 				assert.Contains(t, view, "Allow this session access")

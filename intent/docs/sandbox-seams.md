@@ -23,7 +23,7 @@ A committed file may **request** a seam; it may never grant one.
 | 6 | **Host network** | `internal/runners/podman.go` — `s.NetNS = {NSMode: Host}` | **entire host network namespace**; localhost services reachable | implicit, unconditional — **NOT GATED** |
 | 7 | Host runner / `run_on_host` | `court/tool_dispatch.go`, `court/tools/shell.go` | commands run **on the host**, unsandboxed | **GATED**: a `run_on_host`/`safe_run_on_host` pattern is only a *request*; execution requires the mandate's explicit `SeamHostExec` grant, checked in `Court.CheckHostCommand`. No grant (the no-dialog case) → typed refusal |
 | 8 | `--isolated-host` | `court/court.go`, `headless.go` | bypasses the sandbox entirely | CLI flag — **NOT GATED, deliberately**: an operator's explicit command-line choice, outside the mandate's reach. No seam row corresponds to it and the dialog never implies it is covered |
-| 9 | MCP servers (`[[mcp.servers]]`) | `court/mcp/bridge.go`, `internal/config/mandate.go` | `stdio` subprocesses spawned **on the host**, unsandboxed, with host env access | **GATED**: `[[mcp.servers]]` is only a *request*; spawning requires an explicit `SeamMCPServer` grant (`Selections.MCPServers[id]`). Off by default, excluded from "Allow all", stripped by `BuildMandate` when ungranted, fail-closed (zero servers) under `RestrictiveMandate` |
+| 9 | MCP servers (`[[mcp.servers]]`) | `court/mcp/bridge.go`, `internal/config/mandate.go` | `stdio` subprocesses spawned **on the host**, unsandboxed, with host env access | **GATED**: `[[mcp.servers]]` is only a *request*; spawning requires a `SeamMCPServer` grant (`Selections.MCPServers[id]` or `Selections.AllowAll`). Off by default, included in "Allow all", stripped by `BuildMandate` when ungranted, fail-closed (zero servers) under `RestrictiveMandate` |
 
 ## What edict 1036 scoped
 
@@ -105,9 +105,10 @@ only *requests* a writable bind; the Ruler must still open it in the dialog).
   - **vocabulary** — `config.SeamMCPServer` (`"mcp_server"`) enumerates each
     configured `[[mcp.servers]]` entry in `config.SessionSeams(cfg)` showing
     its `id`, `command`, and `env`.
-  - **no blanket grant** — like `SeamHostExec`, MCP servers start **off by
-    default** and are **excluded from "Allow all"**. Only an explicit
-    `Selections.MCPServers[id] = true` grant admits a server.
+  - **off by default, included in "Allow all"** — MCP servers start **off by
+    default** and are stripped unless granted via `Selections.MCPServers[id]`
+    or `Selections.AllowAll` ("Allow all" checks MCP server rows while still
+    excluding `SeamHostExec`).
   - **stripping & fail closed** — `BuildMandate` strips every ungranted server
     from `Mandate.Config.MCP.Servers` and records auditable `Grant` entries.
     `RestrictiveMandate` (no-dialog / headless) grants zero servers and spawns
@@ -143,7 +144,7 @@ A mandate is **read-only by default**. The only widening path is an explicit
 Ruler grant. Reach *into* the sandbox (mounts, env — seams 2-3) is separate
 from unsandboxed host execution (host runner — seam 7, `Selections.HostExec`;
 and MCP `stdio` servers — seam 9, `Selections.MCPServers`). "Allow all" covers
-in-sandbox assets and never grants host execution or MCP servers.
+in-sandbox assets and MCP servers, and never grants host execution.
 
 ## The no-dialog default
 

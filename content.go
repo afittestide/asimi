@@ -176,7 +176,7 @@ func renderWelcomeHeader(width int, updateAvail, configCreated bool) string {
 			configStyle.Render("📝 User's config file created at ~/.config/asimi/asimi.conf"))
 	}
 
-	parts = append(parts, hintStyle.Render("vi-like UI (INSERT/ESC) · :help tutorial · :qa to quit all tabs"))
+	parts = append(parts, hintStyle.Render("vi-like UI (INSERT/ESC) · :help · :qa to quit Asimi"))
 
 	return lipgloss.JoinVertical(lipgloss.Center, parts...)
 }

@@ -166,9 +166,9 @@ schema_hash?, registered}`. Tool `state` is one of `"unclassified"`,
 
 **`SessionSeams` / `ApplyMandate` and MCP servers** — `SessionSeams`
 includes a `SeamMCPServer` (`kind: "mcp_server"`) row for each configured
-`[[mcp.servers]]` entry. MCP servers are off by default, excluded from
+`[[mcp.servers]]` entry. MCP servers are off by default, included in
 `AllowAll`, and only booted after `ApplyMandate` grants their server ID in
-`selections.MCPServers`.
+`selections.MCPServers` or via `selections.AllowAll`.
 
 **`SetContext` params in detail** — the `api_keys` field is a
 `map[string]string` keyed by provider name (e.g. `"anthropic"`,

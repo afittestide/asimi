@@ -2358,10 +2358,21 @@ func TestMandate_SeamMCPServer_OffByDefaultExcludedFromAllowAllAndStripped(t *te
 	require.True(t, ok)
 	assert.False(t, gTerm.Granted)
 
-	// AllowAllMandate grants env vars but MUST NOT grant MCP servers.
+	// AllowAllMandate grants env vars and MCP servers: Allow all is the blanket
+// affirmative choice for requested assets, and an unsandboxed stdio MCP server
+// is a requested asset (host execution, seam 7, is the authority that stays on
+// its own row).
 	allowAll := AllowAllMandate(42, requested)
 	assert.Equal(t, []string{"SAFE_ENV"}, allowAll.Config.Sandbox.PassthroughEnv)
-	assert.Empty(t, allowAll.Config.MCP.Servers, "AllowAll must never grant SeamMCPServer")
+	require.Len(t, allowAll.Config.MCP.Servers, 2, "AllowAll grants every requested SeamMCPServer")
+	assert.Equal(t, "term", allowAll.Config.MCP.Servers[0].ID)
+	assert.Equal(t, "lsp", allowAll.Config.MCP.Servers[1].ID)
+	gTerm, ok = allowAll.GrantFor(SeamMCPServer, "term")
+	require.True(t, ok)
+	assert.True(t, gTerm.Granted)
+	gLsp, ok := allowAll.GrantFor(SeamMCPServer, "lsp")
+	require.True(t, ok)
+	assert.True(t, gLsp.Granted)
 
 	// Explicit grant for "term" keeps only "term" and strips "lsp".
 	partial := BuildMandate(42, requested, Selections{
@@ -2372,7 +2383,7 @@ func TestMandate_SeamMCPServer_OffByDefaultExcludedFromAllowAllAndStripped(t *te
 	gTerm, ok = partial.GrantFor(SeamMCPServer, "term")
 	require.True(t, ok)
 	assert.True(t, gTerm.Granted)
-	gLsp, ok := partial.GrantFor(SeamMCPServer, "lsp")
+	gLsp, ok = partial.GrantFor(SeamMCPServer, "lsp")
 	require.True(t, ok)
 	assert.False(t, gLsp.Granted)
 }

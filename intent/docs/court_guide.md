@@ -1010,7 +1010,7 @@ env = ["TERM=xterm-256color"]
 **Lifecycle & Security Boundaries:**
 1. **Trust-Dialog Gating (`SeamMCPServer`):** Because `stdio` MCP servers run
    unsandboxed on the host, every `[[mcp.servers]]` entry appears in the
-   launch-time trust dialog, starts **off by default**, is **excluded from
+   launch-time trust dialog, starts **off by default**, is **included in
    "Allow all"**, and spawns zero servers under `RestrictiveMandate`
    (headless / no-dialog).
 2. **Non-Blocking Boot & Reconciliation:** Once granted via `ApplyMandate`,

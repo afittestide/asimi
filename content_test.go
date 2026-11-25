@@ -156,7 +156,7 @@ func TestTabManager_RenderWelcome(t *testing.T) {
 	assert.Contains(t, view, ":qa")
 	assert.Contains(t, view, "quit all tabs")
 	// The tutorial hint must be advertised now that :help tutorial works.
-	assert.Contains(t, view, ":help tutorial")
+	assert.Contains(t, view, ":help")
 	// Shortened welcome drops the birthday banner and verbose bullet list (e1102).
 	assert.NotContains(t, view, "Happy 50th Birthday")
 	assert.NotContains(t, view, "Prompt using the royal")
