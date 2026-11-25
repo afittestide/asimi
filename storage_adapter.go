@@ -437,9 +437,9 @@ func (s *SessionStore) ListSessions(limit int, tabType string) ([]court.Session,
 	return sessions, nil
 }
 
-// CleanupOldSessions removes old sessions for the current branch
+// CleanupOldSessions removes old sessions for the current project across all its branches.
 func (s *SessionStore) CleanupOldSessions() error {
-	return s.store.CleanupOldSessions(0)
+	return s.store.CleanupProjectSessions(s.Host, s.Org, s.Project)
 }
 
 // DeleteSession deletes a session and all its messages from the store

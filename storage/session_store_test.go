@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -383,6 +384,128 @@ func TestCleanupOldSessions_BranchScoping(t *testing.T) {
 	allSessions, err := store.ListAllSessions(0, "", "", "")
 	require.NoError(t, err)
 	require.Len(t, allSessions, 2)
+}
+
+func TestCleanupProjectSessions(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "session_project_cleanup_*.db")
+	require.NoError(t, err)
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	db, err := InitDB(tmpFile.Name())
+	require.NoError(t, err)
+	defer db.Close()
+
+	cfg := &SessionConfig{Enabled: true, MaxSessions: 0, MaxAgeDays: 0}
+	store := NewSessionStore(db, cfg)
+
+	// No-op when repository does not exist yet
+	require.NoError(t, store.CleanupProjectSessions("github.com", "acme", "nonexistent"))
+
+	// Create 4 sessions in project-a across two branches (2 on main, 2 on feature)
+	// and 3 sessions in project-b on main.
+	for i := 0; i < 2; i++ {
+		require.NoError(t, store.SaveSession(&SessionData{
+			ID:          fmt.Sprintf("a-main-%d", i),
+			FirstPrompt: "prompt",
+			Model:       "m",
+			Provider:    "p",
+			WorkingDir:  "/tmp",
+			TabType:     "ruling",
+		}, "github.com", "acme", "project-a", "main"))
+
+		require.NoError(t, store.SaveSession(&SessionData{
+			ID:          fmt.Sprintf("a-feat-%d", i),
+			FirstPrompt: "prompt",
+			Model:       "m",
+			Provider:    "p",
+			WorkingDir:  "/tmp",
+			TabType:     "ruling",
+		}, "github.com", "acme", "project-a", "feature"))
+	}
+	for i := 0; i < 3; i++ {
+		require.NoError(t, store.SaveSession(&SessionData{
+			ID:          fmt.Sprintf("b-main-%d", i),
+			FirstPrompt: "prompt",
+			Model:       "m",
+			Provider:    "p",
+			WorkingDir:  "/tmp",
+			TabType:     "ruling",
+		}, "github.com", "acme", "project-b", "main"))
+	}
+
+	// Age one session in project-a (main), one in project-a (feature), and one in project-b beyond 30 days.
+	oldTS := time.Now().AddDate(0, 0, -40).Unix()
+	nowTS := time.Now().Unix()
+	for id, ts := range map[string]int64{
+		"a-main-0": oldTS,
+		"a-feat-0": oldTS + 1,
+		"a-main-1": nowTS - 10,
+		"a-feat-1": nowTS - 5,
+		"b-main-0": oldTS,
+		"b-main-1": nowTS - 10,
+		"b-main-2": nowTS - 5,
+	} {
+		_, err := db.conn.Exec("UPDATE sessions SET last_updated = ? WHERE id = ?", ts, id)
+		require.NoError(t, err)
+	}
+
+	// With MaxSessions=0 and MaxAgeDays=0, nothing is deleted.
+	require.NoError(t, store.CleanupProjectSessions("github.com", "acme", "project-a"))
+	aSessions, err := store.ListAllSessions(0, "github.com", "acme", "project-a")
+	require.NoError(t, err)
+	require.Len(t, aSessions, 4)
+
+	// Enable MaxAgeDays=30 (MaxSessions still 0): deletes the 2 old sessions in project-a
+	// across both branches, leaving project-b untouched (including its old session).
+	cfg.MaxAgeDays = 30
+	require.NoError(t, store.CleanupProjectSessions("github.com", "acme", "project-a"))
+
+	aSessions, err = store.ListAllSessions(0, "github.com", "acme", "project-a")
+	require.NoError(t, err)
+	require.Len(t, aSessions, 2)
+
+	bSessions, err := store.ListAllSessions(0, "github.com", "acme", "project-b")
+	require.NoError(t, err)
+	require.Len(t, bSessions, 3)
+
+	// Enable MaxSessions=1 (MaxAgeDays=0): keeps only the single newest session in project-a
+	// across all its branches, still leaving project-b untouched.
+	cfg.MaxAgeDays = 0
+	cfg.MaxSessions = 1
+	require.NoError(t, store.CleanupProjectSessions("github.com", "acme", "project-a"))
+
+	aSessions, err = store.ListAllSessions(0, "github.com", "acme", "project-a")
+	require.NoError(t, err)
+	require.Len(t, aSessions, 1)
+	require.Equal(t, "a-feat-1", aSessions[0].ID)
+
+	bSessions, err = store.ListAllSessions(0, "github.com", "acme", "project-b")
+	require.NoError(t, err)
+	require.Len(t, bSessions, 3)
+
+	// Nil config is a safe no-op.
+	nilCfgStore := NewSessionStore(db, nil)
+	require.NoError(t, nilCfgStore.CleanupProjectSessions("github.com", "acme", "project-b"))
+	bSessions, err = store.ListAllSessions(0, "github.com", "acme", "project-b")
+	require.NoError(t, err)
+	require.Len(t, bSessions, 3)
+
+	// Both MaxAgeDays > 0 and MaxSessions > 0 together prune aged sessions and enforce count cap
+	// within project-b without affecting project-a.
+	cfg.MaxAgeDays = 30
+	cfg.MaxSessions = 1
+	require.NoError(t, store.CleanupProjectSessions("github.com", "acme", "project-b"))
+
+	bSessions, err = store.ListAllSessions(0, "github.com", "acme", "project-b")
+	require.NoError(t, err)
+	require.Len(t, bSessions, 1)
+	require.Equal(t, "b-main-2", bSessions[0].ID)
+
+	aSessions, err = store.ListAllSessions(0, "github.com", "acme", "project-a")
+	require.NoError(t, err)
+	require.Len(t, aSessions, 1)
+	require.Equal(t, "a-feat-1", aSessions[0].ID)
 }
 
 // TestInitDB_BusyTimeout verifies that the busy_timeout PRAGMA is set after InitDB

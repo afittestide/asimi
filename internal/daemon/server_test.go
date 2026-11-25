@@ -1505,3 +1505,82 @@ default_permissions = "r--------"
 	}
 	t.Fatalf("MCP subprocess pid %d still alive after client disconnect (ct.Stop did not tear down bridge)", mcpPID)
 }
+
+// TestCreateCourt_SessionRetentionPassthrough verifies that createCourt passes
+// MaxSessions and MaxAgeDays straight through to newSessionStore without
+// overriding 0 with defaults, and clamps negative values to 0.
+func TestCreateCourt_SessionRetentionPassthrough(t *testing.T) {
+	shared, cleanup := newTestShared(t)
+	defer cleanup()
+
+	projectRoot := t.TempDir()
+	runGit(t, projectRoot, "init")
+	runGit(t, projectRoot, "remote", "add", "origin", "https://github.com/acme/daemon-ret.git")
+
+	repoInfo := repo.RepoInfo{
+		ProjectRoot: projectRoot,
+		Slug:        "acme/daemon-ret",
+		Branch:      "main",
+	}
+
+	cases := []struct {
+		name            string
+		inMaxSessions   int
+		inMaxAgeDays    int
+		wantMaxSessions int
+		wantMaxAgeDays  int
+	}{
+		{"zero disables both", 0, 0, 0, 0},
+		{"negative clamped to zero", -3, -7, 0, 0},
+		{"positive passed through", 12, 45, 12, 45},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			projectCfg := config.DefaultConfig()
+			projectCfg.Session.Enabled = true
+			projectCfg.Session.MaxSessions = tc.inMaxSessions
+			projectCfg.Session.MaxAgeDays = tc.inMaxAgeDays
+
+			var called bool
+			var gotMaxSessions, gotMaxAgeDays int
+			factory := func(sdb *storage.DB, ri repo.RepoInfo, maxSessions, maxAgeDays int) (court.SessionPersister, error) {
+				called = true
+				gotMaxSessions = maxSessions
+				gotMaxAgeDays = maxAgeDays
+				return nil, nil
+			}
+
+			c, _, err := createCourt(
+				context.Background(),
+				shared,
+				1,
+				types.SetContextParams{
+					Project:     "acme/daemon-ret",
+					Username:    testUsername(),
+					ProjectRoot: projectRoot,
+				},
+				testUsername(),
+				&projectCfg,
+				repoInfo,
+				factory,
+				false,
+			)
+			if err != nil {
+				t.Fatalf("createCourt: %v", err)
+			}
+			defer c.Stop()
+
+			if !called {
+				t.Fatal("expected newSessionStore factory to be called")
+			}
+			if gotMaxSessions != tc.wantMaxSessions {
+				t.Errorf("maxSessions = %d, want %d", gotMaxSessions, tc.wantMaxSessions)
+			}
+			if gotMaxAgeDays != tc.wantMaxAgeDays {
+				t.Errorf("maxAgeDays = %d, want %d", gotMaxAgeDays, tc.wantMaxAgeDays)
+			}
+		})
+	}
+}
+

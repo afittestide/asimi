@@ -447,6 +447,63 @@ func (s *SessionStore) CleanupOldSessions(branchID int64) error {
 	return nil
 }
 
+// CleanupProjectSessions deletes sessions belonging to the specified repository
+// (across all of its branches) that are older than MaxAgeDays or exceed
+// MaxSessions. It is a no-op if the repository does not exist yet.
+func (s *SessionStore) CleanupProjectSessions(host, org, project string) error {
+	if s.cfg == nil {
+		return nil
+	}
+
+	var repoID int64
+	err := s.db.conn.QueryRow(
+		"SELECT id FROM repositories WHERE host = ? AND org = ? AND project = ?",
+		host, org, project,
+	).Scan(&repoID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to look up repository: %w", err)
+	}
+
+	if s.cfg.MaxAgeDays > 0 {
+		cutoffTime := time.Now().AddDate(0, 0, -s.cfg.MaxAgeDays).Unix()
+		result, err := s.db.conn.Exec(
+			`DELETE FROM sessions
+			 WHERE last_updated < ?
+			   AND branch_id IN (SELECT id FROM branches WHERE repository_id = ?)`,
+			cutoffTime, repoID,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to delete old project sessions: %w", err)
+		}
+
+		if deleted, _ := result.RowsAffected(); deleted > 0 {
+			slog.Info("Deleted old sessions", "count", deleted, "max_age_days", s.cfg.MaxAgeDays, "host", host, "org", org, "project", project)
+		}
+	}
+
+	if s.cfg.MaxSessions > 0 {
+		_, err := s.db.conn.Exec(
+			`DELETE FROM sessions
+			 WHERE branch_id IN (SELECT id FROM branches WHERE repository_id = ?)
+			   AND id NOT IN (
+			       SELECT id FROM sessions
+			       WHERE branch_id IN (SELECT id FROM branches WHERE repository_id = ?)
+			       ORDER BY last_updated DESC
+			       LIMIT ?
+			   )`,
+			repoID, repoID, s.cfg.MaxSessions,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to limit project session count: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // SearchMessages searches for messages matching a regex pattern.
 // host/org/project scope the query; when all empty, searches all sessions.
 func (s *SessionStore) SearchMessages(pattern string, limit int, host, org, project string) ([]SearchResult, error) {

@@ -858,6 +858,52 @@ max_sessions = 20
 	assert.Equal(t, 20, cfg.Session.MaxSessions)
 }
 
+func TestLoadProjectConfig_SessionRetentionZeroDisables(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	// 1. Omitted keys keep defaults: max_sessions = 0, max_age_days = 30.
+	cfg, err := LoadProjectConfig(t.TempDir(), false)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.Session.MaxSessions)
+	assert.Equal(t, 30, cfg.Session.MaxAgeDays)
+
+	// 2. Explicit 0 for both keys is preserved (disables both limits).
+	userConfigDir := filepath.Join(tempHome, ".config", "asimi")
+	require.NoError(t, os.MkdirAll(userConfigDir, 0o755))
+	userConfig := `[session]
+max_sessions = 0
+max_age_days = 0
+`
+	require.NoError(t, os.WriteFile(filepath.Join(userConfigDir, "asimi.conf"), []byte(userConfig), 0o644))
+
+	cfg, err = LoadProjectConfig(t.TempDir(), false)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.Session.MaxSessions)
+	assert.Equal(t, 0, cfg.Session.MaxAgeDays)
+
+	// 3. Project config explicit 0 overrides positive user config values.
+	userPositive := `[session]
+max_sessions = 10
+max_age_days = 15
+`
+	require.NoError(t, os.WriteFile(filepath.Join(userConfigDir, "asimi.conf"), []byte(userPositive), 0o644))
+
+	projectDir := t.TempDir()
+	projectAgentsDir := filepath.Join(projectDir, ".agents")
+	require.NoError(t, os.MkdirAll(projectAgentsDir, 0o755))
+	projectZero := `[session]
+max_sessions = 0
+max_age_days = 0
+`
+	require.NoError(t, os.WriteFile(filepath.Join(projectAgentsDir, "asimi.conf"), []byte(projectZero), 0o644))
+
+	cfg, err = LoadProjectConfig(projectDir, false)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.Session.MaxSessions)
+	assert.Equal(t, 0, cfg.Session.MaxAgeDays)
+}
+
 func TestLoadProjectConfig_EmptyProjectRoot(t *testing.T) {
 	tempHome := t.TempDir()
 	originalHome := os.Getenv("HOME")

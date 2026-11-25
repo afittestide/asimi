@@ -257,7 +257,7 @@ func OSUsername() string {
 // DefaultSessionConfig returns the default session configuration.
 func DefaultSessionConfig() *SessionConfig {
 	return &SessionConfig{
-		MaxSessions: 50,
+		MaxSessions: 0,
 		MaxAgeDays:  30,
 	}
 }

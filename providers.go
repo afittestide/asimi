@@ -264,15 +264,8 @@ func ProvideSessionHistory(db *storage.DB, cfg *Config, repoInfo repo.RepoInfo, 
 	}
 
 	logger.Info("loading session history")
-	defaults := config.DefaultSessionConfig()
-	maxSessions := defaults.MaxSessions
-	maxAgeDays := defaults.MaxAgeDays
-	if cfg.Session.MaxSessions > 0 {
-		maxSessions = cfg.Session.MaxSessions
-	}
-	if cfg.Session.MaxAgeDays > 0 {
-		maxAgeDays = cfg.Session.MaxAgeDays
-	}
+	maxSessions := max(0, cfg.Session.MaxSessions)
+	maxAgeDays := max(0, cfg.Session.MaxAgeDays)
 
 	store, err := NewSessionStore(db, repoInfo, maxSessions, maxAgeDays)
 	if err != nil {

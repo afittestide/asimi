@@ -95,7 +95,7 @@ func TestDefaultSessionConfig(t *testing.T) {
 	got := DefaultSessionConfig()
 
 	want := &SessionConfig{
-		MaxSessions: 50,
+		MaxSessions: 0,
 		MaxAgeDays:  30,
 	}
 
@@ -115,7 +115,7 @@ func TestDefaultSessionConfig_Table(t *testing.T) {
 		got  int
 		want int
 	}{
-		{"MaxSessions", got.MaxSessions, 50},
+		{"MaxSessions", got.MaxSessions, 0},
 		{"MaxAgeDays", got.MaxAgeDays, 30},
 	}
 

@@ -17,6 +17,7 @@ import (
 	"github.com/afittestide/asimi/internal/config"
 	"github.com/afittestide/asimi/internal/repo"
 	"github.com/afittestide/asimi/internal/runners"
+	"github.com/afittestide/asimi/storage"
 )
 
 // TestProvideConfig_ReturnsErrorOnMalformedConfig verifies that ProvideConfig
@@ -348,6 +349,79 @@ func TestProvideCourtForwardsCourtConfig(t *testing.T) {
 	assert.Equal(t, wantProject, got.Project)
 	assert.Equal(t, 4, got.MaxParallelLings)
 	assert.Equal(t, 2*time.Minute, got.StepIdleTimeout)
+}
+
+// TestProvideSessionHistory_RetentionPassthrough verifies that ProvideSessionHistory
+// passes explicit 0 through (disabling cleanup rather than falling back to 50/30),
+// clamps negative values to 0, and honors positive limits.
+func TestProvideSessionHistory_RetentionPassthrough(t *testing.T) {
+	dir := t.TempDir()
+	runProviderGit(t, dir, "init")
+	runProviderGit(t, dir, "remote", "add", "origin", "https://github.com/acme/provider-ret.git")
+
+	db, err := storage.InitDB(filepath.Join(dir, "sessions.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	rawStore := storage.NewSessionStore(db, &storage.SessionConfig{Enabled: true})
+	for _, s := range []struct {
+		id      string
+		ageDays int
+		offset  int64
+	}{
+		{"old-1", 45, 0},
+		{"new-1", 0, -10},
+		{"new-2", 0, -5},
+	} {
+		require.NoError(t, rawStore.SaveSession(&storage.SessionData{
+			ID:          s.id,
+			FirstPrompt: "p",
+			Model:       "m",
+			Provider:    "p",
+			WorkingDir:  dir,
+			TabType:     "ruling",
+		}, "github.com", "acme", "provider-ret", "main"))
+		ts := time.Now().AddDate(0, 0, -s.ageDays).Unix() + s.offset
+		_, err := db.Conn().Exec("UPDATE sessions SET last_updated = ? WHERE id = ?", ts, s.id)
+		require.NoError(t, err)
+	}
+
+	ri := repo.RepoInfo{ProjectRoot: dir, Branch: "main"}
+	logger := slog.Default()
+
+	// Explicit 0/0 disables both limits (45-day-old session survives).
+	cfgZero := &Config{Session: config.SessionConfig{Enabled: true, MaxSessions: 0, MaxAgeDays: 0}}
+	stZero, err := ProvideSessionHistory(db, cfgZero, ri, logger)
+	require.NoError(t, err)
+	require.NotNil(t, stZero)
+	stZero.Close()
+
+	sessions, err := rawStore.ListAllSessions(0, "github.com", "acme", "provider-ret")
+	require.NoError(t, err)
+	require.Len(t, sessions, 3)
+
+	// Negative values clamp to 0 (no pruning).
+	cfgNeg := &Config{Session: config.SessionConfig{Enabled: true, MaxSessions: -5, MaxAgeDays: -10}}
+	stNeg, err := ProvideSessionHistory(db, cfgNeg, ri, logger)
+	require.NoError(t, err)
+	require.NotNil(t, stNeg)
+	stNeg.Close()
+
+	sessions, err = rawStore.ListAllSessions(0, "github.com", "acme", "provider-ret")
+	require.NoError(t, err)
+	require.Len(t, sessions, 3)
+
+	// Positive limits are passed through and enforced.
+	cfgPos := &Config{Session: config.SessionConfig{Enabled: true, MaxSessions: 1, MaxAgeDays: 30}}
+	stPos, err := ProvideSessionHistory(db, cfgPos, ri, logger)
+	require.NoError(t, err)
+	require.NotNil(t, stPos)
+	stPos.Close()
+
+	sessions, err = rawStore.ListAllSessions(0, "github.com", "acme", "provider-ret")
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+	require.Equal(t, "new-2", sessions[0].ID)
 }
 
 // nopLifecycle is a do-nothing fx.Lifecycle for tests that never start the app.

@@ -450,3 +450,73 @@ func TestSaveWithRetry_NonBusyErrorNoRetry(t *testing.T) {
 	store.saveWithRetry(session)
 	require.Equal(t, 1, callCount, "non-BUSY error should not trigger retries")
 }
+
+// TestSessionStore_CleanupProjectScopedAndZeroDisables verifies that the root
+// SessionStore adapter scopes CleanupOldSessions to the current project across
+// all of its branches without deleting sessions from other projects, and that
+// maxSessions=0 / maxAgeDays=0 disables the corresponding pruning rules.
+func TestSessionStore_CleanupProjectScopedAndZeroDisables(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := storage.InitDB(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	projA := filepath.Join(tmpDir, "proj-a")
+	projB := filepath.Join(tmpDir, "proj-b")
+	require.NoError(t, os.MkdirAll(projA, 0o755))
+	require.NoError(t, os.MkdirAll(projB, 0o755))
+
+	runProviderGit(t, projA, "init")
+	runProviderGit(t, projA, "remote", "add", "origin", "https://github.com/acme/project-a.git")
+	runProviderGit(t, projB, "init")
+	runProviderGit(t, projB, "remote", "add", "origin", "https://github.com/acme/project-b.git")
+
+	rawStore := storage.NewSessionStore(db, &storage.SessionConfig{Enabled: true})
+	for _, s := range []struct {
+		id, project, branch string
+		ageDays             int
+		offsetSec           int64
+	}{
+		{"a-main-old", "project-a", "main", 45, 0},
+		{"a-feat-mid", "project-a", "feature", 0, -20},
+		{"a-main-new", "project-a", "main", 0, -5},
+		{"b-main-old", "project-b", "main", 45, 0},
+		{"b-main-new", "project-b", "main", 0, -5},
+	} {
+		require.NoError(t, rawStore.SaveSession(&storage.SessionData{
+			ID:          s.id,
+			FirstPrompt: "p",
+			Model:       "m",
+			Provider:    "p",
+			WorkingDir:  tmpDir,
+			TabType:     "ruling",
+		}, "github.com", "acme", s.project, s.branch))
+		ts := time.Now().AddDate(0, 0, -s.ageDays).Unix() + s.offsetSec
+		_, err := db.Conn().Exec("UPDATE sessions SET last_updated = ? WHERE id = ?", ts, s.id)
+		require.NoError(t, err)
+	}
+
+	// Opening with (0, 0) disables both count and age pruning.
+	storeZero, err := NewSessionStore(db, repo.RepoInfo{ProjectRoot: projA, Branch: "main"}, 0, 0)
+	require.NoError(t, err)
+	storeZero.Close()
+
+	aSessions, err := rawStore.ListAllSessions(0, "github.com", "acme", "project-a")
+	require.NoError(t, err)
+	require.Len(t, aSessions, 3)
+
+	// Opening with (1, 30) prunes project-a across both branches down to 1 newest session,
+	// leaving project-b (including its 45-day-old session) completely untouched.
+	storePrune, err := NewSessionStore(db, repo.RepoInfo{ProjectRoot: projA, Branch: "main"}, 1, 30)
+	require.NoError(t, err)
+	storePrune.Close()
+
+	aSessions, err = rawStore.ListAllSessions(0, "github.com", "acme", "project-a")
+	require.NoError(t, err)
+	require.Len(t, aSessions, 1)
+	require.Equal(t, "a-main-new", aSessions[0].ID)
+
+	bSessions, err := rawStore.ListAllSessions(0, "github.com", "acme", "project-b")
+	require.NoError(t, err)
+	require.Len(t, bSessions, 2)
+}

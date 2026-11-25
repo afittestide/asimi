@@ -285,15 +285,8 @@ func handleResumeCommand(model *TUIModel, args []string) tea.Cmd {
 			model.sessionStore.ProjectRoot != repoInfo.ProjectRoot ||
 			model.sessionStore.Branch != currentBranch {
 
-			maxSessions := 50
-			if model.config.Session.MaxSessions > 0 {
-				maxSessions = model.config.Session.MaxSessions
-			}
-
-			maxAgeDays := 30
-			if model.config.Session.MaxAgeDays > 0 {
-				maxAgeDays = model.config.Session.MaxAgeDays
-			}
+			maxSessions := max(0, model.config.Session.MaxSessions)
+			maxAgeDays := max(0, model.config.Session.MaxAgeDays)
 
 			store, err := NewSessionStore(model.db, repoInfo, maxSessions, maxAgeDays)
 			if err != nil {

@@ -82,15 +82,8 @@ func createCourt(
 	// Wire session persister so daemon sessions are persisted to DB,
 	// same as the TUI path does via ProvideCourt.
 	if shared.Storage != nil && projectCfg.Session.Enabled && newSessionStore != nil {
-		defaults := config.DefaultSessionConfig()
-		maxSessions := defaults.MaxSessions
-		maxAgeDays := defaults.MaxAgeDays
-		if projectCfg.Session.MaxSessions > 0 {
-			maxSessions = projectCfg.Session.MaxSessions
-		}
-		if projectCfg.Session.MaxAgeDays > 0 {
-			maxAgeDays = projectCfg.Session.MaxAgeDays
-		}
+		maxSessions := max(0, projectCfg.Session.MaxSessions)
+		maxAgeDays := max(0, projectCfg.Session.MaxAgeDays)
 		sessionStore, err := newSessionStore(shared.Storage, repoInfo, maxSessions, maxAgeDays)
 		if err != nil {
 			shared.Logger.Warn("daemon: failed to create session store", "conn_id", connID, "err", err)

@@ -187,7 +187,7 @@ func DefaultConfig() Config {
 		},
 		Session: SessionConfig{
 			Enabled:      true,
-			MaxSessions:  50,
+			MaxSessions:  0,
 			MaxAgeDays:   30,
 			ListLimit:    0,
 			AutoSave:     true,

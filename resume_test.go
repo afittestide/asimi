@@ -2,10 +2,13 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/storage"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -221,3 +224,57 @@ func TestResumeRebuildBatch_NoSession_Deactivates(t *testing.T) {
 	assert.Nil(t, cmd)
 	assert.False(t, model.resumeRebuildActive, "pager should deactivate when session is nil")
 }
+
+// TestHandleResumeCommand_ZeroRetentionDoesNotPrune verifies that handleResumeCommand
+// passes MaxSessions=0 and MaxAgeDays=0 straight through to NewSessionStore instead
+// of falling back to hardcoded 50/30 limits.
+func TestHandleResumeCommand_ZeroRetentionDoesNotPrune(t *testing.T) {
+	dir := t.TempDir()
+	runProviderGit(t, dir, "init")
+	runProviderGit(t, dir, "remote", "add", "origin", "https://github.com/acme/resume-ret.git")
+	t.Chdir(dir)
+
+	db, err := storage.InitDB(filepath.Join(dir, "resume.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	rawStore := storage.NewSessionStore(db, &storage.SessionConfig{Enabled: true})
+	require.NoError(t, rawStore.SaveSession(&storage.SessionData{
+		ID:          "resume-old",
+		FirstPrompt: "old prompt",
+		Model:       "m",
+		Provider:    "p",
+		WorkingDir:  dir,
+		TabType:     "ruling",
+	}, "github.com", "acme", "resume-ret", "main"))
+	oldTS := time.Now().AddDate(0, 0, -45).Unix()
+	_, err = db.Conn().Exec("UPDATE sessions SET last_updated = ? WHERE id = ?", oldTS, "resume-old")
+	require.NoError(t, err)
+
+	model := newTestModel(t)
+	model.db = db
+	model.sessionStore = nil
+	model.config.Session.Enabled = true
+	model.config.Session.MaxSessions = 0
+	model.config.Session.MaxAgeDays = 0
+
+	cmd := handleResumeCommand(model, nil)
+	require.NotNil(t, cmd)
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	require.True(t, ok, "expected tea.BatchMsg from handleResumeCommand")
+	for _, subCmd := range batch {
+		if subCmd != nil {
+			subCmd()
+		}
+	}
+	if model.sessionStore != nil {
+		defer model.sessionStore.Close()
+	}
+
+	sessions, err := rawStore.ListAllSessions(0, "github.com", "acme", "resume-ret")
+	require.NoError(t, err)
+	require.Len(t, sessions, 1, "45-day-old session must survive when max_age_days=0 and max_sessions=0")
+	require.Equal(t, "resume-old", sessions[0].ID)
+}
+
