@@ -126,20 +126,19 @@ func (d *TrustDialog) Toggle() {
 }
 
 // ToggleAllowAll flips the named "Allow all" choice and every requested seam
-// with it. It is the affirmative, all-or-nothing action — never the
-// pre-checked default.
+// with it (mounts, env vars, and MCP servers). It is the affirmative,
+// all-or-nothing action — never the pre-checked default.
 //
-// Host execution (seam 7) is deliberately left ON THE RULER'S OWN ROW: "Allow
-// all" means every requested asset reachable inside the sandbox, whereas host
-// execution is unsandboxed and strictly more authority, so it is only ever
-// granted by ticking that row by name.
+// Host execution (seam 7) is deliberately left ON THE RULER'S OWN ROW: it is
+// strictly more authority, so it is only ever granted by ticking that row by
+// name.
 func (d *TrustDialog) ToggleAllowAll() {
 	if d == nil || d.loadErr != nil {
 		return
 	}
 	d.allowAll = !d.allowAll
 	for i, seam := range d.seams {
-		if seam.Kind == config.SeamHostExec || seam.Kind == config.SeamMCPServer {
+		if seam.Kind == config.SeamHostExec {
 			continue
 		}
 		d.granted[i] = d.allowAll
@@ -193,8 +192,8 @@ func (d *TrustDialog) Selections() config.Selections {
 			// authority than the sandbox: no blanket choice may reach it.
 			sel.HostExec = true
 		case config.SeamMCPServer:
-			// MCP servers spawn unsandboxed stdio processes on the host and
-			// are excluded from Allow all: only an explicit row grant enables them.
+			// MCP servers spawn unsandboxed stdio processes on the host; they
+			// start ungranted and are enabled either by their own row or via Allow all.
 			sel.MCPServers[s.MCPServer.ID] = true
 		}
 	}
