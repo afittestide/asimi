@@ -312,7 +312,9 @@ func TestHandleSessionSelected_NonActiveDestinationWithHistoryOpensNewTab(t *tes
 	forge := model.tabs.TabByTarget("forge")
 	forge.Content.Chat.Clear()
 	forge.Content.Chat.AddUserMessage("old forge history")
-	model.tabs.TabByTarget("secretary").Content.Chat.Clear()
+	secretary := model.tabs.TabByTarget("secretary")
+	secretary.Content.Chat.Clear()
+	secretary.Content.Chat.AddUserMessage("secretary work")
 	model.tabs.SwitchToTarget("secretary")
 
 	session := testSession("resume-cross-tab", "Hard nut", time.Now(), "resumed answer")
@@ -322,10 +324,34 @@ func TestHandleSessionSelected_NonActiveDestinationWithHistoryOpensNewTab(t *tes
 
 	assert.Equal(t, "forge-2", model.tabs.ActiveTab().Target)
 	assert.Equal(t, "old forge history", model.tabs.TabByTarget("forge").Content.Chat.Messages[0].Content)
-	assert.Empty(t, model.tabs.TabByTarget("secretary").Content.Chat.Messages,
+	assert.Equal(t, "secretary work", secretary.Content.Chat.Messages[0].Content,
 		"resume must not clear the unrelated active tab")
 	assert.Equal(t, "resumed answer", model.tabs.ActiveTab().Content.Chat.Messages[0].Content)
 	require.Equal(t, []string{"forge-2"}, mock.restoreMinisterSessionChannels)
+}
+
+func TestHandleSessionSelected_ActiveEmptyTabOfTypeIsPreferred(t *testing.T) {
+	model := newTestModel(t)
+	mock := &mockCourtClient{}
+	model.court = mock
+	model.tabs.DismissWelcome()
+	forge := model.tabs.TabByTarget("forge")
+	forge.Content.Chat.Clear()
+	forge.Content.Chat.AddUserMessage("old forge history")
+	model.tabs.SwitchToTarget("forge")
+	model.tabs.Add("Forge", TabType("forge"), model.tabs.UniqueTarget("forge"))
+	forge2 := model.tabs.ActiveTab().Target
+	before := len(model.tabs.tabs)
+
+	session := testSession("resume-active-empty", "Hard nut", time.Now(), "resumed answer")
+	session.TabType = "forge"
+	model.handleSessionSelected(session)
+	drainResumePager(model)
+
+	assert.Len(t, model.tabs.tabs, before, "active empty forge tab should be reused")
+	assert.Equal(t, forge2, model.tabs.ActiveTab().Target)
+	assert.Equal(t, "old forge history", model.tabs.TabByTarget("forge").Content.Chat.Messages[0].Content)
+	require.Equal(t, []string{forge2}, mock.restoreMinisterSessionChannels)
 }
 
 func TestHandleSessionSelected_GreetingOnlyDestinationIsReused(t *testing.T) {
