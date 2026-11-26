@@ -1,8 +1,10 @@
 package worktree
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,7 +120,8 @@ func TestCopyIgnored(t *testing.T) {
 	abs := filepath.Join(root, ".agents", "worktrees", "e1")
 	mock := &recordingRunner{}
 
-	if err := CopyIgnored(context.Background(), mock, root, abs, []string{".env", ".envrc", "*.local"}); err != nil {
+	globs := []string{".env", ".envrc", "*.local"}
+	if err := CopyIgnored(context.Background(), mock, root, abs, globs); err != nil {
 		t.Fatalf("CopyIgnored: %v", err)
 	}
 	joined := strings.Join(mock.commands, "\n")
@@ -127,14 +130,24 @@ func TestCopyIgnored(t *testing.T) {
 			t.Errorf("CopyIgnored command missing %q: %s", needle, joined)
 		}
 	}
-	// The allowlist must be carried as a pathspec after `--` so git only
-	// considers the declared globs. The unbounded form (no pathspec) is what
-	// copied every gitignored artifact (caches, binaries, jobs/, logs).
-	if !strings.Contains(joined, "-- .env .envrc") {
-		t.Errorf("CopyIgnored must pass the allowlist after `--`: %s", joined)
+	// The globs must bound the copy as git pathspecs after a `--` separator;
+	// without them git lists every ignored file (caches, binaries, jobs/).
+	if !strings.Contains(joined, "--exclude-standard -- ") {
+		t.Errorf("CopyIgnored must pass pathspecs after `--`: %s", joined)
 	}
-	if !strings.Contains(joined, `'*.local'`) {
-		t.Errorf("CopyIgnored must quote each glob: %s", joined)
+	for _, pathspec := range []string{"'*.local'", ".env", ".envrc"} {
+		if !strings.Contains(joined, pathspec) {
+			t.Errorf("CopyIgnored allowlist missing pathspec %q: %s", pathspec, joined)
+		}
+	}
+	// The unbounded form (no pathspecs) must be gone: git would otherwise list
+	// every ignored file.
+	if strings.Contains(joined, "--exclude-standard | tar") {
+		t.Errorf("CopyIgnored still uses the unbounded ignored copy: %s", joined)
+	}
+	// Best-effort: an unreadable entry must be skipped, not fatal.
+	if !strings.Contains(joined, "--ignore-failed-read") {
+		t.Errorf("CopyIgnored must pass --ignore-failed-read: %s", joined)
 	}
 	// GNU tar treats --exclude as positional: placed after -T it is
 	// silently ignored, re-opening the recursive copy bug.
@@ -144,16 +157,62 @@ func TestCopyIgnored(t *testing.T) {
 	}
 }
 
-func TestCopyIgnored_NoGlobsIsNoOp(t *testing.T) {
+// TestCopyIgnored_EmptyGlobsIsNoop: an empty allowlist means "copy nothing" —
+// no shell command, no risk of dragging ignored artifacts into the worktree.
+func TestCopyIgnored_EmptyGlobsIsNoop(t *testing.T) {
 	root := t.TempDir()
 	abs := filepath.Join(root, ".agents", "worktrees", "e1")
 	mock := &recordingRunner{}
 
-	if err := CopyIgnored(context.Background(), mock, root, abs, nil); err != nil {
-		t.Fatalf("CopyIgnored: %v", err)
+	for _, globs := range [][]string{nil, {}} {
+		if err := CopyIgnored(context.Background(), mock, root, abs, globs); err != nil {
+			t.Fatalf("CopyIgnored(%v): %v", globs, err)
+		}
 	}
 	if len(mock.commands) != 0 {
-		t.Errorf("no globs must mean no copy command, got %v", mock.commands)
+		t.Errorf("empty globs must be a no-op, got %v", mock.commands)
+	}
+}
+
+// TestCopyIgnored_WarnsOnSkippedEntry pins the best-effort contract: tar's
+// per-file warning (an unreadable/vanished ignored entry skipped via
+// --ignore-failed-read) must not fail the copy, and the skipped path must be
+// surfaced so the operator can see what did not travel.
+func TestCopyIgnored_WarnsOnSkippedEntry(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e1")
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"tar --null": {Output: "tar: .venv/bin/python: Warning: Cannot open: Permission denied\n", ExitCode: "0"},
+	}}
+
+	if err := CopyIgnored(context.Background(), mock, root, abs, []string{".env"}); err != nil {
+		t.Fatalf("a skipped entry must not fail the copy: %v", err)
+	}
+	if !strings.Contains(strings.Join(mock.commands, "\n"), "--ignore-failed-read") {
+		t.Errorf("expected --ignore-failed-read in %v", mock.commands)
+	}
+}
+
+// TestCopyIgnored_WarnNamesSkippedPath is the observable contract of the
+// best-effort copy: the path tar skipped must appear in a Warn record, not be
+// silently dropped (silently dropping an anomaly is itself a defect).
+func TestCopyIgnored_WarnNamesSkippedPath(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e1")
+	mock := &recordingRunner{outputs: map[string]runners.Output{
+		"tar --null": {Output: "tar: node_modules/pkg/index.js: Warning: Cannot open: Permission denied\n", ExitCode: "0"},
+	}}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	if err := CopyIgnored(context.Background(), mock, root, abs, []string{".env"}); err != nil {
+		t.Fatalf("CopyIgnored: %v", err)
+	}
+	if !strings.Contains(buf.String(), "node_modules/pkg/index.js") {
+		t.Errorf("skipped path must be surfaced in a Warn record, got %q", buf.String())
 	}
 }
 
@@ -715,7 +774,7 @@ func TestEnsure_RealGit(t *testing.T) {
 	runGit(t, root, "init", "-b", "main")
 	runGit(t, root, "config", "user.email", "test@example.com")
 	runGit(t, root, "config", "user.name", "Test")
-	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.gocache/\njobs/\nasimi\n.agents/worktrees/\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.gocache/\njobs/\nasimi\n.venv/\n.agents/worktrees/\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
@@ -746,6 +805,25 @@ func TestEnsure_RealGit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "asimi"), []byte("binary\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A language dependency dir must not travel either.
+	if err := os.MkdirAll(filepath.Join(root, ".venv", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".venv", "bin", "python"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// An allowlisted but unreadable entry: the copy is best-effort, so the
+	// ritual must still succeed (tar's --ignore-failed-read skips it with a
+	// warning). Skipped when the test runs as root, where mode 000 is still
+	// readable and the file simply travels.
+	if os.Getuid() != 0 {
+		if err := os.WriteFile(filepath.Join(root, "locked.local"), []byte("LOCKED\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Join(root, "locked.local"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// Plant an ignored nested worktree copy that must not travel into the
 	// new worktree.
 	nested := filepath.Join(root, ".agents", "worktrees", "e999")
@@ -757,7 +835,11 @@ func TestEnsure_RealGit(t *testing.T) {
 	}
 
 	runner := &realLightRunner{root: root}
-	abs, _, branch, created, err := Ensure(context.Background(), runner, root, 123, []string{"local.env"})
+	globs := []string{"local.env"}
+	if os.Getuid() != 0 {
+		globs = append(globs, "locked.local")
+	}
+	abs, _, branch, created, err := Ensure(context.Background(), runner, root, 123, globs)
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
@@ -772,7 +854,7 @@ func TestEnsure_RealGit(t *testing.T) {
 		t.Errorf("ignored file not copied: %v", err)
 	}
 	// ...but the allowlist excluded caches, jobs/, and built binaries.
-	for _, forbidden := range []string{".gocache", "jobs", "asimi"} {
+	for _, forbidden := range []string{".gocache", "jobs", "asimi", ".venv"} {
 		if _, err := os.Stat(filepath.Join(abs, forbidden)); !os.IsNotExist(err) {
 			t.Errorf("CopyIgnored must not copy %q, stat err = %v", forbidden, err)
 		}
@@ -837,6 +919,198 @@ func runGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
 }
+
+// TestEnsure_FailureAfterAddLeavesNoWorktree pins the atomicity invariant: a
+// failure after `git worktree add` (a failed `just install`) must discard the
+// partial worktree and its branch, so the idempotent reuse guard never accepts
+// a half-built tree and a retry starts from scratch.
+func TestEnsure_FailureAfterAddLeavesNoWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.agents/worktrees/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "Justfile"), []byte("install:\n    @true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &failingInstallRunner{realLightRunner: realLightRunner{root: root}}
+	abs, _, branch, _, err := Ensure(context.Background(), runner, root, 321, []string{"local.env"})
+	if err == nil {
+		t.Fatal("expected the failed install to be reported")
+	}
+	if _, statErr := os.Stat(abs); !os.IsNotExist(statErr) {
+		t.Errorf("partial worktree must be removed on failure, stat err = %v", statErr)
+	}
+	// The branch is gone too, so a retry can re-create it.
+	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch).Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		t.Errorf("partial worktree branch %s must be deleted", branch)
+	}
+
+	// The next ritual sees no reusable worktree and creates a fresh one.
+	ok := &realLightRunner{root: root}
+	abs2, _, _, created, err := Ensure(context.Background(), ok, root, 321, nil)
+	if err != nil {
+		t.Fatalf("re-run Ensure: %v", err)
+	}
+	if !created {
+		t.Error("expected created=true after a failed Ensure was cleaned up")
+	}
+	if _, statErr := os.Stat(abs2); statErr != nil {
+		t.Errorf("fresh worktree missing: %v", statErr)
+	}
+}
+
+// TestEnsure_FailureInCopyIgnoredDiscardsWorktree extends the atomicity
+// coverage: the copy of ignored files (the last prepare step) must tear the
+// worktree down too, not just the dependency install.
+func TestEnsure_FailureInCopyIgnoredDiscardsWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	root := t.TempDir()
+	runGit(t, root, "init", "-b", "main")
+	runGit(t, root, "config", "user.email", "test@example.com")
+	runGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("local.env\n.agents/worktrees/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(root, "Justfile"), []byte("install:\n    @true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &failingCopyRunner{realLightRunner: realLightRunner{root: root}}
+	abs, _, branch, _, err := Ensure(context.Background(), runner, root, 322, []string{"local.env"})
+	if err == nil {
+		t.Fatal("expected the failed copy to be reported")
+	}
+	if _, statErr := os.Stat(abs); !os.IsNotExist(statErr) {
+		t.Errorf("partial worktree must be removed on copy failure, stat err = %v", statErr)
+	}
+	if out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch).Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		t.Errorf("partial worktree branch %s must be deleted", branch)
+	}
+}
+
+// TestDiscardPartialWorktree_RemovesDirWhenGitRefuses covers the fallback that
+// actually preserves the atomicity invariant: `git worktree remove` refuses a
+// tree with untracked files (a partially installed dependency tree) and the
+// sandbox forbids --force, so the directory must be dropped directly. If this
+// branch did not run, a poisoned directory would survive and the reuse guard
+// would accept it forever.
+func TestDiscardPartialWorktree_RemovesDirWhenGitRefuses(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e9")
+	if err := os.MkdirAll(filepath.Join(abs, "node_modules", "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedRunner{fail: []string{"worktree remove"}}
+
+	if err := discardPartialWorktree(context.Background(), runner, root, abs, "asimi/e9"); err != nil {
+		t.Fatalf("discardPartialWorktree: %v", err)
+	}
+	if _, err := os.Stat(abs); !os.IsNotExist(err) {
+		t.Errorf("directory must be removed when git worktree remove fails, stat err = %v", err)
+	}
+	// The branch ref and stale worktree metadata are still cleaned up.
+	joined := strings.Join(runner.commands, "\n")
+	for _, needle := range []string{"worktree prune", "update-ref -d refs/heads/asimi/e9"} {
+		if !strings.Contains(joined, needle) {
+			t.Errorf("discard must run %q: %s", needle, joined)
+		}
+	}
+}
+
+// TestFailEnsure_AnnotatesDiscardFailure pins the never-silently-poisoned
+// contract: when the discard itself fails, the returned error must wrap the
+// original cause and name the discard, so the operator knows a directory may
+// still be present.
+func TestFailEnsure_AnnotatesDiscardFailure(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, ".agents", "worktrees", "e9")
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Fail a discard command so discardPartialWorktree returns an error after
+	// the directory fallback succeeds.
+	runner := &scriptedRunner{fail: []string{"worktree prune"}}
+
+	cause := os.ErrInvalid
+	err := failEnsure(context.Background(), runner, root, abs, "asimi/e9", cause)
+	if err == nil {
+		t.Fatal("expected failEnsure to report the discard failure")
+	}
+	if !strings.Contains(err.Error(), "discard partial worktree") {
+		t.Errorf("error must name the discard step: %v", err)
+	}
+	if !strings.Contains(err.Error(), cause.Error()) {
+		t.Errorf("error must wrap the original cause %q: %v", cause.Error(), err)
+	}
+}
+
+// failingInstallRunner fails the `just install` step after git worktree add
+// succeeds, exercising Ensure's atomic-discard path.
+type failingInstallRunner struct{ realLightRunner }
+
+func (r *failingInstallRunner) Run(ctx context.Context, input runners.Input) (runners.Output, error) {
+	if strings.Contains(input.Command, "just install") {
+		return runners.Output{Output: "boom", ExitCode: "1"}, nil
+	}
+	return r.realLightRunner.Run(ctx, input)
+}
+
+// failingCopyRunner fails the ignored-file copy (the last prepare step) after
+// the worktree and dependencies are in place.
+type failingCopyRunner struct{ realLightRunner }
+
+func (r *failingCopyRunner) Run(ctx context.Context, input runners.Input) (runners.Output, error) {
+	if strings.Contains(input.Command, "git ls-files") {
+		return runners.Output{Output: "boom", ExitCode: "1"}, nil
+	}
+	return r.realLightRunner.Run(ctx, input)
+}
+
+// scriptedRunner records every command and reports a non-zero exit for any
+// command containing one of the configured failure substrings.
+type scriptedRunner struct {
+	commands []string
+	fail     []string
+}
+
+func (r *scriptedRunner) Run(_ context.Context, input runners.Input) (runners.Output, error) {
+	r.commands = append(r.commands, input.Command)
+	for _, sub := range r.fail {
+		if strings.Contains(input.Command, sub) {
+			return runners.Output{Output: "boom", ExitCode: "1"}, nil
+		}
+	}
+	return runners.Output{ExitCode: "0"}, nil
+}
+
+func (r *scriptedRunner) Restart(context.Context) error        { return nil }
+func (r *scriptedRunner) Close(context.Context) error          { return nil }
+func (r *scriptedRunner) AllowFallback(bool)                   {}
+func (r *scriptedRunner) RunnerType() string                   { return "mock" }
+func (r *scriptedRunner) GetOS() string                        { return runtime.GOOS }
+func (r *scriptedRunner) SetMessageChannel(chan<- runners.Msg) {}
+func (r *scriptedRunner) HealthCheck(context.Context) error    { return nil }
 
 func TestResolve_MainAndMaster(t *testing.T) {
 	mock := &recordingRunner{outputs: map[string]runners.Output{

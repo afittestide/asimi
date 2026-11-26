@@ -10,14 +10,20 @@ package worktree
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"al.essio.dev/pkg/shellescape"
 
 	"github.com/afittestide/asimi/internal/runners"
 )
+
+// tarWarningPattern matches GNU tar's per-file warning lines, e.g.
+// "tar: locked.env: Warning: Cannot open: Permission denied".
+var tarWarningPattern = regexp.MustCompile(`(?m)^tar: (.+): Warning: `)
 
 // Branch returns the deterministic branch name for an edict.
 func Branch(edictID uint) string {
@@ -30,14 +36,25 @@ func RelPath(edictID uint) string {
 }
 
 // Ensure idempotently creates the edict's branch and worktree, installs
-// dependencies inside it, and carries over the allowlisted gitignored files
-// (copyGlobs). It returns the absolute path, the project-root-relative path,
+// dependencies inside it, and carries over the gitignored files allowed by
+// ignoreGlobs. It returns the absolute path, the project-root-relative path,
 // the branch name, and whether the worktree was created (false when an
 // existing one was reused).
 //
+// Atomicity invariant: the directory at abs only ever exists as a *fully
+// prepared* worktree. The reuse guard at the top treats the directory's mere
+// presence as "done", so any failure after `git worktree add` (a failed
+// dependency install or ignored-file copy) must remove the partial worktree and
+// its branch before returning. Otherwise the next ritual silently reuses the
+// half-built directory and fails forever. Because creation is all-or-nothing,
+// the guard never sees a poisoned tree.
+//
 // Creating depends on the runner supporting shell pipelines: dependency
 // install and ignored-file copy are single shell invocations.
-func Ensure(ctx context.Context, r runners.Runner, root string, edictID uint, copyGlobs []string) (abs, rel, branch string, created bool, err error) {
+//
+// ignoreGlobs is the allowlist of gitignore-style globs whose ignored files are
+// carried into the worktree; nil or empty copies nothing.
+func Ensure(ctx context.Context, r runners.Runner, root string, edictID uint, ignoreGlobs []string) (abs, rel, branch string, created bool, err error) {
 	if root == "" {
 		return "", "", "", false, fmt.Errorf("worktree: empty project root")
 	}
@@ -63,28 +80,70 @@ func Ensure(ctx context.Context, r runners.Runner, root string, edictID uint, co
 		return "", "", "", false, err
 	}
 
+	// Past this point the worktree directory exists: every failure must
+	// discard it so the reuse guard cannot accept a half-built tree.
 	installCmd := fmt.Sprintf("cd %s && just install", shellescape.Quote(abs))
 	if _, err := run(ctx, r, installCmd, "install dependencies in worktree"); err != nil {
-		return "", "", "", false, err
+		return "", "", "", false, failEnsure(ctx, r, root, abs, branch, err)
 	}
 
-	if err := CopyIgnored(ctx, r, root, abs, copyGlobs); err != nil {
-		return "", "", "", false, err
+	if err := CopyIgnored(ctx, r, root, abs, ignoreGlobs); err != nil {
+		return "", "", "", false, failEnsure(ctx, r, root, abs, branch, err)
 	}
 
 	return abs, rel, branch, true, nil
 }
 
-// CopyIgnored copies the gitignored files matching copyGlobs from root into
-// the worktree at abs, so local-only config travels with the worktree. The
-// globs are an opt-in allowlist: only what the caller declares is copied.
-// With no globs there is nothing to copy and the call is a no-op, matching
-// the gitless path.
-func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, copyGlobs []string) error {
+// failEnsure discards a worktree that failed to finish preparing and returns
+// err, annotated when the discard itself fails so the operator knows the
+// directory may still be present (never silently poisoned).
+func failEnsure(ctx context.Context, r runners.Runner, root, abs, branch string, cause error) error {
+	if discardErr := discardPartialWorktree(ctx, r, root, abs, branch); discardErr != nil {
+		return fmt.Errorf("%w (discard partial worktree: %v)", cause, discardErr)
+	}
+	return cause
+}
+
+// discardPartialWorktree removes a half-prepared worktree and its branch,
+// mirroring Remove. `git worktree remove` refuses a tree with untracked files
+// (e.g. partially installed dependencies) and the sandbox forbids --force, so
+// when the clean removal fails the directory is dropped directly and its
+// metadata pruned — the point is that no reusable directory survives.
+func discardPartialWorktree(ctx context.Context, r runners.Runner, root, abs, branch string) error {
+	removeCmd := fmt.Sprintf("git -C %s worktree remove %s", shellescape.Quote(root), shellescape.Quote(abs))
+	if _, err := run(ctx, r, removeCmd, "discard partial worktree"); err != nil {
+		if rmErr := os.RemoveAll(abs); rmErr != nil {
+			return fmt.Errorf("git worktree remove: %v; remove dir: %w", err, rmErr)
+		}
+	}
+	pruneCmd := fmt.Sprintf("git -C %s worktree prune", shellescape.Quote(root))
+	if _, err := run(ctx, r, pruneCmd, "prune partial worktree metadata"); err != nil {
+		return err
+	}
+	branchCmd := fmt.Sprintf("git -C %s update-ref -d refs/heads/%s", shellescape.Quote(root), shellescape.Quote(branch))
+	if _, err := run(ctx, r, branchCmd, "delete partial worktree branch"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CopyIgnored copies the gitignored files matching globs from root into the
+// worktree at abs, so local-only files (env files) travel with the worktree.
+//
+// The allowlist is bounded on purpose: the list is passed to git as pathspecs
+// (`-- <glob>`) instead of copying every ignored file, so caches, built
+// binaries, logs and jobs/ do not multiply per edict. An empty globs list is an
+// explicit no-op — there is nothing to carry.
+//
+// The copy is best-effort: tar's --ignore-failed-read skips an individual
+// unreadable (or vanished) entry and still exits zero, and each skipped entry
+// is surfaced as a slog.Warn naming its path. A single bad ignored file must
+// not sink a ritual.
+func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, globs []string) error {
 	if r == nil {
 		return fmt.Errorf("worktree: no runner configured")
 	}
-	if len(copyGlobs) == 0 {
+	if len(globs) == 0 {
 		return nil
 	}
 	// Build the pathspec: `-- <glob>...` restricts git to the declared
@@ -92,8 +151,8 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, copyGl
 	// globs survive the shell, but git expands them as pathspecs (shell
 	// globbing does not apply to an unexpanded literal in a non-matching
 	// directory).
-	quoted := make([]string, 0, len(copyGlobs))
-	for _, g := range copyGlobs {
+	quoted := make([]string, 0, len(globs))
+	for _, g := range globs {
 		quoted = append(quoted, shellescape.Quote(g))
 	}
 	// .agents/worktrees is itself gitignored, so without the tar --exclude a
@@ -101,10 +160,14 @@ func CopyIgnored(ctx context.Context, r runners.Runner, root, abs string, copyGl
 	// they carry — into itself, growing the tree on every edict. --exclude
 	// must precede -T: GNU tar treats it as positional and silently drops it
 	// when it follows a file list.
-	cmd := fmt.Sprintf("cd %s && git ls-files -z --others --ignored --exclude-standard -- %s | tar --null --exclude=%s -T - -cf - | tar -xf - -C %s",
+	cmd := fmt.Sprintf("cd %s && git ls-files -z --others --ignored --exclude-standard -- %s | tar --null --ignore-failed-read --exclude=%s -T - -cf - | tar -xf - -C %s",
 		shellescape.Quote(root), strings.Join(quoted, " "), shellescape.Quote(".agents/worktrees/*"), shellescape.Quote(abs))
-	if _, err := run(ctx, r, cmd, "copy allowlisted gitignored files into worktree"); err != nil {
+	out, err := run(ctx, r, cmd, "copy gitignored files into worktree")
+	if err != nil {
 		return err
+	}
+	for _, m := range tarWarningPattern.FindAllStringSubmatch(out.Output, -1) {
+		slog.Warn("worktree: skipped ignored file during copy", "path", m[1])
 	}
 	return nil
 }
