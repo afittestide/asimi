@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP support (`stdio`-only) and general `propose` tool** — Bifrost-native `stdio` MCP client integration with project `[[mcp.servers]]` gated in the launch-time trust dialog (`SeamMCPServer`), isolated Minister of Rites classification into Three Realms permissions, a general `propose` tool for Ruler sealing, persisted `mcp_tool_classifications` cache with cross-project reuse (`schema_hash` + `command_hash`, `---------` sealed deny), live-session permission gating, and daemon RPC status (e661)
 - **Event-driven headless mode via `ASIMI_EVENT_JSON` and builtin `hello` ritual** — running `asimi --isolated-host --handsoff` with `ASIMI_EVENT_JSON` set parses the webhook envelope, publishes `webhook_received` after recovery completes, forwards payload fields into triggered ritual inputs, prints `out:` step output to stdout, and ships a deterministic builtin `hello` ritual matching `X-GitHub-Event: ping` (e1093)
 - **Transient scratchpad buffer on `Session`** — ritual step context and retry/rejection notes are injected via a transient scratchpad buffer on sessions for court history visibility without polluting persisted chat history (e723)
+- **Root `Dockerfile` and multi-arch GHCR publishing** — the repo now ships a root `Dockerfile` building the `asimi-factory` Cloud Run image, published multi-arch to GHCR (e1094)
 
 ### Changed
 
@@ -22,15 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`release-version` race gate widened to all packages** — `verify-release-readiness` now runs `just test-race ./...` instead of the `./court/`-only default, making the race detector cover the full codebase; the `update-roadmap` step's instructions were rewritten to be unambiguous (mark landed items done, move missed items to the next version, keep the record)
 - **`[court]` ling settings unified into `max_parallel_lings`** — replaced `ling_ignition_enabled` and `ling_parallelism` with a single `[court] max_parallel_lings` integer (`0` disables automatic ling ignition by default; `N > 0` runs up to `N` ready lings concurrently in the edict's worktree), and removed the unused legacy `ritual_timeout` config field (e1088)
 - **Per-realm seal chain (`intent` vs `earth`) and six derived edict statuses** — split seals by realm (`intent` for `chancellor -> ruler`, `earth` for `judge -> chancellor -> ruler`) with a v8-to-v9 migration; expanded derived edict statuses to `draft`, `intent-approved`, `active` (ritual running), `blocked`, `sealed`, and `cancelled`, and wired the TUI to prompt for Ruler intent approval when `(chancellor, intent)` is granted (e713)
+- **Zhengming answers no longer mutate edict intent/seals** — a Ruler's answer to a zhengming prompt is now applied to the prompt alone, never mutating the edict's intent or seals; triage also works for `intent-approved` and merging edicts (e1104)
+- **Trust dialog centers and owns the viewport** — the prompt is hidden while the trust dialog is open, the dialog is centered in the viewport, and the shortened welcome banner is folded into it (e1102)
+- **Session retention off by default and per-project** — `max_sessions` now defaults to `0`, which disables retention limits entirely, and session cleanup is scoped per project (e1103)
 
 ### Fixed
 
 - **All `[court]` config fields wired into Court construction** — both standalone (`ProvideCourt`) and daemon (`createCourt`) Court constructors previously cherry-picked only a subset of `[court]` settings and silently dropped fields like `step_idle_timeout` and ling configuration; they now forward all `[court]` fields via `CourtConfig.Resolved`, while keeping `project` checkout-derived and `isolated_host` caller-verified (e1088)
 - **`list_edicts` filtered by derived status after `LIMIT`** — filtered queries (such as `status="cancelled"` or `status="sealed"`) previously truncated to the newest `limit` rows before checking derived status, falsely reporting "none match" when matches lay beyond the limit, and reported the limit as `in_scope`; `list_edicts` now resolves and filters across the full scope before applying `limit` and reports the true scope size in `in_scope` (e1080)
 - **`castle-siege` 0-ling retry deadlock** — routed Judge and Chancellor failures back to `strategizing` when no lings exist instead of deadlocking on an empty forging retry loop (e1099)
+- **"Allow all" now includes every requested seam** — the blanket choice ticked only a subset of rows; it now includes all requested assets (including MCP server rows), while the project directory stays read-write and mounts still never open for writing without an explicit per-mount grant (d4fb38c5, f36a7164)
+- **Worktree prep no longer sinks the first ritual** — the ignored-copy allowlist is bounded, prep is best-effort, and failures clean up after themselves instead of wedging the ritual before it starts (e966, absorbs e946)
+- **Network-dependent update check removed from CI** — `TestCheckForUpdates` no longer runs in CI (e1068)
 
 ### Removed
 
+- **Non-functional "Edit" option in the zhengming dialog** — removed the dead menu entry (e1105)
 - **Obsolete in-repo `nvim/` files** — removed the legacy `nvim/` plugin docs, loader, and test stubs ahead of the standalone `asimi.nvim` track (c9ededb74)
 
 ### Developer tooling
