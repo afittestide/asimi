@@ -78,19 +78,6 @@ type AnsweringChatMsg struct {
 	RequestID string
 }
 
-// AnsweringEditMsg is emitted when the user selects "Edit" to edit a question in $EDITOR
-type AnsweringEditMsg struct {
-	RequestID string
-	Question  string // The question text to edit
-}
-
-// AnsweringEditDoneMsg is emitted after editing is complete, with the (possibly modified) question text
-type AnsweringEditDoneMsg struct {
-	RequestID        string
-	Question         string // The edited question text (may be modified or original if no changes)
-	OriginalQuestion string // The original question text for comparison
-}
-
 // AnsweringState holds state for the answering mode UI
 type AnsweringState struct {
 	RequestID string
@@ -466,7 +453,7 @@ func (p *PromptComponent) HandleZhengmingPending(msg court.ZhengmingPendingMsg) 
 		aq[i] = AnsweringQuestion{
 			Text:    q.Text,
 			Summary: q.Summary,
-			Options: append(q.Options, "Edit", "Chat"),
+			Options: append(q.Options, "Chat"),
 		}
 	}
 
@@ -673,7 +660,7 @@ func (p *PromptComponent) syncAnsweringMode() {
 }
 
 // ParkAnswering takes requestID off screen without retiring it: the Ruler chose
-// an intermediate action (Edit / Chat) and has not acted on the request yet. The
+// an intermediate action (Chat) and has not acted on the request yet. The
 // request stays open. If another request is queued it takes the screen so it
 // stays visible and reachable; the parked request goes to the back of the queue.
 // When it is the only open request, the typable prompt answers it.
@@ -697,30 +684,6 @@ func (p *PromptComponent) ParkAnswering(requestID string) {
 	p.pendingMenu = nil
 	p.EnterViInsertMode()
 	p.TextArea.Focus()
-}
-
-// ResumeAnswering brings a parked request back on screen. It never clobbers a
-// request that arrived while the editor was open: if one is on screen, the
-// resumed request stays queued so both remain open.
-func (p *PromptComponent) ResumeAnswering(requestID string) {
-	idx := -1
-	for i, st := range p.pendingAnswering {
-		if st.RequestID == requestID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		return // already on screen, or not ours to resume
-	}
-	resumed := p.pendingAnswering[idx]
-	p.pendingAnswering = append(p.pendingAnswering[:idx], p.pendingAnswering[idx+1:]...)
-	if p.answering == nil || p.answering.NotARequest {
-		p.pendingMenu = nil
-		p.activateAnswering(resumed)
-		return
-	}
-	p.pendingAnswering = append(p.pendingAnswering, resumed)
 }
 
 // ResolveAnswering retires requestID — the Ruler acted on it (answered,
@@ -749,15 +712,6 @@ func removeAnswering(states []*AnsweringState, requestID string) []*AnsweringSta
 		}
 	}
 	return out
-}
-
-// UpdateAnsweringQuestion updates the current question's text and resets selection
-func (p *PromptComponent) UpdateAnsweringQuestion(text string) {
-	if p.answering != nil && p.answering.Current < len(p.answering.Questions) {
-		p.answering.Questions[p.answering.Current].Text = text
-		p.answering.Questions[p.answering.Current].Summary = text
-		p.answering.Questions[p.answering.Current].Selected = 0
-	}
 }
 
 // updateViModeStyle updates the border color based on vi mode state
@@ -1053,9 +1007,9 @@ func (p PromptComponent) Update(msg interface{}) (PromptComponent, tea.Cmd) {
 		if p.answering != nil {
 			return p.updateAnswering(keyMsg)
 		}
-		// No gate is on screen but some are parked (the Ruler chose Chat or
-		// Edit on the last one). Offer the same switch keys so those gates stay
-		// reachable instead of becoming invisible.
+		// No gate is on screen but some are parked (the Ruler chose Chat on the
+		// last one). Offer the same switch keys so those gates stay reachable
+		// instead of becoming invisible.
 		if p.PendingAnsweringCount() > 0 {
 			switch keyMsg.String() {
 			case "ctrl+n":
@@ -1229,17 +1183,7 @@ func (p PromptComponent) updateAnswering(keyMsg tea.KeyMsg) (PromptComponent, te
 		q.Selected = (q.Selected - 1 + totalOptions) % totalOptions
 	case "enter":
 		slog.Info("User hit enter in answering", "selected", q.Selected, "len", len(q.Options))
-		if q.Options[q.Selected] == "Edit" {
-			// "Edit" selected — open question in external editor
-			requestID := a.RequestID
-			questionText := q.Text
-			if q.Summary != "" {
-				questionText = q.Summary
-			}
-			return p, func() tea.Msg {
-				return AnsweringEditMsg{RequestID: requestID, Question: questionText}
-			}
-		} else if q.Options[q.Selected] == "Chat" {
+		if q.Options[q.Selected] == "Chat" {
 			requestID := a.RequestID
 			return p, func() tea.Msg {
 				return AnsweringChatMsg{RequestID: requestID}

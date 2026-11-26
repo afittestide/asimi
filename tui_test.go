@@ -6336,13 +6336,34 @@ func TestAnsweringEditMsg_EdictActionMenu_ExitsAnsweringMode(t *testing.T) {
 	showEdictActionMenu(model, 42)
 	require.NotNil(t, model.prompt().answering, "should be in answering mode")
 
-	// Simulate user selecting "Edit"
-	newModel, _ := model.handleCustomMessages(AnsweringEditMsg{
-		RequestID: "edict-42",
-	})
+	// Navigate to "Edit" and press Enter in PromptComponent.Update
+	editIdx := -1
+	for i, opt := range model.prompt().answering.Questions[0].Options {
+		if opt == "Edit" {
+			editIdx = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, editIdx, "edict action menu should contain Edit option")
+	p := *model.prompt()
+	for i := 0; i < editIdx; i++ {
+		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	p, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	*model.prompt() = p
+	require.NotNil(t, cmd, "selecting Edit should emit AnsweredMsg")
+
+	answeredMsg, ok := cmd().(AnsweredMsg)
+	require.True(t, ok, "expected AnsweredMsg")
+	assert.Equal(t, "edict-42", answeredMsg.RequestID)
+	assert.Equal(t, []string{"Edit"}, answeredMsg.Answers)
+
+	// Handle AnsweredMsg in TUI
+	newModel, editCmd := model.handleCustomMessages(answeredMsg)
 	updated, ok := newModel.(TUIModel)
 	require.True(t, ok)
 	assert.Nil(t, updated.prompt().answering, "should exit answering mode before opening editor")
+	assert.NotNil(t, editCmd, "should return non-nil editor tea.Cmd")
 }
 
 // --- Tests for handleEdictCancel already-cancelled ---
@@ -6957,7 +6978,7 @@ func TestViewLayoutHeightInvariantAnsweringMode(t *testing.T) {
 			{
 				Text:    "Which approach do you prefer?",
 				Summary: "Which approach?",
-				Options: []string{longOption, "Short", longOption, "Edit"},
+				Options: []string{longOption, "Short", longOption, "Chat"},
 			},
 		},
 		Answers: make([]string, 1),
@@ -8482,33 +8503,6 @@ func TestGatesCommandReportsNonePending(t *testing.T) {
 	content := updated.tabs.Content()
 	assert.Equal(t, ViewGate, content.GetActiveView())
 	assert.Contains(t, content.View(), "No Ruler requests awaiting an answer.")
-}
-
-// TestAnsweringEditDone_UnchangedKeepsGateOpen verifies an editor round-trip
-// that changed nothing does not retire a gate the Ruler never acted on.
-func TestAnsweringEditDone_UnchangedKeepsGateOpen(t *testing.T) {
-	model := newTestModel(t)
-	mock := &mockCourtClient{}
-	model.court = mock
-
-	model.prompt().HandleZhengmingPending(court.ZhengmingPendingMsg{
-		RequestID:  "gate-1",
-		ChannelID:  "secretary",
-		MinisterID: "secretary",
-		Questions:  storage.ZhengmingQuestions{{Text: "Proceed?", Summary: "Proceed?", Options: []string{"Yes", "No"}}},
-	})
-
-	newModel, _ := model.handleCustomMessages(AnsweringEditDoneMsg{
-		RequestID:        "gate-1",
-		Question:         "Proceed?",
-		OriginalQuestion: "Proceed?",
-	})
-	updated, ok := newModel.(TUIModel)
-	require.True(t, ok)
-
-	require.NotNil(t, updated.prompt().answering, "an unchanged edit must not close the gate")
-	assert.Equal(t, "gate-1", updated.prompt().ActiveAnsweringRequest())
-	assert.Empty(t, mock.zhengmingResponses, "no answer was given, so nothing may be recorded")
 }
 
 // --- Handsoff mode tests ---

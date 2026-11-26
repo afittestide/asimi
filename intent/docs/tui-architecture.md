@@ -506,7 +506,7 @@ The prompt dynamically adjusts its height based on content:
 - **Minimum (2 lines)**: Empty prompt, single-line content, or scroll mode
 - **Expanded (`ExpandedHeight`, default 10)**: When content spans multiple lines (including wrapped text)
 - **Maximum (50% of screen)**: Hard cap to ensure content area remains usable
-- **Answering mode**: Sized to fit title + question + options (including "Edit"/"Chat" which are part of Options)
+- **Answering mode**: Sized to fit title + question + options (including "Chat" which is part of Options)
 
 ### Height Calculation Logic
 

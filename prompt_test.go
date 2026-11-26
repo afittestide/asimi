@@ -304,102 +304,9 @@ func TestArrowKeysInInsertMode(t *testing.T) {
 	}
 }
 
-// TestAnsweringModeEditOption tests that the Edit option appears and emits the correct message
-func TestAnsweringModeEditOption(t *testing.T) {
-	prompt := NewPromptComponent(80, 10)
-
-	// Create answering state with a question
-	state := &AnsweringState{
-		RequestID: "test-request-1",
-		Title:     "Zhengming: Sage asks",
-		Questions: []AnsweringQuestion{
-			{
-				Text:     "What would you like to do?",
-				Summary:  "What to do?",
-				Options:  []string{"Accept", tools.AnswerReject, "Edit", "Chat"},
-				Selected: 0,
-			},
-		},
-		Answers: make([]string, 1),
-	}
-	prompt.EnterAnsweringMode(state)
-
-	// View should include "Edit" option
-	view := prompt.View()
-	if !strings.Contains(view, "Edit") {
-		t.Error("View should contain 'Edit' option")
-	}
-
-	// Navigate down to Edit option (Options: Accept, Reject, Chat, Edit)
-	// Current selected is 0 (Accept), down to 1 (Reject), down to 2 (Chat), down to 3 (Edit)
-	downMsg := tea.KeyMsg{Type: tea.KeyDown}
-	prompt, _ = prompt.Update(downMsg) // Selected = 1
-	prompt, _ = prompt.Update(downMsg) // Selected = 2
-
-	// Press Enter to select Edit
-	enterMsg := tea.KeyMsg{Type: tea.KeyEnter}
-	_, cmd := prompt.Update(enterMsg)
-
-	// Should emit AnsweringEditMsg
-	if cmd == nil {
-		t.Fatal("Expected cmd to emit AnsweringEditMsg")
-	}
-
-	// Execute the command to get the message
-	msg := cmd()
-	if editMsg, ok := msg.(AnsweringEditMsg); ok {
-		if editMsg.RequestID != "test-request-1" {
-			t.Errorf("Expected RequestID 'test-request-1', got %q", editMsg.RequestID)
-		}
-		if editMsg.Question != "What to do?" {
-			t.Errorf("Expected Question 'What to do?' (summary), got %q", editMsg.Question)
-		}
-	} else {
-		t.Fatalf("Expected AnsweringEditMsg, got %T", msg)
-	}
-}
-
-// TestAnsweringModeEditUpdatesQuestion tests that UpdateAnsweringQuestion updates the current question
-func TestAnsweringModeEditUpdatesQuestion(t *testing.T) {
-	prompt := NewPromptComponent(80, 10)
-
-	// Create answering state
-	state := &AnsweringState{
-		RequestID: "test-request-2",
-		Title:     "Zhengming: Sage asks",
-		Questions: []AnsweringQuestion{
-			{
-				Text:     "Original question text",
-				Summary:  "Original",
-				Options:  []string{"Yes", "No"},
-				Selected: 0,
-			},
-		},
-		Answers: make([]string, 1),
-	}
-	prompt.EnterAnsweringMode(state)
-
-	// Update the question
-	modifiedText := "Modified question text"
-	prompt.UpdateAnsweringQuestion(modifiedText)
-
-	// Verify the question was updated
-	if prompt.answering.Questions[0].Text != modifiedText {
-		t.Errorf("Expected Text %q, got %q", modifiedText, prompt.answering.Questions[0].Text)
-	}
-	if prompt.answering.Questions[0].Summary != modifiedText {
-		t.Errorf("Expected Summary %q, got %q", modifiedText, prompt.answering.Questions[0].Summary)
-	}
-
-	// Selection should be reset to 0
-	if prompt.answering.Questions[0].Selected != 0 {
-		t.Errorf("Expected Selected to be reset to 0, got %d", prompt.answering.Questions[0].Selected)
-	}
-}
-
-// TestHandleZhengmingPendingAppendsEditChat verifies that HandleZhengmingPending
-// appends "Edit" and "Chat" to each question's Options.
-func TestHandleZhengmingPendingAppendsEditChat(t *testing.T) {
+// TestHandleZhengmingPendingAppendsChat verifies that HandleZhengmingPending
+// appends only "Chat" (and not "Edit") to each question's Options.
+func TestHandleZhengmingPendingAppendsChat(t *testing.T) {
 	prompt := NewPromptComponent(80, 10)
 
 	msg := court.ZhengmingPendingMsg{
@@ -423,15 +330,17 @@ func TestHandleZhengmingPendingAppendsEditChat(t *testing.T) {
 	}
 
 	for i, q := range prompt.answering.Questions {
-		expected := len(msg.Questions[i].Options) + 2 // +Edit +Chat
+		expected := len(msg.Questions[i].Options) + 1 // +Chat
 		if len(q.Options) != expected {
 			t.Errorf("Question %d: expected %d options, got %d", i, expected, len(q.Options))
 		}
-		if q.Options[len(q.Options)-2] != "Edit" {
-			t.Errorf("Question %d: expected second-to-last option 'Edit', got %q", i, q.Options[len(q.Options)-2])
-		}
 		if q.Options[len(q.Options)-1] != "Chat" {
 			t.Errorf("Question %d: expected last option 'Chat', got %q", i, q.Options[len(q.Options)-1])
+		}
+		for _, opt := range q.Options {
+			if opt == "Edit" {
+				t.Errorf("Question %d: unexpected 'Edit' option in %v", i, q.Options)
+			}
 		}
 	}
 }
@@ -448,7 +357,7 @@ func TestAnsweringModeChatOption(t *testing.T) {
 			{
 				Text:     "Pick one",
 				Summary:  "Pick",
-				Options:  []string{"Accept", tools.AnswerReject, "Edit", "Chat"},
+				Options:  []string{"Accept", tools.AnswerReject, "Chat"},
 				Selected: 0,
 			},
 		},
@@ -456,11 +365,10 @@ func TestAnsweringModeChatOption(t *testing.T) {
 	}
 	prompt.EnterAnsweringMode(state)
 
-	// Navigate to "Chat" (index 3)
+	// Navigate to "Chat" (index 2)
 	downMsg := tea.KeyMsg{Type: tea.KeyDown}
 	prompt, _ = prompt.Update(downMsg) // Selected = 1
-	prompt, _ = prompt.Update(downMsg) // Selected = 2
-	prompt, _ = prompt.Update(downMsg) // Selected = 3 (Chat)
+	prompt, _ = prompt.Update(downMsg) // Selected = 2 (Chat)
 
 	// Press Enter to select Chat
 	enterMsg := tea.KeyMsg{Type: tea.KeyEnter}
@@ -819,7 +727,7 @@ func TestViewAnsweringHeightMatchesCalculateDesiredHeightLongQuestion(t *testing
 			{
 				Text:    longQuestion,
 				Summary: longQuestion,
-				Options: []string{"Accept", "Reject", "Edit", "Chat"},
+				Options: []string{"Accept", "Reject", "Chat"},
 			},
 		},
 		Answers: make([]string, 1),
@@ -977,8 +885,7 @@ func TestAnsweringRotateMakesEveryGateSelectable(t *testing.T) {
 	}
 }
 
-// TestAnsweringParkPromotesNextGate verifies parking the active gate (Edit /
-// Chat) leaves the *other* open gates answerable. A parked gate is not retired,
+// TestAnsweringParkPromotesNextGate verifies parking the active gate (Chat) leaves the *other* open gates answerable. A parked gate is not retired,
 // but it also must not strand the queue: with answering==nil the prompt renders
 // the plain textarea and the queued requests are neither visible nor reachable.
 func TestAnsweringParkPromotesNextGate(t *testing.T) {
@@ -993,7 +900,7 @@ func TestAnsweringParkPromotesNextGate(t *testing.T) {
 		})
 	}
 
-	// The Ruler chooses Chat/Edit on the active gate.
+	// The Ruler chooses Chat on the active gate.
 	prompt.ParkAnswering("gate-1")
 
 	if got := prompt.OpenAnsweringRequests(); len(got) != 2 {
@@ -1007,37 +914,8 @@ func TestAnsweringParkPromotesNextGate(t *testing.T) {
 	}
 }
 
-// TestAnsweringResumeDoesNotClobberNewArrival verifies the Edit round-trip
-// cannot erase a request that arrived while the editor was open. The parked gate
-// must come back without evicting the newcomer — two gates in, two gates out.
-func TestAnsweringResumeDoesNotClobberNewArrival(t *testing.T) {
-	prompt := NewPromptComponent(80, 10)
-	mk := func(id string) court.ZhengmingPendingMsg {
-		return court.ZhengmingPendingMsg{
-			RequestID:  id,
-			MinisterID: "secretary",
-			Questions: storage.ZhengmingQuestions{
-				{Text: id, Summary: id, Options: []string{"Approve edict", "Reject"}},
-			},
-		}
-	}
-
-	prompt.HandleZhengmingPending(mk("gate-1"))
-	prompt.ParkAnswering("gate-1")              // Ruler chose Edit on gate-1
-	prompt.HandleZhengmingPending(mk("gate-2")) // a second suggestion arrives
-	prompt.ResumeAnswering("gate-1")            // editor round-trip changed nothing
-
-	open := prompt.OpenAnsweringRequests()
-	if len(open) != 2 {
-		t.Fatalf("a gate was lost across park/resume: open=%v active=%q", open, prompt.ActiveAnsweringRequest())
-	}
-	if prompt.ActiveAnsweringRequest() == "" {
-		t.Fatalf("no gate is active after resume: open=%v", open)
-	}
-}
-
 // TestSingleParkedGateStaysVisibleAndReachable verifies that when the only open
-// gate is parked (the Ruler chose Chat or Edit), the typable prompt still says a
+// gate is parked (the Ruler chose Chat), the typable prompt still says a
 // request is outstanding and ctrl+n returns to it. A parked gate that is neither
 // shown nor reachable is a lost gate.
 func TestSingleParkedGateStaysVisibleAndReachable(t *testing.T) {
