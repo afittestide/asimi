@@ -1172,7 +1172,47 @@ func TestHeadlessSink_HandleRitualStepInfo(t *testing.T) {
 	require.Equal(t, "hello from out step\n", out.String())
 }
 
-func TestHeadlessEventMode_MalformedJSON(t *testing.T) {
+// runEventHeadless runs the shared headless path with cli.Event set to raw,
+// capturing stdout and stderr. Sink and event prints target os.Stdout by
+// default, so both are swapped for pipes around the run.
+func runEventHeadless(t *testing.T, raw string) (code int, stdout, stderr string) {
+	t.Helper()
+
+	or, ow, err := os.Pipe()
+	require.NoError(t, err)
+	er, ew, err := os.Pipe()
+	require.NoError(t, err)
+
+	origStdout, origStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = ow, ew
+	origEvent := cli.Event
+	cli.Event = raw
+	t.Cleanup(func() {
+		os.Stdout, os.Stderr = origStdout, origStderr
+		cli.Event = origEvent
+	})
+
+	done := make(chan int, 1)
+	go func() { done <- runHeadlessModeImpl() }()
+
+	var outBuf, errBuf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); io.Copy(&outBuf, or) }()
+	go func() { defer wg.Done(); io.Copy(&errBuf, er) }()
+
+	select {
+	case code = <-done:
+	case <-time.After(120 * time.Second):
+		t.Fatal("event headless run timed out")
+	}
+	ow.Close()
+	ew.Close()
+	wg.Wait()
+	return code, outBuf.String(), errBuf.String()
+}
+
+func TestHeadlessEventMode_MalformedEvent(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  string
@@ -1180,19 +1220,59 @@ func TestHeadlessEventMode_MalformedJSON(t *testing.T) {
 		{name: "invalid json", raw: "{not-json"},
 		{name: "json array", raw: `["a","b"]`},
 		{name: "json null", raw: "null"},
-		{name: "non-object headers", raw: `{"headers":"bad","body":""}`},
-		{name: "non-string body", raw: `{"headers":{},"body":123}`},
-		{name: "non-string header value", raw: `{"headers":{"X-GitHub-Event":123},"body":""}`},
+		{name: "missing event_type", raw: `{"provider":"github","delivery_id":"d","payload":{}}`},
+		{name: "empty event_type", raw: `{"provider":"github","event_type":"","payload":{}}`},
+		{name: "missing payload", raw: `{"provider":"github","event_type":"push"}`},
+		{name: "payload not an object", raw: `{"provider":"github","event_type":"push","payload":"not-json"}`},
+		{name: "payload null", raw: `{"provider":"github","event_type":"push","payload":null}`},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := runHeadlessEventMode(&stdout, &stderr, tc.raw)
+			setupIsolatedEventEnv(t)
+			code, stdout, stderr := runEventHeadless(t, tc.raw)
 			require.Equal(t, 1, code)
-			require.NotEmpty(t, stderr.String())
-			require.Empty(t, stdout.String())
+			require.NotEmpty(t, stderr)
+			require.Empty(t, stdout)
 		})
+	}
+}
+
+// TestParseWebhookEvent_ServiceFormat verifies the --event delivery format
+// normalizes into the storage.JSON trigger payload exactly as specified:
+// event_json verbatim, github_event from event_type, github_delivery from
+// delivery_id, provider and received_at passed through, and body the payload
+// re-serialized as a compact JSON string.
+func TestParseWebhookEvent_ServiceFormat(t *testing.T) {
+	raw := `{"provider":"github","event_type":"push","delivery_id":"d67eccb4-e8e3-11f1-90fa-86ac38dcf04d","received_at":"2026-11-25T15:21:09Z","payload":{"ref":"refs/heads/main","forced":false}}`
+
+	payload, err := parseWebhookEvent(raw)
+	require.NoError(t, err)
+	require.Equal(t, raw, payload["event_json"])
+	require.Equal(t, "push", payload["github_event"])
+	require.Equal(t, "d67eccb4-e8e3-11f1-90fa-86ac38dcf04d", payload["github_delivery"])
+	require.Equal(t, "github", payload["provider"])
+	require.Equal(t, "2026-11-25T15:21:09Z", payload["received_at"])
+	require.JSONEq(t, `{"forced":false,"ref":"refs/heads/main"}`, payload["body"].(string))
+}
+
+// TestParseWebhookEvent_RejectsMalformed verifies strict validation: any
+// malformed delivery is an error, never a silent no-match.
+func TestParseWebhookEvent_RejectsMalformed(t *testing.T) {
+	cases := []string{
+		"{not-json",
+		`["a","b"]`,
+		"null",
+		`{"payload":{}}`,
+		`{"event_type":"","payload":{}}`,
+		`{"event_type":"push"}`,
+		`{"event_type":"push","payload":null}`,
+		`{"event_type":"push","payload":"str"}`,
+	}
+	for _, raw := range cases {
+		payload, err := parseWebhookEvent(raw)
+		require.Error(t, err, "raw: %s", raw)
+		require.Nil(t, payload, "raw: %s", raw)
 	}
 }
 
@@ -1219,39 +1299,69 @@ func setupIsolatedEventEnv(t *testing.T) {
 func TestHeadlessEventMode_PingTriggersHello(t *testing.T) {
 	setupIsolatedEventEnv(t)
 
-	raw := `{"headers":{"X-GitHub-Event":"ping","X-GitHub-Delivery":"delivery-abc"},"body":"{\"zen\":\"keep it simple\"}"}`
-	var stdout, stderr bytes.Buffer
-	code := runHeadlessEventMode(&stdout, &stderr, raw)
+	raw := `{"provider":"github","event_type":"ping","delivery_id":"delivery-abc","received_at":"2026-11-25T15:21:09Z","payload":{"zen":"keep it simple"}}`
+	code, stdout, stderr := runEventHeadless(t, raw)
 
-	require.Equal(t, 0, code, "stderr: %s", stderr.String())
-	require.Contains(t, stdout.String(), "event=ping")
-	require.Contains(t, stdout.String(), "delivery=delivery-abc")
-	require.Contains(t, stdout.String(), raw)
+	require.Equal(t, 0, code, "stderr: %s", stderr)
+	require.Contains(t, stdout, "event=ping")
+	require.Contains(t, stdout, "delivery=delivery-abc")
+	require.Contains(t, stdout, raw)
 }
 
-func TestHeadlessEventMode_CaseInsensitiveHeader(t *testing.T) {
+// TestHeadlessEventMode_PushDeliveryNoMatch is the real-world smoke case:
+// the wh-event.json delivery shape (event_type "push") parses cleanly and
+// routes with no matching ritual, printing the no-match line and exit 0.
+func TestHeadlessEventMode_PushDeliveryNoMatch(t *testing.T) {
 	setupIsolatedEventEnv(t)
 
-	raw := `{"headers":{"x-github-event":"ping","x-github-delivery":"delivery-lower"},"body":"{}"}`
-	var stdout, stderr bytes.Buffer
-	code := runHeadlessEventMode(&stdout, &stderr, raw)
+	raw := `{"provider":"github","event_type":"push","delivery_id":"d67eccb4-e8e3-11f1-90fa-86ac38dcf04d","received_at":"2026-11-25T15:21:09Z","payload":{"ref":"refs/heads/main","before":"7eae20c9","after":"36591d19"}}`
+	code, stdout, stderr := runEventHeadless(t, raw)
 
-	require.Equal(t, 0, code, "stderr: %s", stderr.String())
-	require.Contains(t, stdout.String(), "event=ping")
-	require.Contains(t, stdout.String(), "delivery=delivery-lower")
-	require.Contains(t, stdout.String(), raw)
+	require.Equal(t, 0, code, "stderr: %s", stderr)
+	require.Contains(t, stdout, "no ritual matched webhook_received")
+	require.Contains(t, stdout, `"push"`)
+	require.Contains(t, stdout, `"d67eccb4-e8e3-11f1-90fa-86ac38dcf04d"`)
+}
+
+// TestHeadlessEventMode_SingleCourtStarted pins the Tian ledger to exactly
+// one court_started row per headless run. Regression guard for the merge
+// artifact that published the event twice: duplicated ledger rows and, per
+// ritual_manager.go, every court_started-triggered ritual firing twice per
+// run — invisible to the suite until this assertion existed.
+func TestHeadlessEventMode_SingleCourtStarted(t *testing.T) {
+	setupIsolatedEventEnv(t)
+
+	raw := `{"provider":"github","event_type":"push","delivery_id":"d67eccb4-e8e3-11f1-90fa-86ac38dcf04d","received_at":"2026-11-25T15:21:09Z","payload":{"ref":"refs/heads/main"}}`
+	code, _, stderr := runEventHeadless(t, raw)
+	require.Equal(t, 0, code, "stderr: %s", stderr)
+
+	dbPath := filepath.Join(os.Getenv("ASIMI_HOME"), "asimi.sqlite")
+	conn, err := sql.Open("sqlite", dbPath)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// The run's own connection may still be closing as fx unwinds; wait out
+	// the WAL lock instead of racing it.
+	_, err = conn.Exec("PRAGMA busy_timeout = 5000")
+	require.NoError(t, err)
+
+	var count int
+	require.NoError(t, conn.QueryRow(
+		"SELECT COUNT(*) FROM tian_events WHERE event_type = 'court_started'",
+	).Scan(&count))
+	require.Equal(t, 1, count,
+		"a headless run must persist exactly one court_started row, got %d", count)
 }
 
 func TestHeadlessEventMode_UnmatchedEventExitsZero(t *testing.T) {
 	setupIsolatedEventEnv(t)
 
-	raw := `{"headers":{"X-GitHub-Event":"unknown_test_event","X-GitHub-Delivery":"delivery-999"},"body":"{}"}`
-	var stdout, stderr bytes.Buffer
-	code := runHeadlessEventMode(&stdout, &stderr, raw)
+	raw := `{"provider":"github","event_type":"unknown_test_event","delivery_id":"delivery-999","received_at":"2026-11-25T15:21:09Z","payload":{}}`
+	code, stdout, stderr := runEventHeadless(t, raw)
 
-	require.Equal(t, 0, code, "stderr: %s", stderr.String())
-	require.Contains(t, stdout.String(), "unknown_test_event")
-	require.Contains(t, stdout.String(), "delivery-999")
+	require.Equal(t, 0, code, "stderr: %s", stderr)
+	require.Contains(t, stdout, "unknown_test_event")
+	require.Contains(t, stdout, "delivery-999")
 }
 
 func TestHeadlessSink_EventModeIgnoresStreamDone(t *testing.T) {
@@ -1429,30 +1539,43 @@ func TestHeadlessSink_EventModeIgnoresUnrelatedWhilePending(t *testing.T) {
 	}
 }
 
-func TestSelectEntryMode_EventJSONDoesNotBlockOnOpenStdin(t *testing.T) {
+func TestSelectEntryMode_EventFlagDoesNotBlockOnOpenStdin(t *testing.T) {
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	defer pw.Close()
 
-	// ASIMI_EVENT_JSON with non-TTY open stdin pipe must not block on stdin.
-	mode, arg := selectEntryMode("", `{"headers":{},"body":""}`, false, pr)
+	// --event with non-TTY open stdin pipe must not block on stdin.
+	mode, arg := selectEntryMode("", `{"provider":"github","event_type":"push","payload":{}}`, false, pr)
 	require.Equal(t, entryHeadlessEvent, mode)
-	require.Equal(t, `{"headers":{},"body":""}`, arg)
+	require.Equal(t, `{"provider":"github","event_type":"push","payload":{}}`, arg)
 
-	// Explicit -p prompt still takes precedence over ASIMI_EVENT_JSON.
-	mode, arg = selectEntryMode("do something", `{"headers":{},"body":""}`, false, pr)
+	// Explicit -p prompt still takes precedence over --event.
+	mode, arg = selectEntryMode("do something", `{"provider":"github","event_type":"push","payload":{}}`, false, pr)
 	require.Equal(t, entryHeadlessPrompt, mode)
 	require.Equal(t, "do something", arg)
 
-	// Piped stdin without -p or ASIMI_EVENT_JSON reads prompt.
+	// Piped stdin without -p or --event reads prompt.
 	mode, arg = selectEntryMode("", "", false, strings.NewReader("  piped prompt \n"))
 	require.Equal(t, entryHeadlessPrompt, mode)
 	require.Equal(t, "piped prompt", arg)
 
-	// Empty closed stdin without -p or ASIMI_EVENT_JSON falls back to interactive.
+	// Empty closed stdin without -p or --event falls back to interactive.
 	mode, arg = selectEntryMode("", "", false, strings.NewReader(""))
 	require.Equal(t, entryInteractive, mode)
 	require.Equal(t, "", arg)
+}
+
+// TestEventFlagParsesViaKong asserts the --event CLI flag parses via kong
+// and populates cli.Event, which drives the shared headless run path.
+func TestEventFlagParsesViaKong(t *testing.T) {
+	orig := cli.Event
+	t.Cleanup(func() { cli.Event = orig })
+
+	raw := `{"provider":"github","event_type":"ping","payload":{}}`
+	parser := kong.Must(&cli, cliOptions...)
+	_, err := parser.Parse([]string{"--event", raw})
+	require.NoError(t, err)
+	require.Equal(t, raw, cli.Event)
 }
 
 // TestDebugLogAnnouncement verifies the harness-visible line printed in

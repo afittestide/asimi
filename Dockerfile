@@ -3,13 +3,17 @@
 # Multi-arch runtime image for headless Asimi execution (e.g. Cloud Run Jobs).
 #
 # Expected Cloud Run / ADC runtime environment contract:
-#   ASIMI_EVENT_JSON                JSON event payload driving the headless run
 #   ASIMI_PROVIDER=vertex           LLM provider (Vertex AI)
 #   ASIMI_MODEL=gemini-4-neon       Model identifier
 #   GOOGLE_CLOUD_PROJECT            GCP project ID for Vertex AI
 #   GOOGLE_CLOUD_REGION=global      Optional Vertex AI region
 #   GOOGLE_APPLICATION_CREDENTIALS  Unset (uses Cloud Run ADC via metadata server)
 #   ASIMI_HOME=/tmp/asimi           Ephemeral writable directory for SQLite & logs
+#
+# The webhook event arrives as a CLI argument in the online service's
+# delivery format, supplied by the Cloud Run Job's Args (the ENTRYPOINT
+# above stays unchanged):
+#   asimi --isolated-host --handsoff --event '{"provider":"github","event_type":"push","delivery_id":"...","received_at":"...","payload":{...}}'
 
 FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS builder
 

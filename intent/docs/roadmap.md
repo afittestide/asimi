@@ -11,7 +11,7 @@
   in `intent/letters/e940.md`, Letter 4)
 
 ### Headless Cloud Factory (asimi-factory)
-- Event-driven headless mode via `ASIMI_EVENT_JSON` and the builtin `hello`
+- Event-driven headless mode via `--event` and the builtin `hello`
   ritual (e1093, landed on `main`)
 - Root `Dockerfile` and multi-arch GHCR publishing (`ghcr.io/afittestide/asimi`)
   for the Cloud Run Job image (e1094)

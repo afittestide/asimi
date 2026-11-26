@@ -53,6 +53,7 @@ var cli struct {
 	Provider        string `help:"Override the LLM provider (overrides config file and ASIMI_PROVIDER)"`
 	ReasoningEffort string `help:"Overrides the LLM reasoning effort (low|medium|high), overrides config file and ASIMI_REASONING_EFFORT)"`
 	IsolatedHost    bool   `help:"Run shell commands on host without podman sandbox or approval gates (for already-isolated environments)"`
+	Event           string `help:"Webhook delivery JSON from the online service ({provider, event_type, delivery_id, received_at, payload}) driving an event-driven headless run"`
 	CPUProfile      string `help:"Write CPU profile to file"`
 	MemProfile      string `help:"Write memory profile to file"`
 	Trace           string `help:"Write execution trace to file"`
@@ -143,8 +144,9 @@ func debugLogAnnouncement() string {
 
 // runHeadless wires up non-interactive mode: initialize the logger first,
 // then (in debug mode) announce the resolved log path on stdout so captured
-// transcripts name it, then execute the prompt. stdout is a parameter so the
-// ordering and the announcement are unit-testable without a terminal.
+// transcripts name it, then execute the prompt or the event (cli.Event).
+// stdout is a parameter so the ordering and the announcement are
+// unit-testable without a terminal.
 func runHeadless(stdout io.Writer, startTime time.Time) int {
 	initLogger()
 	if cli.Debug {
@@ -152,15 +154,6 @@ func runHeadless(stdout io.Writer, startTime time.Time) int {
 		slog.Debug("[TIMING] initLogger() completed", "duration", time.Since(startTime))
 	}
 	return runHeadlessMode()
-}
-
-func runHeadlessEvent(stdout, stderr io.Writer, rawEvent string, startTime time.Time) int {
-	initLogger()
-	if cli.Debug {
-		printDebugAnnouncement(stdout)
-		slog.Debug("[TIMING] initLogger() completed", "duration", time.Since(startTime))
-	}
-	return runHeadlessEventMode(stdout, stderr, rawEvent)
 }
 
 func initLogger() {
@@ -489,16 +482,17 @@ func main() {
 
 	// Determine if we should run in non-interactive mode:
 	// 1. Explicit -p flag: asimi -p "prompt here"
-	// 2. ASIMI_EVENT_JSON env var: event-driven headless mode
+	// 2. --event flag: event-driven headless mode
 	// 3. Non-interactive stdin (pipe/redirect): echo "prompt" | asimi
 	isStdinTerminal := isatty.IsTerminal(os.Stdin.Fd())
-	mode, arg := selectEntryMode(cli.Prompt, os.Getenv("ASIMI_EVENT_JSON"), isStdinTerminal, os.Stdin)
+	mode, arg := selectEntryMode(cli.Prompt, cli.Event, isStdinTerminal, os.Stdin)
 	switch mode {
 	case entryHeadlessPrompt:
 		cli.Prompt = arg
 		os.Exit(runHeadless(os.Stdout, startTime))
 	case entryHeadlessEvent:
-		os.Exit(runHeadlessEvent(os.Stdout, os.Stderr, arg, startTime))
+		cli.Event = arg
+		os.Exit(runHeadless(os.Stdout, startTime))
 	}
 
 	// Interactive mode
@@ -536,8 +530,8 @@ const (
 
 // selectEntryMode chooses between prompt headless mode, event headless mode,
 // piped-stdin headless mode, and interactive TUI. Explicit -p takes precedence
-// over ASIMI_EVENT_JSON, and ASIMI_EVENT_JSON is checked before reading
-// non-TTY stdin so an open stdin pipe (e.g. in containers) never blocks.
+// over --event, and --event is checked before reading non-TTY stdin so an
+// open stdin pipe (e.g. in containers) never blocks.
 func selectEntryMode(promptArg, eventJSON string, isStdinTerminal bool, stdin io.Reader) (entryMode, string) {
 	if promptArg != "" {
 		return entryHeadlessPrompt, promptArg

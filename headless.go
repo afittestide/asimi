@@ -29,11 +29,23 @@ import (
 // instead of hanging the process forever.
 const headlessRunWatchdog = 60 * time.Minute
 
-// runHeadlessMode executes a prompt non-interactively: initializes the
-// Court via fx DI, sends the prompt to the secretary, streams plain text
-// to stdout, and waits for the ritual (or chat) to complete.
-// Returns exit code 0 on success, 1 on failure.
+// runHeadlessMode executes a prompt or a webhook event non-interactively
+// through one shared headless path: initializes the Court via fx DI, then
+// either sends the prompt to the secretary (cli.Prompt) or — when --event
+// is given — waits for recovery, arms the matching rituals, and publishes
+// the parsed delivery as webhook_received. Returns exit code 0 on success,
+// 1 on failure.
 func runHeadlessModeImpl() int {
+	var eventPayload storage.JSON
+	if cli.Event != "" {
+		var err error
+		eventPayload, err = parseWebhookEvent(cli.Event)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "asimi: invalid --event: %v\n", err)
+			return 1
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -68,17 +80,23 @@ func runHeadlessModeImpl() int {
 		return 1
 	}
 
-	// Signal court_started so event-driven rituals and health checks fire
-	c.PublishEvent(c.CourtEdictKey(), storage.EventCourtStarted, storage.JSON{
-		"current_version": utils.AsimiVersion,
-	})
-
 	sink := newHeadlessSink(c)
 	sink.handsoff = cli.Handsoff
+	if eventPayload != nil {
+		sink.eventMode = true
+	}
+
 	subCtx, cancelSub := context.WithCancel(ctx)
 	defer cancelSub()
 	events := c.Subscribe(subCtx)
 	go sink.drain(events)
+
+	// Signal court_started so event-driven rituals and health checks fire.
+	// Published after the sink subscribes so it also receives the
+	// notification; the RitualGuard triggers rituals either way.
+	c.PublishEvent(c.CourtEdictKey(), storage.EventCourtStarted, storage.JSON{
+		"current_version": utils.AsimiVersion,
+	})
 
 	// Headless watchdog (e1075): a headless run must never hang forever on a
 	// wedged provider request. When the overall budget expires, the sink is
@@ -93,29 +111,56 @@ func runHeadlessModeImpl() int {
 	})
 	defer watchdog.Stop()
 
-	// Submit the prompt to the secretary (same as TUI's SubmitPromptMsg path)
-	prompt := &court.Prompt{
-		Ctx:       ctx,
-		Message:   cli.Prompt,
-		ChannelID: "secretary",
+	if eventPayload == nil {
+		// Submit the prompt to the secretary (same as TUI's SubmitPromptMsg path)
+		prompt := &court.Prompt{
+			Ctx:       ctx,
+			Message:   cli.Prompt,
+			ChannelID: "secretary",
+		}
+		if err := c.SubmitPrompt("secretary", prompt); err != nil {
+			fmt.Fprintf(os.Stderr, "asimi: failed to submit prompt: %v\n", err)
+			return 1
+		}
+		return sink.wait()
 	}
-	if err := c.SubmitPrompt("secretary", prompt); err != nil {
-		fmt.Fprintf(os.Stderr, "asimi: failed to submit prompt: %v\n", err)
+
+	// Event-driven run (--event): feed the event to the court like any
+	// other event publisher and wait for every triggered ritual to reach a
+	// terminal state.
+	if err := c.WaitForRecovery(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "asimi: failed waiting for recovery: %v\n", err)
 		return 1
 	}
 
-	// Wait for completion
-	exitCode := sink.wait()
-	return exitCode
+	matched := c.MatchingRituals(storage.EventWebhookReceived, eventPayload)
+	if len(matched) == 0 {
+		githubEvent, _ := eventPayload["github_event"].(string)
+		githubDelivery, _ := eventPayload["github_delivery"].(string)
+		fmt.Fprintf(sink.out(), "asimi: no ritual matched webhook_received (github_event=%q, github_delivery=%q)\n", githubEvent, githubDelivery)
+		return 0
+	}
+
+	sink.armEventRituals(matched)
+	c.PublishEvent(c.CourtEdictKey(), storage.EventWebhookReceived, eventPayload)
+	return sink.wait()
 }
 
-type webhookEnvelope struct {
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
+// webhookDelivery is the online service's --event shape: a flat delivery
+// record whose payload carries the full webhook body.
+type webhookDelivery struct {
+	Provider    string          `json:"provider"`
+	EventType   string          `json:"event_type"`
+	DeliveryID  string          `json:"delivery_id"`
+	ReceivedAt  string          `json:"received_at"`
+	Payload     json.RawMessage `json:"payload"`
 }
 
-// parseWebhookEvent parses ASIMI_EVENT_JSON ({"headers": {...}, "body": "..."})
-// into a normalized storage.JSON payload for EventWebhookReceived.
+// parseWebhookEvent parses the --event flag value (the online service's
+// delivery format: {"provider", "event_type", "delivery_id", "received_at",
+// "payload"}) into a normalized storage.JSON payload for
+// EventWebhookReceived. Validation is strict: a malformed delivery is an
+// error, never a silent no-match.
 func parseWebhookEvent(raw string) (storage.JSON, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
@@ -125,112 +170,40 @@ func parseWebhookEvent(raw string) (storage.JSON, error) {
 		return nil, fmt.Errorf("expected a JSON object")
 	}
 
-	var env webhookEnvelope
-	if err := json.Unmarshal([]byte(raw), &env); err != nil {
-		return nil, fmt.Errorf("invalid webhook envelope: %w", err)
+	var d webhookDelivery
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		return nil, fmt.Errorf("invalid webhook delivery: %w", err)
+	}
+	if d.EventType == "" {
+		return nil, fmt.Errorf("event_type must not be empty")
+	}
+	rawPayload, ok := obj["payload"]
+	if !ok {
+		return nil, fmt.Errorf("payload must be present and a JSON object")
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+		return nil, fmt.Errorf("payload must be a JSON object: %w", err)
+	}
+	if payload == nil {
+		return nil, fmt.Errorf("payload must be present and a JSON object")
 	}
 
-	var githubEvent, githubDelivery string
-	for k, v := range env.Headers {
-		switch strings.ToLower(k) {
-		case "x-github-event":
-			githubEvent = v
-		case "x-github-delivery":
-			githubDelivery = v
-		}
+	// Ritual inputs are string-valued, so the payload is re-serialized as a
+	// compact JSON string (event_json keeps the verbatim original).
+	compact, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize payload: %w", err)
 	}
 
 	return storage.JSON{
 		"event_json":      raw,
-		"github_event":    githubEvent,
-		"github_delivery": githubDelivery,
-		"headers":         env.Headers,
-		"body":            env.Body,
+		"github_event":    d.EventType,
+		"github_delivery": d.DeliveryID,
+		"provider":        d.Provider,
+		"received_at":     d.ReceivedAt,
+		"body":            string(compact),
 	}, nil
-}
-
-// runHeadlessEventMode handles event-driven headless execution when
-// ASIMI_EVENT_JSON is set. It boots the Court, waits for startup recovery,
-// publishes EventWebhookReceived, and waits for all triggered rituals to reach
-// a terminal state.
-func runHeadlessEventMode(stdout, stderr io.Writer, rawEvent string) int {
-	payload, err := parseWebhookEvent(rawEvent)
-	if err != nil {
-		fmt.Fprintf(stderr, "asimi: invalid ASIMI_EVENT_JSON: %v\n", err)
-		return 1
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var c *court.Court
-	var cfg *Config
-	var repoInfo repo.RepoInfo
-
-	app := fx.New(
-		fx.NopLogger,
-		fx.Provide(
-			ProvideLogger,
-			ProvideRepoInfo,
-			ProvideConfig,
-			ProvideStorage,
-			ProvideGormDB,
-			ProvideScheduler,
-			ProvideShellRunner,
-			ProvideCourt,
-		),
-		fx.Populate(&c, &cfg, &repoInfo),
-	)
-
-	if err := app.Start(ctx); err != nil {
-		fmt.Fprintf(stderr, "asimi: failed to start: %v\n", err)
-		return 1
-	}
-	defer app.Stop(context.Background())
-
-	if err := c.SetContext(ctx, headlessContextParams(&repoInfo)); err != nil {
-		fmt.Fprintf(stderr, "asimi: context init failed: %v\n", err)
-		return 1
-	}
-
-	sink := newHeadlessSink(c)
-	sink.handsoff = cli.Handsoff
-	sink.stdout = stdout
-	sink.eventMode = true
-
-	subCtx, cancelSub := context.WithCancel(ctx)
-	defer cancelSub()
-	events := c.Subscribe(subCtx)
-	go sink.drain(events)
-
-	watchdog := time.AfterFunc(headlessRunWatchdog, func() {
-		fmt.Fprintf(stderr, "asimi: headless watchdog fired after %s; aborting\n", headlessRunWatchdog)
-		sink.finish(1)
-	})
-	defer watchdog.Stop()
-
-	c.PublishEvent(c.CourtEdictKey(), storage.EventCourtStarted, storage.JSON{
-		"current_version": utils.AsimiVersion,
-	})
-
-	if err := c.WaitForRecovery(ctx); err != nil {
-		fmt.Fprintf(stderr, "asimi: failed waiting for recovery: %v\n", err)
-		return 1
-	}
-
-	matched := c.MatchingRituals(storage.EventWebhookReceived, payload)
-	if len(matched) == 0 {
-		githubEvent, _ := payload["github_event"].(string)
-		githubDelivery, _ := payload["github_delivery"].(string)
-		fmt.Fprintf(stdout, "asimi: no ritual matched webhook_received (github_event=%q, github_delivery=%q)\n", githubEvent, githubDelivery)
-		return 0
-	}
-
-	sink.armEventRituals(matched)
-
-	c.PublishEvent(c.CourtEdictKey(), storage.EventWebhookReceived, payload)
-
-	return sink.wait()
 }
 
 // buildSetContextParams extracts SetContextParams from repo info. Shared by
@@ -337,7 +310,7 @@ type headlessSink struct {
 	// the initial ritual completes: it seals every pending-ascension edict and
 	// waits for their merge-worktree landings before the run exits.
 	mu                  sync.Mutex
-	eventMode           bool           // true when driven by ASIMI_EVENT_JSON
+	eventMode           bool           // true when driven by --event
 	eventRitualsArmed   bool           // true once pendingEventRituals is populated
 	pendingEventRituals map[string]int // matched ritual name -> remaining count awaiting terminal state
 	eventRitualError    bool           // true if any triggered ritual failed in eventMode
