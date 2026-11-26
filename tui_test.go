@@ -5168,6 +5168,75 @@ func TestOnboardingPrompt_NotShownWhenDeclined(t *testing.T) {
 	assert.Nil(t, cmd)
 }
 
+// TestIsolatedHostApproval_YesApprovesHostMode verifies the YES path of the
+// isolated-host approval: the flag clears, an approval toast shows, and the
+// session continues (no quit).
+func TestIsolatedHostApproval_YesApprovesHostMode(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	m.court = &mockCourtClient{}
+	m.isolatedHost = true
+	m.pendingIsolatedHostApproval = true
+
+	newModel, cmd := m.handleCustomMessages(yesNoResponseMsg{answer: true})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.False(t, updated.pendingIsolatedHostApproval, "the flag must clear after YES")
+	assert.Nil(t, cmd, "YES continues the session, no quit")
+
+	toasts := updated.commandLine.ActiveToasts()
+	require.Len(t, toasts, 1)
+	assert.Equal(t, "info", toasts[0].Type)
+	assert.Contains(t, toasts[0].Message, "Host mode approved")
+}
+
+// TestIsolatedHostApproval_NoQuits pins the Ruler's ruling (zhengming
+// c7add99da817a81e): answering NO to the isolated-host approval must exit
+// the session — the exit is the enforcement, because in isolated-host mode
+// commands run on the host unconditionally. There must be NO toast promising
+// the commands won't run.
+func TestIsolatedHostApproval_NoQuits(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	m.court = &mockCourtClient{}
+	m.isolatedHost = true
+	m.pendingIsolatedHostApproval = true
+
+	newModel, cmd := m.handleCustomMessages(yesNoResponseMsg{answer: false})
+	updated, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	assert.False(t, updated.pendingIsolatedHostApproval, "the flag must clear after NO")
+	require.NotNil(t, cmd, "declining host execution must quit")
+	_, quit := cmd().(tea.QuitMsg)
+	assert.True(t, quit, "the NO path must return tea.Quit")
+
+	assert.Empty(t, updated.commandLine.ActiveToasts(),
+		"NO must not show a reassurance toast — nothing is gated, so a promise would be a lie")
+}
+
+// TestIsolatedHostApproval_HandsoffAutoNoQuits drives the full production
+// path: handsoff auto-answers NO to the host-mode YESNO, and the resulting
+// answer handler exits the session. The fail-safe is a diagnosable exit, not
+// a silent widen.
+func TestIsolatedHostApproval_HandsoffAutoNoQuits(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	m.court = &mockCourtClient{}
+	m.isolatedHost = true
+	m.handsoff = true
+
+	updated, cmd := m.Update(trustSeamsLoadedMsg{seams: nil})
+	model := updated.(TUIModel)
+	require.Nil(t, model.trustDialog)
+	assert.True(t, model.pendingIsolatedHostApproval, "the YESNO is pending after the auto-answer is only dispatched, not handled")
+
+	// Feed the auto-NO back through the production answer handler.
+	newModel, quitCmd := model.handleCustomMessages(yesNoResponseMsg{answer: false})
+	_, ok := newModel.(TUIModel)
+	require.True(t, ok)
+	require.NotNil(t, quitCmd, "the handsoff auto-NO must quit the session")
+	_, quit := quitCmd().(tea.QuitMsg)
+	assert.True(t, quit, "handsoff fail-safe: the session exits rather than widening authority")
+	_ = cmd
+}
+
 // TestOnboardingYesNo_YesTriggersLoginWhenNoProvider verifies that answering YES
 // to the onboarding prompt triggers the login view when no provider is set.
 func TestOnboardingYesNo_YesTriggersLoginWhenNoProvider(t *testing.T) {
@@ -10859,17 +10928,101 @@ func TestTrustSeamsLoadedMsg_UpdateEmptyAppliesRestrictiveMandate(t *testing.T) 
 	assert.Empty(t, mock.appliedMandates[0].Mounts, "an empty request grants no mounts")
 	assert.Empty(t, mock.appliedMandates[0].Env, "an empty request grants no env")
 
-	// The skip must be disclosed, not silent: the toast names the mandate and
-	// every seam that stays open despite it (seams 1, 6, 7, 8).
+	// The skip must be disclosed, not silent: the e1079 ruling shortened the
+	// toast to a single plain-language line (pinned below in
+	// TestTrustSeamsLoadedMsg_EmptyToastIsShortAndSingleLine).
 	toasts := model.commandLine.ActiveToasts()
 	require.Len(t, toasts, 1, "skipping the dialog must surface exactly one disclosure toast")
 	assert.Equal(t, "info", toasts[0].Type, "a genuine empty request is normal operation, not an error")
-	assert.Contains(t, toasts[0].Message, "restrictive mandate applied",
-		"the toast must state what was applied")
-	for _, seam := range []string{"Working dir (rw)", "host network", "run_on_host", config.HostBypassFlag} {
-		assert.Contains(t, toasts[0].Message, seam,
-			"the toast must disclose that %q stays as configured", seam)
-	}
+	assert.Contains(t, toasts[0].Message, "requests no extra host assets",
+		"the toast must state the empty request in plain language")
+}
+
+// TestTrustSeamsLoadedMsg_IsolatedHostAsksHostApproval pins the isolated-host
+// ruling (e1079): with --isolated-host there is NO trust dialog (empty or not)
+// and no trust mandate — the sandbox is bypassed, so a seam dialog would be a
+// lie. Instead a YESNO approves this session's host execution.
+func TestTrustSeamsLoadedMsg_IsolatedHostAsksHostApproval(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+	m.isolatedHost = true
+
+	updated, _ := m.Update(trustSeamsLoadedMsg{seams: nil})
+	model := updated.(TUIModel)
+
+	require.Nil(t, model.trustDialog, "isolated host must not open the trust dialog")
+	assert.Empty(t, mock.appliedMandates, "no trust mandate before the Ruler answers")
+
+	assert.True(t, model.commandLine.IsInYesNoMode(),
+		"isolated host must surface a YESNO host-mode approval")
+	// The YESNO question must disclose host execution and the sandbox bypass.
+	rendered := model.commandLine.View()
+	assert.Contains(t, rendered, "host", "the question must name the host")
+	assert.Contains(t, rendered, "sandbox", "the question must name the sandbox bypass")
+	// The scary long toast and doc path must be gone.
+	assert.NotContains(t, rendered, "sandbox-seams.md")
+}
+
+// TestTrustSeamsLoadedMsg_IsolatedHostBeatsTheChooser: a repo that DOES
+// request seams still gets no chooser when isolated-host is on — the mode
+// outranks any seam request, and no seams are granted.
+func TestTrustSeamsLoadedMsg_IsolatedHostBeatsTheChooser(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	mock := &mockCourtClient{}
+	m.court = mock
+	m.isolatedHost = true
+
+	updated, _ := m.Update(trustSeamsLoadedMsg{seams: trustDialogSeams()})
+	model := updated.(TUIModel)
+
+	require.Nil(t, model.trustDialog, "isolated host must not open the chooser even for a non-empty request")
+	assert.Empty(t, mock.appliedMandates, "no trust mandate in isolated-host mode")
+	assert.True(t, model.commandLine.IsInYesNoMode(),
+		"isolated host with seams still asks the host-mode YESNO")
+}
+
+// TestTrustSeamsLoadedMsg_IsolatedHostHandsoffFailsSafe: with no Ruler to
+// ask, the host-mode YESNO auto-answers NO — handsoff must never auto-approve
+// host execution.
+func TestTrustSeamsLoadedMsg_IsolatedHostHandsoffFailsSafe(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	m.court = &mockCourtClient{}
+	m.isolatedHost = true
+	m.handsoff = true
+
+	updated, cmd := m.Update(trustSeamsLoadedMsg{seams: nil})
+	model := updated.(TUIModel)
+
+	require.Nil(t, model.trustDialog, "isolated host + handsoff: no dialog")
+	require.NotNil(t, cmd, "handsoff auto-answers the YESNO rather than prompting")
+	resp, ok := cmd().(yesNoResponseMsg)
+	require.True(t, ok, "handsoff must auto-answer with a yesNoResponseMsg")
+	assert.False(t, resp.answer, "handsoff must auto-answer NO to host execution")
+	assert.False(t, model.commandLine.IsInYesNoMode(), "no interactive prompt in handsoff mode")
+}
+
+// TestTrustSeamsLoadedMsg_EmptyToastIsShortAndSingleLine pins the e1079
+// wording ruling: the empty-request disclosure is one short plain-language
+// line, with no doc path and no scary flag token, readable in a narrow pane.
+func TestTrustSeamsLoadedMsg_EmptyToastIsShortAndSingleLine(t *testing.T) {
+	m := TUIModel{commandLine: NewCommandLineComponent()}
+	m.court = &mockCourtClient{}
+
+	updated, cmd := m.Update(trustSeamsLoadedMsg{seams: nil})
+	model := updated.(TUIModel)
+
+	require.Nil(t, model.trustDialog)
+	require.NotNil(t, cmd)
+	cmd()
+
+	toasts := model.commandLine.ActiveToasts()
+	require.Len(t, toasts, 1)
+	assert.Equal(t, "info", toasts[0].Type)
+	assert.Equal(t, "Sandbox: this project requests no extra host assets", toasts[0].Message)
+	assert.Equal(t, 3*time.Second, toasts[0].Timeout, "the disclosure must be short-lived")
+	assert.NotContains(t, toasts[0].Message, "sandbox-seams.md")
+	assert.NotContains(t, toasts[0].Message, config.HostBypassFlag)
 }
 
 // TestTrustDialog_UnreadableIsInert proves the unreadable dialog cannot be

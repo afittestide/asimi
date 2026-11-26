@@ -108,15 +108,20 @@ type TUIModel struct {
 	// Seal override confirmation state
 	pendingSealOverride   *pendingSealOverride
 	pendingIntentApproval *pendingIntentApproval
-	pendingEdictCancel  *pendingEdictCancel
+	pendingEdictCancel    *pendingEdictCancel
 	// Onboarding model selection confirmation state
 	pendingOnboarding bool
+	// pendingIsolatedHostApproval is set when the YESNO asks the Ruler to
+	// approve host execution under --isolated-host.
+	pendingIsolatedHostApproval bool
 	// trustDialog is the launch-time asset chooser (gh #180 / edict 1036).
 	// It is non-nil only while the Ruler is answering it; its answers become
 	// the session mandate.
 	trustDialog *TrustDialog
 	// Handsoff mode: auto-answer zhengming and YESNO prompts
-	handsoff bool
+	handsoff     bool
+	isolatedHost bool
+
 	// pendingZhengmingChatRequestID is armed when the Ruler selects "Chat" in
 	// a zhengming prompt. The next submitted prompt is delivered as the
 	// zhengming answer to this request instead of starting a new turn.
@@ -404,6 +409,7 @@ func NewTUIModel(cfg *Config, repoInfo *repo.RepoInfo, promptHistory *PromptHist
 		connDropPendingRetry:     make(map[string]pendingRetry),
 		tabExecutionIDs:          make(map[string]string),
 		handsoff:                 cli.Handsoff,
+		isolatedHost:             cli.IsolatedHost,
 	}
 
 	// Initialize tab system with default tabs built from minister defs
@@ -3507,6 +3513,20 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, grantIntentSealCmd(&m, edictID)
 			}
 			return m, nil
+		}
+
+		// Check if this is a response to the isolated-host approval prompt.
+		// The exit IS the enforcement: isolated-host mode runs commands on the
+		// host unconditionally, so declining host execution can only mean
+		// ending the session (zhengming c7add99da817a81e).
+		if m.pendingIsolatedHostApproval {
+			m.pendingIsolatedHostApproval = false
+			if msg.answer {
+				m.commandLine.AddToast("Host mode approved: commands run directly on the host", "info", 3*time.Second)
+				return m, nil
+			}
+			slog.Warn("isolated host mode declined: exiting the session")
+			return m, tea.Quit
 		}
 
 		// Check if this is a response to a seal override request

@@ -86,6 +86,18 @@ func (m *TUIModel) openTrustDialog(seams []config.Seam, loadErr error) tea.Cmd {
 	if m.court == nil {
 		return nil
 	}
+	// --isolated-host bypasses the sandbox entirely: every shell command runs
+	// unsandboxed on the host, so a dialog about sandbox seams would misstate
+	// the session's authority. The operator already chose the flag on the
+	// command line; the YESNO only approves this session's use of it and
+	// grants no seams. Handsoff fails safe via enterYesNoOrAuto: with no
+	// Ruler to ask, host execution is never auto-approved.
+	if m.isolatedHost {
+		slog.Info("isolated host mode: skipping the trust dialog, asking for host-mode approval")
+		question := fmt.Sprintf("Run commands directly on the host (sandbox bypassed by %s)?", config.HostBypassFlag)
+		m.pendingIsolatedHostApproval = true
+		return m.enterYesNoOrAuto(question, false)
+	}
 	if m.handsoff {
 		slog.Info("handsoff: applying restrictive mandate without a trust dialog")
 		return m.applyMandate(restrictiveSelections())
@@ -104,7 +116,7 @@ func (m *TUIModel) openTrustDialog(seams []config.Seam, loadErr error) tea.Cmd {
 	// 1059 / zhengming 44a2a226d637953a).
 	if len(seams) == 0 {
 		slog.Info("empty host asset request: applying restrictive mandate without a trust dialog")
-		m.commandLine.AddToast("Trust: no host assets requested — restrictive mandate applied. Working dir (rw), host network, run_on_host and --isolated-host remain as configured (intent/docs/sandbox-seams.md).", "info", 8*time.Second)
+		m.commandLine.AddToast("Sandbox: this project requests no extra host assets", "info", 3*time.Second)
 		return m.applyMandate(restrictiveSelections())
 	}
 	m.trustDialog = NewTrustDialog(seams)
