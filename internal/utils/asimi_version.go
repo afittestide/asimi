@@ -55,6 +55,11 @@ func ParseVersion(v string) (semver.Version, error) {
 
 // CheckForUpdates checks if a newer version is available on GitHub.
 // The ctx controls the HTTP request timeout and cancellation.
+//
+// Note: this function is exercised end-to-end by the release process, not by
+// unit tests. Do not add a test that dials the real GitHub API — the
+// unauthenticated calls hit shared-runner rate limits (403) and fail CI.
+// ParseGitHubRelease and ParseVersion carry the unit-testable invariants.
 func CheckForUpdates(ctx context.Context) (ReleaseInfo, bool, error) {
 	slog.Debug("Checking updates", "project", GetAsimiSlug())
 

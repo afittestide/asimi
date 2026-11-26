@@ -1,9 +1,7 @@
 package utils
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"runtime"
 	"testing"
 )
@@ -21,30 +19,6 @@ func TestGetAsimiSlug(t *testing.T) {
 	if slug != "afittestide/asimi" {
 		t.Errorf("GetAsimiSlug() = %q, want %q", slug, "afittestide/asimi")
 	}
-}
-
-func TestCheckForUpdates(t *testing.T) {
-	// Skip unless CI=true to avoid network-dependent tests during local development
-	if os.Getenv("CI") == "" {
-		t.Skip("Skipping network-dependent test (set CI=true to run)")
-	}
-
-	// This test makes real HTTP calls to GitHub API
-	// It verifies the full flow works end-to-end
-	release, updated, err := CheckForUpdates(context.Background())
-	if err != nil {
-		// "no release found" is acceptable if repo has no releases
-		if err.Error() != "no release found" {
-			t.Fatalf("CheckForUpdates() error = %v", err)
-		}
-	}
-
-	if !updated {
-		// Current version is up to date - also valid
-		t.Log("Current version is up to date")
-	}
-
-	t.Logf("Release info: version=%s, url=%s", release.Version, release.URL)
 }
 
 func TestParseGitHubRelease(t *testing.T) {
