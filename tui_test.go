@@ -3965,6 +3965,7 @@ type mockCourtClient struct {
 	submitPromptCalls       int
 	resetMinisterSessionIDs []string
 	restoreMinisterSessions []string
+	restoreMinisterSessionChannels []string
 
 	sessionSeams    []config.Seam
 	sessionSeamsErr error
@@ -4156,6 +4157,11 @@ func (m *mockCourtClient) ResetMinisterSession(id string, channelID ...string) {
 
 func (m *mockCourtClient) RestoreMinisterSession(tabType string, msgs []schemas.ChatMessage, channelID ...string) error {
 	m.restoreMinisterSessions = append(m.restoreMinisterSessions, tabType)
+	channel := ""
+	if len(channelID) > 0 {
+		channel = channelID[0]
+	}
+	m.restoreMinisterSessionChannels = append(m.restoreMinisterSessionChannels, channel)
 	return nil
 }
 
@@ -7914,6 +7920,8 @@ func TestHandleSessionSelected_NormalResumeUnchanged(t *testing.T) {
 	// Should have called RestoreMinisterSession
 	require.Len(t, mock.restoreMinisterSessions, 1)
 	assert.Equal(t, "chancellor", mock.restoreMinisterSessions[0])
+	require.Len(t, mock.restoreMinisterSessionChannels, 1)
+	assert.Equal(t, "chancellor", mock.restoreMinisterSessionChannels[0])
 
 	// Should NOT have submitted a prompt
 	assert.Equal(t, 0, mock.submitPromptCalls)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/afittestide/asimi/court"
+	"github.com/afittestide/asimi/internal/ministers"
 	"github.com/afittestide/asimi/storage"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -268,6 +269,16 @@ func formatRelativeTime(t time.Time) string {
 	return t.Format("Jan 2, 2006")
 }
 
+// tabHasHistory reports whether the tab holds anything beyond its greeting.
+func tabHasHistory(t *Tab) bool {
+	for _, message := range t.Content.Chat.Messages {
+		if message.Type != MessageTypeGreeting {
+			return true
+		}
+	}
+	return false
+}
+
 // handleSessionSelected processes a resumed session and updates the TUI model.
 // The full chat rebuild is split into small batches via resumeRebuildBatchMsg
 // ticks so the UI remains responsive while the history assembles. The
@@ -283,11 +294,37 @@ func (m *TUIModel) handleSessionSelected(session *court.Session) tea.Cmd {
 		return nil
 	}
 
+	tabType := session.TabType
+	if tabType == "" {
+		tabType = ministers.Secretary
+	}
 	if m.creatingTab == "" {
-		// Normal resume: clear edict key, switch to session's tab type
+		// Normal resume: clear the edict key and reuse an empty tab of the
+		// session's type, preferring the active one, before opening a new tab.
 		m.currentEdictKey = storage.EdictKey{}
-		if session.TabType != "" {
-			m.tabs.SwitchToTabType(TabType(session.TabType))
+		active := m.tabs.ActiveTab().Target
+		reuse := -1
+		for i := range m.tabs.tabs {
+			t := &m.tabs.tabs[i]
+			if t.Type != TabType(tabType) || t.Streaming || tabHasHistory(t) {
+				continue
+			}
+			if t.Target == active {
+				reuse = i
+				break
+			}
+			if reuse < 0 {
+				reuse = i
+			}
+		}
+		if reuse >= 0 {
+			m.tabs.SwitchToTarget(m.tabs.tabs[reuse].Target)
+		} else {
+			label := ministers.LookupByID(m.tabs.defs, tabType).Label()
+			if label == "" {
+				label = tabType
+			}
+			m.tabs.Add(label, TabType(tabType), m.tabs.UniqueTarget(tabType))
 		}
 	} else {
 		// Edict tab restore: set edict key, stay on the tab
@@ -303,16 +340,8 @@ func (m *TUIModel) handleSessionSelected(session *court.Session) tea.Cmd {
 	// This must happen before the first rebuild tick so the final batch can
 	// submit the pending prompt in the same order as before.
 	if m.court != nil {
-		tabType := session.TabType
-		if tabType == "" {
-			tabType = "secretary"
-		}
 		tab := m.tabs.ActiveTab()
-		if m.creatingTab == "" {
-			m.court.RestoreMinisterSession(tabType, session.GetMessages())
-		} else {
-			m.court.RestoreMinisterSession(tabType, session.GetMessages(), tab.Target)
-		}
+		m.court.RestoreMinisterSession(tabType, session.GetMessages(), tab.Target)
 	}
 
 	// Reset in-session prompt history state to prevent rollback issues
