@@ -191,10 +191,12 @@ func (s *Court) planZhengmingRetirements(pending []storage.Zhengming) []zhengmin
 }
 
 // edictRetirementReason covers the edict-level classes: the edict ascended
-// (a live Ruler seal) or was cancelled. Both mean the container is gone, so
-// both retire as superseded_by_edict. A tombstoned Ruler seal (stale_at set)
-// is not a retirement reason — the edict still reads active, so a stale seal
-// plus a pending request means the request still has work to gate.
+// (a live Ruler earth seal) or was cancelled. Both mean the container is gone,
+// so both retire as superseded_by_edict. A tombstoned Ruler seal (stale_at set)
+// or a ruler:intent-only seal is not a retirement reason — the edict still
+// reads active, so a pending request still has work to gate. A live waiter or
+// an active merge-worktree execution (which runs after ruler:earth) also keeps
+// the request alive until landing finishes.
 func (s *Court) edictRetirementReason(req *storage.Zhengming) (class, reason string, ok bool) {
 	var edict storage.Edict
 	if err := s.db.Where("id = ? AND username = ? AND project = ?",
@@ -204,13 +206,29 @@ func (s *Court) edictRetirementReason(req *storage.Zhengming) (class, reason str
 		}
 	}
 
-	// Same filter as SealService.HasSeal: only a live seal counts.
+	// Same filter as SealService.HasSeal(key, "ruler", "earth"): only a live earth seal counts.
 	var live int64
 	err := s.db.Model(&storage.Seal{}).
-		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND stale_at IS NULL",
-			req.EdictID, req.Username, req.Project, "ruler").
+		Where("edict_id = ? AND username = ? AND project = ? AND minister_id = ? AND realm = ? AND stale_at IS NULL",
+			req.EdictID, req.Username, req.Project, "ruler", "earth").
 		Count(&live).Error
 	if err == nil && live > 0 {
+		if s.zhengming != nil {
+			s.zhengming.mu.Lock()
+			_, hasWaiter := s.zhengming.pending[req.RequestID]
+			s.zhengming.mu.Unlock()
+			if hasWaiter {
+				return "", "", false
+			}
+		}
+		var activeMerge int64
+		if err := s.db.Model(&RitualExecution{}).
+			Where("edict_id = ? AND username = ? AND project = ? AND ritual_name = ? AND state IN ?",
+				req.EdictID, req.Username, req.Project, mergeWorktreeRitual,
+				[]string{string(RitualStatePending), string(RitualStateRunning)}).
+			Count(&activeMerge).Error; err == nil && activeMerge > 0 {
+			return "", "", false
+		}
 		return zhengmingClassAscended, "court: edict ascended (Ruler sealed)", true
 	}
 	return "", "", false

@@ -1106,11 +1106,6 @@ func (m *MinisterBase) HandleZhengmingResponse(ctx context.Context, requestID, a
 	}
 
 	reqKey := storage.EdictKey{ID: req.EdictID, Username: req.Username, Project: req.Project}
-	if req.EdictID != 0 {
-		if err := m.AppendToIntent(reqKey, answer); err != nil {
-			slog.Warn("failed to append clarification to edict", "edict_id", req.EdictID, "error", err)
-		}
-	}
 
 	// Emit zhengming_answered event
 	m.EmitEvent(reqKey, "zhengming_answered", storage.JSON{

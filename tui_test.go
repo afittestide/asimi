@@ -5458,9 +5458,9 @@ func TestAnsweringChatReplyGoesToTheChattedGate(t *testing.T) {
 // with the request it points at. Choosing Chat arms the sentinel so the next
 // submission answers that gate. If the Ruler then returns to the gate (ctrl+n)
 // and answers it with an option, the sentinel must be retired too — otherwise the
-// Ruler's *next* prompt is silently swallowed and recorded as another answer to a
-// request that is already resolved, appending a fresh instruction to that edict's
-// intent (court/minister.go HandleZhengmingResponse → AppendToIntent).
+// Ruler's *next* prompt is silently swallowed and recorded as a duplicate answer
+// to an already-resolved request (see e1104: answers stay on zhengming_requests
+// and no longer mutate the edict's intent).
 func TestChatSentinelRetiredWithItsGate(t *testing.T) {
 	model := newTestModel(t)
 	mock := &mockCourtClient{}

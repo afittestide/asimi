@@ -2670,3 +2670,84 @@ func TestMinisterBase_AppendToIntent_PreservesRulerIntentSeal(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, hasRulerIntent, "ruler intent seal must be preserved on clarification")
 }
+
+func TestMinisterBase_HandleZhengmingResponse_DoesNotMutateIntentOrSeals(t *testing.T) {
+	cases := []struct {
+		name  string
+		seals [][2]string
+	}{
+		{
+			name: "active edict preserves intent and live seals",
+			seals: [][2]string{
+				{"ruler", "intent"},
+				{"judge", "earth"},
+			},
+		},
+		{
+			name: "sealed edict preserves intent and all earth seals",
+			seals: [][2]string{
+				{"ruler", "intent"},
+				{"judge", "earth"},
+				{"chancellor", "earth"},
+				{"ruler", "earth"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupMinisterTestDB(t)
+			base := NewMinisterBase(db, nil, slog.Default(), "testuser", "testproject", nil)
+
+			const originalIntent = "original edict intent"
+			edict := storage.Edict{Intent: originalIntent, Username: "testuser", Project: "testproject"}
+			require.NoError(t, db.Create(&edict).Error)
+
+			key := storage.EdictKey{ID: edict.ID, Username: "testuser", Project: "testproject"}
+			sealSvc := storage.NewSealService(db)
+			for _, s := range tc.seals {
+				require.NoError(t, sealSvc.GrantSeal(key, s[0], s[1], storage.JSON{}))
+			}
+
+			const reqID = "zm-req-1104"
+			const answer = "stash the unstaged file and proceed"
+			require.NoError(t, db.Create(&storage.Zhengming{
+				RequestID:  reqID,
+				EdictID:    edict.ID,
+				Username:   "testuser",
+				Project:    "testproject",
+				MinisterID: "forge",
+				Status:     storage.ZhengmingPending,
+				Questions:  storage.ZhengmingQuestions{{Text: "How should I handle unstaged file?"}},
+			}).Error)
+
+			require.NoError(t, base.HandleZhengmingResponse(context.Background(), reqID, answer))
+
+			// Answer is recorded on zhengming_requests.
+			var gotReq storage.Zhengming
+			require.NoError(t, db.First(&gotReq, "request_id = ?", reqID).Error)
+			assert.Equal(t, storage.ZhengmingAnswered, gotReq.Status)
+			assert.Equal(t, answer, gotReq.Answer)
+
+			// zhengming_answered event is emitted to Tian ledger.
+			var events []storage.TianEvent
+			require.NoError(t, db.Where("edict_id = ? AND event_type = ?", edict.ID, "zhengming_answered").Find(&events).Error)
+			require.Len(t, events, 1)
+			assert.Equal(t, reqID, events[0].Payload["request_id"])
+			assert.Equal(t, answer, events[0].Payload["answer"])
+
+			// Edict intent is completely unchanged.
+			var gotEdict storage.Edict
+			require.NoError(t, db.First(&gotEdict, "id = ? AND username = ? AND project = ?", edict.ID, "testuser", "testproject").Error)
+			assert.Equal(t, originalIntent, gotEdict.Intent)
+			assert.NotContains(t, gotEdict.Intent, "**Clarification:**")
+
+			// All existing live seals remain intact.
+			for _, s := range tc.seals {
+				has, err := sealSvc.HasSeal(key, s[0], s[1])
+				require.NoError(t, err)
+				assert.True(t, has, "seal %s:%s must remain live after zhengming response", s[0], s[1])
+			}
+		})
+	}
+}

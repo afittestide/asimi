@@ -6297,7 +6297,7 @@ func TestZhengmingTriage_RetirementClasses(t *testing.T) {
 				edict := insertTriageEdict(t, db, "ascend me")
 				require.NoError(t, db.Create(&storage.Seal{
 					SealID: "seal-live", EdictID: edict.ID, Username: edict.Username,
-					Project: edict.Project, MinisterID: "ruler",
+					Project: edict.Project, MinisterID: "ruler", Realm: "earth",
 				}).Error)
 				return insertTriageZhengming(t, db, storage.Zhengming{
 					RequestID: "class-a", EdictID: edict.ID,
@@ -6513,6 +6513,102 @@ func TestZhengmingTriage_TombstonedSealDoesNotRetire(t *testing.T) {
 	assertStillPending(t, db, "after-tombstone")
 }
 
+func TestZhengmingTriage_IntentSealAndMergeWorktreeExemption(t *testing.T) {
+	t.Run("ruler:intent only survives triage", func(t *testing.T) {
+		s, db := newDisposalTestCourt(t)
+		edict := insertTriageEdict(t, db, "intent approved only")
+		require.NoError(t, db.Create(&storage.Seal{
+			SealID: "seal-intent", EdictID: edict.ID, Username: edict.Username,
+			Project: edict.Project, MinisterID: "ruler", Realm: "intent",
+		}).Error)
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: "intent-only", EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "clarify?"}},
+		})
+
+		pending, err := s.pendingZhengming()
+		require.NoError(t, err)
+		assert.Empty(t, s.planZhengmingRetirements(pending),
+			"ruler:intent seal must not be treated as ascended")
+		assertStillPending(t, db, "intent-only")
+	})
+
+	for _, state := range []RitualState{RitualStateRunning, RitualStatePending} {
+		t.Run("ruler:earth with "+string(state)+" merge-worktree survives triage", func(t *testing.T) {
+			s, db := newDisposalTestCourt(t)
+			edict := insertTriageEdict(t, db, "merging edict")
+			require.NoError(t, db.Create(&storage.Seal{
+				SealID: "seal-earth", EdictID: edict.ID, Username: edict.Username,
+				Project: edict.Project, MinisterID: "ruler", Realm: "earth",
+			}).Error)
+			require.NoError(t, db.Create(&RitualExecution{
+				ID: "merge-exec-" + string(state), RitualName: mergeWorktreeRitual,
+				EdictID: edict.ID, Username: edict.Username, Project: edict.Project,
+				State: state,
+			}).Error)
+			insertTriageZhengming(t, db, storage.Zhengming{
+				RequestID: "merge-prompt", EdictID: edict.ID,
+				Questions: storage.ZhengmingQuestions{{Text: "unstaged file on main?"}},
+			})
+
+			pending, err := s.pendingZhengming()
+			require.NoError(t, err)
+			assert.Empty(t, s.planZhengmingRetirements(pending),
+				"active merge-worktree prompt must survive triage")
+			assertStillPending(t, db, "merge-prompt")
+		})
+	}
+
+	t.Run("ruler:earth with live waiter survives triage", func(t *testing.T) {
+		s, db := newDisposalTestCourt(t)
+		edict := insertTriageEdict(t, db, "sealed with live waiter")
+		require.NoError(t, db.Create(&storage.Seal{
+			SealID: "seal-earth", EdictID: edict.ID, Username: edict.Username,
+			Project: edict.Project, MinisterID: "ruler", Realm: "earth",
+		}).Error)
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: "live-waiter", EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "still waiting?"}},
+		})
+		s.zhengming.mu.Lock()
+		s.zhengming.pending["live-waiter"] = make(chan ZhengmingAnswer, 1)
+		s.zhengming.mu.Unlock()
+
+		pending, err := s.pendingZhengming()
+		require.NoError(t, err)
+		assert.Empty(t, s.planZhengmingRetirements(pending),
+			"live parked waiter must survive triage")
+		assertStillPending(t, db, "live-waiter")
+	})
+
+	t.Run("ruler:earth with completed merge-worktree and no waiter retires as ascended", func(t *testing.T) {
+		s, db := newDisposalTestCourt(t)
+		edict := insertTriageEdict(t, db, "landed edict")
+		require.NoError(t, db.Create(&storage.Seal{
+			SealID: "seal-earth", EdictID: edict.ID, Username: edict.Username,
+			Project: edict.Project, MinisterID: "ruler", Realm: "earth",
+		}).Error)
+		require.NoError(t, db.Create(&RitualExecution{
+			ID: "merge-exec-done", RitualName: mergeWorktreeRitual,
+			EdictID: edict.ID, Username: edict.Username, Project: edict.Project,
+			State: RitualStateCompleted,
+		}).Error)
+		insertTriageZhengming(t, db, storage.Zhengming{
+			RequestID: "stale-after-merge", EdictID: edict.ID,
+			Questions: storage.ZhengmingQuestions{{Text: "stale?"}},
+		})
+
+		pending, err := s.pendingZhengming()
+		require.NoError(t, err)
+		plan := s.planZhengmingRetirements(pending)
+		require.Len(t, plan, 1)
+		assert.Equal(t, "stale-after-merge", plan[0].requestID)
+		assert.Equal(t, storage.ZhengmingSupersededByEdict, plan[0].status)
+		assert.Equal(t, "court: edict ascended (Ruler sealed)", plan[0].reason)
+		assert.Equal(t, zhengmingClassAscended, plan[0].class)
+	})
+}
+
 // TestZhengmingTriage_NeverRetiresPermanentEdicts pins the explicit carve-out:
 // edict 1 (Court Infrastructure) and edict 0 (the unscoped pseudo-edict) are
 // permanent, whatever else is true of their prompts.
@@ -6592,7 +6688,7 @@ func TestZhengmingTriage_RetiresSurvivorsCounts(t *testing.T) {
 		edict := insertTriageEdict(t, db, fmt.Sprintf("ascended %d", i))
 		require.NoError(t, db.Create(&storage.Seal{
 			SealID: fmt.Sprintf("seal-asc-%d", i), EdictID: edict.ID, Username: edict.Username,
-			Project: edict.Project, MinisterID: "ruler",
+			Project: edict.Project, MinisterID: "ruler", Realm: "earth",
 		}).Error)
 		insertTriageZhengming(t, db, storage.Zhengming{
 			RequestID: fmt.Sprintf("asc-%d", i), EdictID: edict.ID,
@@ -7313,7 +7409,7 @@ func TestZhengmingDelivery_ToastCountsMatchDispositions(t *testing.T) {
 	ascended := insertTriageEdict(t, db, "ascended")
 	require.NoError(t, db.Create(&storage.Seal{
 		SealID: "seal-asc", EdictID: ascended.ID, Username: ascended.Username,
-		Project: ascended.Project, MinisterID: "ruler",
+		Project: ascended.Project, MinisterID: "ruler", Realm: "earth",
 	}).Error)
 	insertTriageZhengming(t, db, storage.Zhengming{
 		RequestID: "asc-1", EdictID: ascended.ID,
