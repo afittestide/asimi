@@ -154,7 +154,7 @@ func TestTabManager_RenderWelcome(t *testing.T) {
 	assert.Contains(t, view, "INSERT")
 	// The welcome screen advertises :qa to quit all tabs (e744).
 	assert.Contains(t, view, ":qa")
-	assert.Contains(t, view, "quit all tabs")
+	assert.Contains(t, view, "quit Asimi")
 	// The tutorial hint must be advertised now that :help tutorial works.
 	assert.Contains(t, view, ":help")
 	// Shortened welcome drops the birthday banner and verbose bullet list (e1102).

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`release-version` ritual preflight gate** — the ritual now opens with a `verify-worktree` gate (clean worktree, `main` pushed to `origin`, no failed CI runs via `just get-runs`) so a release can never be cut from dirty or red state; and a post-release `verify-release` step checks the GitHub release workflow, the one-liner installer, and Homebrew after the Ruler confirms the push
 - **`review-contribution` built-in ritual** — reviews a foreign contributor's GitHub pull request (`pr` input) without checking out or executing untrusted code: the Judge reviews correctness, test coverage, and build/CI safety, the Chancellor checks adherence to the Imperial Code, and the Secretary synthesizes both reports to post an atomic GitHub review (`APPROVE` or `REQUEST_CHANGES`) with inline diff comments (0bb5c5fa4)
 - **The Ruler's Guide (mdBook)** — added a structured, multi-chapter user guide under `intent/guides/ruler/` covering the Court, getting started, edicts, lings, rituals, zhengming, the TUI, models, configuration, and troubleshooting, linked from `README.md` with a `just serve-book <name>` recipe for live preview (e252441e8)
 - **MCP support (`stdio`-only) and general `propose` tool** — Bifrost-native `stdio` MCP client integration with project `[[mcp.servers]]` gated in the launch-time trust dialog (`SeamMCPServer`), isolated Minister of Rites classification into Three Realms permissions, a general `propose` tool for Ruler sealing, persisted `mcp_tool_classifications` cache with cross-project reuse (`schema_hash` + `command_hash`, `---------` sealed deny), live-session permission gating, and daemon RPC status (e661)
@@ -17,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`release-version` race gate widened to all packages** — `verify-release-readiness` now runs `just test-race ./...` instead of the `./court/`-only default, making the race detector cover the full codebase; the `update-roadmap` step's instructions were rewritten to be unambiguous (mark landed items done, move missed items to the next version, keep the record)
 - **`[court]` ling settings unified into `max_parallel_lings`** — replaced `ling_ignition_enabled` and `ling_parallelism` with a single `[court] max_parallel_lings` integer (`0` disables automatic ling ignition by default; `N > 0` runs up to `N` ready lings concurrently in the edict's worktree), and removed the unused legacy `ritual_timeout` config field (e1088)
 - **Per-realm seal chain (`intent` vs `earth`) and six derived edict statuses** — split seals by realm (`intent` for `chancellor -> ruler`, `earth` for `judge -> chancellor -> ruler`) with a v8-to-v9 migration; expanded derived edict statuses to `draft`, `intent-approved`, `active` (ritual running), `blocked`, `sealed`, and `cancelled`, and wired the TUI to prompt for Ruler intent approval when `(chancellor, intent)` is granted (e713)
 

@@ -14,12 +14,16 @@ We follow [Semantic Versioning](https://semver.org/):
 
 ## Release Process
 
+Before starting, verify the court is cutting the release from a clean state:
+no uncommitted changes, local `main` equal to `origin/main`, and no failed
+CI runs (`just get-runs`). Red CI must never be released from.
+
 The instructions below use 0.2.1 as the version, please replace with the current version.
 
 ### 1. Prepare CHANGELOG.md
 
 Review the git log since the last version and ensure all user notable changes are 
-under the Unreleased section of the changle log.
+under the Unreleased section of the change log.
 Then, rename the section to 0.2.1 and add the date:
 
 ```markdown
@@ -75,7 +79,7 @@ git commit -m "chore: releasing 0.2.1"
 
 ```bash
 git tag -a v0.2.1 -m "Release 0.2.1"
-git push origin v0.2.1
+git push origin main --tags
 ```
 
 This triggers the GitHub Actions release workflow which:
@@ -117,7 +121,11 @@ curl -fsSL https://raw.githubusercontent.com/afittestide/asimi/main/scripts/inst
 vim CHANGELOG.md                                                   # Polish changelog
 sed -i 's/var AsimiVersion = .*/var AsimiVersion = "0.2.1"/' internal/utils/asimi_version.go  # Update version
 vim intent/docs/roadmap.md                                                # Update roadmap
-just get-vuln                                                   # Release gate: no reachable vulns
+just test                                                         # Tests pass
+just test-race ./...                                              # Race gate: full package list
+just lint                                                         # Linter clean
+just build                                                        # Project builds
+just get-vuln                                                     # Release gate: no reachable vulns
 git add CHANGELOG.md internal/utils/asimi_version.go intent/docs/roadmap.md && git commit -m "chore: releasing 0.2.1"
 git tag -a v0.2.1 -m "Release 0.2.1"
 git push origin main --tags
@@ -165,10 +173,13 @@ ASIMI_VERSION=v0.2.0 ASIMI_INSTALL_DIR=~/bin curl -fsSL https://asimi.dev/instal
 
 The `release-version` ritual (defined in `.agents/rituals.yaml`) automates this
 process end-to-end. The Chancellor enacts it via `enact_ritual` with a target
-version (e.g. `0.9.0`). The ritual runs through changelog preparation, version
-bump, roadmap update, verification (including the `just get-vuln` vulnerability
-gate), chancellor review, commit-and-tag, and finally asks the Ruler to confirm
-the push via zhengming.
+version (e.g. `0.9.0`). The ritual starts with a preflight gate (clean worktree,
+`main` pushed to `origin`, no failed CI runs), then runs through changelog
+preparation, version bump, roadmap update, verification (including the
+`just get-vuln` vulnerability gate and a full-package `just test-race` race
+gate), chancellor review, commit-and-tag, asks the Ruler to confirm the push
+via zhengming, and finally verifies the release — the GitHub release workflow,
+the one-liner installer, and Homebrew.
 
 Create a dedicated release edict and enact `release-version` bound to it (one
 edict per release); do not use edict 1.
@@ -177,4 +188,3 @@ edict per release); do not use edict 1.
 
 - [roadmap.md](roadmap.md) - Planned and in-flight work
 - [CHANGELOG.md](../CHANGELOG.md) - Version history
-story

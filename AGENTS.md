@@ -33,7 +33,7 @@ Use `just <recipe>` to manage the project:
 - fmt                            # Format code
 - freeze-logs                    # Freeze the log files to `./heaven/logs/asimi[-deamon]-<datetime>.log`
 - get-runs                       # Fetch failed CI runs since the last success, with their entire logs, to heaven/runs.
-- get-vulns                      # Run vulnerability scanning, save output to ./heaven/vuln/<tool>-<datetime>.out
+- get-vuln                      # Run vulnerability scanning, save output to ./heaven/vulns/<tool>-<datetime>.out
 - hello-harbor *args             # Recipe: build the latest asimi for linux, then hand it to Harbor
 - init-podman                    # Init and start the podman machine
 - install                        # Install dependencies

@@ -28,6 +28,31 @@
     - the earth status
   max_retries: 2
   steps:
+    - name: verify-worktree
+      minister: judge
+      given:
+        - "!git status --porcelain  # worktree_status"
+        - "!git fetch origin main --quiet; git rev-parse HEAD  # head"
+        - "!git rev-parse origin/main  # origin_main"
+        - "!just get-runs  # ci_runs"
+      act: |
+        Preflight gate — the release MUST NOT proceed unless the court is
+        cutting it from a clean, green, pushed state:
+
+        1. worktree_status must be empty — no uncommitted changes in the
+           working tree.
+        2. head must equal origin_main — everything intended for this
+           release is committed AND pushed to origin.
+        3. ci_runs must report no failed CI runs — red CI cannot be
+           released from.
+
+        If any check fails, report clearly and do not proceed.
+
+        Use record_verdict to record pass/fail.
+      then:
+        - the verdicts are passed
+      on_failure: retry
+
     - name: prepare-changelog
       minister: secretary
       given:
@@ -61,12 +86,16 @@
     - name: update-roadmap
       minister: forge
       act: |
-        Review intent/docs/roadmap.md entry for {{ .version }}.
-        Move all lines that weren't done in the version to the next version.
-        Lastly, completly remove the roadmap entry for {{ .version }}
-        in this release ({{ .version }}). Move completed items out of the
-        "to develop" sections or mark them as done. Use replace_text for
-        targeted edits — do NOT rewrite the file.
+        Review intent/docs/roadmap.md entries for {{ .version }}:
+        1. For each planned item in this version's section, check whether it
+           actually landed in this release (compare against the CHANGELOG
+           entries you prepared). Mark landed items as done.
+        2. Move any planned item that did NOT land into the next version's
+           section.
+        3. Keep items marked done under this version as the historical
+           record of what shipped.
+
+        Use replace_text for targeted edits — do NOT rewrite the file.
       on_failure: retry
 
     - name: verify-release-readiness
@@ -74,7 +103,7 @@
       given:
         - the earth status
         - "!just test  # test_results"
-        - "!just test-race  # race_results"
+        - "!just test-race ./...  # race_results"
         - "!just lint  # lint_results"
         - "!just build  # build_result"
         - "!just get-vuln  # vuln_results"
@@ -138,5 +167,28 @@
         - "Push release" (runs `git push origin main --tags`)
         - "Hold — review locally first" (stops here, Ruler pushes manually
           when ready)
+
+    - name: verify-release
+      minister: secretary
+      act: |
+        Post-release verification (only if the push was confirmed). Check
+        each of the following and report the outcome of each:
+
+        1. The tag v{{ .version }} is visible on origin
+           (`git fetch origin --tags --quiet; git tag -l v{{ .version }}`).
+        2. The GitHub Actions release workflow completed successfully for
+           the v{{ .version }} tag — the release exists on
+           https://github.com/afittestide/asimi/releases with binaries
+           attached.
+        3. The one-liner installer fetches the new version:
+           `curl -fsSL https://asimi.dev/installer | bash` — verify
+           `asimi --version` reports {{ .version }}.
+        4. If brew is available, `brew upgrade asimi` serves the new
+           version; otherwise note it as unverified.
+
+        Report the results as a summary. A failed check does not roll back
+        the release, but the Ruler must be informed via ask_ruler so a
+        decision can be made.
+      on_failure: retry
   then:
-    - the release is tagged and (if confirmed) pushed
+    - the release is tagged, (if confirmed) pushed, and verified
