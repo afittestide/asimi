@@ -2344,9 +2344,9 @@ func TestRitualStepMsg_CompletedWithoutMessage(t *testing.T) {
 	msgCountAfter := len(chancellorChatAfter.Messages)
 	assert.Equal(t, msgCountBefore+1, msgCountAfter)
 
-	// The last message should contain the "Completed" line
+	// The last message should contain the step name and its run time
 	lastMsg := chancellorChatAfter.Messages[len(chancellorChatAfter.Messages)-1]
-	assert.Contains(t, lastMsg.Content, "Completed: check-sandbox of dawn-audience")
+	assert.Regexp(t, `⏱️ Check-sandbox: (\d+h)?(\d+m)?\d+(\.\d+)?(ms|µs|s)`, lastMsg.Content)
 }
 
 // TestSessionResume_ResetsHistoryState tests that resuming a session resets history state
