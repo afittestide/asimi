@@ -36,6 +36,7 @@ type TUIModel struct {
 	// UI Components
 	status      StatusComponent
 	prompts     map[string]*PromptComponent // keyed by tab Target
+	stepStarts  map[string]time.Time        // step start, keyed by channel and step name
 	tabs        TabManager
 	completions CompletionDialog
 	commandLine *CommandLineComponent
@@ -383,6 +384,7 @@ func NewTUIModel(cfg *Config, repoInfo *repo.RepoInfo, promptHistory *PromptHist
 		// Initialize components
 		status:      status,
 		prompts:     prompts,
+		stepStarts:  make(map[string]time.Time),
 		completions: NewCompletionDialog(),
 		commandLine: NewCommandLineComponent(),
 		modal:       nil,
@@ -2995,6 +2997,9 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Record which execution this tab is streaming, so terminal events
 			// replayed for another (stale) execution can be recognised as such.
 			m.setTabExecutionID(msg.ChannelID, msg.ExecutionID)
+			if msg.StepName != "" {
+				m.stepStarts[msg.ChannelID+"/"+msg.StepName] = time.Now()
+			}
 			text := ""
 			if msg.StepName == "" {
 				text = fmt.Sprintf("%sRitual %s started",
@@ -3029,8 +3034,14 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 				chat.Indent++
 			}
 		case "completed":
+			stepKey := msg.ChannelID + "/" + msg.StepName
+			start, timed := m.stepStarts[stepKey]
+			delete(m.stepStarts, stepKey)
 			if msg.Message != "" {
 				chat.AddMessage(fmt.Sprintf("  %s %s", checkPrefix, msg.Message))
+			} else if timed {
+				name := strings.ToUpper(msg.StepName[:1]) + msg.StepName[1:]
+				chat.AddMessage(fmt.Sprintf("  ⏱️ %s: %s", name, time.Since(start).Round(10*time.Millisecond)))
 			} else {
 				chat.AddMessage(fmt.Sprintf("  Completed: %s of %s", msg.StepName, msg.RitualName))
 			}
@@ -3038,9 +3049,11 @@ func (m TUIModel) handleCustomMessages(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// "started" will re-assert it).
 			m.clearStreamingTab(msg.ChannelID)
 		case "failed":
+			delete(m.stepStarts, msg.ChannelID+"/"+msg.StepName)
 			chat.AddMessage(fmt.Sprintf("  Failed: %s of %s", msg.StepName, msg.RitualName))
 			m.clearStreamingTab(msg.ChannelID)
 		case "aborted":
+			delete(m.stepStarts, msg.ChannelID+"/"+msg.StepName)
 			chat.AddMessage(fmt.Sprintf("  Aborted: %s of %s", msg.StepName, msg.RitualName))
 			m.clearStreamingTab(msg.ChannelID)
 		case "retrying":
